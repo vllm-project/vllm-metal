@@ -23,12 +23,12 @@ from tests.gqa_test_utils import (
     _run_primitive,
 )
 from tools.attention_bench_utils import ref_paged_attn
-from vllm_metal.metal import _load_native_module, get_ops
+from vllm_metal.metal import get_ops
 
 # The native dispatcher owns the supported domain. Parametrize the positive
 # matrices from that table, while routing tests keep independent boundary and
 # rejection expectations. A missing table must fail rather than skip coverage.
-GQA_CONFIG = _load_native_module()._gqa_decode_config_for_test()
+GQA_CONFIG = get_ops()._gqa_decode_config_for_test()
 GQA_GEOMETRIES = tuple(tuple(row) for row in GQA_CONFIG["geometries"])
 GQA_PARTITIONS = tuple(sorted(GQA_CONFIG["partitions"]))
 GQA_SIMD_GROUPS_PER_CORE = GQA_CONFIG["simd_groups_per_core"]
@@ -90,8 +90,8 @@ def test_dispatch_diagnostics_are_disabled_in_a_fresh_process() -> None:
         [
             sys.executable,
             "-c",
-            "from vllm_metal.metal import _load_native_module; "
-            "ops = _load_native_module(); "
+            "from vllm_metal.metal import get_ops; "
+            "ops = get_ops(); "
             "assert ops._set_paged_dispatch_diagnostics(False) is False; "
             "assert ops.last_paged_dispatch() == ''; "
             "assert ops.last_gqa_partition_size() == 0",

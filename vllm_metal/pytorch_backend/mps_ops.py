@@ -49,7 +49,7 @@ def get_mps_ops():
 
     module = _load_mps_module()
     # The shared detector is compiled into each launcher; MPS never loads MLX.
-    gpu_cores = module.detected_gpu_core_count()
+    gpu_cores = module.gpu_core_count()
     build_from_source = envs.VLLM_METAL_BUILD_FROM_SOURCE
     path = prepare_metallib(
         "paged_attention_v2_kern", build_from_source=build_from_source

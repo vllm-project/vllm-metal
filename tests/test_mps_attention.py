@@ -14,9 +14,8 @@ pytestmark = pytest.mark.skipif(
 
 
 def test_mps_prebuilt_loading_without_mlx_or_compiler():
-    # A fresh process ensures the MLX extension is not already resident. Inject
-    # topology only for this test; hosted VMs may omit the IORegistry property.
-    subprocess.run(
+    # Exercise VM fallback in a fresh process without MLX or a compiler.
+    result = subprocess.run(
         [
             sys.executable,
             "-c",
@@ -26,14 +25,20 @@ sys.modules["mlx"] = None
 sys.modules["_paged_ops"] = None
 sys.modules["torch.utils.cpp_extension"] = None
 from vllm_metal.pytorch_backend.mps_ops import _load_mps_module, get_mps_ops
-_load_mps_module()._override_detected_gpu_core_count_for_test(20)
+module = _load_mps_module()
+module._override_detected_gpu_core_count_for_test(0)
+assert module.detected_gpu_core_count() == 0
 get_mps_ops()
+assert module.gpu_core_count() == module.gpu_core_count() == 14
 assert sys.modules["mlx"] is None
 assert sys.modules["_paged_ops"] is None
 """,
         ],
         check=True,
+        capture_output=True,
+        text=True,
     )
+    assert result.stderr.count("GPU core count is unknown") == 1
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])

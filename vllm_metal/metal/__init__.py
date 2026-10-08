@@ -316,8 +316,6 @@ def get_ops() -> ModuleType:
     from vllm_metal import envs
 
     mod = _load_native_module()
-    # Require valid hardware before initializing the MLX shader libraries.
-    mod.detected_gpu_core_count()
 
     # 3. Initialise the required Metal shader libraries (v2 online-softmax, GDN
     #    linear attention, MLA paged attention).  By default we load the

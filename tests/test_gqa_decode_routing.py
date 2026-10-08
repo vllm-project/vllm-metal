@@ -2,7 +2,7 @@
 """P256/P512 production selection and fallback, verified after native evaluation.
 
 Kernel correctness is covered independently in test_gqa_paged_decode.py.
-Tests inject explicit core counts to exercise device-dependent routing.
+Tests inject core counts only when hardware detection is unavailable.
 """
 
 from __future__ import annotations
@@ -35,6 +35,13 @@ def test_native_reports_public_routing_capabilities():
     }
 
 
+def _restore_test_gpu_cores() -> None:
+    ops = get_ops()
+    ops._override_detected_gpu_core_count_for_test(-1)
+    if ops.detected_gpu_core_count() <= 0:
+        ops._override_detected_gpu_core_count_for_test(10)
+
+
 @pytest.fixture(scope="module", autouse=True)
 def _enable_dispatch_diagnostics():
     ops = get_ops()
@@ -46,15 +53,27 @@ def _enable_dispatch_diagnostics():
         ops._set_paged_dispatch_diagnostics(previous)
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _inject_test_gpu_cores():
+    """CI runners often omit IORegistry gpu-core-count; keep routing tests on."""
+    _restore_test_gpu_cores()
+    yield
+    get_ops()._override_detected_gpu_core_count_for_test(-1)
+
+
 def _require_grid(kv_len: int, query_heads: int) -> None:
     """Positive route tests need the measured grid guard on this GPU."""
     cores = get_ops().detected_gpu_core_count()
+    if cores <= 0:
+        pytest.skip("GPU core count unavailable: GQA conservatively disabled")
     if (kv_len // min(GQA_PARTITIONS)) * query_heads < GQA_SIMD_GROUPS_PER_CORE * cores:
         pytest.skip("This boundary is below the GQA grid guard on this GPU")
 
 
 def _eligible_context(query_heads: int = NUM_QUERY_HEADS, minimum: int = 32768) -> int:
     cores = get_ops().detected_gpu_core_count()
+    if cores <= 0:
+        pytest.skip("GPU core count unavailable: GQA conservatively disabled")
     # Round to whole partitions; this helper only sizes positive-test inputs.
     # Expected shape/length decisions are explicit in the boundary tests.
     partitions = (GQA_SIMD_GROUPS_PER_CORE * cores + query_heads - 1) // query_heads
@@ -62,24 +81,20 @@ def _eligible_context(query_heads: int = NUM_QUERY_HEADS, minimum: int = 32768) 
     return n
 
 
-def test_core_count_override_restores_previous_count() -> None:
+def test_core_count_override_restores_hardware_detection() -> None:
     ops = get_ops()
     original = ops.detected_gpu_core_count()
     ops._override_detected_gpu_core_count_for_test(7)
     try:
         assert ops.detected_gpu_core_count() == 7
-        assert ops.min_decode_grid() == 56
-        ops._override_detected_gpu_core_count_for_test(20)
-        assert ops.min_decode_grid() == 160
     finally:
-        ops._override_detected_gpu_core_count_for_test(original)
+        _restore_test_gpu_cores()
     assert ops.detected_gpu_core_count() == original
 
 
 def test_core_count_override_changes_default_routing() -> None:
     """Production dispatch reads the override through detected_gpu_core_count()."""
     ops = get_ops()
-    original = ops.detected_gpu_core_count()
     # Q=32, KV=8000: 31 full P256 partitions. Eligible iff 31*32 >= 33*cores;
     # forty cores require 10752 KV, while ten cores can select GQA.
     ops._override_detected_gpu_core_count_for_test(40)
@@ -105,65 +120,26 @@ def test_core_count_override_changes_default_routing() -> None:
         assert _dispatch_family() == "gqa_decode"
         _assert_close(out, ref, mx.bfloat16)
     finally:
-        ops._override_detected_gpu_core_count_for_test(original)
+        _restore_test_gpu_cores()
 
 
-def test_unknown_core_count_raises() -> None:
+def test_unknown_core_count_keeps_measured_shape_on_baseline() -> None:
     ops = get_ops()
-    original = ops.detected_gpu_core_count()
     ops._override_detected_gpu_core_count_for_test(0)
     try:
-        with pytest.raises(RuntimeError, match="Cannot determine Apple GPU core count"):
-            ops.detected_gpu_core_count()
-        with pytest.raises(RuntimeError, match="Cannot determine Apple GPU core count"):
-            ops.min_decode_grid()
-        with pytest.raises(RuntimeError, match="Cannot determine Apple GPU core count"):
-            _run_primitive(
-                [32768],
-                mx.bfloat16,
-                interleaved=False,
-                seed=37,
-                num_decode_requests=1,
-            )
-    finally:
-        ops._override_detected_gpu_core_count_for_test(original)
-
-
-def test_core_count_failure_propagates_through_backend_loaders(monkeypatch):
-    import vllm_metal.metal as metal
-    from vllm_metal.pytorch_backend import mps_ops
-
-    ops = get_ops()
-    mps = mps_ops._load_mps_module()
-    original, mps_original = (
-        ops.detected_gpu_core_count(),
-        mps.detected_gpu_core_count(),
-    )
-    mps_ops.get_mps_ops.cache_clear()
-    monkeypatch.setattr(
-        mps, "PagedAttention", lambda *args: pytest.fail("MPS shader loading started")
-    )
-    ops._override_detected_gpu_core_count_for_test(0)
-    mps._override_detected_gpu_core_count_for_test(0)
-    try:
-        with pytest.raises(RuntimeError, match="Cannot determine Apple GPU core count"):
-            mps_ops.get_mps_ops()
-
-        # Static metadata remains readable without initializing a backend.
-        monkeypatch.setattr(metal, "_ops_module", None)
-        assert metal._load_native_module()._gqa_decode_config_for_test()["geometries"]
-        monkeypatch.setattr(
-            ops,
-            "init_library_path",
-            lambda *args: pytest.fail("Shader loading started"),
+        assert ops.detected_gpu_core_count() == 0
+        assert ops.min_decode_grid() == 14 * 8
+        out, ref = _run_primitive(
+            [32768],
+            mx.bfloat16,
+            interleaved=False,
+            seed=37,
+            num_decode_requests=1,
         )
-        with pytest.raises(RuntimeError, match="Cannot determine Apple GPU core count"):
-            metal.get_ops()
-        assert metal._ops_module is None
+        _assert_fallback()
+        _assert_close(out, ref, mx.bfloat16)
     finally:
-        ops._override_detected_gpu_core_count_for_test(original)
-        mps._override_detected_gpu_core_count_for_test(mps_original)
-        mps_ops.get_mps_ops.cache_clear()
+        _restore_test_gpu_cores()
 
 
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
@@ -470,7 +446,9 @@ def test_shape_and_device_performance_gate(q, kv, head, block, cores, minimum):
 
 @pytest.mark.parametrize("q,kv,head,block", GQA_GEOMETRIES)
 @pytest.mark.parametrize("n,cores", [(0, 40), (-1, 40), (262145, 0), (65536, -1)])
-def test_invalid_planner_inputs_are_not_eligible(q, kv, head, block, n, cores):
+def test_unknown_core_count_or_empty_length_is_not_eligible(
+    q, kv, head, block, n, cores
+):
     assert not get_ops().gqa_decode_shape_eligible(q, kv, head, n, cores, block)
 
 

@@ -112,6 +112,7 @@ constexpr int kWindowMaxHeadSize = VLLM_METAL_PA_WINDOW_MAX_HEAD;
 // is untouched.
 
 using hardware::detected_gpu_core_count;
+using hardware::gpu_core_count;
 using hardware::override_detected_gpu_core_count_for_test;
 
 // One measured dispatch table, also exposed read-only to numerical/routing
@@ -294,7 +295,7 @@ static bool gqa_decode_shape_eligible(int num_heads, int num_kv_heads,
 }
 
 static int min_decode_grid() {
-  return detected_gpu_core_count() * kernels::kDecodeGroupsPerCore;
+  return gpu_core_count() * kernels::kDecodeGroupsPerCore;
 }
 
 void init_v2_library(const std::string& v2_src) {

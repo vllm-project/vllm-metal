@@ -215,6 +215,7 @@ class PagedAttention {
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("detected_gpu_core_count", &hardware::detected_gpu_core_count);
+  m.def("gpu_core_count", &hardware::gpu_core_count);
   m.def("_override_detected_gpu_core_count_for_test",
         &hardware::override_detected_gpu_core_count_for_test);
   m.def("nax_supported", &nax_supported);

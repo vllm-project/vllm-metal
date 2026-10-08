@@ -19,13 +19,12 @@ from vllm_metal.metal import get_ops
 def _diagnostics_and_cores():
     ops = get_ops()
     previous = ops._set_paged_dispatch_diagnostics(True)
-    previous_cores = ops.detected_gpu_core_count()
     ops._override_detected_gpu_core_count_for_test(40)
     try:
         yield
     finally:
         mx.synchronize()
-        ops._override_detected_gpu_core_count_for_test(previous_cores)
+        ops._override_detected_gpu_core_count_for_test(-1)
         ops._set_paged_dispatch_diagnostics(previous)
 
 
@@ -402,26 +401,21 @@ def test_batch_uses_known_core_budget_without_unsplit_grid_veto(
 ):
     get_ops()._override_detected_gpu_core_count_for_test(cores)
     lengths = [1536, 1793]
-
-    def run():
-        return _run_primitive(
-            lengths,
-            mx.float16,
-            interleaved=True,
-            seed=1007,
-            num_decode_requests=2,
-            num_decode_tokens=2,
-            gqa_context_lens=lengths,
-        )
-
-    if cores == 0:
-        with pytest.raises(RuntimeError, match="Cannot determine Apple GPU core count"):
-            run()
-        return
-    out, ref = run()
-    assert _dispatch_family() == "gqa_decode"
-    assert get_ops().last_gqa_partition_size() == expected_partition
-    assert get_ops().last_gqa_num_requests() == 2
+    out, ref = _run_primitive(
+        lengths,
+        mx.float16,
+        interleaved=True,
+        seed=1007,
+        num_decode_requests=2,
+        num_decode_tokens=2,
+        gqa_context_lens=lengths,
+    )
+    if expected_partition:
+        assert _dispatch_family() == "gqa_decode"
+        assert get_ops().last_gqa_partition_size() == expected_partition
+        assert get_ops().last_gqa_num_requests() == 2
+    else:
+        _assert_fallback()
     _assert_close(out, ref, mx.float16)
 
 
