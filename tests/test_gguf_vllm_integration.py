@@ -22,8 +22,9 @@ from types import SimpleNamespace
 
 import pytest
 import vllm.engine.arg_utils as arg_utils_module
-from huggingface_hub import HfApi
+from huggingface_hub import HfApi, RepoFile
 from huggingface_hub import constants as hf_constants
+from huggingface_hub.errors import IncompleteSnapshotError
 from vllm.engine.arg_utils import EngineArgs
 
 from vllm_metal.gguf import source as gguf_source
@@ -494,6 +495,7 @@ def test_remote_load_source_downloads_one_matching_gguf(
         "allow_patterns": [gguf_path.name],
         "revision": "weights-rev",
         "token": "hf-token",
+        "local_files_only": False,
     }
     assert config_call == {
         "repo_id": "Qwen/Qwen3-0.6B",
@@ -713,3 +715,92 @@ def test_remote_tag_resolves_its_own_file(tmp_path, monkeypatch, tag) -> None:
     )
 
     assert resolved == str(snapshot / f"model-{tag}.gguf")
+
+
+def test_remote_offline_selects_from_cached_listing(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(hf_constants, "HF_HUB_OFFLINE", True)
+    snapshot = tmp_path / "weights"
+    snapshot.mkdir()
+    (snapshot / "model-Q8_0.gguf").write_text("dummy")
+    listing = [
+        RepoFile(path=path, size=0, oid="0")
+        for path in (
+            "README.md",
+            "model-Q8_0-00001-of-00002.gguf",
+            "model-Q8_0-00002-of-00002.gguf",
+            "model-Q8_0.gguf",
+        )
+    ]
+    listing_calls: list[tuple[str, dict[str, object]]] = []
+    downloads: list[dict[str, object]] = []
+
+    def cached_repo_tree(repo_id: str, **kwargs: object) -> list[RepoFile]:
+        listing_calls.append((repo_id, kwargs))
+        return listing
+
+    def partial_snapshot_download(**kwargs: object) -> str:
+        downloads.append(kwargs)
+        if kwargs["allow_patterns"] != ["model-Q8_0.gguf"]:
+            raise IncompleteSnapshotError(
+                "shards not cached", snapshot_path=str(snapshot)
+            )
+        return str(snapshot)
+
+    monkeypatch.setattr(
+        gguf_source,
+        "HfApi",
+        lambda: SimpleNamespace(resolve_revision=lambda *_, **__: "weights-rev"),
+    )
+    monkeypatch.setattr(gguf_source, "get_cached_repo_tree", cached_repo_tree)
+    monkeypatch.setattr(gguf_source, "snapshot_download", partial_snapshot_download)
+    reference = gguf_source.RemoteGGUFReference(repo_id="org/model", quant_type="Q8_0")
+
+    resolved = reference.resolve(
+        cache_dir="cache", revision="rev", ignore_patterns=None, token=None
+    )
+
+    assert resolved == str(snapshot / "model-Q8_0.gguf")
+    assert listing_calls == [
+        ("org/model", {"revision": "weights-rev", "cache_dir": "cache"})
+    ]
+    assert downloads[-1] == {
+        "repo_id": "org/model",
+        "cache_dir": "cache",
+        "allow_patterns": ["model-Q8_0.gguf"],
+        "revision": "weights-rev",
+        "token": None,
+        "local_files_only": True,
+    }
+
+
+def test_remote_offline_rejects_ambiguous_cached_listing(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(hf_constants, "HF_HUB_OFFLINE", True)
+    snapshot = tmp_path / "weights"
+    snapshot.mkdir()
+    (snapshot / "mmproj-model-Q8_0.gguf").write_text("dummy")
+    listing = [
+        RepoFile(path=path, size=0, oid="0")
+        for path in ("mmproj-model-Q8_0.gguf", "model-Q8_0.gguf")
+    ]
+
+    def partial_snapshot_download(**_: object) -> str:
+        raise IncompleteSnapshotError("weights not cached", snapshot_path=str(snapshot))
+
+    monkeypatch.setattr(
+        gguf_source,
+        "HfApi",
+        lambda: SimpleNamespace(resolve_revision=_echo_revision),
+    )
+    monkeypatch.setattr(gguf_source, "get_cached_repo_tree", lambda *_, **__: listing)
+    monkeypatch.setattr(gguf_source, "snapshot_download", partial_snapshot_download)
+    reference = gguf_source.RemoteGGUFReference(repo_id="org/model", quant_type="Q8_0")
+
+    with pytest.raises(ValueError) as excinfo:
+        reference.resolve(
+            cache_dir=None, revision=None, ignore_patterns=None, token=None
+        )
+
+    assert str(excinfo.value) == (
+        "Remote GGUF reference 'org/model:Q8_0' matched multiple files: "
+        "mmproj-model-Q8_0.gguf, model-Q8_0.gguf."
+    )

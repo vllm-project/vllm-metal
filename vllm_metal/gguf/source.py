@@ -9,8 +9,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Self
 
-from huggingface_hub import HfApi, snapshot_download
+from huggingface_hub import HfApi, get_cached_repo_tree, snapshot_download
 from huggingface_hub import constants as hf_constants
+from huggingface_hub.errors import IncompleteSnapshotError
 from huggingface_hub.utils import filter_repo_objects
 
 _GGUF_SUFFIX = ".gguf"
@@ -118,22 +119,32 @@ class RemoteGGUFReference:
         )
         snapshot_dir = None
         if hf_constants.HF_HUB_OFFLINE:
-            snapshot_dir = Path(
-                snapshot_download(
-                    repo_id=self.repo_id,
-                    cache_dir=cache_dir,
-                    allow_patterns=list(self.allow_patterns),
-                    ignore_patterns=ignore_patterns,
-                    revision=revision,
-                    token=token,
-                    local_files_only=True,
+            try:
+                snapshot_dir = Path(
+                    snapshot_download(
+                        repo_id=self.repo_id,
+                        cache_dir=cache_dir,
+                        allow_patterns=list(self.allow_patterns),
+                        ignore_patterns=ignore_patterns,
+                        revision=revision,
+                        token=token,
+                        local_files_only=True,
+                    )
                 )
-            )
-            repo_files = [
-                path.relative_to(snapshot_dir).as_posix()
-                for path in snapshot_dir.rglob("*")
-                if path.is_file()
-            ]
+            except IncompleteSnapshotError:
+                # Raised only with a cached repo listing; select from it like online.
+                repo_files = [
+                    file.path
+                    for file in get_cached_repo_tree(
+                        self.repo_id, revision=revision, cache_dir=cache_dir
+                    )
+                ]
+            else:
+                repo_files = [
+                    path.relative_to(snapshot_dir).as_posix()
+                    for path in snapshot_dir.rglob("*")
+                    if path.is_file()
+                ]
         else:
             repo_files = HfApi().list_repo_files(
                 repo_id=self.repo_id,
@@ -157,6 +168,7 @@ class RemoteGGUFReference:
                     allow_patterns=[filename],
                     revision=revision,
                     token=token,
+                    local_files_only=hf_constants.HF_HUB_OFFLINE,
                 )
             )
         return str(snapshot_dir / filename)

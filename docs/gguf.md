@@ -49,10 +49,10 @@ repository. A quant published both as one file and as that file's shards
 resolves to the single file. Missing or ambiguous matches, and quants published
 only as shards, fail before model load.
 
-With `HF_HUB_OFFLINE=1`, remote references select from the requested revision
-in the local Hugging Face cache. Cache the matching GGUF file and companion
-config/tokenizer first; missing, ambiguous, or shard-only cached matches also
-fail before model load.
+With `HF_HUB_OFFLINE=1`, remote references select from the cached repo listing
+of the requested revision, or from its cached files when the cache has no
+listing. Cache the matching GGUF file and companion config/tokenizer first;
+missing, ambiguous, or shard-only matches also fail before model load.
 
 ## Current scope
 
