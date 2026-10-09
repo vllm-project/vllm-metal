@@ -952,6 +952,13 @@ class MetalPlatform(Platform):
                 "pipeline_parallel_size=1 or an MLX-LM safetensors checkpoint."
             )
 
+        # LoRA cannot wrap the GGUFLinear layers the GGUF loader installs.
+        if vllm_config.lora_config is not None and model_config.quantization == "gguf":
+            raise NotImplementedError(
+                "Metal does not support LoRA with GGUF checkpoints; remove "
+                "--enable-lora or use an MLX-LM safetensors checkpoint."
+            )
+
         # Data parallelism passed every admission guard above (including the
         # multimodal and STT rejections). Only now — after all fail-fasts, before
         # the engine connects — register the Apple-GPU worker patch at the Ray job

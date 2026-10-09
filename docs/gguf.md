@@ -75,4 +75,4 @@ missing, ambiguous, or shard-only matches also fail before model load.
   for one GEMM and free it afterwards.
 - A tied model's unused `output.weight` is skipped whatever its qtype.
 - Unsupported: IQ and T-quants, MoE, SSM or hybrid models, vision
-  models, fused-QKV GGUFs, and sharded GGUF files.
+  models, fused-QKV GGUFs, sharded GGUF files, and LoRA (`--enable-lora`).

@@ -49,6 +49,13 @@ _TINY_CONFIG = {
     "tie_word_embeddings": True,
     "max_position_embeddings": 512,
 }
+_AWQ_QUANTIZATION_CONFIG = {
+    "quant_method": "awq",
+    "bits": 4,
+    "group_size": 128,
+    "zero_point": True,
+    "version": "gemm",
+}
 
 
 @pytest.fixture(autouse=True)
@@ -122,6 +129,40 @@ def test_create_engine_config_routes_local_gguf(gguf_file, config_dir) -> None:
     assert model_config.tokenizer == config_dir
     assert model_config.hf_config.model_type == "qwen3"
     assert model_config.served_model_name == gguf_file
+
+
+@pytest.mark.parametrize("remote", [False, True], ids=["local", "remote"])
+def test_create_engine_config_rejects_lora_for_gguf(
+    gguf_file, config_dir, remote
+) -> None:
+    model = "Qwen/Qwen3-0.6B-GGUF:Q8_0" if remote else gguf_file
+    args = _engine_args(model=model, tokenizer=config_dir, enable_lora=True)
+
+    with pytest.raises(NotImplementedError) as exc_info:
+        args.create_engine_config()
+
+    assert str(exc_info.value) == (
+        "Metal does not support LoRA with GGUF checkpoints; remove "
+        "--enable-lora or use an MLX-LM safetensors checkpoint."
+    )
+
+
+@pytest.mark.parametrize(
+    ("extra_config", "quantization"),
+    [({}, None), ({"quantization_config": _AWQ_QUANTIZATION_CONFIG}, "auto_awq")],
+    ids=["unquantized", "awq"],
+)
+def test_create_engine_config_keeps_lora_for_non_gguf_model(
+    tmp_path, extra_config, quantization
+) -> None:
+    (tmp_path / "config.json").write_text(json.dumps({**_TINY_CONFIG, **extra_config}))
+
+    vllm_config = _engine_args(
+        model=str(tmp_path), enable_lora=True
+    ).create_engine_config()
+
+    assert vllm_config.model_config.quantization == quantization
+    assert vllm_config.lora_config is not None
 
 
 def test_hf_config_path_beats_tokenizer(gguf_file, config_dir, tmp_path) -> None:
