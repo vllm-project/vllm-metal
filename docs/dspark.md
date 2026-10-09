@@ -236,13 +236,19 @@ use the benchmark's streaming usage counts and latency definitions, not SSE
 chunk counts.
 
 `summary.json` retains every repeat's throughput and paired ratio, latency,
-and exact sequence counts. Each run also saves commands, detailed benchmark
-results, token IDs, server logs, source hashes, and before/after counters.
+exact sequence counts, and `greedy_parity_passed` for each arm/concurrency.
+`first_divergences_vs_target` lists the first differing token of every mismatched
+prompt, grouped in `repeat_ids` order. Prompt and output-token indices are
+zero-based; token IDs can be looked up in the saved `tokens.json` files.
+Each run also saves commands, detailed benchmark results, token IDs, server logs,
+source hashes, and before/after counters.
 Counter snapshots wait for completed requests and exclude both warmup passes;
 a missing required counter or a speculative arm with no actual verified drafts
 fails. Failed, incomplete, or mismatched workloads cannot produce a successful
-summary. Token divergence is reported explicitly, without being relabeled as
-top-k agreement or exact losslessness; investigate it with the separate serving
+summary. Any token mismatch in either speculative arm fails greedy qualification
+and makes the command exit nonzero after all measurements finish. The summary
+and raw timings are preserved for diagnosis; their throughput ratios do not
+establish a lossless speedup. Investigate divergences with the separate serving
 parity tool.
 
 Worker snapshots distinguish MLX active/peak allocation, allocator cache, worker

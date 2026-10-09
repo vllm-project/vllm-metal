@@ -21,6 +21,7 @@ from tools.benchmark.dspark_serving_benchmark import (
     stop_server,
     summarize,
     validate_measurement,
+    write_summary,
 )
 
 
@@ -204,32 +205,108 @@ def test_baseline_cannot_include_drafting():
         )
 
 
-def test_summary_pairs_repeats_and_preserves_token_divergence():
+@pytest.fixture
+def serving_rows():
     result, _, _ = measurement()
     rows = []
-    for repeat in (1, 2):
-        for arm, rate, tokens in (
-            ("target", 8 * repeat, [1, 2]),
-            ("dspark", 6 * repeat, [1, 3]),
-            ("draft_model", 10 * repeat, [1, 2]),
-        ):
-            bench = deepcopy(result)
-            bench["output_throughput"] = rate
-            rows.append(
-                {
-                    "repeat": repeat,
-                    "arm": arm,
-                    "concurrency": 1,
-                    "benchmark": bench,
-                    "tokens": [{"tokens": tokens}],
-                }
-            )
+    for concurrency in (1, 4):
+        for repeat in (1, 2):
+            for arm, rate in (
+                ("target", 8 * repeat),
+                ("dspark", 6 * repeat),
+                ("draft_model", 10 * repeat),
+            ):
+                bench = deepcopy(result)
+                bench["output_throughput"] = rate
+                rows.append(
+                    {
+                        "repeat": repeat,
+                        "arm": arm,
+                        "concurrency": concurrency,
+                        "benchmark": bench,
+                        "tokens": [{"tokens": [0, 1, 2]}, {"tokens": [3, 4, 5]}],
+                    }
+                )
+    return rows
+
+
+def test_summary_pairs_repeats_and_preserves_token_divergence(serving_rows):
+    for row in serving_rows:
+        if row["arm"] == "dspark":
+            row["tokens"][1]["tokens"][2] = 6
     # A reversed execution order must still compare each repeat to its own baseline.
-    summary = summarize(rows[::-1])
+    summary = summarize(serving_rows[::-1])
     dspark = next(row for row in summary if row["arm"] == "dspark")
     assert dspark["paired_throughput_ratio_vs_target"] == [0.75, 0.75]
-    assert dspark["exact_sequences_vs_target"] == [0, 0]
+    assert dspark["exact_sequences_vs_target"] == [1, 1]
     assert dspark["median_output_tokens_per_s"] == 9
+    assert not dspark["greedy_parity_passed"]
+    assert (
+        dspark["first_divergences_vs_target"]
+        == [
+            [
+                {
+                    "prompt_index": 1,
+                    "token_index": 2,
+                    "target_token_id": 5,
+                    "arm_token_id": 6,
+                }
+            ]
+        ]
+        * 2
+    )
+
+
+def test_matching_sequences_pass_qualification(tmp_path, serving_rows):
+    write_summary(tmp_path, serving_rows)
+    summary = json.loads((tmp_path / "summary.json").read_text())
+    assert len(summary) == 6
+    assert all(row["greedy_parity_passed"] for row in summary)
+    assert all(row["exact_sequences_vs_target"] == [2, 2] for row in summary)
+    assert all(row["first_divergences_vs_target"] == [[], []] for row in summary)
+
+
+def test_empty_run_cannot_pass_qualification(tmp_path):
+    with pytest.raises(ValueError, match="No serving runs to qualify"):
+        write_summary(tmp_path, [])
+    assert not (tmp_path / "summary.json").exists()
+
+
+@pytest.mark.parametrize("arm", ("dspark", "draft_model"))
+@pytest.mark.parametrize(
+    ("tokens", "index", "actual_id", "target_id"),
+    [([6, 1, 2], 0, 6, 0), ([0, 1, 6], 2, 6, 2), ([0, 1], 2, None, 2)],
+)
+def test_divergence_fails_after_preserving_all_results(
+    tmp_path, serving_rows, arm, tokens, index, actual_id, target_id
+):
+    row = next(
+        r
+        for r in serving_rows
+        if r["arm"] == arm and r["repeat"] == 2 and r["concurrency"] == 4
+    )
+    row["tokens"][0]["tokens"] = tokens
+    with pytest.raises(ValueError, match=f"Greedy token parity failed: {arm} c4"):
+        write_summary(tmp_path, serving_rows[::-1])
+    summary = json.loads((tmp_path / "summary.json").read_text())
+    failed = [r for r in summary if not r["greedy_parity_passed"]]
+    assert len(failed) == 1
+    assert failed[0]["exact_sequences_vs_target"] == [2, 1]
+    assert failed[0]["first_divergences_vs_target"] == [
+        [],
+        [
+            {
+                "prompt_index": 0,
+                "token_index": index,
+                "target_token_id": target_id,
+                "arm_token_id": actual_id,
+            }
+        ],
+    ]
+    assert len(summary) == 6
+    for result in summary:
+        assert len(result["output_tokens_per_s"]) == 2
+        assert len(result["paired_throughput_ratio_vs_target"]) == 2
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="macOS process group lifecycle")

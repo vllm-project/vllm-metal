@@ -21,6 +21,7 @@ import statistics
 import subprocess
 import sys
 import time
+from itertools import zip_longest
 from pathlib import Path
 from urllib.request import Request, urlopen
 
@@ -514,7 +515,7 @@ def summarize(rows: list[dict]) -> list[dict]:
                 ),
                 key=lambda r: r["repeat"],
             )
-            rates, ratios, exact = [], [], []
+            rates, ratios, exact, divergences = [], [], [], []
             for row in selected:
                 baseline = next(
                     r
@@ -525,12 +526,29 @@ def summarize(rows: list[dict]) -> list[dict]:
                 )
                 rates.append(row["benchmark"]["output_throughput"])
                 ratios.append(rates[-1] / baseline["benchmark"]["output_throughput"])
-                exact.append(
-                    sum(
-                        a["tokens"] == b["tokens"]
-                        for a, b in zip(row["tokens"], baseline["tokens"], strict=True)
+                mismatches = []
+                for prompt_index, (actual, expected) in enumerate(
+                    zip(row["tokens"], baseline["tokens"], strict=True)
+                ):
+                    if actual["tokens"] == expected["tokens"]:
+                        continue
+                    token_index, (actual_id, expected_id) = next(
+                        (index, pair)
+                        for index, pair in enumerate(
+                            zip_longest(actual["tokens"], expected["tokens"])
+                        )
+                        if pair[0] != pair[1]
                     )
-                )
+                    mismatches.append(
+                        {
+                            "prompt_index": prompt_index,
+                            "token_index": token_index,
+                            "target_token_id": expected_id,
+                            "arm_token_id": actual_id,
+                        }
+                    )
+                exact.append(len(row["tokens"]) - len(mismatches))
+                divergences.append(mismatches)
             summary.append(
                 {
                     "arm": arm,
@@ -540,6 +558,8 @@ def summarize(rows: list[dict]) -> list[dict]:
                     "median_output_tokens_per_s": statistics.median(rates),
                     "paired_throughput_ratio_vs_target": ratios,
                     "exact_sequences_vs_target": exact,
+                    "greedy_parity_passed": not any(divergences),
+                    "first_divergences_vs_target": divergences,
                     "sequences_per_repeat": len(selected[0]["tokens"]),
                     "mean_ttft_ms": [r["benchmark"]["mean_ttft_ms"] for r in selected],
                     "mean_tpot_ms": [r["benchmark"]["mean_tpot_ms"] for r in selected],
@@ -547,6 +567,24 @@ def summarize(rows: list[dict]) -> list[dict]:
                 }
             )
     return summary
+
+
+def write_summary(output_dir: Path, rows: list[dict]) -> None:
+    if not rows:
+        raise ValueError("No serving runs to qualify")
+    summary = summarize(rows)
+    write_json(output_dir / "summary.json", summary)
+    failed = [
+        f"{row['arm']} c{row['concurrency']}"
+        for row in summary
+        if not row["greedy_parity_passed"]
+    ]
+    if failed:
+        raise ValueError(
+            f"Greedy token parity failed: {', '.join(failed)}. "
+            "Timing results and first divergences are retained in summary.json; "
+            "throughput ratios do not establish a lossless speedup."
+        )
 
 
 def main() -> None:
@@ -709,7 +747,7 @@ def main() -> None:
             raise ValueError(
                 "Source changed during the benchmark; repeat from a fixed checkout"
             )
-        write_json(args.output_dir / "summary.json", summarize(rows))
+        write_summary(args.output_dir, rows)
     except BaseException as exc:
         write_json(
             args.output_dir / "failure.json",
