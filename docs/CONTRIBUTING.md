@@ -54,6 +54,7 @@ Model parity runs separately through [scheduled and requested CI](tools.md#sched
 
 ## Pull requests
 
+- **Before opening a PR:** follow [AGENTS.md](https://github.com/vllm-project/vllm-metal/blob/main/AGENTS.md) for motivation, duplicate-work checks and validation expectations.
 - **Model changes:** run the [greedy parity tool](tools.md) against the environment's native `mlx-lm`. Report `EXACT` and `TOP_K_MATCH` counts separately and investigate failures.
 - **Performance claims:** include before/after [serving benchmark](https://docs.vllm.ai/en/latest/cli/bench/serve/) results, following the [macOS benchmarking guide](benchmarking-macos.md) for workload, machine-state and dispatch controls.
 
