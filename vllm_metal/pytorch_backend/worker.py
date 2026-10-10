@@ -94,6 +94,8 @@ def configure_mps(config):
 
 class MPSWorker(MetalWorker):
     def init_device(self):
+        import vllm_metal.pytorch_backend.rotary  # noqa: F401
+
         if not torch.backends.mps.is_available():
             raise RuntimeError("The experimental backend requires PyTorch MPS")
         configure_mps(self.vllm_config)

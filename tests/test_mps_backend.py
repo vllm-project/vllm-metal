@@ -219,3 +219,30 @@ def test_mps_logprobs(num_logprobs):
     torch.testing.assert_close(
         actual.logprobs[:, 1:].cpu(), expected.topk(num_logprobs, -1).values
     )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "rows,heads,kv_heads,head_size,gapped_heads",
+    [(1, 16, 8, 128, False), (37, 3, 1, 64, False), (37, 4, 2, 64, True)],
+)
+def test_rope_matches_upstream(dtype, rows, heads, kv_heads, head_size, gapped_heads):
+    from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
+
+    from vllm_metal.pytorch_backend.rotary import apply_rope
+
+    # Packed projections exercise row strides and nonzero storage offsets.
+    widths = [heads * head_size, kv_heads * head_size, kv_heads * head_size]
+    packed = torch.randn(rows + 1, sum(widths), device="mps", dtype=dtype)
+    q, k, _ = packed[1:].split(widths, dim=-1)
+    if gapped_heads:
+        q = q.view(rows, heads, head_size)[:, ::2]
+        k = k.view(rows, kv_heads, head_size)[:, ::2]
+    positions = torch.randperm(64, device="mps")[:rows]
+    cache = torch.randn(64, head_size, device="mps", dtype=dtype)
+    expected = RotaryEmbedding.forward_static(
+        positions, q, k, head_size, head_size, cache, True
+    )
+    actual = apply_rope(positions, q, k, cache, head_size)
+    for got, want in zip(actual, expected, strict=True):
+        torch.testing.assert_close(got, want, atol=0, rtol=0)
