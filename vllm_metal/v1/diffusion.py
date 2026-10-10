@@ -13,7 +13,9 @@ back) or accepts all of them. Each engine step runs one phase per request:
   mode. Emits nothing, so the scheduler rejects every draft and the canvas
   slots are reused next step; the sampler's updated canvas is the next draft.
 * ``commit`` — once converged, the argmax canvas is scheduled, run in encoder
-  mode to write its KV, and emitted as accepted tokens.
+  mode to write its KV, and emitted as accepted tokens. Requested logprobs
+  come from the converging denoise step's logits and travel with this
+  emission only, so a request never receives them on another's step.
 
 Encoder and decoder mode share every weight (mlx_vlm ``diffusion_gemma``):
 the encoder uses plain token embeddings, causal attention and its own
@@ -39,11 +41,13 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
-from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
+from vllm.v1.outputs import DraftTokenIds, LogprobsLists, ModelRunnerOutput
 
 from vllm_metal.attention.context import clear_context, get_context, prepare_grouped
+from vllm_metal.v1.prompt_logprobs import _LOGITS_LOGPROBS_MODES
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -204,6 +208,75 @@ def denoise_update(
     return DenoiseOutcome(next_canvas, argmax_canvas, converged, processed)
 
 
+def canvas_logprobs(
+    logits: mx.array,
+    selected: mx.array,
+    *,
+    num_logprobs: int,
+    token_ids: list[int] | None,
+    logits_mode: bool,
+) -> LogprobsLists:
+    """Sample logprobs for every row of a ``(canvas, vocab)`` logits block.
+
+    Column 0 is ``selected``; the rest are ``token_ids`` when given, else the
+    top-``num_logprobs`` ids. ``logits_mode`` reports the logits themselves
+    instead of their log-softmax. Ranks are 1-based and count ties, as in
+    vLLM's ``Sampler.gather_logprobs``.
+    """
+    scores = (
+        logits if logits_mode else logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+    )
+    rows = scores.shape[0]
+    columns = [selected[:, None]]
+    if token_ids:
+        columns.append(
+            mx.broadcast_to(mx.array(token_ids, dtype=mx.int32), (rows, len(token_ids)))
+        )
+    elif num_logprobs > 0:
+        top = mx.argpartition(-scores, num_logprobs - 1, axis=-1)[:, :num_logprobs]
+        order = mx.argsort(-mx.take_along_axis(scores, top, axis=-1), axis=-1)
+        columns.append(mx.take_along_axis(top, order, axis=-1).astype(mx.int32))
+    ids = mx.concatenate(columns, axis=1)
+    values = mx.take_along_axis(scores, ids, axis=-1)
+    ranks = mx.sum(scores >= values[:, :1], axis=-1)
+    mx.eval(ids, values, ranks)
+    return LogprobsLists(
+        np.array(ids, dtype=np.int32),
+        np.array(values, dtype=np.float32),
+        np.array(ranks, dtype=np.int32),
+    )
+
+
+def join_canvas_logprobs(
+    req_ids: list[str], logprobs: dict[str, LogprobsLists]
+) -> LogprobsLists | None:
+    """Concatenate per-request logprob rows in ``req_ids`` order.
+
+    ``cu_num_generated_tokens`` holds each request's first row, so a request
+    without rows this step takes none. Narrower stashes are padded with id 0
+    and ``-inf``.
+    """
+    if not logprobs:
+        return None
+    width = max(rows.logprob_token_ids.shape[1] for rows in logprobs.values())
+    ids, values, ranks = [], [], []
+    starts: list[int] = []
+    offset = 0
+    for req_id in req_ids:
+        starts.append(offset)
+        rows = logprobs.get(req_id)
+        if rows is None:
+            continue
+        pad = ((0, 0), (0, width - rows.logprob_token_ids.shape[1]))
+        ids.append(np.pad(rows.logprob_token_ids, pad, constant_values=0))
+        values.append(np.pad(rows.logprobs, pad, constant_values=float("-inf")))
+        ranks.append(rows.sampled_token_ranks)
+        offset += rows.logprob_token_ids.shape[0]
+    return LogprobsLists(
+        np.concatenate(ids), np.concatenate(values), np.concatenate(ranks), starts
+    )
+
+
 # ---------------------------------------------------------------------------
 # Model forward (mlx_vlm DiffusionGemma, attention routed by the paged context)
 # ---------------------------------------------------------------------------
@@ -327,6 +400,8 @@ class _DiffusionRequest:
     step: int = 0
     history: list[mx.array] = field(default_factory=list)
     soft_embeddings: mx.array | None = None
+    # Taken on the converging step, delivered with the tokens it emits.
+    logprobs: LogprobsLists | None = None
 
 
 @dataclass
@@ -344,6 +419,7 @@ class DiffusionGemmaRuntime:
         self._runner = runner
         self.settings = DiffusionSettings.from_vllm_config(runner.vllm_config)
         self._vocab_size = runner.model_config.get_vocab_size()
+        self._logits_mode = runner.model_config.logprobs_mode in _LOGITS_LOGPROBS_MODES
         self._requests: dict[str, _DiffusionRequest] = {}
 
     def _new_canvas(self, request: _DiffusionRequest) -> None:
@@ -435,8 +511,9 @@ class DiffusionGemmaRuntime:
         if scheduler_output.kv_cache_block_copies:
             runtime.copy_blocks(scheduler_output.kv_cache_block_copies)
         sampled: dict[str, list[int]] = {}
+        logprobs: dict[str, LogprobsLists] = {}
         if encoder_segments:
-            self._run_encoder(encoder_segments, sampled)
+            self._run_encoder(encoder_segments, sampled, logprobs)
         if decoder_segments:
             self._run_decoder(decoder_segments)
 
@@ -452,6 +529,7 @@ class DiffusionGemmaRuntime:
             req_ids=req_ids,
             req_id_to_index={req_id: i for i, req_id in enumerate(req_ids)},
             sampled_token_ids=[sampled.get(req_id, []) for req_id in req_ids],
+            logprobs=join_canvas_logprobs(req_ids, logprobs),
         )
 
     def _forward(self, segments: list[_Segment], *, decoder: bool) -> mx.array:
@@ -498,7 +576,10 @@ class DiffusionGemmaRuntime:
         )
 
     def _run_encoder(
-        self, segments: list[_Segment], sampled: dict[str, list[int]]
+        self,
+        segments: list[_Segment],
+        sampled: dict[str, list[int]],
+        logprobs: dict[str, LogprobsLists],
     ) -> None:
         self._forward(segments, decoder=False)
         runner = self._runner
@@ -507,6 +588,11 @@ class DiffusionGemmaRuntime:
             state = runner._request_states[segment.req_id]
             if request.phase == "commit":
                 sampled[segment.req_id] = segment.token_ids
+                if request.logprobs is not None:
+                    logprobs[segment.req_id] = request.logprobs.slice_request(
+                        0, len(segment.token_ids)
+                    )
+                    request.logprobs = None
                 state.token_ids.extend(segment.token_ids)
                 state.generated_tokens += len(segment.token_ids)
                 self._new_canvas(request)
@@ -546,6 +632,16 @@ class DiffusionGemmaRuntime:
                 # rows the model saw.
                 request.canvas = outcome.argmax_canvas[:length]
                 request.soft_embeddings = None
+                params = self._runner._request_states[segment.req_id].sampling_params
+                if params.num_logprobs is not None:
+                    # As upstream: the schedule-tempered logits of this step.
+                    request.logprobs = canvas_logprobs(
+                        outcome.processed_logits[:length],
+                        request.canvas,
+                        num_logprobs=params.logprobs or 0,
+                        token_ids=params.logprob_token_ids,
+                        logits_mode=self._logits_mode,
+                    )
             else:
                 request.canvas = outcome.next_canvas
                 request.soft_embeddings = self_conditioning_embeddings(

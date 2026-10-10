@@ -7,7 +7,10 @@ from types import SimpleNamespace
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 import pytest
+from vllm.sampling_params import SamplingParams
+from vllm.v1.outputs import LogprobsLists
 
 import vllm_metal.compat as compat
 import vllm_metal.v1.diffusion as diffusion
@@ -16,8 +19,10 @@ from vllm_metal.platform import MetalPlatform
 from vllm_metal.v1.diffusion import (
     DiffusionGemmaRuntime,
     DiffusionSettings,
+    canvas_logprobs,
     denoise_update,
     entropy_bound_mask,
+    join_canvas_logprobs,
     schedule_temperature,
 )
 
@@ -55,6 +60,7 @@ def _vllm_config(
             try_get_generation_config=lambda: gen,
             get_vocab_size=lambda: _VOCAB,
             hf_config=SimpleNamespace(model_type=model_type),
+            logprobs_mode="raw_logprobs",
         ),
         speculative_config=None,
         lora_config=None,
@@ -196,6 +202,77 @@ class TestSamplerMath:
         assert last.converged
 
 
+class TestCanvasLogprobs:
+    _LOGITS = mx.array([[0.0, 3.0, 1.0, 2.0], [4.0, 0.0, 0.0, 1.0]])
+
+    def _log_softmax(self) -> np.ndarray:
+        logits = np.array(self._LOGITS, dtype=np.float64)
+        return logits - np.log(np.exp(logits).sum(axis=-1, keepdims=True))
+
+    def test_reports_the_selected_token_and_the_top_k_per_row(self) -> None:
+        rows = canvas_logprobs(
+            self._LOGITS,
+            mx.array([1, 3]),
+            num_logprobs=2,
+            token_ids=None,
+            logits_mode=False,
+        )
+
+        assert rows.logprob_token_ids.tolist() == [[1, 1, 3], [3, 0, 3]]
+        expected = np.take_along_axis(
+            self._log_softmax(), rows.logprob_token_ids, axis=-1
+        )
+        np.testing.assert_allclose(rows.logprobs, expected, rtol=1e-5)
+        assert rows.sampled_token_ranks.tolist() == [1, 2]
+
+    def test_token_ids_replace_the_top_k(self) -> None:
+        rows = canvas_logprobs(
+            self._LOGITS,
+            mx.array([1, 0]),
+            num_logprobs=2,
+            token_ids=[2, 0],
+            logits_mode=False,
+        )
+
+        assert rows.logprob_token_ids.tolist() == [[1, 2, 0], [0, 2, 0]]
+        expected = np.take_along_axis(
+            self._log_softmax(), rows.logprob_token_ids, axis=-1
+        )
+        np.testing.assert_allclose(rows.logprobs, expected, rtol=1e-5)
+
+    def test_logits_mode_reports_the_logits(self) -> None:
+        rows = canvas_logprobs(
+            self._LOGITS,
+            mx.array([1, 0]),
+            num_logprobs=0,
+            token_ids=None,
+            logits_mode=True,
+        )
+
+        assert rows.logprob_token_ids.tolist() == [[1], [0]]
+        assert rows.logprobs.tolist() == [[3.0], [4.0]]
+
+    def test_join_offsets_each_request_and_pads_narrow_rows(self) -> None:
+        wide = LogprobsLists(
+            np.array([[5, 6, 7], [5, 7, 6]]),
+            np.zeros((2, 3), dtype=np.float32),
+            np.array([1, 1]),
+        )
+        narrow = LogprobsLists(
+            np.array([[9]]), np.zeros((1, 1), dtype=np.float32), np.array([1])
+        )
+
+        joined = join_canvas_logprobs(["a", "idle", "b"], {"a": wide, "b": narrow})
+
+        assert joined is not None
+        assert joined.cu_num_generated_tokens == [0, 2, 2]
+        assert joined.slice_request(1, 0).logprob_token_ids.shape[0] == 0
+        b = joined.slice_request(2, 1)
+        assert b.logprob_token_ids.tolist() == [[9, 0, 0]]
+        assert b.logprobs.tolist() == [[0.0, float("-inf"), float("-inf")]]
+        assert join_canvas_logprobs(["a"], {}) is None
+
+
 class _StubRuntime:
     def __init__(self) -> None:
         self.calls: list[str] = []
@@ -256,6 +333,39 @@ def _scheduler_output(
         scheduled_spec_decode_tokens=drafts or {},
         new_block_ids_to_zero=None,
         kv_cache_block_copies=None,
+    )
+
+
+def _new_req(
+    req_id: str, params: SamplingParams | None = None, prompt=(7, 8)
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        req_id=req_id,
+        prompt_token_ids=list(prompt),
+        sampling_params=params,
+        block_ids=([0],),
+        num_computed_tokens=0,
+    )
+
+
+def _step(rt: DiffusionGemmaRuntime, *req_ids: str, new_reqs=()):
+    """One engine step: new requests prefill whole, running ones run their drafts."""
+    runner = rt._runner
+    drafts = runner._draft_token_ids
+    pending = (
+        {}
+        if drafts is None
+        else dict(zip(drafts.req_ids, drafts.draft_token_ids, strict=True))
+    )
+    scheduled = {r.req_id: len(r.prompt_token_ids) for r in new_reqs}
+    scheduled.update({r: len(pending[r]) for r in req_ids})
+    return rt.execute_model(
+        _scheduler_output(
+            new_reqs=new_reqs,
+            cached={r: len(runner._request_states[r].token_ids) for r in req_ids},
+            scheduled=scheduled,
+            drafts={r: pending[r] for r in req_ids},
+        )
     )
 
 
@@ -422,6 +532,48 @@ class TestRuntimeStepProtocol:
         # The rows the model never saw this step are not committed.
         assert canvas == [3, 1]
         assert out.sampled_token_ids == [[3, 1]]
+
+    def test_logprobs_arrive_with_the_committed_canvas(self, runtime) -> None:
+        rt, _ = runtime
+        out = _step(rt, new_reqs=[_new_req("r", SamplingParams(logprobs=2))])
+        assert out.logprobs is None
+
+        # Two denoise steps converge; nothing is emitted, so no logprobs yet.
+        for _ in range(2):
+            assert _step(rt, "r").logprobs is None
+
+        out = _step(rt, "r")
+
+        assert out.sampled_token_ids == [[3, 1, 4, 1]]
+        rows = out.logprobs.slice_request(0, _CANVAS)
+        assert rows.logprob_token_ids[:, 0].tolist() == [3, 1, 4, 1]
+        assert rows.logprob_token_ids.shape == (_CANVAS, 3)
+        assert rows.sampled_token_ranks.tolist() == [1] * _CANVAS
+        np.testing.assert_allclose(rows.logprobs[:, 0], 0.0, atol=1e-5)
+
+    def test_logprobs_follow_their_own_request_in_lockstep(self, runtime) -> None:
+        # "a" commits on the step "b" converges. b's logprobs must wait for
+        # b's own commit, or the frontend gets fewer rows than tokens.
+        rt, _ = runtime
+        params = SamplingParams(logprob_token_ids=[4, 5])
+
+        _step(rt, new_reqs=[_new_req("a", params)])
+        _step(rt, "a", new_reqs=[_new_req("b", params)])
+        _step(rt, "a", "b")  # a converges
+        out = _step(rt, "a", "b")  # a commits, b converges
+
+        assert out.sampled_token_ids == [[3, 1, 4, 1], []]
+        assert out.logprobs.cu_num_generated_tokens == [0, _CANVAS]
+        assert out.logprobs.logprob_token_ids.shape == (_CANVAS, 3)
+        a = out.logprobs.slice_request(0, _CANVAS)
+        assert a.logprob_token_ids.tolist() == [[t, 4, 5] for t in [3, 1, 4, 1]]
+
+        out = _step(rt, "a", "b")  # b commits
+
+        assert out.sampled_token_ids == [[], [3, 1, 4, 1]]
+        assert out.logprobs.cu_num_generated_tokens == [0, 0]
+        b = out.logprobs.slice_request(1, _CANVAS)
+        assert b.logprob_token_ids.tolist() == [[t, 4, 5] for t in [3, 1, 4, 1]]
 
     def test_finished_requests_drop_their_canvas(self, runtime) -> None:
         rt, _ = runtime
@@ -594,19 +746,46 @@ class TestPlatformDiffusionConfig:
             MetalPlatform._check_diffusion_config(_vllm_config(canvas_length=None))
 
     @pytest.mark.parametrize(
-        ("params", "parameter"),
-        [({"logprobs": 2}, "logprobs"), ({"prompt_logprobs": 1}, "prompt_logprobs")],
+        "params",
+        [
+            {"logprobs": 2},
+            {"logprob_token_ids": [1, 2]},
+            {"extra_args": {"diffusion_canvas_length": _CANVAS}},
+        ],
     )
-    def test_rejects_logprobs_requests_while_serving_diffusion(
+    def test_accepts_sample_logprobs_while_serving_diffusion(
+        self, monkeypatch, params
+    ) -> None:
+        monkeypatch.setattr(MetalPlatform, "_serves_diffusion", True)
+
+        MetalPlatform.validate_request(None, SamplingParams(**params))
+
+    @pytest.mark.parametrize(
+        ("params", "parameter"),
+        [
+            ({"logprobs": -1}, "logprobs"),
+            ({"prompt_logprobs": 1}, "prompt_logprobs"),
+            ({"prompt_logprob_token_ids": [1]}, "prompt_logprob_token_ids"),
+            *(
+                ({"extra_args": {name: value}}, name)
+                for name, value in (
+                    ("diffusion_seed_canvas", [1] * _CANVAS),
+                    ("diffusion_pinned", [0]),
+                    ("diffusion_max_steps", 1),
+                    ("diffusion_read_only", True),
+                    ("diffusion_constrained", True),
+                )
+            ),
+        ],
+    )
+    def test_rejects_what_the_runtime_ignores_while_serving_diffusion(
         self, monkeypatch, params, parameter
     ) -> None:
         from vllm.exceptions import VLLMValidationError
-        from vllm.sampling_params import SamplingParams
 
         monkeypatch.setattr(MetalPlatform, "_serves_diffusion", True)
 
-        MetalPlatform.validate_request(None, SamplingParams())
-        with pytest.raises(VLLMValidationError, match="Logprobs") as exc_info:
+        with pytest.raises(VLLMValidationError, match="not supported") as exc_info:
             MetalPlatform.validate_request(None, SamplingParams(**params))
         assert exc_info.value.parameter == parameter
 
@@ -618,7 +797,6 @@ class TestPlatformDiffusionConfig:
         self, monkeypatch, params, parameter
     ) -> None:
         from vllm.exceptions import VLLMValidationError
-        from vllm.sampling_params import SamplingParams
 
         monkeypatch.setattr(MetalPlatform, "_serves_diffusion", True)
 

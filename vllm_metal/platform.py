@@ -44,6 +44,16 @@ _METAL_DENSE_KV_CACHE_DTYPES: dict[str, torch.dtype] = {
 _METAL_DENSE_KV_CACHE_DTYPE_NAMES: dict[torch.dtype, str] = {
     dtype: name for name, dtype in _METAL_DENSE_KV_CACHE_DTYPES.items()
 }
+# Structured-read extra_args (vllm#57250) that DiffusionGemmaRuntime does not
+# read yet. A diffusion_canvas_length that reaches validate_request equals the
+# served canvas (narrower ones need async scheduling), so it is a no-op.
+_UNSUPPORTED_DIFFUSION_ARGS = (
+    "diffusion_seed_canvas",
+    "diffusion_pinned",
+    "diffusion_max_steps",
+    "diffusion_read_only",
+    "diffusion_constrained",
+)
 
 
 def _pick_mb_buffer_default(
@@ -108,8 +118,8 @@ class MetalPlatform(Platform):
     # recomputes instead of sticking (#585 shape via a second engine).
     _mb_default_installed: ClassVar[str | None] = None
 
-    # Whether the configured model is a block-diffusion LM, whose runner emits
-    # no logprobs; set by check_and_update_config for validate_request.
+    # Whether the configured model is a block-diffusion LM, whose runner has
+    # its own sampler; set by check_and_update_config for validate_request.
     _serves_diffusion: ClassVar[bool] = False
 
     # --- Ray distributed executor support (Phase 1) ---
@@ -306,21 +316,25 @@ class MetalPlatform(Platform):
                 f"vLLM logits processors ({controls}).",
                 parameter=unsupported_controls[0],
             )
-        if cls._serves_diffusion and (
-            params.logprobs is not None or params.prompt_logprobs is not None
-        ):
-            raise VLLMValidationError(
-                "Logprobs are not supported for diffusion models on Metal yet.",
-                parameter="logprobs"
-                if params.logprobs is not None
-                else "prompt_logprobs",
-            )
-        # Upstream's diffusion sampler applies top_k/top_p to the canvas; the
-        # Metal one does not, so refuse them rather than ignore them.
+        # Upstream's diffusion sampler applies top_k/top_p to the canvas and
+        # reads the structured-read extra_args; the Metal one does not, so
+        # refuse them rather than ignore them.
         if cls._serves_diffusion:
+            if params.logprobs == -1:
+                raise VLLMValidationError(
+                    "logprobs=-1 is not supported for diffusion models on Metal.",
+                    parameter="logprobs",
+                )
+            extra_args = params.extra_args or {}
             for name, enabled in (
+                ("prompt_logprobs", params.prompt_logprobs is not None),
+                (
+                    "prompt_logprob_token_ids",
+                    params.prompt_logprob_token_ids is not None,
+                ),
                 ("top_k", params.top_k > 0),
                 ("top_p", params.top_p < 1.0),
+                *((key, key in extra_args) for key in _UNSUPPORTED_DIFFUSION_ARGS),
             ):
                 if enabled:
                     raise VLLMValidationError(
