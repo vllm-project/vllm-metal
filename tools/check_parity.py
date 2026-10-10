@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Compare greedy paged serving with the environment's native mlx-lm.
+"""Compare greedy serving with the backend's native GPU reference.
 
-Generate one native reference, then reuse one HTTP server for individual
-and batched prompt requests. Both backends use the same checkpoint and input IDs.
+Use mlx-lm for MLX, or Transformers on MPS for MPS. Generate one reference,
+then reuse one HTTP server for individual and batched prompt requests. Both
+backends use the same checkpoint and input IDs.
 See docs/tools.md or --help for usage.
 """
 
@@ -27,6 +28,23 @@ if __package__:
     from .parity_prompts import PROMPTS
 else:
     from parity_prompts import PROMPTS
+
+
+def checkpoint(model: str) -> tuple[str, str]:
+    from huggingface_hub import snapshot_download
+    from safetensors import safe_open
+
+    path = Path(model) if Path(model).is_dir() else Path(snapshot_download(model))
+    # MLX preserves checkpoint weights; --dtype alone does not cast them.
+    dtypes = set()
+    for shard in path.glob("*.safetensors"):
+        with safe_open(shard, framework="np") as tensors:
+            dtypes.update(tensors.get_slice(key).get_dtype() for key in tensors.keys())
+    if dtypes not in ({"F16"}, {"BF16"}):
+        raise ValueError(
+            f"Use a uniform FP16/BF16 checkpoint for a fair comparison: {dtypes}"
+        )
+    return str(path.resolve()), "float16" if dtypes == {"F16"} else "bfloat16"
 
 
 def mlx_generate(
@@ -82,6 +100,70 @@ def mlx_generate(
     return results
 
 
+def transformers_generate(
+    model_path: str, prompts: list[str], max_tokens: int, top_k: int | None = None
+) -> list[dict]:
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
+
+    model_path, dtype = checkpoint(model_path)
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    model = (
+        AutoModelForCausalLM.from_pretrained(
+            model_path, dtype=getattr(torch, dtype), attn_implementation="sdpa"
+        )
+        .to("mps")
+        .eval()
+    )
+    # Match --generation-config vllm; checkpoint sampling defaults must not leak in.
+    model.generation_config = GenerationConfig(
+        do_sample=False,
+        max_new_tokens=max_tokens,
+        eos_token_id=None,
+        pad_token_id=tokenizer.pad_token_id,
+        return_dict_in_generate=True,
+        output_scores=top_k is not None,
+    )
+    results = []
+    with torch.inference_mode():
+        for prompt in prompts:
+            input_ids = tokenizer.encode(prompt)
+            if not input_ids:
+                raise ValueError("The prompt must encode to at least one token.")
+            x = torch.tensor([input_ids], device="mps")
+            output = model.generate(x, attention_mask=torch.ones_like(x))
+            tokens = output.sequences[0, len(input_ids) :].tolist()
+            top_logprobs = []
+            if top_k is not None:
+                for logits in output.scores:
+                    scores = logits[0].log_softmax(-1, dtype=torch.float32)
+                    values, indices = scores.topk(top_k)
+                    top_logprobs.append(
+                        [
+                            {
+                                "id": token,
+                                "text": tokenizer.decode([token]),
+                                "logprob": score,
+                                "rank": rank,
+                            }
+                            for rank, (token, score) in enumerate(
+                                zip(indices.tolist(), values.tolist(), strict=True),
+                                start=1,
+                            )
+                        ]
+                    )
+            results.append(
+                {
+                    "prompt": prompt,
+                    "input_ids": input_ids,
+                    "tokens": tokens,
+                    "text": tokenizer.decode(tokens),
+                    "top_logprobs": top_logprobs,
+                }
+            )
+    return results
+
+
 @contextmanager
 def serving(
     model: str,
@@ -90,6 +172,7 @@ def serving(
     gpu_memory_utilization: float,
     log_path: Path,
     env: dict,
+    extra_args: tuple[str, ...] = (),
 ):
     """Start one local server and clean up its process group on every exit."""
     with socket.socket() as sock:
@@ -117,6 +200,7 @@ def serving(
                 "--no-enable-prefix-caching",
                 "--generation-config",
                 "vllm",
+                *extra_args,
             ],
             stdout=log,
             stderr=subprocess.STDOUT,
@@ -175,6 +259,12 @@ def check_parity(
         model = snapshot_download(model)
     model = str(Path(model).resolve())
     env = os.environ.copy()
+    is_mps = env.get("VLLM_METAL_BACKEND", "mlx") == "mps"
+    server_args = ()
+    if is_mps:
+        model, dtype = checkpoint(model)
+        server_args = ("--dtype", dtype)
+        env["PYTORCH_ENABLE_MPS_FALLBACK"] = "0"
     env["PYTHONPATH"] = os.pathsep.join(
         filter(None, [str(Path(__file__).resolve().parents[1]), env.get("PYTHONPATH")])
     )
@@ -182,7 +272,8 @@ def check_parity(
     env.setdefault("GLOO_SOCKET_IFNAME", "lo0")
     reference_path = output_dir / "reference.json"
     reference_path.write_text(json.dumps(prompts))
-    print("Generating native MLX reference...", flush=True)
+    reference_name = "Transformers/MPS" if is_mps else "MLX"
+    print(f"Generating native {reference_name} reference...", flush=True)
     with (output_dir / "reference.log").open("w") as log:
         subprocess.run(
             [
@@ -212,6 +303,7 @@ def check_parity(
         gpu_memory_utilization,
         output_dir / "serve.log",
         env,
+        server_args,
     ) as base_url:
         for size in batch_sizes:
             print(f"Prompts/request: {size}", flush=True)
@@ -356,7 +448,7 @@ def compare_results(
                 print(f"  Expected {max_tokens} tokens, got {len(ref['tokens'])}")
             else:
                 print(f"  First differing token (0-based): {mismatch}")
-            print(f"  mlx-lm: {ref['tokens']}\n          {ref['text']!r}")
+            print(f"  reference: {ref['tokens']}\n          {ref['text']!r}")
             print(f"  metal:  {got['tokens']}\n          {got['text']!r}")
             if complete and mismatch is not None and top_k is not None:
                 candidates = (ref["tokens"][mismatch], got["tokens"][mismatch])
@@ -421,7 +513,12 @@ def main() -> None:
         parser.error("--batch-size values must be positive")
     if args.generate_reference:
         prompts = json.loads(args.generate_reference.read_text())
-        reference = mlx_generate(args.model, prompts, args.max_tokens, args.top_k)
+        generate = (
+            transformers_generate
+            if os.environ.get("VLLM_METAL_BACKEND", "mlx") == "mps"
+            else mlx_generate
+        )
+        reference = generate(args.model, prompts, args.max_tokens, args.top_k)
         args.generate_reference.write_text(json.dumps(reference))
         return
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))

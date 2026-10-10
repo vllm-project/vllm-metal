@@ -197,3 +197,25 @@ def test_shortconv_checkpoint_survives_resume():
     preprocess_state(state, batch, tables, config, computed)
     assert torch.equal(cache[0], checkpoint)
     assert torch.equal(cache[2], checkpoint)
+
+
+@pytest.mark.parametrize("num_logprobs", [0, 2])
+def test_mps_logprobs(num_logprobs):
+    from vllm_metal.pytorch_backend.runtime import compute_topk_scores
+
+    logits = torch.tensor([[3.0, 3.0, 1.0, -2.0], [1.0, 5.0, 2.0, 0.0]], device="mps")
+    # Include the selected token even outside top-k, with correct tie ranks.
+    actual = compute_topk_scores(
+        logits, num_logprobs, torch.tensor([2, 1], device="mps")
+    )
+    expected = logits.cpu().log_softmax(-1)
+    assert actual.logprobs.device.type == "mps"
+    assert actual.logprob_token_ids[:, 0].tolist() == [2, 1]
+    assert actual.selected_token_ranks.tolist() == [3, 1]
+    torch.testing.assert_close(
+        actual.logprobs.cpu(),
+        expected.gather(-1, actual.logprob_token_ids.cpu().long()),
+    )
+    torch.testing.assert_close(
+        actual.logprobs[:, 1:].cpu(), expected.topk(num_logprobs, -1).values
+    )

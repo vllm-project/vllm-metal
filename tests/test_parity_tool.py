@@ -148,7 +148,13 @@ class TestParityTool:
 
         @contextmanager
         def server(
-            model, max_model_len, max_num_seqs, gpu_memory_utilization, log_path, env
+            model,
+            max_model_len,
+            max_num_seqs,
+            gpu_memory_utilization,
+            log_path,
+            env,
+            extra_args=(),
         ):
             assert max_num_seqs == 2
             assert gpu_memory_utilization == 0.65
