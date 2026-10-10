@@ -44,16 +44,6 @@ _METAL_DENSE_KV_CACHE_DTYPES: dict[str, torch.dtype] = {
 _METAL_DENSE_KV_CACHE_DTYPE_NAMES: dict[torch.dtype, str] = {
     dtype: name for name, dtype in _METAL_DENSE_KV_CACHE_DTYPES.items()
 }
-# Structured-read extra_args (vllm#57250) that DiffusionGemmaRuntime does not
-# read yet. A diffusion_canvas_length that reaches validate_request equals the
-# served canvas (narrower ones need async scheduling), so it is a no-op.
-_UNSUPPORTED_DIFFUSION_ARGS = (
-    "diffusion_seed_canvas",
-    "diffusion_pinned",
-    "diffusion_max_steps",
-    "diffusion_read_only",
-    "diffusion_constrained",
-)
 
 
 def _pick_mb_buffer_default(
@@ -316,16 +306,14 @@ class MetalPlatform(Platform):
                 f"vLLM logits processors ({controls}).",
                 parameter=unsupported_controls[0],
             )
-        # Upstream's diffusion sampler applies top_k/top_p to the canvas and
-        # reads the structured-read extra_args; the Metal one does not, so
-        # refuse them rather than ignore them.
+        # Upstream's diffusion sampler applies top_k/top_p to the canvas; the
+        # Metal one does not, so refuse them rather than ignore them.
         if cls._serves_diffusion:
             if params.logprobs == -1:
                 raise VLLMValidationError(
                     "logprobs=-1 is not supported for diffusion models on Metal.",
                     parameter="logprobs",
                 )
-            extra_args = params.extra_args or {}
             for name, enabled in (
                 ("prompt_logprobs", params.prompt_logprobs is not None),
                 (
@@ -334,7 +322,6 @@ class MetalPlatform(Platform):
                 ),
                 ("top_k", params.top_k > 0),
                 ("top_p", params.top_p < 1.0),
-                *((key, key in extra_args) for key in _UNSUPPORTED_DIFFUSION_ARGS),
             ):
                 if enabled:
                     raise VLLMValidationError(
