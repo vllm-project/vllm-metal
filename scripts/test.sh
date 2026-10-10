@@ -9,6 +9,8 @@ main() {
   # shellcheck source=lib.sh disable=SC1091
   source "${script_dir}/lib.sh"
 
+  python3 .github/scripts/test_installation.py -v
+
   setup_dev_env
 
   if [ "$(uname)" == "Darwin" ]; then

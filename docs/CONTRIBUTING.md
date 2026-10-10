@@ -73,3 +73,20 @@ Open a pull request against `main` in `vllm-project/vllm-metal`.
 uv pip install -r docs/requirements-docs.txt
 mkdocs serve
 ```
+
+## Fresh-install smoke test
+
+On an Apple Silicon Mac with `uv` on `PATH`, run:
+
+```bash
+VLLM_METAL_TEST_FRESH_INSTALL=1 python3 .github/scripts/test_installation.py -v
+```
+
+This opt-in test installs both the default development release and the stable
+release into separate temporary environments, with fresh package and model
+caches. It runs the server and request examples from the installation guide,
+using an available localhost port, and checks for a nonempty response and Metal
+GPU activation. It downloads several gigabytes per channel and can take several
+minutes. Environments, caches, and server processes are cleaned up afterward.
+It validates the script's release-wheel path, not Homebrew or an editable build.
+Without the environment variable, only the installer argument tests run.
