@@ -215,6 +215,11 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
     def needs_step_context(self) -> bool:
         return True
 
+    @property
+    def state_checkpoint_stride(self) -> int | None:
+        """Stride of align-mode state checkpoints; None for per-request states."""
+        return self.state_manager.checkpoint_stride
+
     def zero_blocks(self, block_ids: Sequence[int]) -> None:
         self.state_cache.apply_pending_states(block_ids)
         self.storage.zero_blocks(block_ids)

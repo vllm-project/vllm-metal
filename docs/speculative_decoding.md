@@ -7,7 +7,7 @@ for method behavior and configuration details.
 | | MTP | Draft model | N-gram |
 |---|---|---|---|
 | `--speculative-config` method | `mtp` | `draft_model` | `ngram` |
-| Target models | Gemma4 | Non-hybrid paged-attention models | Non-hybrid paged-attention models |
+| Target models | Gemma4 | Non-hybrid paged-attention models | Any paged-attention model, hybrid GDN included |
 | Draft source | Matching Gemma4 assistant checkpoint | Separate smaller model | Prompt and output token history |
 | `num_speculative_tokens` | Configurable (2–3 typical) | Configurable (3–5 typical) | Configurable (3–5 typical) |
 | Additional model weights | Assistant checkpoint | Draft model | None |
@@ -29,9 +29,41 @@ These methods currently have these Metal-specific constraints:
 - Scheduling must be synchronous. The Metal platform disables async scheduling
   when speculative decoding is configured.
 - Pipeline parallelism is not supported with speculative decoding.
-- Hybrid GDN targets and heterogeneous draft vocabularies are not supported.
+- Heterogeneous draft vocabularies are not supported.
 - `long_prefill_token_threshold`, when set, must be at least
   `1 + num_speculative_tokens`.
+
+## Hybrid GDN targets
+
+N-gram speculation works on hybrid GDN targets (Qwen3.5/Qwen3.8-style
+linear-attention hybrids) as of this change:
+
+- The verification forward runs the draft span through the same paged kernels
+  as plain decode — full-attention layers take the extra query rows, and the
+  GDN layers run their state scan over the span. No kernels changed.
+- GDN state is *staged*: each verify span defers its span-final state, and a
+  partial acceptance re-scans the accepted prefix from the untouched
+  pre-span state (see `vllm_metal/attention/impls/gdn_spec.py`). A full
+  acceptance keeps the staged update at zero extra cost.
+- Hybrid verification requires the lazy GDN kernels
+  (`VLLM_METAL_GDN_LAZY_KERNELS`, on by default); disabling them is rejected
+  at startup.
+- With align-mode prefix caching, per-request drafts are capped at the
+  state-block boundary so prefix checkpoints stay exact; the cap costs a few
+  percent of average draft depth.
+- **When to enable**: n-gram only pays on repeated token spans. On repetitive
+  long contexts (agent loops, code, template text, cache-hit re-asks) it is
+  the single biggest decode lever; on diverse text it can be a net loss that
+  grows with context length. Measured on Qwen3.8-27B (MLX 4-bit, single
+  stream, 64-token greedy decode): repeated 30K context 25.6 → 56.8 tok/s
+  (2.2x); diverse 30K context 25.8 → 18.3 tok/s (0.71x — leave it off);
+  short diverse context roughly break-even to +30%. Benchmark your own
+  workload shape before enabling.
+
+Draft-model and MTP methods on hybrid targets remain unsupported until their
+proposers honor the same state staging. Unsupported hybrid speculative
+pairings — a non-ngram method, or a non-GDN hybrid state family (mamba2, KDA,
+shortconv) — are rejected at startup, not at the first verification.
 
 ## Gemma4 MTP
 

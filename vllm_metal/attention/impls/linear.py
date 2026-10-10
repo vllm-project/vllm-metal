@@ -22,6 +22,11 @@ from vllm_metal.attention.impls.gdn_lazy import (
     GDNRecurrentDecodeRequest,
     GDNRecurrentPrefillRequest,
 )
+from vllm_metal.attention.impls.gdn_spec import (
+    GDNSpecVerifyStep,
+    is_spec_verify_batch,
+    stash_spec_verify_layer,
+)
 from vllm_metal.metal import get_ops
 
 _DEFAULT_RECURRENT_DECODE_THREADGROUP_DV = 4
@@ -47,6 +52,7 @@ class _GDNForwardState:
     total_tokens: int
     slot_ids: list[int]
     num_decode_requests: int
+    is_spec_verify: bool = False
 
 
 @dataclass(frozen=True)
@@ -146,12 +152,56 @@ class GDNPagedAttentionWrapper(nn.Module):
             return self._inner(x, mask=mask, cache=cache)
 
         state = self._prepare_gdn_forward_state(x, ctx)
+        if state.is_spec_verify and not self._lazy_kernels_enabled():
+            raise NotImplementedError(
+                "Speculative decode verification on hybrid GDN models "
+                "requires the lazy GDN kernels (VLLM_METAL_GDN_LAZY_KERNELS); "
+                "the eager fallback updates state in place and cannot stage "
+                "verify spans for rollback."
+            )
         mixed_qkv, z, a, b = self._project_inputs(state)
         conv_packed = self._run_conv(mixed_qkv, state)
         q, k, v = self._split_and_normalize(conv_packed, state)
         g, beta = self._compute_gates(a, b, state)
         y_flat = self._run_recurrent(q, k, v, g, beta, state)
+        if state.is_spec_verify:
+            self._stash_spec_verify(state, mixed_qkv, q, k, v, g, beta)
         return self._project_output(y_flat, z, state)
+
+    def _stash_spec_verify(
+        self,
+        state: _GDNForwardState,
+        mixed_qkv: mx.array,
+        q: mx.array,
+        k: mx.array,
+        v: mx.array,
+        g: mx.array,
+        beta: mx.array,
+    ) -> None:
+        """Stage this layer's verify activations for the acceptance fixup."""
+        state_cache = self._gdn_state_cache
+        stash = state_cache.spec_verify_stash
+        if stash is None:
+            stash = GDNSpecVerifyStep()
+            state_cache.spec_verify_stash = stash
+        stash_spec_verify_layer(
+            stash,
+            cache_idx=self._gdn_cache_idx,
+            slot_ids=state.slot_ids,
+            cu_seqlens=state.cu_seqlens,
+            span_lengths=tuple(
+                state.cu_seqlens[i + 1] - state.cu_seqlens[i]
+                for i in range(state.num_requests)
+            ),
+            compute_dtype=self._recurrent_prefill_compute_dtype(),
+            decode_threadgroup_dv=self._recurrent_decode_threadgroup_dv(),
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            mixed_qkv=mixed_qkv,
+        )
 
     def _prepare_gdn_forward_state(
         self, x: mx.array, ctx: PagedAttentionContext
@@ -172,6 +222,7 @@ class GDNPagedAttentionWrapper(nn.Module):
             total_tokens=x.shape[1],
             slot_ids=slot_ids,
             num_decode_requests=ctx.num_decode_requests,
+            is_spec_verify=is_spec_verify_batch(ctx.num_decode_requests, cu_seqlens),
         )
 
     def _project_inputs(
@@ -214,7 +265,7 @@ class GDNPagedAttentionWrapper(nn.Module):
         cache_idx = self._gdn_cache_idx
         slot_ids = state.slot_ids
 
-        if state.num_decode_requests == state.num_requests:
+        if state.num_decode_requests == state.num_requests and not state.is_spec_verify:
             conv_packed = self._gdn_lazy.try_conv_decode(
                 mixed_qkv, inner, state_cache, cache_idx, slot_ids
             )
@@ -307,7 +358,7 @@ class GDNPagedAttentionWrapper(nn.Module):
         state: _GDNForwardState,
     ) -> mx.array:
         # === Step 5: Batched recurrent update ===
-        if state.num_decode_requests == state.num_requests:
+        if state.num_decode_requests == state.num_requests and not state.is_spec_verify:
             request = GDNRecurrentDecodeRequest(
                 q=q,
                 k=k,
@@ -341,6 +392,12 @@ class GDNPagedAttentionWrapper(nn.Module):
             y_flat = self._gdn_lazy.try_recurrent_prefill(request)
             if y_flat is not None:
                 return y_flat
+            if state.is_spec_verify:
+                raise RuntimeError(
+                    "speculative verify span was ineligible for the GDN state "
+                    "scan kernel; hybrid speculative decode cannot fall back "
+                    "to in-place state updates (staging would be lost)"
+                )
         self._gdn_state_cache.apply_pending_recurrent_state(self._gdn_cache_idx)
         return self._run_recurrent_fallback(q, k, v, g, beta, state)
 
@@ -349,7 +406,7 @@ class GDNPagedAttentionWrapper(nn.Module):
     ) -> bool:
         return (
             self._lazy_kernels_enabled()
-            and state.num_decode_requests < state.num_requests
+            and (state.num_decode_requests < state.num_requests or state.is_spec_verify)
             and state.total_tokens > state.num_requests
         )
 
@@ -359,9 +416,8 @@ class GDNPagedAttentionWrapper(nn.Module):
     def _should_defer_conv_prefill_containing_state(
         self, state: _GDNForwardState
     ) -> bool:
-        return (
-            self._lazy_kernels_enabled()
-            and state.num_decode_requests < state.num_requests
+        return self._lazy_kernels_enabled() and (
+            state.num_decode_requests < state.num_requests or state.is_spec_verify
         )
 
     def _should_try_conv_prefill_containing_lazy(self, state: _GDNForwardState) -> bool:
@@ -373,7 +429,7 @@ class GDNPagedAttentionWrapper(nn.Module):
         # larger.
         return (
             self._lazy_kernels_enabled()
-            and state.num_decode_requests < state.num_requests
+            and (state.num_decode_requests < state.num_requests or state.is_spec_verify)
             and self._gdn_lazy_policy.should_try_conv_prefill_lazy()
         )
 
@@ -388,9 +444,11 @@ class GDNPagedAttentionWrapper(nn.Module):
         return self._gdn_lazy_policy.recurrent_prefill_compute_dtype()
 
     def _should_defer_recurrent_prefill_state(self, state: _GDNForwardState) -> bool:
-        return (
-            self._lazy_kernels_enabled()
-            and self._gdn_lazy_policy.should_defer_recurrent_prefill_state(
+        # Verify spans always defer: the pre-forward state in the stable pool
+        # is the depth-0 rollback point the acceptance fixup re-scans from.
+        return self._lazy_kernels_enabled() and (
+            state.is_spec_verify
+            or self._gdn_lazy_policy.should_defer_recurrent_prefill_state(
                 state.num_requests
             )
         )

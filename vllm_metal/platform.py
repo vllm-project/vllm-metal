@@ -656,14 +656,40 @@ class MetalPlatform(Platform):
                     "'align' for models without SupportsMambaPrefixCaching). "
                     "Use align mode: --enable-prefix-caching resolves to it."
                 )
-            if cache_config.enable_prefix_caching:
-                from vllm_metal.attention.runtime.factory import (
-                    state_family_for_model_type,
-                )
+            from vllm_metal.attention.runtime.factory import (
+                state_family_for_model_type,
+            )
 
-                state_family = state_family_for_model_type(
-                    model_config.hf_text_config.model_type
-                )
+            state_family = state_family_for_model_type(
+                model_config.hf_text_config.model_type
+            )
+            if vllm_config.speculative_config is not None:
+                spec_method = vllm_config.speculative_config.method
+                if spec_method != "ngram" or state_family.label != "gdn":
+                    # The verify-span staging and acceptance rollback live in
+                    # the GDN state wrapper only; other hybrid state families
+                    # (mamba2, KDA, shortconv) would silently corrupt their
+                    # recurrent state on a partial accept, and the other
+                    # speculators are not validated on any hybrid target.
+                    # Reject at config time rather than at the first verify
+                    # forward.
+                    raise NotImplementedError(
+                        "Speculative decoding on hybrid models on Metal is "
+                        "implemented for the ngram method on GDN-family "
+                        "targets only; this configuration pairs method "
+                        f"{spec_method!r} with the {state_family.label!r} "
+                        "state family."
+                    )
+                if not envs.VLLM_METAL_GDN_LAZY_KERNELS:
+                    # Hybrid GDN verification runs multi-token spans through
+                    # the variable-length lazy scan kernels; the eager path
+                    # only implements single-row decode.
+                    raise NotImplementedError(
+                        "ngram speculative decoding on hybrid GDN targets "
+                        "requires the lazy GDN kernels "
+                        "(VLLM_METAL_GDN_LAZY_KERNELS=0 disables them)."
+                    )
+            if cache_config.enable_prefix_caching:
                 if (
                     cache_config.mamba_cache_mode
                     not in state_family.supported_cache_modes
@@ -674,16 +700,12 @@ class MetalPlatform(Platform):
                         f"mamba_cache_mode {state_family.supported_cache_modes}, "
                         f"not {cache_config.mamba_cache_mode!r}",
                     )
-            if (
-                cache_config.enable_prefix_caching
-                and vllm_config.speculative_config is not None
-            ):
-                cls._disable_hybrid_prefix_caching(
-                    vllm_config,
-                    "draft-state rollback across mamba state blocks "
-                    "(num_speculative_blocks) is not implemented for "
-                    "speculative decoding",
-                )
+                # ngram+GDN is the one hybrid speculative configuration that
+                # keeps align-mode prefix caching: verification stages GDN
+                # state per verify span and caps drafts at the state-block
+                # boundary (gdn_spec), keeping align-mode checkpoints exact.
+                # Every other hybrid+speculative combination was rejected
+                # above, so no APC downgrade for speculators remains here.
 
         # Pipeline parallelism is supported on Metal/MLX: each stage runs in its
         # own worker process and the inter-stage activations cross the

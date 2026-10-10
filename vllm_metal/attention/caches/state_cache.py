@@ -12,6 +12,7 @@ import mlx.core as mx
 
 if TYPE_CHECKING:
     from vllm_metal.attention.context import PagedAttentionContext
+    from vllm_metal.attention.impls.gdn_spec import GDNSpecVerifyStep
 
 
 @functools.cache
@@ -49,6 +50,10 @@ class PagedStateCache:
         self.pending_conv_slot_ids = [None] * self.num_layers
         self.pending_recurrent_states = [None] * self.num_layers
         self.pending_recurrent_slot_ids = [None] * self.num_layers
+        # Verify-span activations staged for the post-verification state
+        # fixup (speculative decode on hybrid GDN models); None off the
+        # speculative path. Owned by gdn_spec, cleared every step.
+        self.spec_verify_stash: GDNSpecVerifyStep | None = None
 
     def store_conv_state(self, layer_idx: int, array: mx.array) -> None:
         """Store a layer's updated conv pool, keeping pool siblings aliased."""

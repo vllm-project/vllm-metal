@@ -211,6 +211,13 @@ class NgramProposer(NoOwnKVProposer):
         req_ids: list[str] = []
         draft_token_ids: list[list[int]] = []
         for (req_id, state), draft in zip(drafting, drafts, strict=True):
+            cap = ctx.draft_caps.get(req_id) if ctx.draft_caps is not None else None
+            if cap is not None and len(draft) > cap:
+                draft = draft[:cap]
+                if not draft:
+                    # Trimmed by a positional cap, not by missing history:
+                    # not miss evidence for the cooldown.
+                    continue
             if not draft:
                 # A too-short history isn't evidence against repetition --
                 # there just isn't enough of it yet to check.

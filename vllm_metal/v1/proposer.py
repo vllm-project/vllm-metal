@@ -85,6 +85,12 @@ class ProposeContext:
     # under the same id).
     finished_req_ids: set[str]
     target_aux_hidden_states: tuple[mx.array, ...] = ()
+    # Per-request cap on draft length for the NEXT step (req_id -> max
+    # drafts). Set for hybrid align-mode targets: a verify span must not
+    # cross a state-checkpoint block boundary, or the checkpoint left behind
+    # would hold a state at the wrong depth for prefix reuse. Proposers trim
+    # to the cap; None or missing means uncapped.
+    draft_caps: Mapping[str, int] | None = None
 
 
 class MetalProposer(Protocol):

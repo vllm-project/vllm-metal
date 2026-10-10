@@ -65,6 +65,7 @@ def _context(
     request_states: dict[str, SimpleNamespace] | None = None,
     num_speculative_tokens: int = 3,
     finished_req_ids: set[str] | None = None,
+    draft_caps: dict[str, int] | None = None,
 ) -> ProposeContext:
     decode_reqs = decode_reqs or []
     prefill_reqs = prefill_reqs or []
@@ -87,6 +88,7 @@ def _context(
         num_decode_segments=len(decode_reqs),
         num_speculative_tokens=num_speculative_tokens,
         finished_req_ids=finished_req_ids or set(),
+        draft_caps=draft_caps,
     )
 
 
@@ -157,6 +159,39 @@ class TestNgramProposePropose:
         ctx = _context(decode_reqs=[("r0", state)])
 
         assert proposer.propose(ctx) is None
+
+    def test_draft_cap_trims_long_draft(self) -> None:
+        # A positional cap (hybrid state-block boundary) trims the matched
+        # draft instead of dropping the request.
+        proposer = _proposer(prompt_lookup_min=2, prompt_lookup_max=3)
+        state = _request_state([1, 2, 3, 1, 2, 3, 1, 2])
+        ctx = _context(decode_reqs=[("r0", state)], draft_caps={"r0": 1})
+
+        drafts = proposer.propose(ctx)
+
+        assert drafts is not None
+        assert drafts.req_ids == ["r0"]
+        assert drafts.draft_token_ids == [[3]]
+
+    def test_draft_cap_to_empty_is_not_miss_evidence(self) -> None:
+        # A draft trimmed away by a positional cap says nothing about
+        # repetition exploitability: no miss streak, no pending record, and
+        # the request drafts again once the cap lifts.
+        proposer = _proposer(prompt_lookup_min=2, prompt_lookup_max=3)
+        state = _request_state([1, 2, 3, 1, 2, 3, 1, 2])
+        capped = _context(decode_reqs=[("r0", state)], draft_caps={"r0": 0})
+
+        for _ in range(2 * ngram_mod._MAX_CONSECUTIVE_MISSES):
+            assert proposer.propose(capped) is None
+
+        assert "r0" not in proposer._cooldown
+        assert proposer._miss_streak.get("r0", 0) == 0
+        assert "r0" not in proposer._pending
+
+        uncapped = _context(decode_reqs=[("r0", state)])
+        drafts = proposer.propose(uncapped)
+        assert drafts is not None
+        assert drafts.draft_token_ids == [[3, 1, 2]]
 
     def test_empty_context_returns_none(self) -> None:
         assert _proposer().propose(_context()) is None

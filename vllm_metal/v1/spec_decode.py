@@ -120,6 +120,7 @@ class SpeculativeDecodeController:
         is_hybrid: bool,
         use_async_scheduling: bool = False,
         speculative_config: SpeculativeConfig | None = None,
+        hybrid_family: str | None = None,
     ) -> None:
         """Fail fast for unsupported or inconsistent scheduler handoffs."""
         # All three Metal proposers (draft-model, MTP, n-gram) hand drafts
@@ -142,11 +143,31 @@ class SpeculativeDecodeController:
         }
         has_invalid_spec_tokens = any(count > 0 for count in invalid_counts.values())
 
+        # Hybrid GDN targets verify n-gram drafts through packed decode spans:
+        # full-attention layers take the extra query rows, the GDN layers run
+        # their state scan over the span, and the acceptance fixup in gdn_spec
+        # rolls partial accepts back to the accepted depth. The staging and
+        # fixup live in the GDN state wrapper only — other hybrid state
+        # families (mamba2, KDA, shortconv) have no rollback, so a partial
+        # accept would silently corrupt their recurrent state — and the other
+        # speculators are not validated on hybrid targets yet.
         if (active_spec_tokens or has_invalid_spec_tokens) and is_hybrid:
-            raise NotImplementedError(
-                "Speculative decode verification is not supported for hybrid "
-                "models on Metal yet."
+            if hybrid_family is not None and hybrid_family != "gdn":
+                raise NotImplementedError(
+                    "Speculative decode verification for hybrid models on "
+                    f"Metal is implemented for the GDN state family only; "
+                    f"this target's state family is {hybrid_family!r}."
+                )
+            method = (
+                speculative_config.method if speculative_config is not None else None
             )
+            if method != "ngram":
+                raise NotImplementedError(
+                    "Speculative decode verification for hybrid models on "
+                    "Metal supports the ngram method only (draft-model, MTP, "
+                    "and block drafts are not validated on hybrid GDN "
+                    "targets yet)."
+                )
 
         decode_req_ids = {req_id for req_id, _ in decode_reqs}
         unexpected_req_ids = sorted(set(spec_tokens) - decode_req_ids)

@@ -58,6 +58,11 @@ class AlignStateManager:
     def needs_materialize(self) -> bool:
         return self._needs_materialize
 
+    @property
+    def checkpoint_stride(self) -> int | None:
+        """State-checkpoint block stride, or None for per-request states."""
+        return self._block_size if self._mamba_cache_mode == "align" else None
+
     def populate_step_context(
         self,
         *,

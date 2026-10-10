@@ -1313,16 +1313,16 @@ class TestMetalPlatform:
         finally:
             reset_config()
 
-    def test_check_and_update_config_downgrades_default_hybrid_prefix_caching(
+    def test_check_and_update_config_rejects_non_ngram_hybrid_speculation(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Hybrid combinations Metal cannot serve downgrade APC, not reject.
+        """Hybrid targets reject non-ngram speculators at config time.
 
-        vLLM 0.28.0 enables prefix caching by default for hybrid models and
-        resolves mamba_cache_mode='align' / mamba_block_size=block_size before
-        the platform hook runs; failing here would fail every default launch.
-        The downgrade restores the upstream APC-off resolution.
+        Verify-span staging and acceptance rollback exist only for the ngram
+        method on GDN-family targets; any other pairing must fail fast here
+        rather than at the first verify forward. Rejecting (not downgrading)
+        is safe: no hybrid+speculative configuration ran before.
         """
         self._patch_stt_resolution(monkeypatch, is_stt=False)
         reset_config()
@@ -1341,27 +1341,127 @@ class TestMetalPlatform:
                     num_speculative_tokens=2,
                 ),
             )
-            # Upstream resolves mamba_block_size = block_size AFTER CacheConfig
-            # construction (models/config.py), so user_specified stays False.
             vllm_config.cache_config.mamba_block_size = 16
-            assert vllm_config.cache_config.user_specified_mamba_block_size is False
+            with pytest.raises(
+                NotImplementedError,
+                match="ngram method on GDN-family targets only",
+            ):
+                MetalPlatform.check_and_update_config(vllm_config)
+        finally:
+            reset_config()
+
+    def test_check_and_update_config_rejects_ngram_for_non_gdn_hybrid(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """ngram on a non-GDN hybrid family is rejected at config time.
+
+        mamba2/KDA/shortconv wrappers flush span-final state in place with no
+        rollback, so a partial accept would silently corrupt recurrent state.
+        """
+        self._patch_stt_resolution(monkeypatch, is_stt=False)
+        reset_config()
+        try:
+            vllm_config = self._hybrid_vllm_config(
+                SimpleNamespace(
+                    block_size=16,
+                    kv_cache_dtype_skip_layers=[],
+                    enable_prefix_caching=False,
+                    mamba_cache_mode="none",
+                    mamba_ssm_cache_dtype="float32",
+                ),
+                speculative_config=SimpleNamespace(
+                    method="ngram",
+                    use_heterogeneous_vocab=False,
+                    num_speculative_tokens=3,
+                ),
+                model_type="nemotron_h",
+            )
+            with pytest.raises(
+                NotImplementedError,
+                match="ngram method on GDN-family targets only",
+            ):
+                MetalPlatform.check_and_update_config(vllm_config)
+        finally:
+            reset_config()
+
+    def test_check_and_update_config_hybrid_ngram_requires_lazy_gdn_kernels(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Hybrid GDN verification runs multi-token spans through the lazy
+        scan kernels; disabling them must fail at config time, not mid-forward."""
+        monkeypatch.setenv("VLLM_METAL_GDN_LAZY_KERNELS", "0")
+        self._patch_stt_resolution(monkeypatch, is_stt=False)
+        reset_config()
+        try:
+            vllm_config = self._hybrid_vllm_config(
+                SimpleNamespace(
+                    block_size=16,
+                    kv_cache_dtype_skip_layers=[],
+                    enable_prefix_caching=False,
+                    mamba_cache_mode="none",
+                    mamba_ssm_cache_dtype="float32",
+                ),
+                speculative_config=SimpleNamespace(
+                    method="ngram",
+                    use_heterogeneous_vocab=False,
+                    num_speculative_tokens=3,
+                ),
+            )
+            with pytest.raises(
+                NotImplementedError, match="requires the lazy GDN kernels"
+            ):
+                MetalPlatform.check_and_update_config(vllm_config)
+        finally:
+            reset_config()
+
+    def test_check_and_update_config_accepts_hybrid_ngram_align_prefix_caching(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """ngram on a GDN hybrid keeps align-mode prefix caching enabled.
+
+        Verification stages GDN state per verify span and caps drafts at the
+        state-block boundary (gdn_spec), keeping align checkpoints exact.
+        """
+        self._patch_stt_resolution(monkeypatch, is_stt=False)
+        reset_config()
+        try:
+            vllm_config = self._hybrid_vllm_config(
+                SimpleNamespace(
+                    block_size=16,
+                    kv_cache_dtype_skip_layers=[],
+                    enable_prefix_caching=True,
+                    mamba_cache_mode="align",
+                    mamba_ssm_cache_dtype="float32",
+                ),
+                speculative_config=SimpleNamespace(
+                    method="ngram",
+                    use_heterogeneous_vocab=False,
+                    num_speculative_tokens=3,
+                ),
+            )
+            vllm_config.cache_config.mamba_block_size = 16
             MetalPlatform.check_and_update_config(vllm_config)
         finally:
             reset_config()
 
         cache_config = vllm_config.cache_config
-        assert cache_config.enable_prefix_caching is False
-        assert cache_config.mamba_cache_mode == "none"
-        assert cache_config.mamba_block_size == 32768
+        assert cache_config.enable_prefix_caching is True
+        assert cache_config.mamba_cache_mode == "align"
+        assert cache_config.mamba_block_size == 16
 
     def test_hybrid_prefix_caching_downgrade_rejects_user_mamba_block_size(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """An explicit --mamba-block-size fails fast when APC must be downgraded.
 
-        Once the hook disables prefix caching, upstream's
-        validate_mamba_block_size (an after-validator) would reject the kept
-        value with a misleading message; the Metal constraint wins instead.
+        The remaining APC downgrade is for state families without align-mode
+        support (e.g. slot-keyed nemotron_h). Once the hook disables prefix
+        caching, upstream's validate_mamba_block_size (an after-validator)
+        would reject the kept value with a misleading message; the Metal
+        constraint wins instead.
         """
         self._patch_stt_resolution(monkeypatch, is_stt=False)
         reset_config()
@@ -1375,11 +1475,7 @@ class TestMetalPlatform:
                     mamba_block_size=64,
                     mamba_ssm_cache_dtype="float32",
                 ),
-                speculative_config=SimpleNamespace(
-                    method="draft_model",
-                    use_heterogeneous_vocab=False,
-                    num_speculative_tokens=2,
-                ),
+                model_type="nemotron_h",
             )
             assert vllm_config.cache_config.user_specified_mamba_block_size is True
             with pytest.raises(NotImplementedError, match="mamba-block-size"):
