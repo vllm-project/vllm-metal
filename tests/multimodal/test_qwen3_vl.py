@@ -11,6 +11,9 @@ import pytest
 import torch
 from vllm.multimodal.inputs import MultiModalFieldConfig, MultiModalKwargsItem
 
+from tests.multimodal.hidden_state_parity import (
+    assert_hidden_states_reproduce_call_lm_logits,
+)
 from vllm_metal.multimodal import (
     MultiModalFeatureSpec,
     PlaceholderRange,
@@ -977,6 +980,70 @@ class TestQwen3VLMultimodalAdapterCallLmHiddenStates:
 
         with pytest.raises(RuntimeError, match="backbone not resolved"):
             not_callable.call_lm_hidden_states(*args)
+
+    def test_hidden_states_reproduce_call_lm_logits_through_the_runner_head(
+        self,
+    ) -> None:
+        # Real mlx_vlm backbone + head, mirroring the Gemma 4 check: the
+        # runner's selective-logits path must reproduce ``call_lm`` logits
+        # exactly when hidden states go through ``project_logits``.
+        try:
+            from mlx_vlm.models.qwen3_vl.config import (
+                ModelConfig,
+                TextConfig,
+                VisionConfig,
+            )
+            from mlx_vlm.models.qwen3_vl.language import LanguageModel
+        except ModuleNotFoundError as exc:
+            if exc.name and exc.name.startswith("mlx_vlm"):
+                pytest.skip("mlx-vlm is only installed on Darwin/arm64")
+            raise
+        except RuntimeError as exc:
+            if "No Metal device available" in str(exc):
+                pytest.skip("mlx-vlm import requires a Metal device")
+            raise
+
+        text_config = TextConfig(
+            model_type="qwen3_vl",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=48,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=16,
+            vocab_size=64,
+            max_position_embeddings=64,
+            rms_norm_eps=1e-6,
+            rope_theta=10000.0,
+        )
+        model_config = ModelConfig(
+            text_config=text_config,
+            vision_config=VisionConfig(
+                depth=1,
+                hidden_size=32,
+                out_hidden_size=32,
+                num_heads=2,
+                image_size=32,
+                patch_size=16,
+            ),
+            model_type="qwen3_vl",
+            vocab_size=64,
+        )
+        language_model = LanguageModel(text_config, model_config)
+        mx.eval(language_model.parameters())
+        model = SimpleNamespace(
+            vision_tower=None,
+            language_model=language_model,
+            config=model_config,
+        )
+        adapter = Qwen3VLMultimodalAdapter.from_loaded_model(model)
+
+        assert_hidden_states_reproduce_call_lm_logits(
+            adapter,
+            model,
+            mx.array([[5, 9, 9, 7, 3, 2]], dtype=mx.int32),
+            num_layers=text_config.num_hidden_layers,
+        )
 
 
 class TestQwen3VLMultimodalAdapterFromLoadedModel:

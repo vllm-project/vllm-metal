@@ -11,6 +11,9 @@ import pytest
 import torch
 from vllm.multimodal.inputs import MultiModalFieldConfig, MultiModalKwargsItem
 
+from tests.multimodal.hidden_state_parity import (
+    assert_hidden_states_reproduce_call_lm_logits,
+)
 from vllm_metal.multimodal import MultiModalFeatureSpec, PlaceholderRange
 from vllm_metal.multimodal.paddleocr_vl import PaddleOCRVLMultimodalAdapter
 
@@ -551,6 +554,60 @@ class TestPaddleOCRVLMultimodalAdapterCallLmHiddenStates:
                 [None],
                 mx.zeros((3, 1, 1), dtype=mx.int32),
             )
+
+    def test_hidden_states_reproduce_call_lm_logits_through_the_runner_head(
+        self,
+    ) -> None:
+        # Real mlx_vlm backbone + head, mirroring the Gemma 4 check: the
+        # runner's selective-logits path must reproduce ``call_lm`` logits
+        # exactly when hidden states go through ``project_logits``.
+        try:
+            from mlx_vlm.models.paddleocr_vl.config import (
+                ModelConfig,
+                TextConfig,
+                VisionConfig,
+            )
+            from mlx_vlm.models.paddleocr_vl.language import LanguageModel
+        except ModuleNotFoundError as exc:
+            if exc.name and exc.name.startswith("mlx_vlm"):
+                pytest.skip("mlx-vlm is only installed on Darwin/arm64")
+            raise
+        except RuntimeError as exc:
+            if "No Metal device available" in str(exc):
+                pytest.skip("mlx-vlm import requires a Metal device")
+            raise
+
+        text_config = TextConfig(
+            model_type="paddleocr_vl",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=48,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=16,
+            vocab_size=64,
+            max_position_embeddings=64,
+            rms_norm_eps=1e-6,
+            rope_theta=10000.0,
+        )
+        model_config = ModelConfig(
+            text_config=text_config, vision_config=VisionConfig()
+        )
+        language_model = LanguageModel(text_config, model_config)
+        mx.eval(language_model.parameters())
+        model = SimpleNamespace(
+            visual=None,
+            language_model=language_model,
+            config=model_config,
+        )
+        adapter = PaddleOCRVLMultimodalAdapter.from_loaded_model(model)
+
+        assert_hidden_states_reproduce_call_lm_logits(
+            adapter,
+            model,
+            mx.array([[5, 9, 9, 7, 3]], dtype=mx.int32),
+            num_layers=text_config.num_hidden_layers,
+        )
 
 
 class TestPaddleOCRVLMultimodalAdapterFromLoadedModel:
