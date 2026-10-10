@@ -24,7 +24,7 @@ from mlx.utils import tree_flatten
 
 
 class GGUFLoadError(RuntimeError):
-    """Raised when a local GGUF checkpoint cannot be loaded through the MLX path."""
+    """Raised when a GGUF checkpoint cannot be loaded through the MLX path."""
 
 
 class GGUFModelAdapter:
@@ -126,6 +126,17 @@ class GGUFModelAdapter:
                 "the .gguf and config_dir describe different models."
             )
         return arch
+
+    @classmethod
+    def validate_config_model_type(cls, config_model_type: str) -> None:
+        """Reject a config family that :meth:`resolve_arch` rejects for every .gguf."""
+        config_arch = cls._config_model_type_to_gguf_arch(config_model_type)
+        if config_arch not in cls.SUPPORTED_DENSE_ARCHS:
+            raise GGUFLoadError(
+                f"Config model_type {config_model_type!r} is not a supported dense "
+                "decoder; the GGUF loader supports "
+                f"{sorted(cls.SUPPORTED_DENSE_ARCHS)}."
+            )
 
     @classmethod
     def from_model(

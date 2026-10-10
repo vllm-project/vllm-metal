@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import itertools
+import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +14,8 @@ from huggingface_hub import HfApi, get_cached_repo_tree, snapshot_download
 from huggingface_hub import constants as hf_constants
 from huggingface_hub.errors import IncompleteSnapshotError
 from huggingface_hub.utils import filter_repo_objects
+
+from vllm_metal.gguf.adapter import GGUFLoadError, GGUFModelAdapter
 
 _GGUF_SUFFIX = ".gguf"
 _REMOTE_REF_RE = re.compile(
@@ -94,6 +97,14 @@ class RemoteGGUFReference:
             for prefix, suffix in itertools.product(_REMOTE_PREFIXES, _REMOTE_SUFFIXES)
         )
 
+    def validate_tag(self) -> None:
+        if self.quant_type.upper() not in _SUPPORTED_REMOTE_TAGS:
+            supported = ", ".join(sorted(_SUPPORTED_REMOTE_TAGS))
+            raise ValueError(
+                f"Remote GGUF tag {self.quant_type!r} is not supported by "
+                f"vllm-metal; supported tags: {supported}."
+            )
+
     def resolve(
         self,
         *,
@@ -102,12 +113,6 @@ class RemoteGGUFReference:
         ignore_patterns: list[str] | str | None,
         token: bool | str | None,
     ) -> str:
-        if self.quant_type.upper() not in _SUPPORTED_REMOTE_TAGS:
-            supported = ", ".join(sorted(_SUPPORTED_REMOTE_TAGS))
-            raise ValueError(
-                f"Remote GGUF tag {self.quant_type!r} is not supported by "
-                f"vllm-metal; supported tags: {supported}."
-            )
         # vLLM pins the engine revision to the config repo's commit; resolving
         # it here re-resolves the requested revision for this weights repo.
         revision = HfApi().resolve_revision(
@@ -216,16 +221,10 @@ class GGUFLoadSource:
         cache_dir = None if load_config is None else load_config.download_dir
         ignore_patterns = None if load_config is None else load_config.ignore_patterns
         token = model_config.hf_token
-        if cls.is_weights_path(weights_ref):
-            weights_path = weights_ref
-        elif remote_ref := RemoteGGUFReference.parse(weights_ref):
-            weights_path = remote_ref.resolve(
-                cache_dir=cache_dir,
-                revision=model_config.revision,
-                ignore_patterns=ignore_patterns,
-                token=token,
-            )
-        else:
+        remote_ref = RemoteGGUFReference.parse(weights_ref)
+        if remote_ref is not None:
+            remote_ref.validate_tag()
+        elif not cls.is_weights_path(weights_ref):
             raise ValueError(
                 "GGUF model_config must carry a local .gguf path or remote "
                 f"repo_id:quant reference in model_weights; got {weights_ref!r}."
@@ -238,6 +237,19 @@ class GGUFLoadSource:
             token=token,
             allow_patterns=_CONFIG_ALLOW_PATTERNS,
         )
+        if remote_ref is None:
+            weights_path = weights_ref
+        else:
+            # The loader rejects the same families, but only after the download.
+            GGUFModelAdapter.validate_config_model_type(
+                cls._read_config_model_type(config_dir)
+            )
+            weights_path = remote_ref.resolve(
+                cache_dir=cache_dir,
+                revision=model_config.revision,
+                ignore_patterns=ignore_patterns,
+                token=token,
+            )
         tokenizer_dir = cls._resolve_companion_source(
             model_config.tokenizer or model_config.model,
             cache_dir=cache_dir,
@@ -280,3 +292,10 @@ class GGUFLoadSource:
             revision=revision,
             token=token,
         )
+
+    @staticmethod
+    def _read_config_model_type(config_dir: str) -> str:
+        config_file = Path(config_dir) / "config.json"
+        if not config_file.is_file():
+            raise GGUFLoadError(f"No config.json in config_dir {config_dir!r}")
+        return str(json.loads(config_file.read_text()).get("model_type", ""))
