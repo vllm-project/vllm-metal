@@ -64,6 +64,7 @@ nav:
   - Home: index.md
   - Getting Started:
     - Installation: installation.md
+    - Recipes by Mac Memory: recipes.md
     - Configuration: configuration.md
   - Models:
     - Supported Models: supported_models.md
