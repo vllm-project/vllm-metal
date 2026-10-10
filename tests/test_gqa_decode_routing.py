@@ -128,6 +128,7 @@ def test_unknown_core_count_keeps_measured_shape_on_baseline() -> None:
     ops._override_detected_gpu_core_count_for_test(0)
     try:
         assert ops.detected_gpu_core_count() == 0
+        assert ops.min_decode_grid() == 14 * 8
         out, ref = _run_primitive(
             [32768],
             mx.bfloat16,

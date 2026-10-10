@@ -22,7 +22,7 @@ except ImportError:
 
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 
-from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
+from vllm_metal.tensor_bridge import torch_to_mlx
 from vllm_metal.v1.spec_decode import PagedDecodeSegment, SpeculativeDecodeController
 
 

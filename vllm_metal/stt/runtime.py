@@ -43,7 +43,7 @@ class STTRuntimeAdapter(ABC):
     def _to_mx_float16(value: STTAudioInput) -> mx.array:
         """Convert common multimodal payload types into ``mx.float16``."""
         if isinstance(value, torch.Tensor):
-            from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
+            from vllm_metal.tensor_bridge import torch_to_mlx
 
             # vLLM's multimodal cache may hand the same features to later
             # requests with this audio, in the model dtype (usually bf16).

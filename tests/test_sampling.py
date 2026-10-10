@@ -15,7 +15,7 @@ from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
-from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch
+from vllm_metal.tensor_bridge import mlx_to_torch
 from vllm_metal.v1 import sampling_batch
 from vllm_metal.v1.model_runner import (
     PrefillRequest,

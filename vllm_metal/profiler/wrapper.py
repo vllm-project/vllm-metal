@@ -6,33 +6,59 @@ start/stop surface — ``LLM.start_profile`` / ``LLM.stop_profile``, the
 ``/start_profile`` and ``/stop_profile`` HTTP endpoints, and the engine's
 ``collective_rpc("profile", ...)`` plumbing — routes through unchanged.
 
-Only the two abstract methods need bodies: ``_start`` calls
-``mlx.metal.start_capture`` and ``_stop`` calls ``mlx.metal.stop_capture``.
-The output is a ``.gputrace`` bundle that opens directly in Xcode (the same
-artifact Xcode's "Capture GPU Frame" produces).
+Uses the selected backend's capture API: MLX start/stop calls or PyTorch's
+``torch.mps.profiler.metal_capture`` context manager. The output is a
+``.gputrace`` bundle that opens directly in Xcode.
 
 The ``delay_iterations`` / ``max_iterations`` scheduling fields are
 **rejected** at construction time: they are advanced by
 ``WorkerProfiler.step()``, which the metal worker never calls.
 
 Apple gates frame capture behind ``MTL_CAPTURE_ENABLED=1`` in the process
-environment.  We check that up front and raise with an actionable message;
-the alternative is a generic "Capturing is not supported" from MLX.
+environment. We check that up front and raise with an actionable message.
 """
 
 from __future__ import annotations
 
 import os
+import shutil
+from collections.abc import Iterator
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import override
 from uuid import uuid4
 
-import mlx.core as mx
 from vllm.config import ProfilerConfig
 from vllm.logger import init_logger
 from vllm.profiler.wrapper import WorkerProfiler
 
+from vllm_metal import envs
+
 logger = init_logger(__name__)
+
+
+@contextmanager
+def _mlx_capture(path: str) -> Iterator[None]:
+    import mlx.core as mx
+
+    mx.metal.start_capture(path)
+    try:
+        yield
+    finally:
+        mx.metal.stop_capture()
+
+
+@contextmanager
+def _mps_capture(path: str) -> Iterator[None]:
+    from torch.mps.profiler import metal_capture
+
+    # PyTorch 2.13 writes <counter>-<name>.gputrace in the worker's cwd.
+    # Give it a unique basename, then honor our configured output directory.
+    name = f"vllm_{uuid4().hex}"
+    with metal_capture(name):
+        yield
+    (capture,) = Path.cwd().glob(f"*-{name}.gputrace")
+    shutil.move(str(capture), path)
 
 
 class MetalProfilerWrapper(WorkerProfiler):
@@ -73,17 +99,20 @@ class MetalProfilerWrapper(WorkerProfiler):
 
         Path(trace_dir).mkdir(parents=True, exist_ok=True)
         self._trace_prefix = Path(trace_dir) / f"{trace_name}_"
+        self._capture = ExitStack()
 
     @override
     def _start(self) -> None:
         # Metal refuses to capture to an existing bundle, including one left
         # by an earlier start/stop cycle or a previous worker instance.
         trace_path = f"{self._trace_prefix}{uuid4().hex}.gputrace"
-        mx.metal.start_capture(trace_path)
+        capture = _mps_capture if envs.VLLM_METAL_BACKEND == "mps" else _mlx_capture
+        # Adapt the native capture context to vLLM's separate start/stop RPCs.
+        self._capture.enter_context(capture(trace_path))
         logger.info(
             "Metal frame capture started. Trace will be saved to %s", trace_path
         )
 
     @override
     def _stop(self) -> None:
-        mx.metal.stop_capture()
+        self._capture.close()

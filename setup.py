@@ -15,11 +15,17 @@ class BinaryDistribution(Distribution):
 setup(
     distclass=BinaryDistribution,
     package_data={
+        "vllm_metal.pytorch_backend": [
+            "*.mm",
+            f"_mps_ops{sysconfig.get_config_var('EXT_SUFFIX')}",
+            "_mps_ops.torch-version",
+        ],
         "vllm_metal.metal": [
             f"_paged_ops{sysconfig.get_config_var('EXT_SUFFIX')}",
             "_paged_ops.mlx-version",
             "*.metallib",
             "*.cpp",
+            "*.h",
             "kernels_v2/*.metal",
         ],
     },

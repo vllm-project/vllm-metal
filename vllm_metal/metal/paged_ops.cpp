@@ -18,19 +18,21 @@
 #include <unordered_map>
 #include <vector>
 
-#include <CoreFoundation/CoreFoundation.h>
-#include <IOKit/IOKitLib.h>
-
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
+
+#include "metal_device.h"
+#include "paged_attention_kernels.h"
 
 #include "mlx/mlx.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/primitives.h"
 
 namespace nb = nanobind;
+namespace kernels = vllm_metal::kernels;
+namespace hardware = vllm_metal::hardware;
 using namespace mlx::core;
 
 void register_mlx_patch(nb::module_& m);
@@ -109,63 +111,9 @@ constexpr int kWindowMaxHeadSize = VLLM_METAL_PA_WINDOW_MAX_HEAD;
 // when the base grid underfills the GPU, so saturated high-concurrency serving
 // is untouched.
 
-// GPU core count via IORegistry.  Metal/MLX expose no core-count API, but the
-// split-KV gate needs to scale per machine — a small laptop GPU and a large
-// desktop one saturate at very different grid sizes. Read once; zero means
-// unknown so the new GQA performance gate can fail closed.
-// Tests may inject a non-negative count through
-// `_override_detected_gpu_core_count_for_test` so CI hosts without
-// IORegistry still exercise default routing. Production must not call it.
-static std::atomic<int> g_test_gpu_core_count{-1};
-
-static int hardware_gpu_core_count() {
-  static const int v = []() {
-    int cores = 0;
-    io_iterator_t it;
-    if (IOServiceGetMatchingServices(kIOMainPortDefault,
-                                     IOServiceMatching("AGXAccelerator"),
-                                     &it) == KERN_SUCCESS) {
-      io_object_t obj;
-      while ((obj = IOIteratorNext(it))) {
-        CFTypeRef p = IORegistryEntrySearchCFProperty(
-            obj, kIOServicePlane, CFSTR("gpu-core-count"),
-            kCFAllocatorDefault, kIORegistryIterateRecursively);
-        if (p) {
-          if (CFGetTypeID(p) == CFNumberGetTypeID())
-            CFNumberGetValue((CFNumberRef)p, kCFNumberIntType, &cores);
-          CFRelease(p);
-        }
-        IOObjectRelease(obj);
-        if (cores > 0) break;
-      }
-      IOObjectRelease(it);
-    }
-    return cores;
-  }();
-  return v;
-}
-
-static int detected_gpu_core_count() {
-  const int override =
-      g_test_gpu_core_count.load(std::memory_order_relaxed);
-  if (override >= 0)
-    return override;
-  return hardware_gpu_core_count();
-}
-
-static void override_detected_gpu_core_count_for_test(int cores) {
-  if (cores < -1)
-    throw std::invalid_argument(
-        "test GPU core override must be >= -1 (got " +
-        std::to_string(cores) + ")");
-  g_test_gpu_core_count.store(cores, std::memory_order_relaxed);
-}
-
-// Preserve the established split-KV fallback when detection is unavailable.
-static int gpu_core_count() {
-  const int cores = detected_gpu_core_count();
-  return cores > 0 ? cores : 14;
-}
+using hardware::detected_gpu_core_count;
+using hardware::gpu_core_count;
+using hardware::override_detected_gpu_core_count_for_test;
 
 // One measured dispatch table, also exposed read-only to numerical/routing
 // tests. Include the kernel page view so geometry and page admission cannot
@@ -221,18 +169,6 @@ static std::string gqa_decode_kernel_name(
     const std::string& dtype, int head_size, int block_size, int partition_size) {
   return "paged_attention_gqa_decode_" + dtype + "_hs" + std::to_string(head_size)
       + "_bs" + std::to_string(block_size) + "_ps" + std::to_string(partition_size);
-}
-
-static std::string paged_reduce_kernel_name(
-    const std::string& dtype, int head_size, int partition_size) {
-  return "paged_attention_v2_reduce_" + dtype + "_hs" + std::to_string(head_size)
-      + "_nt256_nsl32_ps" + std::to_string(partition_size);
-}
-
-static size_t paged_reduce_threadgroup_bytes(int64_t num_partitions) {
-  // Two FP32 statistics per partition; Metal requires 16-byte alignment.
-  return (static_cast<size_t>(num_partitions) * 2 * sizeof(float) + 15) &
-      ~size_t(15);
 }
 
 static bool paged_reduce_memory_fits(
@@ -315,7 +251,7 @@ static int gqa_decode_partition_for_lengths(
   // Include a caller's larger allocation bound in the reducer resource check.
   const int64_t allocation_length = std::max(max_seq_len, plan.max_length);
   const int64_t partitions256 = (allocation_length + 255) / 256;
-  if (!paged_reduce_memory_fits(paged_reduce_threadgroup_bytes(partitions256),
+  if (!paged_reduce_memory_fits(kernels::paged_reduce_threadgroup_bytes(partitions256),
                                kGqaReduceStaticMemoryBytes,
                                kM3GqaReducerMemoryBytes)) return partition;
   return 256;
@@ -358,19 +294,8 @@ static bool gqa_decode_shape_eligible(int num_heads, int num_kv_heads,
                                    max_seq_len, gpu_cores, block_size) > 0;
 }
 
-// Engage the split while the base decode grid (num_q_heads * num_seqs) stays
-// below ~8 threadgroups per GPU core.  On a 14-core M1 Pro that is 112.  At 8K
-// context with the fixed 512-token (16-way) split, this regime measured:
-// conc=1 -33%, conc=2 -6.7%, conc=4 -5.3%, fading to ~-1.6% (noise) by conc=8 —
-// so the split stays on through ~conc 6 and disengages beyond, where it stops
-// paying.  Scales with core count.
-// (An adaptive runtime split count was tried and reverted: this kernel is
-// memory-bound, so it likes oversubscription — fewer splits hurt, and ~512-token
-// partitions are the sweet spot, so a fixed size + a wider gate is simpler and
-// just as fast.)
 static int min_decode_grid() {
-  static const int v = gpu_core_count() * 8;
-  return v;
+  return gpu_core_count() * kernels::kDecodeGroupsPerCore;
 }
 
 void init_v2_library(const std::string& v2_src) {
@@ -399,21 +324,10 @@ static std::string nax_source_;
 static bool nax_lib_ready_ = false;   // a NAX library was registered
 static bool nax_enabled_ = true;      // test / A-B switch
 
-// Match MLX's hardware gate, but ignore MLX_METAL_NO_NAX because this library
-// is compiled separately. The 'p' family requires generation 18 rather than 17.
 static bool nax_hardware_supported() {
-  static const bool v = []() {
-    bool ok = false;
-    if (__builtin_available(macOS 26.2, *)) {
-      ok = true;
-    }
-    auto& d = metal::device(Device::gpu);
-    const auto& arch = d.get_architecture();
-    if (arch.empty()) return false;
-    ok &= d.get_architecture_gen() >= (arch.back() == 'p' ? 18 : 17);
-    return ok;
-  }();
-  return v;
+  auto* device = metal::device(Device::gpu).mtl_device();
+  return hardware::nax_supported(
+      device->supportsFamily(static_cast<MTL::GPUFamily>(hardware::kApple10)));
 }
 
 void init_nax_library(const std::string& nax_src) {
@@ -548,48 +462,6 @@ static void bind_paged_attn_buffers(
   enc.set_bytes(sliding_window_i, 21);
 }
 
-// Tiled kernel: Flash-Attention-style with simdgroup 8×8 MMA.
-// One TileConfig per supported HEAD_SIZE. NUM_THREADS = NUM_SG * 32.
-struct TileConfig {
-  int BQ;
-  int TILE_KV;
-  int NUM_THREADS;
-};
-
-// ─ How to add a new HEAD_SIZE ────────────────────────────────────────────
-// Budget: smem <= 32 KB (Apple Silicon per-threadgroup memory limit, M1-M4).
-// Formula:
-//   smem = (BQ + 2*TILE_KV) * (HEAD_SIZE + 8) * 2 bytes
-//   where  BQ+2*TILE_KV = Q-rows + K-rows + V-rows
-//          HEAD_SIZE+8  = row stride (+8 = SMEM_PAD for bank-conflict
-//                                     avoidance; see pagedattention_tiled.metal)
-//          *2           = sizeof(bf16/half); fp8 KV would change this
-//
-// Constraints on (BQ, TILE_KV):
-//   BQ <= 2*TILE_KV       (O_smem fp32 reuses Q+K+V region at kernel exit)
-//   BQ / NUM_SG == 8      (each simdgroup owns 8 Q rows; 8x8 MMA fragment)
-//   HEAD_SIZE, TILE_KV multiples of 8
-// NUM_THREADS = NUM_SG * 32 (one Apple simdgroup = 32 lanes).
-//
-// HEAD_SIZE -> (BQ, TILE_KV, NUM_THREADS, NUM_SG, smem):
-//   64, 96, 128 -> (32, 32, 128, 4, 24-26 KB)
-//   256         -> (16, 16,  64, 2,   25.3 KB)
-//   512         -> ( 8,  8,  32, 1,   24.9 KB)  // no in-threadgroup SG parallelism
-// 80, 112 excluded by HD_TILES % NUM_SG(4) == 0.
-// ─────────────────────────────────────────────────────────────────────────
-static std::optional<TileConfig> select_tile_config(int head_size) {
-  switch (head_size) {
-    case 64: case 96: case 128:
-      return TileConfig{32, 32, 128};
-    case 256:
-      return TileConfig{16, 16, 64};
-    case 512:
-      return TileConfig{8, 8, 32};
-    default:
-      return std::nullopt;
-  }
-}
-
 // Same buffer ABI as the tiled kernel, with BQ=64 and no threadgroup memory.
 static void dispatch_paged_attention_nax(
     array& out, const array& query,
@@ -601,8 +473,8 @@ static void dispatch_paged_attention_nax(
     Stream s, const array* sinks) {
   auto& d = metal::device(s.device);
 
-  constexpr int kNaxBQ = 64;
-  constexpr int kNaxThreads = 128;
+  using kernels::kNaxBQ;
+  using kernels::kNaxThreads;
 
   int total_q_tokens = static_cast<int>(query.shape(0));
   int head_size  = static_cast<int>(query.shape(2));
@@ -611,9 +483,7 @@ static void dispatch_paged_attention_nax(
   bool use_sinks = sinks != nullptr;
 
   std::string base_kname =
-      "paged_attention_nax_" + dtype_to_metal(query.dtype()) +
-      "_hs" + std::to_string(head_size) +
-      "_bs" + std::to_string(block_size);
+      kernels::nax_name(dtype_to_metal(query.dtype()), head_size, block_size);
   std::string hash_name = base_kname + "_sk" + (use_sinks ? "1" : "0");
 
   auto* lib = d.get_library("paged_attention_nax_kern");
@@ -645,7 +515,7 @@ static void dispatch_paged_attention_tiled(
     const array& block_tables, const array& seq_lens,
     const array& cu_seqlens_q,
     int block_size, int max_seq_len, int sliding_window, int q_block_offset,
-    TileConfig cfg, Stream s, const array* sinks,
+    kernels::TileConfig cfg, Stream s, const array* sinks,
     const array* mm_prefix_ranges) {
   auto& d = metal::device(s.device);
 
@@ -664,13 +534,7 @@ static void dispatch_paged_attention_tiled(
   bool use_mm_prefix = mm_prefix_ranges != nullptr;
 
   auto dt = dtype_to_metal(query.dtype());
-  std::string base_kname =
-      "paged_attention_tiled_" + dt +
-      "_hs" + std::to_string(head_size) +
-      "_bs" + std::to_string(block_size) +
-      "_bq" + std::to_string(cfg.BQ) +
-      "_tk" + std::to_string(cfg.TILE_KV) +
-      "_nt" + std::to_string(cfg.NUM_THREADS);
+  std::string base_kname = kernels::tiled_name(dt, head_size, block_size, cfg);
   std::string hash_name = base_kname + "_sk" + (use_sinks ? "1" : "0")
                           + "_mp" + (use_mm_prefix ? "1" : "0");
 
@@ -684,15 +548,7 @@ static void dispatch_paged_attention_tiled(
        {&use_mm_prefix, MTL::DataType::DataTypeBool, NS::UInteger(120)}});
 
   const int t_size = static_cast<int>(query.itemsize());
-  // S, O, m, l are register-resident, so no S/O/M/L threadgroup buffers.
-  // Output staging reuses Q_smem as fp32 O_smem at exit; fits because
-  // BQ*LD*4 <= (BQ+2*TILE_KV)*LD*2  <=>  BQ <= 2*TILE_KV.
-  // A1: leading dim padded by 16 B for bank-conflict avoidance —
-  // smem_pad/ld MUST match SMEM_PAD/LD in pagedattention_tiled.metal.
-  const int smem_pad = 16 / t_size;
-  const int ld       = head_size + smem_pad;
-  size_t shmem = static_cast<size_t>(
-      (cfg.BQ + 2 * cfg.TILE_KV) * ld * t_size);  // Q + K + V, padded
+  size_t shmem = kernels::tiled_shared_bytes(cfg, head_size, t_size);
 
   int num_heads = static_cast<int>(query.shape(1));
   auto& enc = metal::get_command_encoder(s);
@@ -726,7 +582,7 @@ static void dispatch_paged_attention_tiled(
 static MTL::ComputePipelineState* paged_attention_v2_reduce_kernel(
     metal::Device& d, const std::string& dt, int head_size,
     int partition_size, bool use_sinks, bool use_tq_fc) {
-  const auto rname = paged_reduce_kernel_name(dt, head_size, partition_size);
+  const auto rname = kernels::paged_reduce_kernel_name(dt, head_size, partition_size);
   // The reduce kernel reads only use_sinks (40) and use_turboquant (50); the
   // other function constants are inert for it.  TurboQuant batches take this
   // path (use_tq_fc varies: the TQ reduce applies the deferred inverse FWHT),
@@ -757,7 +613,7 @@ static void dispatch_paged_attention_v2_reduce(
     rkernel = paged_attention_v2_reduce_kernel(
         d, dt, head_size, partition_size, use_sinks, use_tq_fc);
   }
-  const size_t reduce_shmem = paged_reduce_threadgroup_bytes(max_num_partitions);
+  const size_t reduce_shmem = kernels::paged_reduce_threadgroup_bytes(max_num_partitions);
   const size_t capacity = d.mtl_device()->maxThreadgroupMemoryLength();
   if (!paged_reduce_memory_fits(
           reduce_shmem, rkernel->staticThreadgroupMemoryLength(), capacity)) {
@@ -840,7 +696,7 @@ static void dispatch_paged_attention_v2_online(
       && dtype_ok && mm_prefix_ranges == nullptr
       && nax_eligible(query.dtype(), head_size, block_size);
   const auto tile_config = has_prefill && !window_batch && !use_turboquant
-      && dtype_ok ? select_tile_config(head_size) : std::nullopt;
+      && dtype_ok ? kernels::select_tile_config(head_size) : std::nullopt;
 
   // Split long ordinary decode rows from tiled prefill. Keep spec and NAX on
   // their established whole-batch routes.
@@ -941,9 +797,9 @@ static void dispatch_paged_attention_v2_online(
   // invisible on 10-core M4 / M2 Ultra whose thresholds land elsewhere.
   // (For non-window batches grid_y == total_q_tokens, so this is the
   // same value the gate always used.)
-  const int gate_grid = num_heads * total_q_tokens;  // grid.z = 1 occupancy
   const bool partition = (pure_decode || window_batch)
-      && gate_grid < min_decode_grid() && max_num_partitions >= 2;
+      && kernels::should_split_decode(
+          num_heads, total_q_tokens, max_num_partitions, detected_gpu_core_count());
 
   auto* lib = d.get_library("paged_attention_v2_kern");
   auto& enc = metal::get_command_encoder(s);
@@ -1004,7 +860,7 @@ static void dispatch_paged_attention_v2_online(
       : nullptr;
   const bool gqa_decode = scratch_fits
       && paged_reduce_memory_fits(
-          paged_reduce_threadgroup_bytes(gqa_partitions),
+          kernels::paged_reduce_threadgroup_bytes(gqa_partitions),
           gqa_rkernel->staticThreadgroupMemoryLength(),
           d.mtl_device()->maxThreadgroupMemoryLength());
   if (gqa_decode) {
@@ -1056,11 +912,9 @@ static void dispatch_paged_attention_v2_online(
     return;
   }
 
-  std::string kname =
-      "paged_attention_" + dt + "_cache_" + k_cache_dt + "_" + v_cache_dt +
-      "_hs" + std::to_string(head_size) +
-      "_bs" + std::to_string(block_size) +
-      "_nt256_nsl32_ps" + std::to_string(partition ? kPartitionSize : 0);
+  std::string kname = kernels::paged_name(
+      dt, k_cache_dt, v_cache_dt, head_size, block_size,
+      partition ? kPartitionSize : 0);
 
   bool use_partitioning  = partition;
   bool use_alibi         = false;
@@ -1092,22 +946,9 @@ static void dispatch_paged_attention_v2_online(
        {&window_q_fc,      MTL::DataType::DataTypeInt,  NS::UInteger(110)}});
 
   constexpr int NUM_THREADS    = 256;
-  constexpr int NUM_SIMD_LANES = 32;
-  constexpr int NUM_WARPS      = NUM_THREADS / NUM_SIMD_LANES;
-  // Window mode widens the per-warp score slices to one BLOCK_SIZE slice
-  // per row and stages the sub-window's query rows after them; the layout
-  // must mirror the kernel's shared_mem carve exactly.
-  const int rows_per_tg = window_batch ? kWindowRows : 1;
-  int warp_scores_bytes = NUM_WARPS * rows_per_tg * block_size
-                          * static_cast<int>(sizeof(float));
-  int q_window_bytes = window_batch
-      ? kWindowRows * head_size * static_cast<int>(query.itemsize())
-      : 0;
-  int merge_bytes = (2 * NUM_WARPS + NUM_WARPS * head_size)
-                    * static_cast<int>(sizeof(float));
-  size_t shmem = static_cast<size_t>(
-      std::max(warp_scores_bytes + q_window_bytes, merge_bytes));
-  shmem = (shmem + 15) & ~size_t(15);
+  const size_t shmem = kernels::paged_threadgroup_bytes(
+      head_size, block_size, static_cast<int>(query.itemsize()),
+      window_batch, kWindowRows);
 
   // TurboQuant scale/zero/centroid buffers (slots 22-27); shared by both paths.
   auto bind_turboquant = [&]() {
@@ -1385,7 +1226,7 @@ static array paged_attention_primitive_fn(
     const int head_size_q = static_cast<int>(query.shape(2));
     if (query.dtype() == float32 || query.dtype() != key_cache.dtype()
         || window_seqlen_q > 1 || total_q <= num_segments
-        || !select_tile_config(head_size_q)) {
+        || !kernels::select_tile_config(head_size_q)) {
       throw std::invalid_argument(
           "mm_prefix ranges need the tiled prefill kernel: a non-float32 "
           "query matching the KV cache dtype, at least one multi-token "
@@ -1712,7 +1553,7 @@ class ReshapeAndCachePrimitive : public Primitive {
 
     auto kv_dt    = dtype_to_metal(key.dtype());
     auto cache_dt = dtype_to_metal(inputs[2].dtype());
-    std::string kname = "reshape_and_cache_kv_" + kv_dt + "_cache_" + cache_dt;
+    std::string kname = kernels::reshape_and_cache_name(kv_dt, cache_dt);
 
     // rac_use_fp8_scales (fc 100) = false: non-quantized cache, so the
     // k_scale/v_scale buffers (5,6) are absent from the signature.
@@ -2280,11 +2121,11 @@ NB_MODULE(_paged_ops, m) {
   register_mlx_patch(m);
   m.attr("PARTITION_SIZE") = nb::int_(kPartitionSize);
   m.def("detected_gpu_core_count", &detected_gpu_core_count,
-        "Detected GPU core count, or zero when detection is unavailable.");
+        "Positive GPU core count; raises if detection is unavailable or invalid.");
   m.def("_override_detected_gpu_core_count_for_test",
         &override_detected_gpu_core_count_for_test, nb::arg("cores"),
-        "Test-only. A non-negative count replaces IORegistry detection; "
-        "-1 restores hardware detection. Production routing must not call this.");
+        "Test-only. A positive count replaces hardware detection; zero simulates "
+        "failure and -1 restores detection. Production must not call this.");
   m.def("_set_paged_dispatch_diagnostics", &set_paged_dispatch_diagnostics,
         nb::arg("enabled"),
         "Private process-wide diagnostic opt-in; disabled by default. "
@@ -2370,7 +2211,7 @@ NB_MODULE(_paged_ops, m) {
           for (const char* dtype : {"half", "bfloat16_t"}) {
             for (int part : kGqaPartitionSizes) {
               for (const auto& layout : kGqaDecodeGeometries) {
-                const auto reducer = paged_reduce_kernel_name(
+                const auto reducer = kernels::paged_reduce_kernel_name(
                     dtype, layout.head_size, part);
                 bool no = false;
                 if (d.get_kernel(reducer, lib, reducer + "_gqa_check",
@@ -2403,7 +2244,7 @@ NB_MODULE(_paged_ops, m) {
 
   m.def("tile_config",
         [](int head_size) -> nb::object {
-          auto cfg = select_tile_config(head_size);
+          auto cfg = kernels::select_tile_config(head_size);
           if (!cfg) return nb::none();
           return nb::make_tuple(cfg->BQ, cfg->TILE_KV);
         },
@@ -2616,7 +2457,7 @@ NB_MODULE(_paged_ops, m) {
           const int64_t num_partitions =
               (static_cast<int64_t>(max_seq_len) + partition_size - 1) /
               partition_size;
-          if (paged_reduce_threadgroup_bytes(num_partitions) >
+          if (kernels::paged_reduce_threadgroup_bytes(num_partitions) >
               metal::device(Device::gpu).mtl_device()->maxThreadgroupMemoryLength()) {
             throw std::invalid_argument(
                 "GQA test partition exceeds the device threadgroup memory limit");

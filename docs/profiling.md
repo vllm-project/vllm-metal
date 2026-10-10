@@ -2,7 +2,9 @@
 
 vllm-metal ships an in-process **frame-capture profiler** that records every Metal command issued during inference. Captures open in Xcode's GPU Frame Debugger and give you per-kernel GPU timing (via the **Profile** button), command ordering, and full buffer state — everything you typically want for both performance and correctness debugging on Apple Silicon. **This is the recommended path.**
 
-The profiler plugs into vLLM's standard profiler API — `LLM.start_profile()`, the `POST /start_profile` HTTP endpoint, etc. — and calls `mlx.metal.start_capture` underneath. Captures must be bounded (see the [recommended recipe](#recommended-starting-recipe)).
+The profiler plugs into vLLM's standard profiler API — `LLM.start_profile()`, the `POST /start_profile` HTTP endpoint, etc. — and uses the selected backend's native capture API: `mlx.metal.start_capture` / `stop_capture` for MLX, or `torch.mps.profiler.metal_capture` for PyTorch MPS. Captures must be bounded (see the [recommended recipe](#recommended-starting-recipe)).
+
+PyTorch 2.13 first writes a numbered trace in the worker's current directory, which must be writable. The wrapper moves it into `torch_profiler_dir` when capture stops.
 
 For users already familiar with Apple's Instruments.app, Apple's `xctrace` is available as a lower-overhead, whole-process alternative for wall-clock and GPU-utilization views — see [Advanced: xctrace](#advanced-xctrace) at the end. It's a different mental model and doesn't surface MLX kernel names; reach for it only if you already know how to read Metal System Trace.
 

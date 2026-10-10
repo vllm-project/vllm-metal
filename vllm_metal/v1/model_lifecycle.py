@@ -21,8 +21,8 @@ from vllm_metal.compiled_mlp import CompiledMLPBlocks
 from vllm_metal.config import get_config
 from vllm_metal.gguf.source import GGUFLoadSource
 from vllm_metal.multimodal.gemma4 import Gemma4VisionSidecar
-from vllm_metal.pytorch_backend.tensor_bridge import TORCH_TO_MLX_DTYPE
 from vllm_metal.quant.awq_loader import AWQQuantLoader
+from vllm_metal.tensor_bridge import TORCH_TO_MLX_DTYPE
 from vllm_metal.utils import get_model_download_path
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPAssistantLoader
 from vllm_metal.v1.mlx_lm_paths import (

@@ -185,7 +185,7 @@ def test_budget_above_buffer_limit_uses_shared_regions(monkeypatch):
     from vllm.v1.core.kv_cache_utils import get_kv_cache_config_from_groups
 
     from tests.stub_runner import make_cache_config
-    from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
+    from vllm_metal.tensor_bridge import torch_to_mlx
     from vllm_metal.v1.cache_policy import WorkerCachePlanner
 
     groups = make_storage().config.kv_cache_groups

@@ -10,7 +10,7 @@ import mlx.core as mx
 import torch
 from huggingface_hub import snapshot_download
 
-from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
+from vllm_metal.tensor_bridge import torch_to_mlx
 
 _ENCODER_DOWNLOAD_PATTERNS = (
     "config.json",

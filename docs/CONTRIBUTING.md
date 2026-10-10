@@ -3,6 +3,8 @@
 To run a released build, use the [installation guide](installation.md).
 The setup below is for editing vllm-metal itself.
 
+For the experimental backend, follow the [PyTorch MPS decision contract](pytorch-mps.md).
+
 ## Development setup
 
 On an Apple Silicon Mac, install full
@@ -34,9 +36,8 @@ When changing `.metal` shaders or `paged_ops.cpp`, enable source builds:
 VLLM_METAL_BUILD_FROM_SOURCE=1 vllm serve <model>
 ```
 
-Restart the process after each edit. This mode rebuilds the C++ extension when
-its inputs change and compiles shaders through MLX; no separate `.metallib`
-build is needed. To refresh the prebuilt artifacts instead, run
+Restart the process after each edit. This mode rebuilds the selected backend's native
+extension and shaders. To refresh both launchers and the shared prebuilt artifacts, run
 `python -m vllm_metal.metal.build`. Stale local artifacts are rejected when
 source mode is disabled.
 

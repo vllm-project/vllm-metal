@@ -149,6 +149,8 @@ Thumbs.db
 vllm_metal/metal/*.metallib
 vllm_metal/metal/*.sha256
 vllm_metal/metal/*.mlx-version
+vllm_metal/pytorch_backend/*.torch-version
+vllm_metal/pytorch_backend/*.sha256
 
 # Model files
 *.bin

@@ -26,6 +26,9 @@ logger = logging.getLogger(__name__)
 _THIS_DIR = Path(__file__).resolve().parent
 _KERNELS_V2_DIR = _THIS_DIR / "kernels_v2"
 
+# The extension can be loaded for metadata before execution is initialized.
+_native_module: ModuleType | None = None
+
 # Cached after first get_ops() call.  By default both the .cpp extension and
 # the required Metal shader libraries are loaded prebuilt from the package,
 # so there is no first-request shader compile. Set VLLM_METAL_BUILD_FROM_SOURCE=1
@@ -221,23 +224,11 @@ def metal_mla_paged_attention(
     return out
 
 
-def get_ops() -> ModuleType:
-    """Import the native paged_ops extension and initialise its Metal libraries.
-
-    By default the prebuilt ``.so`` and required ``.metallib`` libraries are
-    loaded by path via MLX
-    (``Device::get_library(name, path)``). When ``VLLM_METAL_BUILD_FROM_SOURCE``
-    is set, the ``.so`` is rebuilt and the shader sources are read, pre-processed
-    (includes inlined) and JIT-compiled in-process via
-    ``mlx::core::metal::Device::get_library(name, builder)`` instead.
-
-    Returns:
-        The ``_paged_ops`` module with ``paged_attention_primitive()`` and
-        the TurboQuant / GDN / MLA ops.
-    """
-    global _ops_module
-    if _ops_module is not None:
-        return _ops_module
+def _load_native_module() -> ModuleType:
+    """Import the native extension without initializing its kernel libraries."""
+    global _native_module
+    if _native_module is not None:
+        return _native_module
 
     # The prebuilt .so links `-lmlx` with no rpath, so it records a dependency on
     # `@rpath/libmlx.dylib` (libmlx's install name) that it cannot resolve on its
@@ -300,6 +291,31 @@ def get_ops() -> ModuleType:
         raise ImportError(f"Cannot load extension from {so_path}")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
+    _native_module = mod
+    return mod
+
+
+def get_ops() -> ModuleType:
+    """Import the native paged_ops extension and initialise its Metal libraries.
+
+    By default the prebuilt ``.so`` and required ``.metallib`` libraries are
+    loaded by path via MLX
+    (``Device::get_library(name, path)``). When ``VLLM_METAL_BUILD_FROM_SOURCE``
+    is set, the ``.so`` is rebuilt and the shader sources are read, pre-processed
+    (includes inlined) and JIT-compiled in-process via
+    ``mlx::core::metal::Device::get_library(name, builder)`` instead.
+
+    Returns:
+        The ``_paged_ops`` module with ``paged_attention_primitive()`` and
+        the TurboQuant / GDN / MLA ops.
+    """
+    global _ops_module
+    if _ops_module is not None:
+        return _ops_module
+
+    from vllm_metal import envs
+
+    mod = _load_native_module()
 
     # 3. Initialise the required Metal shader libraries (v2 online-softmax, GDN
     #    linear attention, MLA paged attention).  By default we load the
@@ -309,6 +325,7 @@ def get_ops() -> ModuleType:
     # NAX is optional: unsupported hardware, missing artifacts, and load
     # failures retain the established dispatch path.
     nax_prebuilt_path: Path | None = None
+    build_from_source = envs.VLLM_METAL_BUILD_FROM_SOURCE
     if build_from_source:
         mod.init_v2_library(_build_v2_paged_attention_source())
         mod.init_gdn_library(_build_gdn_source())

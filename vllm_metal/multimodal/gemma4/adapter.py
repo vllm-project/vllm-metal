@@ -30,7 +30,7 @@ from vllm_metal.multimodal.text_backbone import (
     resolve_backbone_embed_tokens,
     resolve_text_backbone,
 )
-from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
+from vllm_metal.tensor_bridge import torch_to_mlx
 
 logger = init_logger(__name__)
 
