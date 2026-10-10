@@ -5,9 +5,9 @@ Marked ``slow`` — opt in with ``pytest -m slow`` (matches the existing
 real-model convention in the shared parity tool).  Skips when
 the model is not pre-pulled into the HF cache; pre-pull locally with::
 
-    hf download mlx-community/Qwen3-VL-4B-Instruct-4bit
+    hf download mlx-community/PaddleOCR-VL-4bit
 
-Override via ``QWEN3_VL_PARITY_MODEL`` env var.
+Override via ``PADDLEOCR_VL_PARITY_MODEL`` env var.
 """
 
 from __future__ import annotations
@@ -27,10 +27,10 @@ from tests.multimodal.vl_parity import (
     reference_logits,
     skip_unless_cached,
 )
-from vllm_metal.multimodal.qwen3_vl import Qwen3VLMultimodalAdapter
+from vllm_metal.multimodal.paddleocr_vl import PaddleOCRVLMultimodalAdapter
 
 MODEL_ID = os.environ.get(
-    "QWEN3_VL_PARITY_MODEL", "mlx-community/Qwen3-VL-4B-Instruct-4bit"
+    "PADDLEOCR_VL_PARITY_MODEL", "mlx-community/PaddleOCR-VL-4bit"
 )
 
 skip_unless_cached(MODEL_ID)
@@ -49,18 +49,16 @@ def _kwargs_item(
 ) -> MultiModalKwargsItem:
     """Wrap mlx-vlm processor output into the MultiModalKwargsItem the adapter expects.
 
-    Mirrors vLLM's Qwen2-VL field factory: pixel_values uses ``flat_from_sizes``
-    (the leading axis is patch count, not batch); image_grid_thw uses ``batched``.
+    The processor emits ``pixel_values`` already batched per image —
+    ``(1, patches, 3, patch, patch)`` — and ``image_grid_thw`` as ``(1, 3)``.
     """
     pixels_t = torch.from_numpy(np.asarray(pixel_values))
-    grid_t = torch.from_numpy(np.asarray(image_grid_thw))  # (1, 3)
-    pixel_grid_sizes = grid_t.prod(-1)  # (1,) — patches per image
-    pixel_cfg = MultiModalFieldConfig.flat_from_sizes("image", pixel_grid_sizes)
-    grid_cfg = MultiModalFieldConfig.batched("image", keep_on_cpu=True)
+    grid_t = torch.from_numpy(np.asarray(image_grid_thw))
+    field_cfg = MultiModalFieldConfig.batched("image", keep_on_cpu=True)
     return MultiModalKwargsItem(
         {
-            "pixel_values": pixel_cfg.build_elems("pixel_values", pixels_t)[0],
-            "image_grid_thw": grid_cfg.build_elems("image_grid_thw", grid_t)[0],
+            "pixel_values": field_cfg.build_elems("pixel_values", pixels_t)[0],
+            "image_grid_thw": field_cfg.build_elems("image_grid_thw", grid_t)[0],
         }
     )
 
@@ -72,14 +70,10 @@ def test_call_lm_logits_match_reference(loaded):
 
     ref = reference_logits(model, input_ids, pixel_values, image_grid_thw)
     got = adapter_logits(
-        Qwen3VLMultimodalAdapter.from_loaded_model(model),
+        PaddleOCRVLMultimodalAdapter.from_loaded_model(model),
         model,
         input_ids,
-        image_token_id=int(model.config.image_token_index),
+        image_token_id=int(model.config.image_token_id),
         item=_kwargs_item(pixel_values, image_grid_thw),
-        extra_lm_kwargs=lambda enc, mask: {
-            "visual_pos_masks": mask[None, :],
-            "deepstack_visual_embeds": enc.deepstack_visual_embeds,
-        },
     )
     assert_logits_match(got, ref)
