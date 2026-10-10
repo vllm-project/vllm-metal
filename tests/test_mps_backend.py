@@ -147,3 +147,53 @@ def test_rms_norm_parity(dtype, fused):
         torch.testing.assert_close(residual.cpu(), expected_residual, atol=0, rtol=0)
         torch.testing.assert_close(actual[0].cpu(), expected[0], atol=0, rtol=0)
     torch.testing.assert_close(actual.cpu(), expected, **op.get_tolerance(dtype))
+
+
+def test_shortconv_checkpoint_survives_resume():
+    from vllm_metal.pytorch_backend.input_ops import preprocess_state
+    from vllm_metal.pytorch_backend.runner import MPSKVBlockZeroer
+
+    device = torch.device("mps")
+    cache = torch.arange(12, dtype=torch.float16, device=device).reshape(3, 2, 2)
+    checkpoint = cache[2].clone()
+    zeroer = MPSKVBlockZeroer([cache.flatten()], num_blocks=3)
+    spec = SimpleNamespace(block_size=4)
+    config = SimpleNamespace(kv_cache_groups=[SimpleNamespace(layer_names=["conv"])])
+    context = SimpleNamespace(
+        static_forward_context={"conv": SimpleNamespace(kv_cache=[cache])}
+    )
+    state = SimpleNamespace(
+        _align_mode=True,
+        _mamba_state_idx_gpu=torch.tensor([-1, 0], device=device, dtype=torch.int32),
+        _get_mamba_group_info=lambda _: ([0], spec),
+        vllm_config=SimpleNamespace(compilation_config=context),
+    )
+    batch = SimpleNamespace(
+        num_reqs=1,
+        idx_mapping=torch.tensor([1], device=device, dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 1], device=device, dtype=torch.int32),
+    )
+    tables = (torch.tensor([[2, 0]], device=device, dtype=torch.int32),)
+    computed = torch.tensor([0, 4], device=device, dtype=torch.int32)
+
+    # Resume the four-token prefix in block 2, continuing in recycled block 0.
+    expected = cache.clone()
+    expected[0].zero_()
+    zeroer.zero_block_ids([0])
+    assert torch.equal(cache, expected)
+    preprocess_state(state, batch, tables, config, computed)
+    assert torch.equal(cache[0], checkpoint)
+
+    # Advancing within the same block must not reload or mutate the checkpoint.
+    cache[0].add_(1)
+    computed[1] = 5
+    preprocess_state(state, batch, tables, config, computed)
+    assert torch.equal(cache[0], checkpoint + 1)
+    assert torch.equal(cache[2], checkpoint)
+
+    # Re-admission at the cached prefix must restore the original state again.
+    state._mamba_state_idx_gpu[1] = 0
+    computed[1] = 4
+    preprocess_state(state, batch, tables, config, computed)
+    assert torch.equal(cache[0], checkpoint)
+    assert torch.equal(cache[2], checkpoint)
