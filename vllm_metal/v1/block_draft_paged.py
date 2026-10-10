@@ -181,10 +181,14 @@ class BlockDraftPagedCache:
                 attn = layer.self_attn
                 x = layer.input_layernorm(h)
                 q, k, v = attn.project_block(x, model.rope, offsets)
-                q = q.transpose(0, 2, 1, 3)
-                k = k.transpose(0, 2, 1, 3)
-                v = v.transpose(0, 2, 1, 3).reshape(
-                    -1, cfg.num_key_value_heads, cfg.head_dim
+                # Transpose/reshape may preserve head-major storage. The
+                # Metal attention and scatter kernels require dense token rows.
+                q = mx.contiguous(q.transpose(0, 2, 1, 3))
+                k = mx.contiguous(k.transpose(0, 2, 1, 3))
+                v = mx.contiguous(
+                    v.transpose(0, 2, 1, 3).reshape(
+                        -1, cfg.num_key_value_heads, cfg.head_dim
+                    )
                 )
                 k, v = get_ops().reshape_and_cache(
                     k.reshape(v.shape),

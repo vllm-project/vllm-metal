@@ -104,6 +104,53 @@ def test_candidate_limited_proposals_commit_features_and_reuse_pages(dtype, widt
     _check_ragged_proposals(dtype, 16, width, True, True, draft_topk=8)
 
 
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("width", [3, 7])
+@pytest.mark.parametrize("quantized", [False, True])
+def test_single_request_with_head_major_projections(
+    monkeypatch, dtype, width, quantized
+):
+    model, cache = make_cache(dtype, quantized=quantized)
+    reference = model
+    if quantized:
+        from tests.test_dspark_quantization import dequantized_model
+
+        reference = dequantized_model(model)
+
+    def head_major(project):
+        def forward(*args):
+            # RoPE may return head-major storage; transposing back to token
+            # order does not guarantee dense rows for the Metal kernels.
+            return tuple(mx.contiguous(a) for a in project(*args))
+
+        return forward
+
+    for layer in model.backbone.layers:
+        attn = layer.self_attn
+        monkeypatch.setattr(attn, "project_block", head_major(attn.project_block))
+
+    draft = cache.compile_draft(num_draft_tokens=width)
+    table, anchor = [5, 2, 7, 1], mx.array([11])
+    for length in (7, 17, 41):
+        features = [mx.random.normal((1, length, 64)).astype(dtype) for _ in range(3)]
+        cache.write_context([f[0] for f in features], [(table, 0, length)])
+        actual = draft(anchor, [(table, length)])
+        hidden = _torch_forward(
+            reference.backbone, reference.block_embeddings(anchor, width), features
+        )
+        expected = reference.greedy_proposal(mx.array(hidden).astype(dtype), anchor)
+        mx.eval(actual, expected, *cache.storage.buffers)
+        np.testing.assert_array_equal(np.array(actual[0]), np.array(expected[0]))
+        tolerance = 0.04 if dtype == mx.bfloat16 else 0.006
+        for observed, wanted in zip(actual[1:], expected[1:], strict=True):
+            np.testing.assert_allclose(
+                np.array(observed.astype(mx.float32)),
+                np.array(wanted.astype(mx.float32)),
+                atol=tolerance,
+                rtol=tolerance,
+            )
+
+
 def _check_ragged_proposals(
     dtype, block_size, width, confidence, with_markov, draft_topk=None, quantized=False
 ):
