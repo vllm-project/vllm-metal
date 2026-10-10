@@ -7,13 +7,17 @@ Tests inject core counts only when hardware detection is unavailable.
 
 from __future__ import annotations
 
+import contextlib
+
 import mlx.core as mx
+import numpy as np
 import pytest
 
 from tests.gqa_test_utils import (
     _assert_close,
     _assert_fallback,
     _dispatch_family,
+    _grouped_paged_reference,
     _run_primitive,
 )
 from tests.test_gqa_paged_decode import (
@@ -22,6 +26,7 @@ from tests.test_gqa_paged_decode import (
     GQA_SIMD_GROUPS_PER_CORE,
     NUM_QUERY_HEADS,
 )
+from vllm_metal.attention.block_tables import build_block_tables
 from vllm_metal.metal import get_ops
 
 
@@ -32,6 +37,7 @@ def test_native_reports_public_routing_capabilities():
         "decode_routing_metadata": True,
         "gqa_batch_context_lens": True,
         "gqa_length_plan": True,
+        "gqa_mixed_decode_plan": True,
     }
 
 
@@ -330,6 +336,355 @@ def test_split_mixed_decode_stays_on_upstream_path(disabled, force_tiled_prefill
     assert _dispatch_family() == "mixed_prefill_decode"
     assert get_ops().last_gqa_partition_size() == 0
     _assert_close(out, ref, mx.float16)
+
+
+def test_split_nax_mixed_decode_stays_on_upstream_path():
+    """The NAX split routes its decode rows exactly like the tiled split."""
+    ops = get_ops()
+    if not (ops.nax_supported() and ops.nax_ready()):
+        pytest.skip("NAX prefill needs an M5 GPU and the NAX metallib")
+    out, ref = _run_primitive(
+        [8192, 128],
+        mx.float16,
+        interleaved=True,
+        seed=720,
+        query_lens=[1, 32],
+        num_decode_requests=1,
+        num_decode_tokens=1,
+        max_decode_context_len=8192,
+    )
+    assert _dispatch_family() == "mixed_nax_prefill_decode"
+    assert ops.last_gqa_partition_size() == 0
+    _assert_close(out, ref, mx.float16)
+
+
+_SERVE_GEOMETRY = (32, 8, 128, 16)
+_MIXED_FAMILIES = {"mixed_prefill_decode", "mixed_nax_prefill_decode"}
+
+
+@contextlib.contextmanager
+def _gpu_cores(count: int):
+    """Pin the core count that GQA admission reads, then restore detection.
+
+    Mixed-prefix expectations depend on the grid guard (33 SIMD groups per
+    core), so every such test fixes the count instead of inheriting the host's.
+    """
+    get_ops()._override_detected_gpu_core_count_for_test(count)
+    try:
+        yield
+    finally:
+        _restore_test_gpu_cores()
+
+
+def _mixed_inputs(
+    decode_lengths,
+    prefills,
+    *,
+    geometry=_SERVE_GEOMETRY,
+    dtype=mx.bfloat16,
+    cache_block=None,
+    table_tokens=0,
+    seed=1060,
+):
+    """Leading one-row decode sequences followed by (query, kv) prefill chunks.
+
+    With ``cache_block``, K and V are strided views into one interleaved buffer
+    of scheduler pages larger than the kernel block, with block tables
+    translated by ``build_block_tables`` exactly as the runner passes them.
+    ``table_tokens`` pads every table row to address that many tokens.
+    """
+    q_heads, kv_heads, head, block = geometry
+    mx.random.seed(seed)
+    seqs = [(1, n) for n in decode_lengths] + list(prefills)
+    query = mx.random.normal((sum(q for q, _ in seqs), q_heads, head)).astype(dtype)
+    if cache_block is None:
+        num_blocks = 2048
+        shape = (num_blocks, block, kv_heads, head)
+        key = mx.random.normal(shape).astype(dtype)
+        value = mx.random.normal(shape).astype(dtype)
+        width = max(-(-kv // block) for _, kv in seqs)
+        tables = mx.random.randint(0, num_blocks, (len(seqs), width)).astype(mx.int32)
+        ref_key, ref_value = key, value
+    else:
+        counts = [-(-kv // cache_block) for _, kv in seqs]
+        order = np.random.default_rng(seed).permutation(sum(counts)).tolist()
+        pages = []
+        for count in counts:
+            pages.append(order[:count])
+            order = order[count:]
+        num_pages = sum(counts)
+        raw = mx.random.normal((num_pages, cache_block, kv_heads, 2 * head))
+        raw = raw.astype(dtype)
+        strides = (cache_block * kv_heads * 2 * head, kv_heads * 2 * head, 2 * head, 1)
+        shape = (num_pages, cache_block, kv_heads, head)
+        key = get_ops().as_strided(raw, shape, strides, 0)
+        value = get_ops().as_strided(raw, shape, strides, head)
+        tables, kernel_block = build_block_tables(pages, cache_block)
+        assert kernel_block == block
+        ref_key = (key + 0).reshape(-1, block, kv_heads, head)
+        ref_value = (value + 0).reshape(-1, block, kv_heads, head)
+    if table_tokens:
+        pad = table_tokens // block - tables.shape[1]
+        tables = mx.concatenate([tables, mx.zeros((len(seqs), pad), mx.int32)], 1)
+    kv_lens = mx.array([kv for _, kv in seqs], dtype=mx.int32)
+    cu = mx.cumsum(mx.array([0] + [q for q, _ in seqs], dtype=mx.int32))
+    mx.eval(query, key, value, ref_key, ref_value, tables, kv_lens, cu)
+    return {
+        "seqs": seqs,
+        "geometry": geometry,
+        "dtype": dtype,
+        "k": key,
+        "v": value,
+        "ref_k": ref_key,
+        "ref_v": ref_value,
+        "q": query,
+        "tables": tables,
+        "kv_lens": kv_lens,
+        "cu": cu,
+    }
+
+
+def _mixed_call(d, rows, max_seq_len, **kwargs):
+    """Run the first ``rows`` sequences, or the whole batch when rows is None."""
+    _, kv_heads, head, block = d["geometry"]
+    if rows is None:
+        query, tables, kv_lens, cu = d["q"], d["tables"], d["kv_lens"], d["cu"]
+    else:
+        query, tables, kv_lens = d["q"][:rows], d["tables"][:rows], d["kv_lens"][:rows]
+        cu = mx.arange(rows + 1, dtype=mx.int32)
+    out = mx.array(0)
+    get_ops().paged_attention_primitive(
+        query,
+        d["k"],
+        d["v"],
+        kv_heads,
+        head**-0.5,
+        0.0,
+        tables,
+        kv_lens,
+        cu,
+        block,
+        max_seq_len,
+        -1,
+        out,
+        **kwargs,
+    )
+    mx.eval(out)
+    return out
+
+
+def _decode_meta(decode_lengths):
+    rows = len(decode_lengths)
+    return {
+        "num_decode_requests": rows,
+        "num_decode_tokens": rows,
+        "max_decode_context_len": max(decode_lengths),
+    }
+
+
+def _prefill_backend(name, request):
+    ops = get_ops()
+    if name == "tiled":
+        request.getfixturevalue("force_tiled_prefill")
+        return "mixed_prefill_decode"
+    if not (ops.nax_supported() and ops.nax_ready()):
+        pytest.skip("NAX prefill needs an M5 GPU and the NAX metallib")
+    return "mixed_nax_prefill_decode"
+
+
+def _assert_prefix_runs_pure_decode_gqa(d, decode_lengths, family):
+    """Decode rows match the same rows as a pure GQA batch, bit for bit."""
+    ops = get_ops()
+    rows = len(decode_lengths)
+    max_seq_len = max(kv for _, kv in d["seqs"])
+    plan = ops.gqa_decode_length_plan(decode_lengths)
+    meta = _decode_meta(decode_lengths)
+
+    mixed = _mixed_call(d, None, max_seq_len, gqa_length_plan=plan, **meta)
+    assert _dispatch_family() == family
+    partition = ops.last_gqa_partition_size()
+    assert partition in GQA_PARTITIONS
+    assert ops.last_gqa_num_requests() == rows
+
+    pure = _mixed_call(d, rows, max(decode_lengths), gqa_length_plan=plan, **meta)
+    assert _dispatch_family() == "gqa_decode"
+    assert ops.last_gqa_partition_size() == partition
+    whole = _mixed_call(d, None, max_seq_len)
+
+    assert mx.array_equal(mixed[:rows], pure).item()
+    assert mx.array_equal(mixed[rows:], whole[rows:]).item()
+    head = d["geometry"][2]
+    ref = _grouped_paged_reference(
+        query=d["q"][:rows].astype(mx.float32),
+        key_cache=d["ref_k"].astype(mx.float32),
+        value_cache=d["ref_v"].astype(mx.float32),
+        query_lens=[1] * rows,
+        kv_lens=list(decode_lengths),
+        block_tables=np.array(d["tables"][:rows]),
+        scale=head**-0.5,
+    )
+    _assert_close(mixed[:rows], ref, d["dtype"])
+    return partition
+
+
+@pytest.mark.parametrize("prefill_kernel", ["tiled", "nax"])
+@pytest.mark.parametrize(
+    "decode_lengths,partition",
+    [([16384, 9000, 4096, 12000], 512), ([16384], 256)],
+    ids=["d4", "d1"],
+)
+def test_mixed_decode_prefix_uses_gqa_with_its_length_plan(
+    prefill_kernel, decode_lengths, partition, request
+):
+    """With a prefix plan the decode rows run pure-decode GQA bit-for-bit.
+
+    At 40 cores the lone 16384-token row clears the grid guard only with P256
+    (64 * 32 >= 1320); the prefill chunk is longer than every decode row, so
+    the prefix must be planned from its own lengths, not max_seq_len.
+    """
+    family = _prefill_backend(prefill_kernel, request)
+    d = _mixed_inputs(decode_lengths, [(256, 18000), (64, 64)])
+    with _gpu_cores(40):
+        assert (
+            _assert_prefix_runs_pure_decode_gqa(d, decode_lengths, family) == partition
+        )
+
+
+_GEOMETRY_DECODE_LENGTHS = [8192, 6000, 5000, 4500]
+
+
+@pytest.mark.parametrize("prefill_kernel", ["tiled", "nax"])
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("geometry", GQA_GEOMETRIES)
+def test_mixed_decode_prefix_gqa_across_geometries(
+    geometry, dtype, prefill_kernel, request
+):
+    """Every whitelisted geometry admits the prefix (44 full P512 partitions
+    times at least 16 heads >= 33 * 20) and keeps the pure-decode bits."""
+    family = _prefill_backend(prefill_kernel, request)
+    lengths = _GEOMETRY_DECODE_LENGTHS
+    d = _mixed_inputs(lengths, [(128, 9000)], geometry=geometry, dtype=dtype)
+    with _gpu_cores(20):
+        _assert_prefix_runs_pure_decode_gqa(d, lengths, family)
+
+
+@pytest.mark.parametrize("prefill_kernel", ["tiled", "nax"])
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize(
+    "geometry,cache_block",
+    [((24, 4, 256, 16), 784), ((16, 2, 256, 32), 1056)],
+)
+def test_mixed_decode_prefix_gqa_with_converted_page_stride(
+    geometry, cache_block, dtype, prefill_kernel, request
+):
+    """Hybrid-model pages: strided K/V views of scheduler pages larger than
+    the kernel block, read through translated block tables."""
+    family = _prefill_backend(prefill_kernel, request)
+    lengths = _GEOMETRY_DECODE_LENGTHS
+    d = _mixed_inputs(
+        lengths,
+        [(128, 9000)],
+        geometry=geometry,
+        dtype=dtype,
+        cache_block=cache_block,
+    )
+    with _gpu_cores(20):
+        _assert_prefix_runs_pure_decode_gqa(d, lengths, family)
+
+
+@pytest.mark.parametrize("prefill_kernel", ["tiled", "nax"])
+@pytest.mark.parametrize("with_plan", [True, False])
+@pytest.mark.parametrize("prefill_kv", [18000, 65536])
+def test_short_decode_prefix_is_gated_by_its_own_length(
+    prefill_kv, with_plan, prefill_kernel, request
+):
+    """The GQA gate counts only the decode rows, never the prefill chunk.
+
+    At 20 cores a lone 4096-token row has 16 full P256 partitions
+    (16 * 32 < 660) and must stay per-token. The split still happens, and the
+    long prefill KV, which would clear the gate if it were counted, must not
+    admit the prefix.
+    """
+    family = _prefill_backend(prefill_kernel, request)
+    ops = get_ops()
+    lengths = [4096]
+    d = _mixed_inputs(lengths, [(256, prefill_kv)])
+    meta = _decode_meta(lengths)
+    plan = {"gqa_length_plan": ops.gqa_decode_length_plan(lengths)} if with_plan else {}
+    with _gpu_cores(20):
+        mixed = _mixed_call(d, None, prefill_kv, **plan, **meta)
+        assert _dispatch_family() == family
+        assert ops.last_gqa_partition_size() == 0
+        pure = _mixed_call(d, 1, 4096, gqa_disabled=True, **meta)
+        whole = _mixed_call(d, None, prefill_kv)
+    assert mx.array_equal(mixed[:1], pure).item()
+    assert mx.array_equal(mixed[1:], whole[1:]).item()
+
+
+@pytest.mark.parametrize("prefill_kernel", ["tiled", "nax"])
+@pytest.mark.parametrize("disabled", [False, True])
+def test_mixed_prefix_plan_with_allocation_wide_max_seq_len(
+    disabled, prefill_kernel, request
+):
+    """A legal 4M-token max_seq_len must not size the prefix's partitions.
+
+    At 12 cores the 4096-token row is admitted with P256 (16 * 32 >= 396); its
+    16 partitions follow the plan. Disabled, the per-token prefix needs 8 P512
+    partitions where the allocation bound would plan 8192.
+    """
+    family = _prefill_backend(prefill_kernel, request)
+    ops = get_ops()
+    lengths = [4096]
+    bound = 4 * 1024 * 1024
+    d = _mixed_inputs(lengths, [(2, 2)], table_tokens=bound)
+    meta = _decode_meta(lengths)
+    plan = ops.gqa_decode_length_plan(lengths)
+    with _gpu_cores(12):
+        mixed = _mixed_call(
+            d, None, bound, gqa_length_plan=plan, gqa_disabled=disabled, **meta
+        )
+        assert _dispatch_family() == family
+        assert ops.last_gqa_partition_size() == (0 if disabled else 256)
+        pure = _mixed_call(
+            d, 1, 4096, gqa_length_plan=plan, gqa_disabled=disabled, **meta
+        )
+        whole = _mixed_call(d, None, bound)
+    assert mx.array_equal(mixed[:1], pure).item()
+    assert mx.array_equal(mixed[1:], whole[1:]).item()
+
+
+@pytest.mark.parametrize("prefill_kernel", ["tiled", "nax"])
+def test_mixed_decode_prefix_without_plan_or_disabled_stays_per_token(
+    prefill_kernel, request
+):
+    family = _prefill_backend(prefill_kernel, request)
+    ops = get_ops()
+    lengths = [16384, 9000, 4096, 12000]
+    d = _mixed_inputs(lengths, [(256, 18000)])
+    meta = _decode_meta(lengths)
+    plan = ops.gqa_decode_length_plan(lengths)
+    for kwargs in ({}, {"gqa_length_plan": plan, "gqa_disabled": True}):
+        _mixed_call(d, None, 18000, **meta, **kwargs)
+        assert _dispatch_family() == family
+        assert ops.last_gqa_partition_size() == 0
+
+
+@pytest.mark.parametrize("bad", ["count", "length"])
+def test_mixed_prefix_plan_must_match_the_decode_rows(bad):
+    ops = get_ops()
+    lengths = [8192, 8192]
+    d = _mixed_inputs(lengths, [(64, 4096)])
+    plan_lengths = lengths + [4096] if bad == "count" else [8192, 9000]
+    with pytest.raises(ValueError, match="leading ordinary decode rows"):
+        _mixed_call(
+            d,
+            None,
+            9000,
+            num_decode_requests=2,
+            num_decode_tokens=2,
+            max_decode_context_len=8192,
+            gqa_length_plan=ops.gqa_decode_length_plan(plan_lengths),
+        )
 
 
 def test_spec_window_does_not_switch_kernel_family() -> None:

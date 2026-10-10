@@ -24,6 +24,7 @@ def test_structured_capabilities_are_normalized():
         "decode_routing_metadata": True,
         "gqa_batch_context_lens": False,
         "gqa_length_plan": False,
+        "gqa_mixed_decode_plan": False,
     }
     query.assert_called_once_with()
 

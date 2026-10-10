@@ -893,7 +893,7 @@ class TestSDPAForward:
         assert spy.calls[-1].num_decode_requests == 1
 
     @pytest.mark.parametrize("disabled", [False, True])
-    @pytest.mark.parametrize("capability", ["none", "lengths", "plan"])
+    @pytest.mark.parametrize("capability", ["none", "lengths", "plan", "mixed_plan"])
     @pytest.mark.parametrize("kind", ["decode", "mixed", "expanded_verify"])
     def test_gqa_batch_metadata_is_only_forwarded_for_ordinary_decode(
         self, monkeypatch, disabled, capability, kind
@@ -920,7 +920,8 @@ class TestSDPAForward:
                 "gqa_disable": True,
                 "decode_routing_metadata": True,
                 "gqa_batch_context_lens": capability == "lengths",
-                "gqa_length_plan": capability == "plan",
+                "gqa_length_plan": capability in ("plan", "mixed_plan"),
+                "gqa_mixed_decode_plan": capability == "mixed_plan",
             }
         )
         monkeypatch.setattr(spy, "paged_attention_capabilities", query)
@@ -937,7 +938,12 @@ class TestSDPAForward:
         total = len(ctx.slot_mapping)
         x = mx.ones((1, total, _HIDDEN), mx.float16)
         zeros = mx.zeros((1, total, _N_HEADS * _HEAD_DIM), mx.float16)
-        eligible = kind == "decode" and not disabled
+        # Ordinary decode rows: the whole decode batch, or (with the mixed
+        # capability) the leading decode rows of a mixed batch.
+        planned = capability in ("plan", "mixed_plan")
+        eligible = not disabled and (
+            kind == "decode" or (kind == "mixed" and capability == "mixed_plan")
+        )
         with (
             patch.object(sdpa_mod, "get_ops", return_value=spy),
             patch.object(sdpa_mod, "truncate_padded_output", return_value=zeros),
@@ -948,16 +954,35 @@ class TestSDPAForward:
                 [2, 4] if eligible and capability == "lengths" else None
             )
             plan = spy.calls[-1].gqa_length_plan
-            assert plan == ((2, 4) if eligible and capability == "plan" else None)
-            assert len(spy.length_plans) == int(eligible and capability == "plan")
+            assert plan == ((2, 4) if eligible and planned else None)
+            assert len(spy.length_plans) == int(eligible and planned)
             query.assert_called_once_with()
-            if eligible and capability == "plan":
+            if eligible and planned and kind == "decode":
                 # A new forward has new lengths and must not reuse the old plan.
                 prepare_grouped([([[1]], 4), ([[0]], 2)], [], (8,))
                 next_ctx = get_context()
                 sdpa_forward(inner, x, next_ctx, cache, layer_idx=0)
                 assert spy.length_plans == [(2, 4), (5, 3)]
                 assert spy.calls[-1].gqa_length_plan is not plan
+            if eligible and planned and kind == "mixed":
+                # Later forwards change decode membership, order and lengths;
+                # each plans only its own leading decode rows, once per forward.
+                forwards = [
+                    ([([[2]], 6), ([[0]], 2), ([[1]], 4)], [([[1]], 2, 0)], (7, 3, 5)),
+                    ([([[1]], 3)], [([[0]], 1, 0), ([[2]], 2, 1)], (4,)),
+                ]
+                expected = [(2, 4)]
+                for next_decode, next_prefill, next_plan in forwards:
+                    prepare_grouped(next_decode, next_prefill, (8,))
+                    next_ctx = get_context()
+                    tokens = len(next_ctx.slot_mapping)
+                    next_x = mx.ones((1, tokens, _HIDDEN), mx.float16)
+                    for _layer in range(2):
+                        sdpa_forward(inner, next_x, next_ctx, cache, layer_idx=0)
+                    expected.append(next_plan)
+                    assert spy.length_plans == expected
+                    assert spy.calls[-1].gqa_length_plan == next_plan
+                    assert spy.calls[-1].num_decode_requests == len(next_plan)
 
     def test_mixed_batch_routes_slots_and_page_tables_by_layer_group(self) -> None:
         """Full and sliding layers consume their scheduler-group metadata."""
