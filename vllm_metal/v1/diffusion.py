@@ -13,7 +13,16 @@ back) or accepts all of them. Each engine step runs one phase per request:
   mode. Emits nothing, so the scheduler rejects every draft and the canvas
   slots are reused next step; the sampler's updated canvas is the next draft.
 * ``commit`` — once converged, the argmax canvas is scheduled, run in encoder
-  mode to write its KV, and emitted as accepted tokens.
+  mode to write its KV, and emitted as accepted tokens. Requested logprobs
+  come from the converging denoise step's logits and travel with this
+  emission only, so a request never receives them on another's step.
+
+Structured reads (vllm#57250) set ``extra_args``: a seed canvas replaces the
+first random one, pinned rows keep their seed through every denoise step and
+feed no self-conditioning, a step cap ends the canvas early, and a read-only
+request emits its argmax canvas on the converging step, with temperature-1
+logprobs, instead of committing it. A constrained request's logits are
+masked to its ``logprob_token_ids``.
 
 Encoder and decoder mode share every weight (mlx_vlm ``diffusion_gemma``):
 the encoder uses plain token embeddings, causal attention and its own
@@ -39,11 +48,13 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
-from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
+from vllm.v1.outputs import DraftTokenIds, LogprobsLists, ModelRunnerOutput
 
 from vllm_metal.attention.context import clear_context, get_context, prepare_grouped
+from vllm_metal.v1.prompt_logprobs import _LOGITS_LOGPROBS_MODES
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -174,11 +185,14 @@ def denoise_update(
     history: list[mx.array],
     settings: DiffusionSettings,
     vocab_size: int,
+    max_steps: int,
 ) -> DenoiseOutcome:
     """One accept/renoise step over a ``(canvas, vocab)`` logits block.
 
     ``step`` is the number of denoise steps already run on this canvas;
     ``history`` holds the previous argmax canvases and is updated in place.
+    The canvas converges at the latest on step ``max_steps``, while the
+    temperature schedule keeps following ``settings.max_denoising_steps``.
     """
     processed = logits.astype(mx.float32) / schedule_temperature(step, settings)
     log_probs = processed - mx.logsumexp(processed, axis=-1, keepdims=True)
@@ -198,10 +212,92 @@ def denoise_update(
     history.append(argmax_canvas)
     del history[: -settings.stability_threshold or None]
 
-    converged = (bool(stable) and bool(confident.item())) or (
-        step + 1 >= settings.max_denoising_steps
-    )
+    converged = (bool(stable) and bool(confident.item())) or step + 1 >= max_steps
     return DenoiseOutcome(next_canvas, argmax_canvas, converged, processed)
+
+
+# Large and finite rather than -inf: the entropy multiplies probabilities by
+# log-probabilities, and 0 * -inf is NaN (upstream ``_MASKED_LOGIT``).
+_MASKED_LOGIT = -1e20
+
+
+def mask_to_allowed(logits: mx.array, allowed: mx.array) -> mx.array:
+    """Restrict ``(rows, vocab)`` logits to a boolean vocabulary mask.
+
+    The softmax of a masked row is the distribution renormalized over the
+    allowed ids, so argmax, sampling, entropy and self-conditioning all stay
+    inside the set (``diffusion_constrained``).
+    """
+    return mx.where(allowed, logits, _MASKED_LOGIT)
+
+
+def canvas_logprobs(
+    logits: mx.array,
+    selected: mx.array,
+    *,
+    num_logprobs: int,
+    token_ids: list[int] | None,
+    logits_mode: bool,
+) -> LogprobsLists:
+    """Sample logprobs for every row of a ``(canvas, vocab)`` logits block.
+
+    Column 0 is ``selected``; the rest are ``token_ids`` when given, else the
+    top-``num_logprobs`` ids. ``logits_mode`` reports the logits themselves
+    instead of their log-softmax. Ranks are 1-based and count ties, as in
+    vLLM's ``Sampler.gather_logprobs``.
+    """
+    scores = (
+        logits if logits_mode else logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+    )
+    rows = scores.shape[0]
+    columns = [selected[:, None]]
+    if token_ids:
+        columns.append(
+            mx.broadcast_to(mx.array(token_ids, dtype=mx.int32), (rows, len(token_ids)))
+        )
+    elif num_logprobs > 0:
+        top = mx.argpartition(-scores, num_logprobs - 1, axis=-1)[:, :num_logprobs]
+        order = mx.argsort(-mx.take_along_axis(scores, top, axis=-1), axis=-1)
+        columns.append(mx.take_along_axis(top, order, axis=-1).astype(mx.int32))
+    ids = mx.concatenate(columns, axis=1)
+    values = mx.take_along_axis(scores, ids, axis=-1)
+    ranks = mx.sum(scores >= values[:, :1], axis=-1)
+    mx.eval(ids, values, ranks)
+    return LogprobsLists(
+        np.array(ids, dtype=np.int32),
+        np.array(values, dtype=np.float32),
+        np.array(ranks, dtype=np.int32),
+    )
+
+
+def join_canvas_logprobs(
+    req_ids: list[str], logprobs: dict[str, LogprobsLists]
+) -> LogprobsLists | None:
+    """Concatenate per-request logprob rows in ``req_ids`` order.
+
+    ``cu_num_generated_tokens`` holds each request's first row, so a request
+    without rows this step takes none. Narrower stashes are padded with id 0
+    and ``-inf``.
+    """
+    if not logprobs:
+        return None
+    width = max(rows.logprob_token_ids.shape[1] for rows in logprobs.values())
+    ids, values, ranks = [], [], []
+    starts: list[int] = []
+    offset = 0
+    for req_id in req_ids:
+        starts.append(offset)
+        rows = logprobs.get(req_id)
+        if rows is None:
+            continue
+        pad = ((0, 0), (0, width - rows.logprob_token_ids.shape[1]))
+        ids.append(np.pad(rows.logprob_token_ids, pad, constant_values=0))
+        values.append(np.pad(rows.logprobs, pad, constant_values=float("-inf")))
+        ranks.append(rows.sampled_token_ranks)
+        offset += rows.logprob_token_ids.shape[0]
+    return LogprobsLists(
+        np.concatenate(ids), np.concatenate(values), np.concatenate(ranks), starts
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -321,12 +417,21 @@ def _warn_ignored_sampling_params(params: SamplingParams) -> None:
 
 @dataclass
 class _DiffusionRequest:
+    # Denoise steps after which a canvas converges at the latest.
+    max_steps: int
     phase: Literal["prefill", "denoise", "commit"] = "prefill"
     # Tokens the next denoise/commit step runs (and the scheduler's drafts).
     canvas: mx.array | None = None
     step: int = 0
     history: list[mx.array] = field(default_factory=list)
     soft_embeddings: mx.array | None = None
+    # Taken on the converging step, delivered with the tokens it emits.
+    logprobs: LogprobsLists | None = None
+    # Structured-read options (vllm#57250), from the request's extra_args.
+    seed_canvas: mx.array | None = None
+    pinned: mx.array | None = None  # bool, (canvas,)
+    read_only: bool = False
+    allowed: mx.array | None = None  # bool, (vocab,)
 
 
 @dataclass
@@ -344,11 +449,46 @@ class DiffusionGemmaRuntime:
         self._runner = runner
         self.settings = DiffusionSettings.from_vllm_config(runner.vllm_config)
         self._vocab_size = runner.model_config.get_vocab_size()
+        self._logits_mode = runner.model_config.logprobs_mode in _LOGITS_LOGPROBS_MODES
         self._requests: dict[str, _DiffusionRequest] = {}
 
-    def _new_canvas(self, request: _DiffusionRequest) -> None:
+    def _new_request(self, params: SamplingParams) -> _DiffusionRequest:
+        """Read the structured-read extra_args.
+
+        vLLM's ``validate_diffusion_sampling_params`` has checked them by
+        now: the seed spans the canvas, pins come with a seed and stay inside
+        it, and ``diffusion_constrained`` comes with ``logprob_token_ids``.
+        """
+        args = params.extra_args or {}
+        settings = self.settings
+        request = _DiffusionRequest(
+            max_steps=min(
+                int(args.get("diffusion_max_steps", settings.max_denoising_steps)),
+                settings.max_denoising_steps,
+            ),
+            read_only=bool(args.get("diffusion_read_only", False)),
+        )
+        seed = args.get("diffusion_seed_canvas")
+        if seed is not None:
+            request.seed_canvas = mx.array(seed, dtype=mx.int32)
+            pinned = np.zeros(settings.canvas_length, dtype=np.bool_)
+            pinned[args.get("diffusion_pinned") or []] = True
+            if pinned.any():
+                request.pinned = mx.array(pinned)
+        if args.get("diffusion_constrained"):
+            allowed = np.zeros(self._vocab_size, dtype=np.bool_)
+            allowed[params.logprob_token_ids] = True
+            request.allowed = mx.array(allowed)
+        return request
+
+    def _new_canvas(self, request: _DiffusionRequest, *, seeded: bool) -> None:
         request.phase = "denoise"
-        request.canvas = random_canvas(self.settings.canvas_length, self._vocab_size)
+        if seeded and request.seed_canvas is not None:
+            request.canvas = request.seed_canvas
+        else:
+            request.canvas = random_canvas(
+                self.settings.canvas_length, self._vocab_size
+            )
         request.step = 0
         request.history.clear()
         request.soft_embeddings = None
@@ -401,7 +541,10 @@ class DiffusionGemmaRuntime:
         decoder_segments: list[_Segment] = []
         for req_id, num_tokens in scheduler_output.num_scheduled_tokens.items():
             state = runner._request_states[req_id]
-            request = self._requests.setdefault(req_id, _DiffusionRequest())
+            request = self._requests.get(req_id)
+            if request is None:
+                request = self._new_request(state.sampling_params)
+                self._requests[req_id] = request
             start = num_computed[req_id]
             drafts = scheduler_output.scheduled_spec_decode_tokens.get(req_id)
             if request.phase == "prefill":
@@ -435,10 +578,11 @@ class DiffusionGemmaRuntime:
         if scheduler_output.kv_cache_block_copies:
             runtime.copy_blocks(scheduler_output.kv_cache_block_copies)
         sampled: dict[str, list[int]] = {}
+        logprobs: dict[str, LogprobsLists] = {}
         if encoder_segments:
-            self._run_encoder(encoder_segments, sampled)
+            self._run_encoder(encoder_segments, sampled, logprobs)
         if decoder_segments:
-            self._run_decoder(decoder_segments)
+            self._run_decoder(decoder_segments, sampled, logprobs)
 
         req_ids = list(scheduler_output.num_scheduled_tokens)
         draft_token_ids: list[list[int]] = []
@@ -452,6 +596,7 @@ class DiffusionGemmaRuntime:
             req_ids=req_ids,
             req_id_to_index={req_id: i for i, req_id in enumerate(req_ids)},
             sampled_token_ids=[sampled.get(req_id, []) for req_id in req_ids],
+            logprobs=join_canvas_logprobs(req_ids, logprobs),
         )
 
     def _forward(self, segments: list[_Segment], *, decoder: bool) -> mx.array:
@@ -498,7 +643,10 @@ class DiffusionGemmaRuntime:
         )
 
     def _run_encoder(
-        self, segments: list[_Segment], sampled: dict[str, list[int]]
+        self,
+        segments: list[_Segment],
+        sampled: dict[str, list[int]],
+        logprobs: dict[str, LogprobsLists],
     ) -> None:
         self._forward(segments, decoder=False)
         runner = self._runner
@@ -506,14 +654,36 @@ class DiffusionGemmaRuntime:
             request = self._requests[segment.req_id]
             state = runner._request_states[segment.req_id]
             if request.phase == "commit":
-                sampled[segment.req_id] = segment.token_ids
-                state.token_ids.extend(segment.token_ids)
-                state.generated_tokens += len(segment.token_ids)
-                self._new_canvas(request)
+                self._emit(segment.req_id, segment.token_ids, sampled, logprobs)
+                self._new_canvas(request, seeded=False)
             elif segment.start_pos + len(segment.token_ids) >= len(state.token_ids):
-                self._new_canvas(request)
+                # The seed replaces only the first canvas after the prompt.
+                self._new_canvas(
+                    request, seeded=len(state.token_ids) == state.prompt_len
+                )
 
-    def _run_decoder(self, segments: list[_Segment]) -> None:
+    def _emit(
+        self,
+        req_id: str,
+        token_ids: list[int],
+        sampled: dict[str, list[int]],
+        logprobs: dict[str, LogprobsLists],
+    ) -> None:
+        request = self._requests[req_id]
+        state = self._runner._request_states[req_id]
+        sampled[req_id] = token_ids
+        if request.logprobs is not None:
+            logprobs[req_id] = request.logprobs.slice_request(0, len(token_ids))
+            request.logprobs = None
+        state.token_ids.extend(token_ids)
+        state.generated_tokens += len(token_ids)
+
+    def _run_decoder(
+        self,
+        segments: list[_Segment],
+        sampled: dict[str, list[int]],
+        logprobs: dict[str, LogprobsLists],
+    ) -> None:
         hidden = self._forward(segments, decoder=True)
         model = self._runner.model
         offset = 0
@@ -524,6 +694,8 @@ class DiffusionGemmaRuntime:
             # transient regardless of batch size.
             logits = canvas_logits(model, hidden[0, offset : offset + length])
             offset += length
+            if request.allowed is not None:
+                logits = mask_to_allowed(logits, request.allowed)
             # Like upstream, pad a clipped canvas with uniform (zero) logits:
             # the unscheduled rows are resampled at random and, at maximum
             # entropy, cannot make the canvas converge on their own.
@@ -538,17 +710,47 @@ class DiffusionGemmaRuntime:
                 history=request.history,
                 settings=self.settings,
                 vocab_size=self._vocab_size,
+                max_steps=request.max_steps,
             )
             request.step += 1
-            if outcome.converged:
-                request.phase = "commit"
-                # Padded rows only converge on the last step; commit only the
-                # rows the model saw.
-                request.canvas = outcome.argmax_canvas[:length]
-                request.soft_embeddings = None
-            else:
+            if not outcome.converged:
                 request.canvas = outcome.next_canvas
-                request.soft_embeddings = self_conditioning_embeddings(
-                    model, outcome.processed_logits
+                soft = self_conditioning_embeddings(model, outcome.processed_logits)
+                if request.pinned is not None:
+                    # A pinned row holds its seed token, so the model's own
+                    # prediction there must not reach the next step either.
+                    request.canvas = mx.where(
+                        request.pinned, request.seed_canvas, request.canvas
+                    )
+                    soft = mx.where(request.pinned[:, None], 0, soft)
+                request.soft_embeddings = soft
+                mx.eval(request.canvas, request.soft_embeddings)
+                continue
+
+            # Padded rows only converge on the last step; emit only the rows
+            # the model saw.
+            emitted = outcome.argmax_canvas[:length]
+            request.soft_embeddings = None
+            params = self._runner._request_states[segment.req_id].sampling_params
+            if params.num_logprobs is not None:
+                # As upstream: reads report temperature-1 logprobs, generation
+                # the schedule-tempered logits of this step.
+                source = logits if request.read_only else outcome.processed_logits
+                request.logprobs = canvas_logprobs(
+                    source[:length],
+                    emitted,
+                    num_logprobs=params.logprobs or 0,
+                    token_ids=params.logprob_token_ids,
+                    logits_mode=self._logits_mode,
                 )
-                mx.eval(request.soft_embeddings)
+            if request.read_only:
+                # A read emits now and skips the commit forward. Its canvas KV
+                # is the decoder's, which is harmless: emitting the canvas
+                # reaches max_tokens, so the request ends. A clipped read
+                # keeps its argmax canvas and emits again when it next
+                # converges, as upstream does.
+                self._emit(segment.req_id, emitted.tolist(), sampled, logprobs)
+                request.canvas = outcome.argmax_canvas
+            else:
+                request.phase = "commit"
+                request.canvas = emitted
