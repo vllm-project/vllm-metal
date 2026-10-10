@@ -44,7 +44,6 @@ COMMON_DRAFT_OPTIONS: Mapping[str, Any] = {
     "quantization": None,
     "quantization_config": None,
     "is_causal": False,
-    "sample_from_anchor": False,
     "input_embedding_scale": 1.0,
     "output_multiplier": 1.0,
     "final_logit_softcapping": None,

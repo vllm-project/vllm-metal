@@ -80,6 +80,7 @@ class DSparkConfig:
             "partial_rotary_factor": 1.0,
             "tie_word_embeddings": False,
             "dflash_query_causal": False,
+            "sample_from_anchor": True,
             "log_snr_conditioning": False,
             "enable_qwen35_gated_q_proj": False,
         }

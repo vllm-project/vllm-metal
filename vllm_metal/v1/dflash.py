@@ -110,7 +110,11 @@ class DFlashConfig:
             or raw.get("model_type") != "qwen3"
         ):
             raise ValueError("Expected a z-lab Qwen3 DFlashDraftModel checkpoint")
-        supported = {**COMMON_DRAFT_OPTIONS, "rope_parameters": None}
+        supported = {
+            **COMMON_DRAFT_OPTIONS,
+            "rope_parameters": None,
+            "sample_from_anchor": False,
+        }
         for name, expected in supported.items():
             if raw.get(name, expected) != expected:
                 raise ValueError(f"Unsupported DFlash {name}: {raw[name]!r}")

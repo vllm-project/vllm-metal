@@ -390,6 +390,22 @@ def test_checkpoint_round_trip_preserves_all_heads_and_precision(
         np.testing.assert_array_equal(array(value), array(expected))
 
 
+@pytest.mark.parametrize("sample_from_anchor", [None, True, False])
+def test_checkpoint_anchor_layout_matches_dspark(tmp_path, sample_from_anchor):
+    cfg, _ = checkpoint(tmp_path)
+    path = tmp_path / "config.json"
+    raw = json.loads(path.read_text())
+    if sample_from_anchor is not None:
+        raw["sample_from_anchor"] = sample_from_anchor
+        path.write_text(json.dumps(raw))
+    if sample_from_anchor is False:
+        with pytest.raises(ValueError, match="sample_from_anchor"):
+            load_dspark(tmp_path, target_config=_target_config(cfg.backbone))
+    else:
+        model = load_dspark(tmp_path, target_config=_target_config(cfg.backbone))
+        assert model.config == cfg
+
+
 def test_checkpoint_rename_rejects_colliding_model_parameters(tmp_path):
     cfg, _ = checkpoint(tmp_path)
     model = DSparkModel(cfg)
