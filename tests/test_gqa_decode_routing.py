@@ -332,6 +332,26 @@ def test_split_mixed_decode_stays_on_upstream_path(disabled, force_tiled_prefill
     _assert_close(out, ref, mx.float16)
 
 
+def test_split_nax_mixed_decode_stays_on_upstream_path():
+    """The NAX split routes its decode rows exactly like the tiled split."""
+    ops = get_ops()
+    if not (ops.nax_supported() and ops.nax_ready()):
+        pytest.skip("NAX prefill needs an M5 GPU and the NAX metallib")
+    out, ref = _run_primitive(
+        [8192, 128],
+        mx.float16,
+        interleaved=True,
+        seed=720,
+        query_lens=[1, 32],
+        num_decode_requests=1,
+        num_decode_tokens=1,
+        max_decode_context_len=8192,
+    )
+    assert _dispatch_family() == "mixed_nax_prefill_decode"
+    assert ops.last_gqa_partition_size() == 0
+    _assert_close(out, ref, mx.float16)
+
+
 def test_spec_window_does_not_switch_kernel_family() -> None:
     out, ref = _run_primitive(
         [32768 + 4],

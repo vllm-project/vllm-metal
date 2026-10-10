@@ -311,6 +311,270 @@ def test_mixed_batch_dispatches_decode_by_context(
     np.testing.assert_array_equal(mixed[decode_rows:], whole_tiled[decode_rows:])
 
 
+@pytest.fixture
+def nax_prefill():
+    """Route eligible prefill to NAX and record the dispatch family.
+
+    Skips off M5: the NAX kernel cannot run there, and the tiled twin of this
+    path is covered by test_mixed_batch_dispatches_decode_by_context.
+    """
+    ops = get_ops()
+    if not (ops.nax_supported() and ops.nax_ready()):
+        pytest.skip("NAX prefill needs an M5 GPU and the NAX metallib")
+    ops.set_nax_enabled(True)
+    previous = ops._set_paged_dispatch_diagnostics(True)
+    try:
+        yield ops
+    finally:
+        mx.synchronize()
+        ops._set_paged_dispatch_diagnostics(previous)
+
+
+@pytest.mark.parametrize(
+    "decode_rows,decode_context,head_size,dtype,sliding_window,use_sinks",
+    [
+        (1, 4096, 128, mx.float16, -1, False),
+        (9, 16384, 128, mx.bfloat16, -1, False),
+        # Decode prefix crosses NAX's 64-row q-block boundary.
+        (65, 4096, 128, mx.float16, -1, False),
+        (65, 4096, 256, mx.bfloat16, 100, True),
+        (3, 4096, 64, mx.float16, 100, True),
+        (2, 4096, 512, mx.bfloat16, -1, False),
+        # Below the split threshold the whole batch stays on NAX.
+        (9, 4095, 128, mx.float16, -1, False),
+    ],
+)
+def test_nax_mixed_batch_splits_long_decode_prefix(
+    decode_rows: int,
+    decode_context: int,
+    head_size: int,
+    dtype: mx.Dtype,
+    sliding_window: int,
+    use_sinks: bool,
+    nax_prefill,
+) -> None:
+    """Long decode rows leave the NAX tile; prefill rows keep NAX bit-for-bit."""
+    ops = nax_prefill
+    split_decode = decode_context >= 4096
+    seq_lens = (
+        [(1, decode_context)] + [(1, 64)] * (decode_rows - 1) + [(129, 259), (64, 64)]
+    )
+    mx.random.seed(0)
+    num_kv_heads, num_query_heads = 2, 8
+    d = _make_cache_and_inputs(
+        512, num_kv_heads, num_query_heads, seq_lens, head_size=head_size, dtype=dtype
+    )
+    sinks = (
+        (mx.random.normal((num_query_heads,)) * 0.5).astype(mx.float32)
+        if use_sinks
+        else None
+    )
+    if sinks is not None:
+        mx.eval(sinks)
+
+    def run_attention(
+        query: mx.array,
+        block_tables: mx.array,
+        kv_lens: mx.array,
+        cu_seqlens: mx.array,
+        decode_count: int = 0,
+        max_context: int = 0,
+    ) -> tuple[np.ndarray, str]:
+        out = mx.array(0)
+        ops.paged_attention_primitive(
+            query,
+            d["key_cache"],
+            d["value_cache"],
+            d["num_kv_heads"],
+            d["scale"],
+            0.0,
+            block_tables,
+            kv_lens,
+            cu_seqlens,
+            BLOCK_SIZE,
+            d["max_kv_len"],
+            sliding_window,
+            out,
+            sinks=sinks,
+            num_decode_requests=decode_count,
+            num_decode_tokens=decode_count,
+            max_decode_context_len=max_context,
+        )
+        mx.eval(out)
+        return np.array(out.astype(mx.float32)), ops.last_paged_dispatch()
+
+    mixed, mixed_family = run_attention(
+        d["query"],
+        d["block_tables"],
+        d["kv_lens_arr"],
+        d["cu_seqlens_q"],
+        decode_rows,
+        decode_context,
+    )
+    whole_nax, whole_family = run_attention(
+        d["query"], d["block_tables"], d["kv_lens_arr"], d["cu_seqlens_q"]
+    )
+    pure_decode, _ = run_attention(
+        d["query"][:decode_rows],
+        d["block_tables"][:decode_rows],
+        d["kv_lens_arr"][:decode_rows],
+        mx.arange(decode_rows + 1, dtype=mx.int32),
+        decode_rows,
+        decode_context,
+    )
+
+    assert whole_family == "nax_prefill"
+    assert mixed_family == (
+        "mixed_nax_prefill_decode" if split_decode else "nax_prefill"
+    )
+    expected_decode = pure_decode if split_decode else whole_nax[:decode_rows]
+    np.testing.assert_array_equal(mixed[:decode_rows], expected_decode)
+    np.testing.assert_array_equal(mixed[decode_rows:], whole_nax[decode_rows:])
+
+    if sinks is None:
+        # Independent fp32 reference for every row of the mixed batch.
+        ref = ref_paged_attn(
+            query=d["query"].astype(mx.float32),
+            key_cache=d["key_cache"].astype(mx.float32),
+            value_cache=d["value_cache"].astype(mx.float32),
+            query_lens=d["query_lens"],
+            kv_lens=d["kv_lens"],
+            block_tables=np.array(d["block_tables"]),
+            scale=d["scale"],
+            sliding_window=sliding_window if sliding_window >= 0 else None,
+        )
+        np.testing.assert_allclose(
+            mixed, np.array(ref.astype(mx.float32)), atol=2e-2, rtol=1e-2
+        )
+
+
+@pytest.mark.parametrize("gqa_disabled", [False, True])
+@pytest.mark.parametrize("prefill_kernel", ["tiled", "nax"])
+def test_split_decode_prefix_is_bounded_by_decode_context(
+    prefill_kernel: str, gqa_disabled: bool, request
+) -> None:
+    """The split decode prefix sizes its split-KV work by the decode rows.
+
+    max_seq_len only has to bound every row, so a caller may pass a legal
+    allocation bound. At 4M tokens per-token split-KV would plan 8192 P512
+    partitions, whose reducer statistics exceed threadgroup memory, while the
+    4096-token decode row needs 8. The whole batch on the prefill kernel
+    accepts that bound, so the split batch must too, with GQA on or off.
+    """
+    ops = get_ops()
+    if prefill_kernel == "tiled":
+        request.getfixturevalue("force_tiled_prefill")
+        families = ("mixed_prefill_decode", "tiled_prefill")
+    else:
+        request.getfixturevalue("nax_prefill")
+        families = ("mixed_nax_prefill_decode", "nax_prefill")
+    allocation_bound = 4 * 1024 * 1024
+    decode_context = 4096
+    num_kv_heads, num_query_heads = 8, 32
+    mx.random.seed(1061)
+    d = _make_cache_and_inputs(
+        300,
+        num_kv_heads,
+        num_query_heads,
+        [(1, decode_context), (2, 2)],
+        dtype=mx.bfloat16,
+    )
+    # Rows may address the whole allocation: pad the table to the bound.
+    used = d["block_tables"].shape[1]
+    tables = mx.concatenate(
+        [
+            d["block_tables"],
+            mx.zeros((2, allocation_bound // BLOCK_SIZE - used), mx.int32),
+        ],
+        axis=1,
+    )
+    mx.eval(tables)
+
+    def run_attention(
+        query: mx.array,
+        block_tables: mx.array,
+        kv_lens: mx.array,
+        cu_seqlens: mx.array,
+        max_seq_len: int,
+        decode_count: int = 0,
+        disabled: bool = gqa_disabled,
+    ) -> tuple[np.ndarray, str, int]:
+        out = mx.array(0)
+        ops.paged_attention_primitive(
+            query,
+            d["key_cache"],
+            d["value_cache"],
+            num_kv_heads,
+            d["scale"],
+            0.0,
+            block_tables,
+            kv_lens,
+            cu_seqlens,
+            BLOCK_SIZE,
+            max_seq_len,
+            -1,
+            out,
+            num_decode_requests=decode_count,
+            num_decode_tokens=decode_count,
+            max_decode_context_len=decode_context if decode_count else 0,
+            gqa_disabled=disabled,
+        )
+        mx.eval(out)
+        return (
+            np.array(out.astype(mx.float32)),
+            ops.last_paged_dispatch(),
+            ops.last_gqa_partition_size(),
+        )
+
+    previous = ops._set_paged_dispatch_diagnostics(True)
+    try:
+        mixed, mixed_family, mixed_partition = run_attention(
+            d["query"],
+            tables,
+            d["kv_lens_arr"],
+            d["cu_seqlens_q"],
+            allocation_bound,
+            1,
+        )
+        whole, whole_family, _ = run_attention(
+            d["query"],
+            tables,
+            d["kv_lens_arr"],
+            d["cu_seqlens_q"],
+            allocation_bound,
+        )
+        # The prefix stays on the per-token kernel on every core count.
+        pure_decode, _, _ = run_attention(
+            d["query"][:1],
+            tables[:1],
+            d["kv_lens_arr"][:1],
+            mx.arange(2, dtype=mx.int32),
+            decode_context,
+            1,
+            True,
+        )
+    finally:
+        mx.synchronize()
+        ops._set_paged_dispatch_diagnostics(previous)
+
+    assert (mixed_family, whole_family) == families
+    assert mixed_partition == 0
+    np.testing.assert_array_equal(mixed[:1], pure_decode)
+    np.testing.assert_array_equal(mixed[1:], whole[1:])
+    ref = ref_paged_attn(
+        query=d["query"].astype(mx.float32),
+        key_cache=d["key_cache"].astype(mx.float32),
+        value_cache=d["value_cache"].astype(mx.float32),
+        query_lens=d["query_lens"],
+        kv_lens=d["kv_lens"],
+        block_tables=np.array(d["block_tables"]),
+        scale=d["scale"],
+    )
+    np.testing.assert_allclose(
+        mixed, np.array(ref.astype(mx.float32)), atol=2e-2, rtol=1e-2
+    )
+
+
 @pytest.mark.slow
 def test_sliding_window_bounds_tiled_prefill_work(force_tiled_prefill) -> None:
     """A 1024-token window avoids most KV tiles of an 8K prefill."""
