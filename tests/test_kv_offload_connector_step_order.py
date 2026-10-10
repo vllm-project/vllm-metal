@@ -11,84 +11,23 @@ write into the offload pool, so the ordering is a correctness contract.
 
 Two levels are covered. ``execute_model`` is driven for real, far enough to
 record that it handles preemptions before opening the step, then stopped with
-a deliberate raise; that pins the call order itself. The cross-step tests then
-drive the runner's helpers in that same order to pin the lifecycle across a
-step boundary, which no single ``execute_model`` call can show.
+a deliberate raise. That pins the call order itself, and leaves the step open
+as a real failure would. The cross-step tests chain steps to pin the lifecycle
+across a step boundary, which no single ``execute_model`` call can show. The
+real ``MetalKVConnector`` runs throughout, over a spy transfer group.
 """
 
 from __future__ import annotations
 
-from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 
 import mlx.core as mx
 import pytest
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
-from vllm.v1.outputs import KVConnectorOutput
 
 import vllm_metal.v1.model_runner as mr
 from tests.stub_runner import make_stub_runner
-
-
-class _ConnectorSpy:
-    """Records the connector lifecycle and enforces upstream's invariants.
-
-    Mirrors the two things upstream does that this test is about: metadata is
-    bound on enter and cleared on the no-forward path, and ``get_finished``
-    asserts the metadata is still bound when the context closes.
-    """
-
-    def __init__(self) -> None:
-        self.events: list[str] = []
-        self.metadata_bound = False
-        self.step = "?"
-
-    # -- the runner's collaborators -------------------------------------
-    def handle_preemptions(self, metadata) -> None:
-        del metadata
-        self.events.append(f"preempt:{self.step}")
-
-    def no_forward(self, *args, **kwargs):
-        del args, kwargs
-        self.events.append(f"no_forward:{self.step}")
-        self.metadata_bound = False  # upstream clears on this path
-        return mr.EMPTY_MODEL_RUNNER_OUTPUT
-
-    @contextmanager
-    def step_context(self, scheduler_output, *args, **kwargs):
-        del scheduler_output, args, kwargs
-        self.metadata_bound = True
-        self.events.append(f"open:{self.step}")
-        output = KVConnectorOutput()
-        try:
-            yield output
-        finally:
-            if not self.metadata_bound:
-                raise AssertionError(
-                    "connector step closed after its metadata was cleared"
-                )
-            self.events.append(f"close:{self.step}")
-            output.finished_recving = {f"r-{self.step}"}
-
-
-@pytest.fixture
-def spy(monkeypatch) -> _ConnectorSpy:
-    connector = _ConnectorSpy()
-    monkeypatch.setattr(mr, "has_kv_transfer_group", lambda: True)
-    monkeypatch.setattr(mr, "get_kv_transfer_group", lambda: connector)
-    monkeypatch.setattr(mr, "set_forward_context", lambda *a, **k: nullcontext())
-    monkeypatch.setattr(
-        mr.KVConnectorModelRunnerMixin,
-        "_get_kv_connector_output",
-        staticmethod(connector.step_context),
-    )
-    monkeypatch.setattr(
-        mr.KVConnectorModelRunnerMixin,
-        "kv_connector_no_forward",
-        staticmethod(connector.no_forward),
-    )
-    return connector
 
 
 def _scheduler_output(req_ids: list[str]) -> SchedulerOutput:
@@ -125,33 +64,34 @@ def _drive_execute_model_prologue(runner, scheduler_output) -> None:
         runner.execute_model(scheduler_output)
 
 
-def test_execute_model_handles_preemptions_before_opening_the_step(spy):
+def test_execute_model_handles_preemptions_before_opening_the_step(spy_group):
     """The store fence depends on this order inside execute_model itself."""
     runner = make_stub_runner(model=SimpleNamespace())
-    spy.step = "1"
+    spy_group.step = "1"
 
     _drive_execute_model_prologue(runner, _scheduler_output(["r0"]))
 
-    assert spy.events == ["preempt:1", "open:1"]
+    assert spy_group.events == ["preempt:1", "open:1"]
 
 
-def test_zero_token_step_still_handles_preemptions(spy):
+def test_zero_token_step_still_handles_preemptions(spy_group):
     """A step with no forward must still let KV transfers progress."""
     runner = make_stub_runner(model=SimpleNamespace())
-    spy.step = "1"
+    spy_group.step = "1"
 
     runner.execute_model(_scheduler_output([]))
 
-    assert spy.events == ["preempt:1", "no_forward:1"]
+    # no_forward runs a whole step: preempt, open and close.
+    assert spy_group.events == ["preempt:1", "open:1", "close:1"]
+    assert not spy_group.metadata_bound
 
 
-def _pipelined_decode_step(runner, spy, tag: str) -> None:
+def _pipelined_decode_step(runner, spy_group, tag: str) -> None:
     """One pipeline-eligible decode step, in execute_model's own order."""
-    spy.step = tag
+    spy_group.step = tag
     scheduler_output = _scheduler_output(["r0"])
 
-    # execute_model: preemptions are handled BEFORE the step context opens.
-    spy.handle_preemptions(None)
+    # As execute_model: the step start handles preemptions, then opens.
     runner._kv_connector_start_step(scheduler_output)
 
     state = mr.RequestState(
@@ -182,14 +122,14 @@ def _pipelined_decode_step(runner, spy, tag: str) -> None:
     runner.sample_tokens(grammar_output=None)
 
 
-def test_step_context_closes_before_the_next_step_handles_preemptions(spy):
+def test_step_closes_before_the_next_step_handles_preemptions(spy_group):
     """close(k) must precede preempt(k+1), or the flush fence is a no-op."""
     runner = make_stub_runner(model=SimpleNamespace())
 
-    _pipelined_decode_step(runner, spy, "1")
-    _pipelined_decode_step(runner, spy, "2")
+    _pipelined_decode_step(runner, spy_group, "1")
+    _pipelined_decode_step(runner, spy_group, "2")
 
-    assert spy.events == [
+    assert spy_group.events == [
         "preempt:1",
         "open:1",
         "close:1",
@@ -199,41 +139,89 @@ def test_step_context_closes_before_the_next_step_handles_preemptions(spy):
     ]
 
 
-def test_zero_token_step_after_a_pipelined_step_does_not_crash(spy):
-    """A leaked context plus a zero-token step kills engine core upstream.
-
-    The no-forward path clears the connector metadata, so a later close of the
-    still-open previous context trips get_finished's metadata assertion."""
+def test_zero_token_step_after_a_pipelined_step_does_not_crash(spy_group):
+    """A pipelined step closes at submit, so a zero-token step after it runs
+    against no open step. See the leaked-step tests below for a step that
+    was never closed."""
     runner = make_stub_runner(model=SimpleNamespace())
 
-    _pipelined_decode_step(runner, spy, "1")
+    _pipelined_decode_step(runner, spy_group, "1")
 
     # Step 2 schedules nothing: execute_model takes the no-forward path and
     # sample_tokens is never called.
-    spy.step = "2"
-    spy.handle_preemptions(None)
-    spy.no_forward(_scheduler_output([]), runner.vllm_config)
+    spy_group.step = "2"
+    runner.execute_model(_scheduler_output([]))
 
-    # Step 3 opens its own context. With step 1 leaked, the recovery close
-    # would run against cleared metadata and raise.
-    spy.step = "3"
+    # Step 3 opens its own step; nothing is left open to recover.
+    spy_group.step = "3"
     runner._kv_connector_start_step(_scheduler_output(["r0"]))
 
-    assert "close:1" in spy.events
-    assert spy.events.index("close:1") < spy.events.index("no_forward:2")
+    assert "close:1" in spy_group.events
+    assert spy_group.events.index("close:1") < spy_group.events.index("preempt:2")
 
 
-def test_sample_tokens_without_pending_state_closes_the_step(spy):
+def test_sample_tokens_without_pending_state_closes_the_step(spy_group):
     """execute_model can fail after opening the step; sample_tokens ends it."""
     runner = make_stub_runner(model=SimpleNamespace())
-    spy.step = "1"
-    runner._kv_connector_start_step(_scheduler_output(["r0"]))
+    spy_group.step = "1"
+    _drive_execute_model_prologue(runner, _scheduler_output(["r0"]))
     runner._execute_model_state = None
 
     assert runner.sample_tokens(grammar_output=None) is None
 
-    assert spy.events == ["open:1", "close:1"]
-    assert runner._kv_connector_stack is None
+    assert spy_group.events == ["preempt:1", "open:1", "close:1"]
+    # Worker shutdown closes again; the step must not close twice.
+    assert runner.finish_kv_connector_step() is None
+    assert spy_group.events.count("close:1") == 1
+
+
+def test_leaked_step_closes_before_the_next_step_handles_preemptions(spy_group):
+    """execute_model raised after opening step 1, so nothing closed it."""
+    runner = make_stub_runner(model=SimpleNamespace())
+    spy_group.step = "1"
+    _drive_execute_model_prologue(runner, _scheduler_output(["r0"]))
+
+    spy_group.step = "2"
+    _drive_execute_model_prologue(runner, _scheduler_output(["r0"]))
+
+    assert spy_group.events == ["preempt:1", "open:1", "close:1", "preempt:2", "open:2"]
+
+
+def test_leaked_step_closes_before_a_zero_token_step(spy_group):
+    """A zero-token step after a leaked one must not handle its preemptions
+    first, and must not clear the leaked step's metadata before its close."""
+    runner = make_stub_runner(model=SimpleNamespace())
+    spy_group.step = "1"
+    _drive_execute_model_prologue(runner, _scheduler_output(["r0"]))
+
+    spy_group.step = "2"
+    runner.execute_model(_scheduler_output([]))
+    spy_group.step = "3"
+    _drive_execute_model_prologue(runner, _scheduler_output(["r0"]))
+
+    assert spy_group.events == [
+        "preempt:1",
+        "open:1",
+        "close:1",
+        "preempt:2",
+        "open:2",
+        "close:2",
+        "preempt:3",
+        "open:3",
+    ]
+
+
+def test_each_close_tells_the_connector_the_forward_is_done(spy_group):
+    """finish_forward runs once per closed step."""
+    runner = make_stub_runner(model=SimpleNamespace())
+    spy_group.step = "1"
+    _drive_execute_model_prologue(runner, _scheduler_output(["r0"]))
+    assert spy_group.finish_forward_calls == 0
+
+    runner.finish_kv_connector_step()
+    runner.finish_kv_connector_step()
+
+    assert spy_group.finish_forward_calls == 1
 
 
 @pytest.fixture
@@ -243,18 +231,11 @@ def no_connector(monkeypatch) -> None:
     def forbidden(*args, **kwargs):
         raise AssertionError("connector touched without a KV connector")
 
+    import vllm_metal.v1.kv_connector as metal_kv_connector
+
     monkeypatch.setattr(mr, "has_kv_transfer_group", lambda: False)
     monkeypatch.setattr(mr, "get_kv_transfer_group", forbidden)
-    monkeypatch.setattr(
-        mr.KVConnectorModelRunnerMixin,
-        "_get_kv_connector_output",
-        staticmethod(forbidden),
-    )
-    monkeypatch.setattr(
-        mr.KVConnectorModelRunnerMixin,
-        "kv_connector_no_forward",
-        staticmethod(forbidden),
-    )
+    monkeypatch.setattr(metal_kv_connector, "get_kv_transfer_group", forbidden)
 
 
 def test_zero_token_step_without_connector_is_unchanged(no_connector):

@@ -12,16 +12,15 @@ connector output, and the step context does not leak into the next step.
 
 from __future__ import annotations
 
-from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 
 import mlx.core as mx
 import pytest
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
-from vllm.v1.outputs import KVConnectorOutput
 
 import vllm_metal.v1.model_runner as mr
+from tests.kv_connector_spy import SpyTransferGroup
 from tests.stub_runner import make_stub_runner
 
 FINISHED_RECVING = {"r1"}
@@ -29,7 +28,7 @@ INVALID_BLOCK_IDS = {7, 11}
 
 
 def _scheduler_output(req_ids: list[str]) -> SchedulerOutput:
-    return SchedulerOutput(
+    scheduler_output = SchedulerOutput(
         scheduled_new_reqs=[],
         scheduled_cached_reqs=CachedRequestData.make_empty(),
         num_scheduled_tokens=dict.fromkeys(req_ids, 1),
@@ -42,6 +41,9 @@ def _scheduler_output(req_ids: list[str]) -> SchedulerOutput:
         num_invalid_spec_tokens=None,
         num_spec_tokens_to_schedule=0,
     )
+    # The scheduler sets this whenever a KV connector is configured.
+    scheduler_output.kv_connector_metadata = SimpleNamespace()
+    return scheduler_output
 
 
 def _decode_state() -> mr.RequestState:
@@ -74,48 +76,32 @@ def _paged_state(decode_reqs, scheduler_output) -> mr._PagedForwardState:
 
 
 class _ConnectorEnv:
-    """Fake connector step whose output is tagged per step."""
+    """Spy connector whose step output is tagged per step."""
 
-    def __init__(self) -> None:
+    def __init__(self, group: SpyTransferGroup) -> None:
+        self.group = group
+        group.finished_recving = set(FINISHED_RECVING)
+        group.invalid_block_ids = set(INVALID_BLOCK_IDS)
         self.tag = "s0"
+
+    @property
+    def tag(self) -> str:
+        return self._tag
+
+    @tag.setter
+    def tag(self, value: str) -> None:
+        self._tag = value
+        self.group.finished_sending = {value}
 
 
 @pytest.fixture
-def connector_env(monkeypatch) -> _ConnectorEnv:
-    """Make the runner's connector-step helpers runnable off-device.
+def connector_env(spy_group: SpyTransferGroup) -> _ConnectorEnv:
+    """Make the runner's connector step runnable off-device.
 
-    ``_kv_connector_start_step`` runs for real, since it owns the ExitStack
-    whose lifetime is under test. Only its two collaborators are faked: the
-    forward context needs a real VllmConfig, and the upstream mixin needs a
-    registered transfer group and live GPU caches. Neither is available to a
-    stub runner, and neither is what these tests are about.
-
-    The fake populates its fields on EXIT, mirroring the upstream mixin
-    (vllm/v1/worker/kv_connector_model_runner_mixin.py). Upstream sets more
-    fields than these three; the whole object is handed over by reference, so
-    the extra fields ride along untouched.
+    ``_kv_connector_start_step`` and ``MetalKVConnector`` run for real, since
+    the step's lifetime is under test. Only the transfer group is a spy.
     """
-    env = _ConnectorEnv()
-    monkeypatch.setattr(mr, "has_kv_transfer_group", lambda: True)
-    monkeypatch.setattr(mr, "set_forward_context", lambda *a, **k: nullcontext())
-
-    @contextmanager
-    def fake_get_kv_connector_output(scheduler_output, *args, **kwargs):
-        del scheduler_output, args, kwargs
-        output = KVConnectorOutput()
-        try:
-            yield output
-        finally:
-            output.finished_sending = {env.tag}
-            output.finished_recving = set(FINISHED_RECVING)
-            output.invalid_block_ids = set(INVALID_BLOCK_IDS)
-
-    monkeypatch.setattr(
-        mr.KVConnectorModelRunnerMixin,
-        "_get_kv_connector_output",
-        staticmethod(fake_get_kv_connector_output),
-    )
-    return env
+    return _ConnectorEnv(spy_group)
 
 
 def _arm_eligible_step(runner, scheduler_output) -> None:
@@ -169,7 +155,7 @@ class TestDeferredDecodeCarriesConnectorOutput:
         # Assert - the deferred step left no context open for the next step
         # to find. Asserted directly rather than via the leak log, which is
         # wording that can change.
-        assert runner._kv_connector_stack is None
+        assert runner.finish_kv_connector_step() is None
 
     def test_each_pipelined_step_carries_its_own_connector_output(self, connector_env):
         """Two steps in flight must not swap or share their connector output."""

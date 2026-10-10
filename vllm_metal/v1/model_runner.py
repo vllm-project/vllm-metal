@@ -12,7 +12,6 @@ Key contracts:
 """
 
 from collections.abc import Sequence
-from contextlib import ExitStack
 from dataclasses import dataclass, field
 from importlib.metadata import entry_points
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypeAlias, cast
@@ -25,7 +24,6 @@ from vllm.distributed.kv_transfer import (
     get_kv_transfer_group,
     has_kv_transfer_group,
 )
-from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.pooling_params import PoolingParams
@@ -49,9 +47,7 @@ from vllm.v1.outputs import (
 )
 from vllm.v1.sample.logits_processor import LOGITSPROCS_GROUP
 from vllm.v1.sample.sampler import Sampler
-from vllm.v1.worker.kv_connector_model_runner_mixin import (
-    KVConnectorModelRunnerMixin,
-)
+from vllm.v1.worker.gpu.kv_connector import NO_OP_KV_CONNECTOR, KVConnector
 
 from vllm_metal import envs
 from vllm_metal.attention.context import (
@@ -369,8 +365,8 @@ class MetalModelRunner:
 
     # Class-level defaults so stub runners built via __new__ are safe on
     # paths that check connector state.
-    _kv_connector_stack: ExitStack | None = None
-    _kv_connector_output: KVConnectorOutput | None = None
+    _kv_connector_driver: KVConnector | None = None
+    _kv_step_finished_req_ids: set[str] | None = None
 
     def __init__(self, vllm_config: VllmConfig):
         """Initialize model runner.
@@ -445,10 +441,10 @@ class MetalModelRunner:
         self._sampler = Sampler(logprobs_mode=self.model_config.logprobs_mode)
 
         self._draft_token_ids: DraftTokenIds | None = None
-        # KV connector step context, held open across the execute_model /
-        # sample_tokens split (see _kv_connector_start_step).
-        self._kv_connector_stack: ExitStack | None = None
-        self._kv_connector_output: KVConnectorOutput | None = None
+        # KV connector step, open across the execute_model / sample_tokens
+        # split (see _kv_connector_start_step). Not None while a step is open.
+        self._kv_connector_driver: KVConnector | None = None
+        self._kv_step_finished_req_ids: set[str] | None = None
 
         # Paged attention state (set by worker during cache initialization)
         self._paged_attention_runtime: PagedAttentionRuntime | None = None
@@ -948,44 +944,54 @@ class MetalModelRunner:
             )
         get_kv_transfer_group().register_kv_caches(storage)
 
-    def _kv_connector_start_step(self, scheduler_output: SchedulerOutput) -> None:
-        """Open the connector step context for this step.
+    def _kv_connector(self) -> KVConnector:
+        """The connector driver, in MRv2's shape; a no-op without a connector."""
+        if self._kv_connector_driver is None:
+            from vllm_metal.v1.kv_connector import MetalKVConnector
 
-        Holds the mixin's context open across execute_model and sample_tokens.
-        Must run before the forward, so sync loads land before attention reads.
+            self._kv_connector_driver = (
+                MetalKVConnector(self.vllm_config)
+                if has_kv_transfer_group()
+                else NO_OP_KV_CONNECTOR
+            )
+        return self._kv_connector_driver
+
+    def _kv_connector_start_step(self, scheduler_output: SchedulerOutput) -> None:
+        """Open this step's connector step: preemptions, metadata, sync loads.
+
+        Stays open across execute_model and sample_tokens. Must run before the
+        forward, so sync loads land before attention reads.
         """
-        if self._kv_connector_stack is not None:
-            # A previous step raised between start and finish. Close it here:
-            # a context left open breaks the store-flush ordering and writes
-            # the wrong KV into the offload pool.
-            logger.error("Closing leaked KV connector step context.")
+        self._close_leaked_kv_connector_step()
+        self._kv_connector().pre_forward(scheduler_output)
+        self._kv_step_finished_req_ids = scheduler_output.finished_req_ids
+
+    def _close_leaked_kv_connector_step(self) -> None:
+        """Close a step a previous execute_model left open when it raised.
+
+        Runs before the next step handles preemptions: a step left open breaks
+        the store-flush ordering and writes the wrong KV into the offload pool.
+        """
+        if self._kv_step_finished_req_ids is not None:
+            logger.error("Closing leaked KV connector step.")
             self._close_kv_connector_step()
-        stack = ExitStack()
-        stack.enter_context(set_forward_context(None, self.vllm_config))
-        # The private form on purpose. The public wrapper re-checks
-        # has_kv_transfer_group() and would turn a missing group into a
-        # silent no-op. The caller has already checked it.
-        self._kv_connector_output = stack.enter_context(
-            KVConnectorModelRunnerMixin._get_kv_connector_output(scheduler_output)
-        )
-        self._kv_connector_stack = stack
 
     def _close_kv_connector_step(self) -> KVConnectorOutput | None:
-        stack = self._kv_connector_stack
-        output = self._kv_connector_output
-        self._kv_connector_stack = None
-        self._kv_connector_output = None
-        if stack is not None:
-            stack.close()  # fills `output` in the mixin's finally block
-        return output
+        finished_req_ids = self._kv_step_finished_req_ids
+        self._kv_step_finished_req_ids = None
+        if finished_req_ids is None:
+            return None
+        connector = self._kv_connector()
+        connector.finish_forward()
+        return connector.post_forward(finished_req_ids)
 
     def finish_kv_connector_step(self) -> KVConnectorOutput | None:
-        """Close this step's connector context, if one is open.
+        """Close this step's connector step, if one is open.
 
         Idempotent. Every exit that ends a step goes through here, including
         worker shutdown. A no-op without a KV connector.
         """
-        if self._kv_connector_stack is None or not has_kv_transfer_group():
+        if self._kv_step_finished_req_ids is None or not has_kv_transfer_group():
             return None
         return self._close_kv_connector_step()
 
@@ -3016,9 +3022,6 @@ class MetalModelRunner:
             raise spec_decode_error
 
         if has_kv_transfer_group():
-            kv_connector_metadata = scheduler_output.kv_connector_metadata
-            assert kv_connector_metadata is not None
-            get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
             if scheduler_output.total_num_scheduled_tokens == 0:
                 # KV transfers must progress even on steps with no forward.
                 # Apply the runtime releases queued by the reconcile above, as
@@ -3026,9 +3029,10 @@ class MetalModelRunner:
                 runtime = self._paged_attention_runtime
                 if runtime is not None:
                     runtime.materialize_pending_state()
-                return KVConnectorModelRunnerMixin.kv_connector_no_forward(
-                    scheduler_output, self.vllm_config
-                )
+                # Handles preemptions, as pre_forward does on other steps.
+                self._close_leaked_kv_connector_step()
+                return self._kv_connector().no_forward(scheduler_output)
+            # Handles preemptions before opening the step.
             self._kv_connector_start_step(scheduler_output)
 
         batch = _ExecutionBatch()
@@ -3122,7 +3126,7 @@ class MetalModelRunner:
             if is_non_last_stage(self.pp):
                 # KV offloading with PP is rejected at config time. If that
                 # is relaxed, this exit must also finish the connector step.
-                assert self._kv_connector_stack is None
+                assert self._kv_step_finished_req_ids is None
                 self._execute_model_state = None
                 runtime = self._paged_attention_runtime
                 if runtime is not None:

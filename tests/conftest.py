@@ -6,10 +6,14 @@ import multiprocessing as mp
 import os
 import random
 import signal
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pytest
 import torch
+
+if TYPE_CHECKING:
+    from tests.kv_connector_spy import SpyTransferGroup
 
 os.environ["MLX_ENABLE_TF32"] = "0"  # Keep FP32 parity checks strict on M5.
 
@@ -115,3 +119,22 @@ def _no_kv_commit_probe(monkeypatch: pytest.MonkeyPatch) -> None:
     """
 
     monkeypatch.setenv("VLLM_METAL_KV_COMMIT_PROBE", "0")
+
+
+@pytest.fixture
+def spy_group(monkeypatch) -> SpyTransferGroup:
+    """Install a spy as the KV transfer group the runner's connector uses."""
+    import vllm_metal.v1.kv_connector as metal_kv_connector
+    import vllm_metal.v1.model_runner as mr
+    from tests.kv_connector_spy import SpyTransferGroup
+
+    group = SpyTransferGroup()
+    monkeypatch.setattr(mr, "has_kv_transfer_group", lambda: True)
+    monkeypatch.setattr(metal_kv_connector, "get_kv_transfer_group", lambda: group)
+    # The driver opens a forward context for loads; a stub runner has no real
+    # VllmConfig, and the spy ignores the context.
+    import vllm.v1.worker.gpu.kv_connector as upstream
+
+    monkeypatch.setattr(upstream, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(upstream, "get_forward_context", lambda: None)
+    return group
