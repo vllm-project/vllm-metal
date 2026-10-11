@@ -19,6 +19,10 @@ The default is the 40 prompts in `tools/parity_prompts.py`, greedy decoding, and
 
 Exit status is 0 when all prompts pass, otherwise nonzero. No saved golden token IDs or regeneration step is needed.
 
+## Laya decision parity
+
+For FP32 Laya encoder pooling, use [the Laya reference comparison](laya.md#validate-against-original-laya). It compares probabilities and logits rather than generated tokens; `EXACT` / `TOP_K_MATCH` token counts do not apply.
+
 ## Scheduled and requested CI
 
 Parity runs daily at 07:17 UTC on `main`. Users with repository write access can also comment `/ci parity` on an open PR once the workflow is on the default branch.

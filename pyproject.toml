@@ -104,6 +104,7 @@ metal = "vllm_metal:register"
 # subprocesses; the target module stays importable without the `gguf` extra.
 [project.entry-points."vllm.general_plugins"]
 gguf_metal = "vllm_metal.gguf.vllm_integration:register"
+laya_metal = "vllm_metal.laya_registration:register"
 
 [tool.setuptools]
 include-package-data = false
