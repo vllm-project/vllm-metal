@@ -30,6 +30,7 @@ from vllm_metal.attention.caches.turboquant import (
     packed_dim,
     prefill_workspace_bytes,
 )
+from vllm_metal.attention.dispatch import AttnCaps, select_attention_backend
 from vllm_metal.attention.impls.turboquant_prefill import (
     dtype_head_reason,
     workspace_upper_bound,
@@ -693,9 +694,11 @@ class ModelCachePolicy:
             )
             return
         model_layer_names = self._attention_layer_names()
-        runtime = self._build_sdpa_backend(
+        runtime = self.build_paged_attention_runtime(
             block_size=self._runner.cache_config.block_size
         )
+        if not isinstance(runtime, SDPAPagedAttentionRuntime):
+            raise TypeError("Layout-driven attention requires an SDPA paged runtime")
         runtime.initialize_from_config(kv_cache_config, model_layer_names)
         n_patched = runtime.patch_model(self._runner.model)
         block_size = runtime.kv_group_block_sizes()[0]
@@ -860,9 +863,26 @@ class ModelCachePolicy:
         self._require_supported_per_layer_shapes()
         if self._runner.is_hybrid:
             return self._build_hybrid_backend()
-        if self._runner.is_mla:
-            return self._build_mla_backend(block_size)
-        return self._build_sdpa_backend(block_size)
+        backend = select_attention_backend(self._attention_caps(block_size=block_size))
+        logger.info("Metal attention backend: %s", backend.name)
+        return backend.build_runtime(self, block_size=block_size)
+
+    def _attention_caps(self, *, block_size: int) -> AttnCaps:
+        head_dims: tuple[int, ...] = ()
+        if not self._runner.is_mla:
+            per_layer = self._runner.head_dim_per_layer
+            head_dims = (
+                tuple(per_layer) if per_layer is not None else (self._runner.head_dim,)
+            )
+        return AttnCaps(
+            is_mla=self._runner.is_mla,
+            is_hybrid=self._runner.is_hybrid,
+            kv_paged=True,
+            dtype=self._require_kv_cache_dtype(),
+            head_dims=head_dims,
+            block_size=block_size,
+            turboquant=get_config().turboquant,
+        )
 
     def install_gemma4_mtp_kv_sharing(
         self,
@@ -890,6 +910,12 @@ class ModelCachePolicy:
         )
 
     def _build_hybrid_backend(self) -> HybridPagedAttentionRuntime:
+        forced = envs.VLLM_METAL_ATTENTION_BACKEND
+        if forced is not None:
+            raise ValueError(
+                f"VLLM_METAL_ATTENTION_BACKEND={forced!r} is incompatible: "
+                "runtime overrides are not supported for hybrid models"
+            )
         self._reject_turboquant_for_mla()
         return HybridPagedAttentionRuntime(
             hybrid_plan=self._hybrid_plan(),

@@ -897,7 +897,7 @@ class TestYocoCacheIntegration:
     _NUM_SHARED = 3
     _NUM_UNIQUE = _NUM_HIDDEN - _NUM_SHARED
     _NUM_KV_HEADS = 2
-    _HEAD_DIM = 4
+    _HEAD_DIM = 64
     _BLOCK_SIZE = 16
     _VOCAB_SIZE = 100
 

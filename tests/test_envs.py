@@ -136,6 +136,16 @@ def test_boolean_defaults(
     assert getattr(envs, name) is expected
 
 
+def test_attention_backend_override_is_lazy_and_unvalidated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("VLLM_METAL_ATTENTION_BACKEND", raising=False)
+    assert envs.VLLM_METAL_ATTENTION_BACKEND is None
+
+    monkeypatch.setenv("VLLM_METAL_ATTENTION_BACKEND", "third_party_backend")
+    assert envs.VLLM_METAL_ATTENTION_BACKEND == "third_party_backend"
+
+
 def test_validate_environment_accepts_the_defaults(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

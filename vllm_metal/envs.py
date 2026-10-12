@@ -17,6 +17,7 @@ environment variable" warnings.
 ``MetalPlatform.check_and_update_config``) and reports every bad value
 together, so a typo fails the startup rather than the first request that
 reads it.  Boolean switches treat ``"1"`` as on and anything else as off.
+Registry-backed attention names are validated when the model runtime is built.
 """
 
 import os
@@ -120,6 +121,7 @@ if TYPE_CHECKING:
     VLLM_METAL_COMPILED_MLP: bool = False
     VLLM_METAL_NATIVE_SAMPLING: bool = False
     VLLM_METAL_MLA_KERNEL: bool = False
+    VLLM_METAL_ATTENTION_BACKEND: str | None = None
     VLLM_METAL_DISABLE_NAX: bool = False
     VLLM_METAL_DISABLE_GQA_DECODE: bool = False
     VLLM_METAL_TQ_PREFILL: str = "auto"
@@ -181,6 +183,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # qk_rope_head_dim=64, block_size ∈ {16, 32}, fp16/bf16,
     # decode-only).
     "VLLM_METAL_MLA_KERNEL": _bool("VLLM_METAL_MLA_KERNEL", False),
+    # Runtime-family override; names and capabilities are checked by the
+    # attention registry when the loaded model's runtime is built.
+    "VLLM_METAL_ATTENTION_BACKEND": lambda: os.getenv("VLLM_METAL_ATTENTION_BACKEND"),
     # Emergency override for automatic M5 NAX prefill attention.
     "VLLM_METAL_DISABLE_NAX": _bool("VLLM_METAL_DISABLE_NAX", False),
     # Emergency override for the GQA-shared flash-decode dispatch gate
