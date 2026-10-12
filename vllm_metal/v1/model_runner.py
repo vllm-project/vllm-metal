@@ -1667,6 +1667,7 @@ class MetalModelRunner:
         states_missing = False
         decode_req_ids: list[str] = []
         decode_params: list[SamplingParams] = []
+        decode_num_output_tokens: list[int] = []
         for req_id in cached_reqs.req_ids:
             state = self._request_states.get(req_id)
             if state is None:
@@ -1680,6 +1681,7 @@ class MetalModelRunner:
             decode_req_ids.append(req_id)
             if state.sampling_params is not None:
                 decode_params.append(state.sampling_params)
+                decode_num_output_tokens.append(len(state.token_ids) - state.prompt_len)
 
         adapter = self._multimodal_adapter
         mm_forward_forced = self._mm_forward_forced(adapter)
@@ -1720,12 +1722,16 @@ class MetalModelRunner:
         sampling = SamplingShape(
             native_greedy=(
                 not states_missing
-                and SamplingBatch.params_allow_native_greedy(decode_params)
+                and SamplingBatch.params_allow_native_greedy(
+                    decode_params, decode_num_output_tokens
+                )
             ),
             native_random=(
                 self._native_sample_key is not None
                 and not states_missing
-                and SamplingBatch.params_allow_native_random(decode_params)
+                and SamplingBatch.params_allow_native_random(
+                    decode_params, decode_num_output_tokens
+                )
             ),
         )
         return self._decode_pipeline.evaluate_gate(capabilities, step, sampling)
@@ -3182,6 +3188,7 @@ class MetalModelRunner:
         tokens = SamplingBatch.native_decode_tokens(
             logits[0, : len(decode_reqs), :],
             [state.sampling_params for _, state in decode_reqs],
+            [len(state.token_ids) - state.prompt_len for _, state in decode_reqs],
             vocab_size=self._vocab_size,
             next_key=(
                 self._next_native_sample_key

@@ -84,8 +84,7 @@ Transcribe audio to text.
 | `repetition_penalty` | float | `1.0` | Penalize tokens already in the prompt or the transcript |
 | `frequency_penalty` / `presence_penalty` | float | `0.0` | Penalize tokens already in the transcript |
 
-`max_completion_tokens` caps the transcript. `logit_bias` and `min_tokens` are
-rejected for every vllm-metal request.
+`max_completion_tokens` caps the transcript.
 
 ### `POST /v1/audio/translations`
 

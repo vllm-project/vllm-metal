@@ -301,21 +301,6 @@ class MetalPlatform(Platform):
         if not isinstance(params, SamplingParams):
             return
 
-        unsupported_controls = [
-            name
-            for name, enabled in (
-                ("logit_bias", bool(params.logit_bias)),
-                ("min_tokens", params.min_tokens > 0),
-            )
-            if enabled
-        ]
-        if unsupported_controls:
-            controls = ", ".join(unsupported_controls)
-            raise VLLMValidationError(
-                "vllm-metal does not support sampling controls backed by "
-                f"vLLM logits processors ({controls}).",
-                parameter=unsupported_controls[0],
-            )
         # Upstream's diffusion sampler applies top_k/top_p to the canvas and
         # reads the structured-read extra_args; the Metal one does not, so
         # refuse them rather than ignore them.

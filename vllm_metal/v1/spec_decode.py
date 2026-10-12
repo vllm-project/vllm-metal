@@ -418,6 +418,8 @@ class SpeculativeDecodeController:
                 or sampling_params.num_logprobs is not None
                 or bool(sampling_params.allowed_token_ids)
                 or bool(sampling_params.bad_words_token_ids)
+                or bool(sampling_params.logit_bias)
+                or request_state.generated_tokens < sampling_params.min_tokens
             )
             if unsupported:
                 raise NotImplementedError(

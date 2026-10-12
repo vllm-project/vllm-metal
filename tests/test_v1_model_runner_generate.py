@@ -3058,6 +3058,41 @@ class TestPipelineGateSpecDecodeDerivation:
         assert decision.eligible is False
         assert decision.reason == "non-native sampling"
 
+    @pytest.mark.parametrize(
+        ("token_ids", "expected_eligible", "expected_reason"),
+        [
+            ([1, 7], False, "non-native sampling"),
+            ([1, 7, 8], True, "eligible"),
+        ],
+        ids=["min-tokens-pending", "min-tokens-reached"],
+    )
+    def test_min_tokens_blocks_pipeline_only_until_reached(
+        self,
+        token_ids: list[int],
+        expected_eligible: bool,
+        expected_reason: str,
+    ) -> None:
+        # Arrange — stop tokens are masked on the torch sampler until the
+        # request has generated min_tokens outputs.
+        runner = self._runner(drafter=None)
+        runner._request_states = {
+            "r0": mr.RequestState(
+                token_ids=token_ids,
+                prompt_len=1,
+                sampling_params=SamplingParams(temperature=0.0, min_tokens=2),
+                generator=None,
+                generated_tokens=len(token_ids) - 1,
+            )
+        }
+        scheduler_output = self._cached_decode_output("r0")
+
+        # Act
+        decision = runner._evaluate_pipeline_gate(scheduler_output)
+
+        # Assert
+        assert decision.eligible is expected_eligible
+        assert decision.reason == expected_reason
+
     def test_clean_decode_step_is_eligible(self) -> None:
         # Arrange
         runner = self._runner(drafter=None)
