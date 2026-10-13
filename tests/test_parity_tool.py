@@ -180,10 +180,17 @@ class TestParityTool:
 
         @contextmanager
         def server(
-            model, max_model_len, max_num_seqs, gpu_memory_utilization, log_path, env
+            model,
+            max_model_len,
+            max_num_seqs,
+            gpu_memory_utilization,
+            log_path,
+            env,
+            additional_config=None,
         ):
             assert max_num_seqs == 2
             assert gpu_memory_utilization == 0.65
+            assert additional_config is None
             events.append("server started")
             yield "http://localhost/v1"
             events.append("server stopped")

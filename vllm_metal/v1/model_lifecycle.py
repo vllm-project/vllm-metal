@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import mlx.core as mx
 import torch
 from mlx_lm import load as mlx_lm_load
 from mlx_vlm import load as mlx_vlm_load
@@ -20,6 +21,7 @@ from vllm_metal.compat import apply_compat_patches, embedding_load_scope
 from vllm_metal.compiled_mlp import CompiledMLPBlocks
 from vllm_metal.config import get_config
 from vllm_metal.gguf.source import GGUFLoadSource
+from vllm_metal.moe_offload import install_expert_offload, resolve_checkpoint_dir
 from vllm_metal.multimodal.gemma4 import Gemma4VisionSidecar
 from vllm_metal.pytorch_backend.tensor_bridge import TORCH_TO_MLX_DTYPE
 from vllm_metal.quant.awq_loader import AWQQuantLoader
@@ -388,6 +390,13 @@ class ModelLifecycle:
             else AWQQuantLoader.for_model(model_name, revision=revision)
         )
 
+        expert_cache_bytes = get_config().moe_expert_cache_bytes
+        if expert_cache_bytes and (is_gguf or is_vlm or awq_loader is not None):
+            raise NotImplementedError(
+                "MoE expert offloading supports mlx-lm text checkpoints only, "
+                "not GGUF, AWQ, or multimodal models."
+            )
+
         if is_gguf:
             load_label = "GGUF model"
             model, tokenizer = self._load_gguf_text_model(
@@ -417,9 +426,16 @@ class ModelLifecycle:
             model, tokenizer = self._load_mlx_lm_text_model(
                 model_name,
                 tokenizer_config,
-                lazy=lazy_weights,
+                lazy=lazy_weights or bool(expert_cache_bytes),
                 revision=revision,
             )
+            if expert_cache_bytes:
+                self._runner._expert_store = install_expert_offload(
+                    model,
+                    resolve_checkpoint_dir(model_name, revision),
+                    expert_cache_bytes,
+                )
+                mx.eval(model.parameters())
 
         loaded_from = (
             gguf_source.weights_path if gguf_source is not None else model_name

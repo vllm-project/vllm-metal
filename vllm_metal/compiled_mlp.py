@@ -31,6 +31,7 @@ from mlx.utils import tree_unflatten
 from vllm.logger import init_logger
 
 from vllm_metal import envs as metal_envs
+from vllm_metal.moe_offload import OffloadedSwitchGLU
 
 logger = init_logger(__name__)
 
@@ -77,11 +78,17 @@ class CompiledMLPBlocks:
             for name, module in model.named_modules()
             if isinstance(module, CompiledMLPBlock)
         ]
+        # A block that streams its experts syncs with the host mid-forward,
+        # which a compiled trace cannot do.
         candidates = {
             name: module
             for name, module in model.named_modules()
             if type(module) in policies
             and not any(name.startswith(prefix) for prefix in wrapper_prefixes)
+            and not any(
+                isinstance(child, OffloadedSwitchGLU)
+                for _, child in module.named_modules()
+            )
         }
         # Wrap outermost targets only: a target nested inside another (the
         # MoE block's shared-expert MLP) compiles as part of the outer trace.

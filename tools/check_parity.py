@@ -94,6 +94,7 @@ def serving(
     gpu_memory_utilization: float,
     log_path: Path,
     env: dict,
+    additional_config: str | None = None,
 ):
     """Start one local server and clean up its process group on every exit."""
     with socket.socket() as sock:
@@ -121,7 +122,8 @@ def serving(
                 "--no-enable-prefix-caching",
                 "--generation-config",
                 "vllm",
-            ],
+            ]
+            + (["--additional-config", additional_config] if additional_config else []),
             stdout=log,
             stderr=subprocess.STDOUT,
             start_new_session=True,
@@ -162,6 +164,7 @@ def check_parity(
     batch_sizes: tuple[int, ...] = (1, 2),
     output_dir: Path | None = None,
     gpu_memory_utilization: float = 0.65,
+    additional_config: str | None = None,
 ) -> bool:
     """Generate one reference, then compare every request batch size on one server."""
     if not prompts or not batch_sizes or min(batch_sizes) < 1:
@@ -216,6 +219,7 @@ def check_parity(
         gpu_memory_utilization,
         output_dir / "serve.log",
         env,
+        additional_config,
     ) as base_url:
         for size in batch_sizes:
             print(f"Prompts/request: {size}", flush=True)
@@ -374,6 +378,10 @@ def main() -> None:
         choices=["native", "target", "dflash", "dspark", "draft_model", "replay"],
         help=argparse.SUPPRESS,
     )
+    parser.add_argument(
+        "--additional-config",
+        help="JSON passed to vllm serve --additional-config (serving side only)",
+    )
     parser.add_argument("--generate-reference", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.max_tokens < 1:
@@ -420,6 +428,7 @@ def main() -> None:
         tuple(args.batch_size),
         args.output_dir,
         args.gpu_memory_utilization,
+        args.additional_config,
     )
     raise SystemExit(0 if passed else 1)
 

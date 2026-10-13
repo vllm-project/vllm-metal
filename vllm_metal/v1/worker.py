@@ -113,6 +113,7 @@ class MetalWorker(WorkerBase):
             self.metal_config.k_quant = add.get("k_quant", "q8_0")
             self.metal_config.v_quant = add.get("v_quant", "q3_0")
             self.metal_config._validate_turboquant()
+        self.metal_config.apply_moe_expert_offload(add)
 
         # Disable custom all reduce (not supported on Metal)
         self.parallel_config.disable_custom_all_reduce = True

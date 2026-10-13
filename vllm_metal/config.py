@@ -2,7 +2,7 @@
 """Configuration for vLLM Metal plugin via environment variables."""
 
 from dataclasses import dataclass
-from typing import Literal, cast
+from typing import Any, Literal, cast
 
 import vllm_metal.envs as envs
 
@@ -41,6 +41,8 @@ class MetalConfig:
     turboquant: bool = False  # Enable TurboQuant KV cache compression
     k_quant: str = "q8_0"  # Key quantization type: q8_0, q4_0, int8, uint8, etc.
     v_quant: str = "q3_0"  # Value quantization type: q2_0, q3_0, q4_0, q5_0 (Lloyd-Max)
+    # >0 streams MoE experts from the checkpoint through a cache of this size.
+    moe_expert_cache_bytes: int = 0
 
     def __post_init__(self) -> None:
         if self.multimodal_mode not in VALID_MULTIMODAL_MODES:
@@ -67,6 +69,29 @@ class MetalConfig:
                     f"Invalid v_quant={self.v_quant!r}. "
                     f"Available quantization types: {available}"
                 )
+
+    def apply_moe_expert_offload(self, additional_config: Any) -> None:
+        """Read ``{"moe_expert_offload": {"cache_gb": <float>}}`` from --additional-config."""
+        if not isinstance(additional_config, dict):
+            return
+        options = additional_config.get("moe_expert_offload")
+        if options is None:
+            return
+        if not isinstance(options, dict) or set(options) != {"cache_gb"}:
+            raise ValueError(
+                "moe_expert_offload takes exactly one key, cache_gb, e.g. "
+                '--additional-config \'{"moe_expert_offload": {"cache_gb": 2}}\''
+            )
+        cache_gb = options["cache_gb"]
+        if isinstance(cache_gb, bool) or not isinstance(cache_gb, int | float):
+            raise ValueError(
+                f"moe_expert_offload.cache_gb must be a number, got {cache_gb!r}"
+            )
+        if cache_gb <= 0:
+            raise ValueError(
+                f"moe_expert_offload.cache_gb must be positive, got {cache_gb!r}"
+            )
+        self.moe_expert_cache_bytes = int(cache_gb * 2**30)
 
     @classmethod
     def from_env(cls) -> "MetalConfig":

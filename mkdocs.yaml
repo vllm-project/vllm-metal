@@ -75,6 +75,7 @@ nav:
     - Speech-to-Text: stt.md
     - Turboquant: turboquant.md
     - KV Cache Offloading: kv_offloading.md
+    - MoE Expert Offloading: moe_offload.md
     - GPU Profiling: profiling.md
     - Distributed (Ray): distributed.md
   - Tools: tools.md

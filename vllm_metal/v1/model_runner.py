@@ -132,6 +132,7 @@ from vllm_metal.v1.spec_decode import (
 from vllm_metal.v1.structured_output import MetalStructuredOutputApplier
 
 if TYPE_CHECKING:
+    from vllm_metal.moe_offload import ExpertStore
     from vllm_metal.patches.aux_hidden_states import AuxHiddenStateCapture
 
 logger = init_logger(__name__)
@@ -367,6 +368,7 @@ class MetalModelRunner:
     # paths that check connector state.
     _kv_connector_driver: KVConnector | None = None
     _kv_step_finished_req_ids: set[str] | None = None
+    _expert_store: "ExpertStore | None" = None
 
     def __init__(self, vllm_config: VllmConfig):
         """Initialize model runner.
@@ -1056,6 +1058,10 @@ class MetalModelRunner:
         mx.synchronize()
         overhead = mx.get_cache_memory() - cache_before
         mx.set_cache_limit(overhead)
+        if self._expert_store is not None:
+            # The profile touched every expert; the plan reserves the cache
+            # budget itself, so start serving from an empty cache.
+            self._expert_store.clear()
         return overhead
 
     def _mm_step_can_run(self, adapter: MultimodalRuntimeAdapter) -> bool:
