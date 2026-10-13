@@ -17,7 +17,6 @@ from vllm.config import (
     SchedulerConfig,
     VllmConfig,
 )
-from vllm.exceptions import VLLMValidationError
 from vllm.sampling_params import SamplingParams
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.selector import AttentionSelectorConfig
@@ -221,24 +220,18 @@ class TestMetalPlatform:
             MetalPlatform.set_device(torch.device("cpu", 1))
 
     @pytest.mark.parametrize(
-        ("sampling_params", "control"),
+        "sampling_params",
         [
-            (SamplingParams(logit_bias={1: 2.0}), "logit_bias"),
-            (SamplingParams(min_tokens=2), "min_tokens"),
+            SamplingParams(min_p=0.2),
+            SamplingParams(logit_bias={1: 2.0}),
+            SamplingParams(min_tokens=2),
         ],
-        ids=["logit-bias", "min-tokens"],
+        ids=["min-p", "logit-bias", "min-tokens"],
     )
-    def test_validate_request_rejects_logits_processor_controls(
-        self,
-        sampling_params: SamplingParams,
-        control: str,
+    def test_validate_request_accepts_logits_processor_controls(
+        self, sampling_params: SamplingParams
     ) -> None:
-        with pytest.raises(VLLMValidationError, match=control) as exc_info:
-            MetalPlatform.validate_request({}, sampling_params)
-        assert exc_info.value.parameter == control
-
-    def test_validate_request_accepts_min_p(self) -> None:
-        MetalPlatform.validate_request({}, SamplingParams(min_p=0.2))
+        MetalPlatform.validate_request({}, sampling_params)
 
     def test_check_and_update_config_rejects_pipeline_with_tensor_parallel(
         self,
