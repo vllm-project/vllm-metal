@@ -141,6 +141,7 @@ block-FP8 checkpoint is not supported.
 | Ling-3.0 Tiny | 🔵 | Hybrid MLA + KDA (paged latent + recurrent state) | 🔵 | `inclusionAI/Ling-3.0-tiny` (BF16 or converted MXFP8) |
 | GLM-4.5 | Not verified | MLA (paged latent cache, MLX SDPA — no Metal kernel) | Not verified | — |
 | MiniCPM3-4B | ✅ | MLA (paged latent cache) | ✅ | `mlx-community/MiniCPM3-4B-4bit` |
+| MiniCPM4 | 🔵 | GQA (paged) | Not verified | `openbmb/MiniCPM4-0.5B-mlx` (needs `--trust-remote-code`) |
 | GLM-4.7-Flash | 🔵 | GQA (paged) | ✅ | `mlx-community/GLM-4.7-Flash-4bit` |
 | DeepSeek-R1-Distill-Qwen | ✅ | GQA (paged) | ✅ | `mlx-community/DeepSeek-R1-Distill-Qwen-7B-3bit` |
 | Phi-4-mini | ✅ | GQA packed qkv (paged) | ✅ | `microsoft/Phi-4-mini-instruct` |

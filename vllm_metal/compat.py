@@ -39,6 +39,7 @@ def apply_compat_patches() -> None:
     _apply_bytelevel_patch_during_registration()
     _patch_mlx_lm_qwen35_fp8_sanitize()
     _patch_mlx_lm_qwen3_flat_weight_prefix()
+    _patch_mlx_lm_minicpm4_model_type()
     _patch_transformers_exaone4_config()
 
 
@@ -1005,6 +1006,26 @@ def _qwen3_flat_weight_prefix(
         key if key.startswith("lm_head.") else f"model.{key}": value
         for key, value in weights.items()
     }
+
+
+def _patch_mlx_lm_minicpm4_model_type() -> None:
+    """Load MiniCPM4 checkpoints that declare ``model_type: minicpm4``.
+
+    openbmb's MLX conversions of MiniCPM4 declare ``minicpm4``, but mlx_lm
+    runs MiniCPM4 on its ``minicpm`` module (ml-explore/mlx-lm#212) and has no
+    module by that name, so loading fails before any weight is read. openbmb's
+    own config class declares ``minicpm``, and the checkpoint's tensors match
+    that module name for name.
+
+    TODO: remove when the pinned mlx_lm maps ``minicpm4`` (#1084).
+    """
+    try:
+        from mlx_lm.utils import MODEL_REMAPPING
+    except ImportError as exc:
+        logger.warning("Could not install the MiniCPM4 model type mapping: %s", exc)
+        return
+
+    MODEL_REMAPPING.setdefault("minicpm4", "minicpm")
 
 
 def _patch_mlx_lm_qwen3_flat_weight_prefix() -> bool:

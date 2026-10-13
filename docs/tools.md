@@ -11,7 +11,7 @@ python tools/check_parity.py --model /path/to/checkpoint --top-k 5 --batch-size 
 
 The tool generates the native MLX reference once and exits that process before starting one `vllm serve` instance. It checks `/health`, compares individual prompts and pairs of prompts through `/v1/completions`, then stops the server. The server's sequence limit is the largest requested batch size, and prefix caching is disabled. Each pair is submitted in one HTTP request. These are request batch sizes, not assertions about the actual GPU batch size. Both backends use the same checkpoint and input token IDs.
 
-The default is the 40 prompts in `tools/parity_prompts.py`, greedy decoding, and 10 output tokens, ignoring EOS. Use `--prompt` for custom text, `--max-tokens` for output length, and `--help` for all options. Inputs are plain text without a chat template. Logs, the native reference, and a summary are saved to `--output-dir`, or a new temporary directory printed at startup. The tool selects an available localhost port automatically.
+The default is the 40 prompts in `tools/parity_prompts.py`, greedy decoding, and 10 output tokens, ignoring EOS. Use `--prompt` for custom text, `--max-tokens` for output length, `--trust-remote-code` for checkpoints that ship their own config code, and `--help` for all options. Inputs are plain text without a chat template. Logs, the native reference, and a summary are saved to `--output-dir`, or a new temporary directory printed at startup. The tool selects an available localhost port automatically.
 
 - `EXACT`: every output token matches.
 - `TOP_K_MATCH`: the first divergence passes mutual top-K membership; later tokens are not compared. Enabled with `--top-k K`.
