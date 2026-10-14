@@ -745,6 +745,50 @@ class TestPackedRoPE:
         assert len(captured) == 1
         assert captured[0] is provided
 
+    def test_batched_mrope_matches_per_segment_rotation(self):
+        """The packed rotation equals rotating each segment on its own, for
+        decode rows, a prefill chunk and caller positions in one batch."""
+        import mlx.core as mx
+        from mlx_vlm.models.qwen3_5.language import (
+            Qwen3_5RotaryEmbedding,
+            apply_multimodal_rotary_pos_emb,
+        )
+
+        from vllm_metal.attention.impls.varlen_rope_compat import apply_packed_rope
+
+        class Attention:
+            rotary_emb = Qwen3_5RotaryEmbedding(
+                64,
+                max_position_embeddings=4096,
+                base=10_000_000,
+                mrope_section=[11, 11, 10],
+            )
+
+        cu_seqlens = [0, 1, 2, 6, 9]
+        offsets = [41, 7, 0, 0]
+        image_pos = mx.array([[[3, 3, 3]], [[3, 4, 4]], [[3, 3, 4]]], dtype=mx.int32)
+        positions = [None, None, None, image_pos]
+        mx.random.seed(0)
+        q = mx.random.normal((1, 4, 9, 64))
+        k = mx.random.normal((1, 2, 9, 64))
+
+        q_out, k_out = apply_packed_rope(
+            Attention(), q, k, cu_seqlens, offsets=offsets, positions=positions
+        )
+
+        for i in range(len(cu_seqlens) - 1):
+            s, e = cu_seqlens[i], cu_seqlens[i + 1]
+            pos = positions[i]
+            if pos is None:
+                ids = mx.arange(offsets[i], offsets[i] + e - s, dtype=mx.int32)
+                pos = mx.broadcast_to(ids[None, None, :], (3, 1, e - s))
+            cos, sin = Attention.rotary_emb(q[:, :, s:e], pos)
+            q_ref, k_ref = apply_multimodal_rotary_pos_emb(
+                q[:, :, s:e], k[:, :, s:e], cos, sin
+            )
+            assert mx.allclose(q_out[:, :, s:e], q_ref, atol=1e-5).item()
+            assert mx.allclose(k_out[:, :, s:e], k_ref, atol=1e-5).item()
+
     def test_mrope_mixed_int_offset_and_array_positions(self, monkeypatch):
         """Each segment independently picks int-offset or array-position."""
         import sys
@@ -785,9 +829,8 @@ class TestPackedRoPE:
             positions=[None, caller_pos],
         )
 
-        assert len(recorded) == 2
-        # First seg: arange(7, 10) broadcast over (3, 1, 3)
-        assert recorded[0].shape == (3, 1, 3)
-        assert recorded[0].tolist() == [[[7, 8, 9]]] * 3
-        # Second seg: caller-supplied positions used verbatim
-        assert recorded[1] is caller_pos
+        # One rotation over the packed batch: arange(7, 10) for the first
+        # segment, the caller's positions verbatim for the second.
+        assert len(recorded) == 1
+        assert recorded[0].shape == (3, 1, 5)
+        assert recorded[0].tolist() == [[[7, 8, 9, 10, 11]]] * 3
