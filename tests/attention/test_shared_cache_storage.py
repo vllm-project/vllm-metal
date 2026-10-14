@@ -18,7 +18,7 @@ from vllm.v1.kv_cache_interface import (
 
 from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
 from vllm_metal.attention.caches.state_cache import PagedStateCache
-from vllm_metal.attention.caches.storage import KVCacheStorage
+from vllm_metal.attention.caches.storage import CacheViews, KVCacheStorage
 from vllm_metal.attention.impls.linear import GDNPagedAttentionWrapper, _GDNForwardState
 from vllm_metal.metal import get_ops
 
@@ -273,3 +273,39 @@ def test_count_initialized_runtime_refuses_sleep_release():
 
     with pytest.raises(NotImplementedError, match="Sleep mode does not support"):
         runtime.release_kv_memory()
+
+
+def test_state_slot_gather_past_32_bit_offsets():
+    """Gather state rows whose element offsets cross INT32_MAX.
+
+    A state component view strides inside a wider packed per-block page, so a
+    slot's offset is ``slot x page stride``; MLX reads such views with 32-bit
+    gather offsets and returns garbage once that product crosses the limit.
+    """
+    from vllm_metal.tensor_bridge import torch_to_mlx
+
+    page_elems = 1 << 20  # packed per-block page stride, fp16 elements
+    row = (4, 8)
+    num_slots = (1 << 31) // page_elems + 2  # slot 2048 starts at 2^31
+    raw = torch.empty((num_slots, page_elems * 2), dtype=torch.uint8)
+    flat = raw.view(torch.float16)
+    conv_t = flat.as_strided((num_slots, *row), (page_elems, row[1], 1))
+    storage = SimpleNamespace(region_offsets=[0], buffers=[torch_to_mlx(raw)])
+    cache = PagedStateCache([CacheViews(storage, [conv_t])])
+
+    for slot, value in ((3, 5.0), (num_slots - 1, 9.0)):
+        flat[slot, : int(np.prod(row))] = value
+
+    ids = mx.array([3, num_slots - 1], dtype=mx.int32)
+    got = cache.gather_conv_rows(0, ids)
+    mx.eval(got)
+    expected = np.stack([np.full(row, v, dtype=np.float16) for v in (5.0, 9.0)])
+    np.testing.assert_array_equal(np.array(got), expected)
+
+    # Slot copies take the same gather path for their sources.
+    cache.copy_slots([3], [1], [0])
+    mx.eval(*storage.buffers)
+    np.testing.assert_array_equal(
+        flat[1, : int(np.prod(row))].numpy(),
+        np.full(row, 5.0, dtype=np.float16).reshape(-1),
+    )

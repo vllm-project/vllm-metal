@@ -10,6 +10,8 @@ from typing import TYPE_CHECKING
 
 import mlx.core as mx
 
+from vllm_metal.attention.caches.storage import CacheViews
+
 if TYPE_CHECKING:
     from vllm_metal.attention.context import PagedAttentionContext
 
@@ -20,6 +22,20 @@ def _native_row_scatter() -> Callable[..., mx.array]:
     from vllm_metal.metal import get_ops
 
     return get_ops().gdn_state_scatter
+
+
+def _gather_rows(
+    states: Sequence[mx.array] | CacheViews, layer_idx: int, ids: mx.array
+) -> mx.array:
+    """Rows ``ids`` of ``states[layer_idx]``.
+
+    Shared-pool views stride a state component inside a wider packed page, so
+    a plain ``view[ids]`` can overflow MLX's 32-bit gather offsets; dense
+    per-layer arrays take it directly.
+    """
+    if isinstance(states, CacheViews):
+        return states.gather_rows(layer_idx, ids)
+    return states[layer_idx][ids]
 
 
 @dataclass(frozen=True)
@@ -99,6 +115,14 @@ class PagedStateCache:
         """Return the cache indices of layers in one mamba cache group."""
         return [idx for idx, o in enumerate(self._layer_group_ordinals) if o == ordinal]
 
+    def gather_conv_rows(self, layer_idx: int, ids: mx.array) -> mx.array:
+        """Rows ``ids`` of a layer's conv pool, dense or shared-backing view."""
+        return _gather_rows(self.conv_states, layer_idx, ids)
+
+    def gather_recurrent_rows(self, layer_idx: int, ids: mx.array) -> mx.array:
+        """Rows ``ids`` of a layer's recurrent pool, dense or shared view."""
+        return _gather_rows(self.recurrent_states, layer_idx, ids)
+
     def copy_slots(
         self, src_ids: list[int], dst_ids: list[int], layer_indices: list[int]
     ) -> None:
@@ -119,10 +143,10 @@ class PagedStateCache:
             # Gather first (its output is O(rows)), then write the rows back.
             # Reading the sources into their own array keeps the copy atomic
             # when one pair's destination is another pair's source.
-            self.write_conv_rows(layer_idx, self.conv_states[layer_idx][src], dst)
+            self.write_conv_rows(layer_idx, self.gather_conv_rows(layer_idx, src), dst)
             if self.recurrent_states:
                 self.write_recurrent_rows(
-                    layer_idx, self.recurrent_states[layer_idx][src], dst
+                    layer_idx, self.gather_recurrent_rows(layer_idx, src), dst
                 )
 
     def zero_slots(self, slot_ids: list[int], layer_indices: list[int]) -> None:
@@ -376,7 +400,7 @@ class StateSlotArraysCache:
         self._state_cache = state_cache
         self._cache_idx = cache_idx
         self._slot_ids = slot_ids
-        packed_conv = state_cache.conv_states[cache_idx][slot_ids]
+        packed_conv = state_cache.gather_conv_rows(cache_idx, slot_ids)
         if conv_widths is None:
             self._conv_states = [packed_conv]
         else:
@@ -394,7 +418,7 @@ class StateSlotArraysCache:
                 offset += width
                 split_points.append(offset)
             self._conv_states = list(mx.split(packed_conv, split_points, axis=-1))
-        self._recurrent_state = state_cache.recurrent_states[cache_idx][slot_ids]
+        self._recurrent_state = state_cache.gather_recurrent_rows(cache_idx, slot_ids)
 
     def __getitem__(self, idx: int) -> mx.array:
         if 0 <= idx < len(self._conv_states):
