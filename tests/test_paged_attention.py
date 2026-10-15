@@ -699,11 +699,8 @@ class TestPackedRoPE:
         assert mx.allclose(q_out, q + 3).item()
         assert mx.allclose(k_out, k + 4).item()
 
-    def test_mrope_uses_caller_positions_when_provided(self, monkeypatch):
+    def test_mrope_uses_caller_positions_when_provided(self):
         """When ``positions[i]`` is an array, M-RoPE consumes it directly."""
-        import sys
-        import types
-
         import mlx.core as mx
 
         from vllm_metal.attention.impls.varlen_rope_compat import (
@@ -712,24 +709,14 @@ class TestPackedRoPE:
 
         captured: list[mx.array] = []
 
-        class FakeMRoPE:
-            def rotary_emb(self, x, position_ids):
+        class FakeRotaryEmbedding:
+            def apply_rotary(self, q, k, position_ids):
+                # Only routing matters here, not the rotation math.
                 captured.append(position_ids)
-                # Return cos/sin shaped to match rotary_emb's contract; we
-                # do not care about correctness here, only routing.
-                seg_len = x.shape[2]
-                head_dim = x.shape[3]
-                cos = mx.zeros((1, 1, seg_len, head_dim))
-                sin = mx.zeros((1, 1, seg_len, head_dim))
-                return cos, sin
+                return q, k
 
-        # Patch apply_multimodal_rotary_pos_emb so we do not need real mlx_vlm
-        # math; just route q,k through unchanged.  ``monkeypatch.setitem``
-        # restores the original sys.modules entry at teardown so this fake
-        # cannot leak into later tests in the same process.
-        fake_mod = types.ModuleType("mlx_vlm.models.qwen3_5.language")
-        fake_mod.apply_multimodal_rotary_pos_emb = lambda q, k, cos, sin: (q, k)
-        monkeypatch.setitem(sys.modules, "mlx_vlm.models.qwen3_5.language", fake_mod)
+        class FakeMRoPE:
+            rotary_emb = FakeRotaryEmbedding()
 
         q = mx.zeros((1, 1, 3, 2))
         k = mx.zeros((1, 1, 3, 2))
@@ -745,18 +732,30 @@ class TestPackedRoPE:
         assert len(captured) == 1
         assert captured[0] is provided
 
-    def test_batched_mrope_matches_per_segment_rotation(self):
-        """The packed rotation equals rotating each segment on its own, for
-        decode rows, a prefill chunk and caller positions in one batch."""
+    @pytest.mark.parametrize("model", ["qwen3_vl", "qwen3_5"])
+    @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
+    def test_batched_mrope_matches_per_segment_rotation(self, model, dtype):
+        """One ``rotary_emb.apply_rotary`` call over the packed batch (the
+        fused Metal path when available) equals rotating each segment on its
+        own with eager cos/sin, for decode rows, a prefill chunk and caller
+        (image) positions in one batch."""
         import mlx.core as mx
-        from mlx_vlm.models.qwen3_5.language import (
-            Qwen3_5RotaryEmbedding,
-            apply_multimodal_rotary_pos_emb,
-        )
+        from mlx_vlm.models.rope_utils import apply_multimodal_rotary_pos_emb
 
         from vllm_metal.attention.impls.varlen_rope_compat import apply_packed_rope
 
-        class Attention:
+        if model == "qwen3_vl":
+            from mlx_vlm.models.qwen3_vl.language import Qwen3VLRotaryEmbedding
+
+            rotary_emb = Qwen3VLRotaryEmbedding(
+                64,
+                max_position_embeddings=4096,
+                base=5_000_000,
+                rope_scaling={"rope_type": "default", "mrope_section": [12, 10, 10]},
+            )
+        else:
+            from mlx_vlm.models.qwen3_5.language import Qwen3_5RotaryEmbedding
+
             rotary_emb = Qwen3_5RotaryEmbedding(
                 64,
                 max_position_embeddings=4096,
@@ -764,36 +763,58 @@ class TestPackedRoPE:
                 mrope_section=[11, 11, 10],
             )
 
+        class Attention:
+            pass
+
+        attn = Attention()
+        attn.rotary_emb = rotary_emb
         cu_seqlens = [0, 1, 2, 6, 9]
         offsets = [41, 7, 0, 0]
         image_pos = mx.array([[[3, 3, 3]], [[3, 4, 4]], [[3, 3, 4]]], dtype=mx.int32)
         positions = [None, None, None, image_pos]
         mx.random.seed(0)
-        q = mx.random.normal((1, 4, 9, 64))
-        k = mx.random.normal((1, 2, 9, 64))
+        q = mx.random.normal((1, 4, 9, 64)).astype(getattr(mx, dtype))
+        k = mx.random.normal((1, 2, 9, 64)).astype(getattr(mx, dtype))
+        atol = 1e-5 if dtype == "float32" else 2e-2
 
         q_out, k_out = apply_packed_rope(
-            Attention(), q, k, cu_seqlens, offsets=offsets, positions=positions
+            attn, q, k, cu_seqlens, offsets=offsets, positions=positions
         )
 
+        assert q_out.dtype == q.dtype and k_out.dtype == k.dtype
         for i in range(len(cu_seqlens) - 1):
             s, e = cu_seqlens[i], cu_seqlens[i + 1]
             pos = positions[i]
             if pos is None:
                 ids = mx.arange(offsets[i], offsets[i] + e - s, dtype=mx.int32)
                 pos = mx.broadcast_to(ids[None, None, :], (3, 1, e - s))
-            cos, sin = Attention.rotary_emb(q[:, :, s:e], pos)
+            q_seg, k_seg = q[:, :, s:e], k[:, :, s:e]
+            cos, sin = rotary_emb(q_seg, pos)
             q_ref, k_ref = apply_multimodal_rotary_pos_emb(
-                q[:, :, s:e], k[:, :, s:e], cos, sin
+                q_seg,
+                k_seg,
+                cos,
+                sin,
+                mrope_section=rotary_emb.mrope_section,
+                style=rotary_emb.style,
             )
-            assert mx.allclose(q_out[:, :, s:e], q_ref, atol=1e-5).item()
-            assert mx.allclose(k_out[:, :, s:e], k_ref, atol=1e-5).item()
+            assert mx.allclose(q_out[:, :, s:e], q_ref, atol=atol).item()
+            assert mx.allclose(k_out[:, :, s:e], k_ref, atol=atol).item()
 
-    def test_mrope_mixed_int_offset_and_array_positions(self, monkeypatch):
+    def test_mrope_requires_apply_rotary(self):
+        import mlx.core as mx
+
+        from vllm_metal.attention.impls.varlen_rope_compat import apply_packed_rope
+
+        class Attention:
+            rotary_emb = object()
+
+        q = mx.zeros((1, 1, 2, 4))
+        with pytest.raises(NotImplementedError, match="apply_rotary"):
+            apply_packed_rope(Attention(), q, q, [0, 2])
+
+    def test_mrope_mixed_int_offset_and_array_positions(self):
         """Each segment independently picks int-offset or array-position."""
-        import sys
-        import types
-
         import mlx.core as mx
 
         from vllm_metal.attention.impls.varlen_rope_compat import (
@@ -802,18 +823,13 @@ class TestPackedRoPE:
 
         recorded: list[mx.array] = []
 
-        class FakeMRoPE:
-            def rotary_emb(self, x, position_ids):
+        class FakeRotaryEmbedding:
+            def apply_rotary(self, q, k, position_ids):
                 recorded.append(position_ids)
-                seg_len = x.shape[2]
-                head_dim = x.shape[3]
-                cos = mx.zeros((1, 1, seg_len, head_dim))
-                sin = mx.zeros((1, 1, seg_len, head_dim))
-                return cos, sin
+                return q, k
 
-        fake_mod = types.ModuleType("mlx_vlm.models.qwen3_5.language")
-        fake_mod.apply_multimodal_rotary_pos_emb = lambda q, k, cos, sin: (q, k)
-        monkeypatch.setitem(sys.modules, "mlx_vlm.models.qwen3_5.language", fake_mod)
+        class FakeMRoPE:
+            rotary_emb = FakeRotaryEmbedding()
 
         q = mx.zeros((1, 1, 5, 2))
         k = mx.zeros((1, 1, 5, 2))

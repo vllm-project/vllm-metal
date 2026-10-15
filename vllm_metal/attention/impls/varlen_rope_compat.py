@@ -24,23 +24,6 @@ _VECTOR_OFFSET_ROPE_TYPES = (
 )
 
 
-def _apply_mrope_segment_with_positions(
-    rotary_emb: Callable[..., tuple[mx.array, mx.array]],
-    q_seg: mx.array,
-    k_seg: mx.array,
-    position_ids: mx.array,
-) -> tuple[mx.array, mx.array]:
-    """Apply M-RoPE with ``(3, 1, seq_len)`` positions over packed Q/K.
-
-    mlx_vlm's Qwen3_5RotaryEmbedding expects ``(x, position_ids)`` and returns
-    ``(cos, sin)``; the rotation is ``apply_multimodal_rotary_pos_emb``.
-    """
-    from mlx_vlm.models.qwen3_5.language import apply_multimodal_rotary_pos_emb
-
-    cos, sin = rotary_emb(q_seg, position_ids)  # type: ignore[operator]
-    return apply_multimodal_rotary_pos_emb(q_seg, k_seg, cos, sin)
-
-
 def _apply_single_token_batched_rope(
     rope_fn: Callable[..., mx.array],
     x: mx.array,
@@ -179,7 +162,8 @@ def apply_packed_rope(
     YOCO KV sharing where keys arrive already RoPE'd from a prior layer).
 
     Supports both mlx_lm's ``rope(x, offset=)`` API and mlx_vlm's
-    ``rotary_emb(x, position_ids)`` M-RoPE API (Qwen3.5).
+    ``rotary_emb.apply_rotary(q, k, position_ids)`` M-RoPE API (Qwen3-VL,
+    Qwen3.5).
     """
     rope_fn = getattr(attn_module, "rope", None)
     rotary_emb = getattr(attn_module, "rotary_emb", None) if rope_fn is None else None
@@ -211,10 +195,17 @@ def apply_packed_rope(
         # M-RoPE angles depend only on each token's own position ids, so the
         # whole packed batch rotates in one call over its concatenated
         # positions, instead of one cos/sin/rotate chain per segment.
+        # The embedding owns its frequency layout and its fused Metal kernel.
+        apply_rotary = getattr(rotary_emb, "apply_rotary", None)
+        if apply_rotary is None:
+            raise NotImplementedError(
+                f"Attention module {type(attn_module).__name__} exposes a "
+                f"rotary_emb ({type(rotary_emb).__name__}) without "
+                "apply_rotary(q, k, position_ids); only mlx_vlm "
+                "MRoPERotaryEmbedding-style M-RoPE is supported."
+            )
         position_ids = _packed_mrope_positions(cu_seqlens, offsets, positions)
-        rotated_q, rotated_k = _apply_mrope_segment_with_positions(
-            rotary_emb, queries, keys, position_ids
-        )
+        rotated_q, rotated_k = apply_rotary(queries, keys, position_ids)
         return rotated_q, (rotated_k if apply_keys else keys)
 
     q_parts = []
