@@ -579,8 +579,38 @@ def test_default_pool_for_mla_holds_one_latent_row_per_token(use_mla: bool) -> N
     MetalPlatform.check_and_update_config(vllm_config)
 
     extra = vllm_config.kv_transfer_config.kv_connector_extra_config
-    # layers * (kv_lora_rank + qk_rope_head_dim) * bf16, two 4096-token requests.
+    # layers * (kv_lora_rank + qk_rope_head_dim) * fp16, two 4096-token requests.
     assert extra["cpu_bytes_to_use"] == 62 * 288 * 2 * 4096 * 2 == 292_552_704
+
+
+def test_default_pool_for_mla_without_rope_dim_uses_the_runtime_default() -> None:
+    vllm_config = _base_config()
+    vllm_config.model_config.hf_text_config = SimpleNamespace(
+        model_type="deepseek_v2", kv_lora_rank=512
+    )
+    vllm_config.kv_transfer_config = _metal_connector_without_size()
+    _uniform_model(vllm_config, layers=2, kv_heads=1, head_size=576)
+    vllm_config.model_config.dtype = torch.float32
+
+    MetalPlatform.check_and_update_config(vllm_config)
+
+    extra = vllm_config.kv_transfer_config.kv_connector_extra_config
+    # layers * (kv_lora_rank + default rope 64) * fp32, two 4096-token requests.
+    assert extra["cpu_bytes_to_use"] == 2 * 576 * 4 * 4096 * 2
+
+
+def test_default_pool_for_null_kv_lora_rank_holds_k_and_v() -> None:
+    vllm_config = _base_config()
+    vllm_config.model_config.hf_text_config = SimpleNamespace(
+        model_type="qwen3", kv_lora_rank=None
+    )
+    vllm_config.kv_transfer_config = _metal_connector_without_size()
+    _uniform_model(vllm_config, layers=2, kv_heads=4, head_size=64)
+
+    MetalPlatform.check_and_update_config(vllm_config)
+
+    extra = vllm_config.kv_transfer_config.kv_connector_extra_config
+    assert extra["cpu_bytes_to_use"] == 2 * 2 * 4 * 64 * 2 * 4096 * 2
 
 
 def test_mla_pool_rope_default_matches_the_runtime() -> None:
