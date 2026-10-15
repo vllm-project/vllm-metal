@@ -1769,8 +1769,8 @@ class TestGDNLazySharedOwner:
         # Assert
         assert first is second
         assert calls == [
-            "gdn_conv1d_silu_decode_v2",
-            "gdn_conv1d_silu_prefill_v2",
+            "gdn_conv1d_decode_v2",
+            "gdn_conv1d_prefill_v2",
             "gdn_recurrent_decode_v2",
             "gdn_recurrent_prefill_v2",
         ]
@@ -1779,8 +1779,8 @@ class TestGDNLazySharedOwner:
         disabled = GDNLazyKernels.shared()
         assert disabled is not first
         assert calls == [
-            "gdn_conv1d_silu_decode_v2",
-            "gdn_conv1d_silu_prefill_v2",
+            "gdn_conv1d_decode_v2",
+            "gdn_conv1d_prefill_v2",
             "gdn_recurrent_decode_v2",
             "gdn_recurrent_prefill_v2",
         ]

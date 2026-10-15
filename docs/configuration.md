@@ -8,6 +8,7 @@ vllm-metal validates these variables when the engine configuration is created an
 |----------|---------|-------------|
 | `VLLM_MLX_DEVICE` | `gpu` | MLX device (`gpu` or `cpu`) |
 | `VLLM_METAL_DISABLE_NAX` | `0` | Emergency override for automatic M5 NAX prefill attention. Set to `1` to force the non-NAX fallback. |
+| `VLLM_METAL_SDPA_CONTIGUOUS_PREFILL` | `0` | Opt-in dense-cache prefill through fused MLX SDPA. Eligible requests gather their paged K/V into temporary buffers; the cache remains paged. See [eligibility and validation](#contiguous-sdpa-prefill). |
 | `VLLM_METAL_DISABLE_GQA_DECODE` | `0` | Set to `1` to keep eligible ordinary decode on the established per-token / split-KV kernels. Automatic GQA routing uses the [supported geometries, kernel pages and batch planning rules](gqa-decode.md), requiring 33 complete-partition SIMD groups per detected GPU core. It normally prefers the largest eligible 256/512-token partition; calibrated 10-core M3 guards narrow short-context admission and prefer P256 for supported head256 batches at longer contexts. This switch only disables the optimization. |
 | `VLLM_METAL_TQ_PREFILL` | `auto` | Materialize eligible TurboQuant prefills when NAX is available. `1` explicitly enables the tiled fallback on other GPUs; `0` keeps compressed attention. Set before worker startup. |
 | `VLLM_METAL_TQ_PREFILL_MAX_MIB` | `auto` | TurboQuant prefill workspace, reserved inside `gpu_memory_utilization` before KV sizing. `auto` caps the device allowance by model and scheduler limits for non-speculative serving, and can fall below 256 MiB. A number sets an explicit MiB limit; `0` disables materialization. See [automatic sizing and memory bounds](turboquant.md#prefill-acceleration). |
@@ -25,6 +26,31 @@ vllm-metal validates these variables when the engine configuration is created an
 | `VLLM_METAL_SPEC_INGEST_CHUNK` | `1024` | Maximum number of cold draft-model KV-ingest tokens processed per forward ([issue #482](https://github.com/vllm-project/vllm-metal/issues/482)). Chunking bounds each dispatch stall and the peak logits allocation; a multiple of the KV block size is recommended. Set to `0` to restore single-forward ingest; a non-integer or negative value fails the startup. |
 | `VLLM_METAL_VISIBLE_DEVICES` | — | Set automatically by the Ray executor per worker (the device-control var); not user-configurable. See [Distributed](distributed.md). |
 | `VLLM_METAL_RING_BASE_PORT` | `32323` | Base TCP port for the MLX ring data plane under pipeline parallelism, in the user-port range `[1024, 65535]`; stage *r* binds `base + r` (so the default is `32323`/`32324` for two stages). Set the **same** value on every node to move the ring off a busy port — e.g. when an `mlx.launch` job, a restart still in `TIME_WAIT`, or another PP job holds the default. See [Distributed](distributed.md#pipeline-parallelism). |
+
+## Contiguous SDPA Prefill
+
+`VLLM_METAL_SDPA_CONTIGUOUS_PREFILL=1` enables fused causal attention for
+eligible pure-prefill batches with FP16 or BF16 K/V. It requires the pinned
+MLX 0.32.2 and matching native artifacts. Head dimensions 64, 72, 80, 96 and
+128 require more than eight query tokens per request. Head dimension 256
+additionally requires NAX-capable hardware and at least 1024 query tokens
+per request. D192 and D512 keep the paged path.
+
+Every request must also exceed a conservative 15 GFLOP attention-work floor.
+This policy was measured on M5 Max at D128/D256; it is not a universal
+performance crossover. A batch containing an ineligible request stays paged.
+Decode, mixed decode/prefill, speculative verification, sliding windows,
+attention sinks, softcapping, bidirectional segments and TurboQuant keep their
+existing paths. Fused execution is required explicitly so MLX cannot silently
+materialize a full query-by-key score matrix.
+
+The temporary gathered K/V grows with the active requests' context lengths.
+Validate peak memory and serving performance for the intended workload using
+the [benchmarking guide](benchmarking-macos.md). The switch defaults off and
+is read dynamically. `VLLM_METAL_DISABLE_NAX=1` also disables this path,
+preserving the emergency override when both switches are set.
+Close attention outputs do not imply identical greedy
+token sequences; use the [parity tool](tools.md) with eligible long inputs.
 
 ## MLX Command-Buffer Defaults
 

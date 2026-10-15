@@ -8,13 +8,14 @@ from threading import Lock
 from typing import Any, ClassVar
 
 import mlx.core as mx
+import mlx.nn as nn
 
 import vllm_metal.envs as envs
 from vllm_metal.attention.caches.state_cache import PagedStateCache
 from vllm_metal.metal import _read_v2_metal_source
 
-_GDN_CONV1D_V2_SOURCE = _read_v2_metal_source("gdn_conv1d_silu_decode.metal")
-_GDN_CONV1D_PREFILL_V2_SOURCE = _read_v2_metal_source("gdn_conv1d_silu_prefill.metal")
+_GDN_CONV1D_V2_SOURCE = _read_v2_metal_source("gdn_conv1d_decode.metal")
+_GDN_CONV1D_PREFILL_V2_SOURCE = _read_v2_metal_source("gdn_conv1d_prefill.metal")
 _GDN_RECURRENT_DECODE_V2_SOURCE = _read_v2_metal_source("gdn_recurrent_decode.metal")
 _GDN_RECURRENT_PREFILL_V2_SOURCE = _read_v2_metal_source("gdn_recurrent_prefill.metal")
 _RECURRENT_SIMDGROUP_WIDTH = 32
@@ -110,7 +111,7 @@ class GDNLazyKernels:
             conv_kernel
             if conv_kernel is not None
             else self._make_kernel(
-                "gdn_conv1d_silu_decode_v2",
+                "gdn_conv1d_decode_v2",
                 ["input", "conv_state_in", "weights", "slot_mapping", "num_requests"],
                 ["output", "conv_state_out"],
                 _GDN_CONV1D_V2_SOURCE,
@@ -120,7 +121,7 @@ class GDNLazyKernels:
             conv_prefill_kernel
             if conv_prefill_kernel is not None
             else self._make_kernel(
-                "gdn_conv1d_silu_prefill_v2",
+                "gdn_conv1d_prefill_v2",
                 [
                     "input",
                     "conv_state_in",
@@ -279,7 +280,7 @@ class GDNLazyKernels:
             ("CONV_DIM", conv_dim),
             ("KERNEL_SIZE", kernel_size),
         ]
-        conv_silu_out, conv_state_updates = self._conv_kernel(
+        conv_out, conv_state_updates = self._conv_kernel(
             inputs=kernel_inputs,
             template=template,
             grid=(grid_size, 1, 1),
@@ -290,7 +291,7 @@ class GDNLazyKernels:
         state_cache.write_conv_rows(cache_idx, conv_state_updates, slot_ids_arr)
         if state_view.uses_compact_state:
             state_cache.clear_pending_conv_state(cache_idx)
-        return conv_silu_out.reshape(1, total_tokens, conv_dim)
+        return nn.silu(conv_out).reshape(1, total_tokens, conv_dim)
 
     def try_conv_prefill(
         self,
@@ -352,7 +353,7 @@ class GDNLazyKernels:
             output_dtypes=[output_dtype, conv_state_in.dtype],
         )
         state_cache.set_pending_conv_state(cache_idx, slot_ids, conv_state_updates)
-        return conv_out.reshape(1, total_tokens, conv_dim)
+        return nn.silu(conv_out).reshape(1, total_tokens, conv_dim)
 
     def try_recurrent_decode(
         self,
@@ -474,7 +475,7 @@ class GDNLazyKernels:
             request.q.reshape(total_tokens, n_hk, d_k).astype(kernel_dtype),
             request.k.reshape(total_tokens, n_hk, d_k).astype(kernel_dtype),
             request.v.reshape(total_tokens, n_hv, d_v).astype(kernel_dtype),
-            request.g.reshape(total_tokens, n_hv).astype(kernel_dtype),
+            request.g.reshape(total_tokens, n_hv),
             request.beta.reshape(total_tokens, n_hv).astype(kernel_dtype),
             state_in,
             cu_seqlens_arr,

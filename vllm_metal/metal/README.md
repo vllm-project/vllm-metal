@@ -39,8 +39,8 @@ MLX, via `_read_v2_metal_source`:
 
 | Shader | Compiled kernel name |
 |--------|----------------------|
-| `gdn_conv1d_silu_decode.metal` | `gdn_conv1d_silu_decode_v2` |
-| `gdn_conv1d_silu_prefill.metal` | `gdn_conv1d_silu_prefill_v2` |
+| `gdn_conv1d_decode.metal` | `gdn_conv1d_decode_v2` |
+| `gdn_conv1d_prefill.metal` | `gdn_conv1d_prefill_v2` |
 | `gdn_recurrent_decode.metal` | `gdn_recurrent_decode_v2` |
 | `gdn_recurrent_prefill.metal` | `gdn_recurrent_prefill_v2` |
 
@@ -58,7 +58,7 @@ MLX, via `_read_v2_metal_source`:
 | `mla.metal` | Single-pass paged Multi-head Latent Attention. |
 | `gdn_linear_attention.metal` | GDN (gated delta-net) linear-attention kernel for hybrid models. |
 | `gdn_state_scatter.metal` | Scatter or zero cache/state rows, including updates to shared upstream storage. |
-| `gdn_conv1d_silu_decode.metal` | Lazy GDN decode: causal conv1d + SiLU. |
-| `gdn_conv1d_silu_prefill.metal` | Lazy GDN prefill: causal conv1d + SiLU. |
+| `gdn_conv1d_decode.metal` | Lazy GDN decode: causal conv1d; MLX SiLU follows the dtype rounding boundary. |
+| `gdn_conv1d_prefill.metal` | Lazy GDN prefill: causal conv1d; MLX SiLU follows the dtype rounding boundary. |
 | `gdn_recurrent_decode.metal` | Lazy GDN decode: recurrent state update. |
 | `gdn_recurrent_prefill.metal` | Lazy GDN prefill: recurrent state updates over packed sequences. |

@@ -31,10 +31,11 @@ dependencies = [
     # libmlx.dylib carries no SONAME version (compatibility version 0.0.0), so
     # a wheel built against one MLX is only ABI-safe against that exact MLX.
     # Rebuild and re-release the wheel on every MLX bump.
-    "mlx==0.32.1; platform_system == 'Darwin' and platform_machine == 'arm64'",
-    # Git SHA (2026-08-25), not a version: this revision requires MLX >=0.32.1
-    # and includes cache APIs not available in the latest release (0.31.3).
-    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@9e6acca691e64d6d8bb808c328fcdea459099cca ; platform_system == 'Darwin' and platform_machine == 'arm64'",
+    # 0.32.2 adds fused D256 causal prefill on NAX devices.
+    "mlx==0.32.2; platform_system == 'Darwin' and platform_machine == 'arm64'",
+    # Pin the GDN Q/K normalization fix shared by the paged implementation
+    # and native model parity references; this revision requires MLX >=0.32.2.
+    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@a63e24c389382619eb6d9af656e3b46024be217a ; platform_system == 'Darwin' and platform_machine == 'arm64'",
     "llguidance>=1.7.0,<1.8.0; platform_machine == 'x86_64' or platform_machine == 'arm64' or platform_machine == 'aarch64' or platform_machine == 'ppc64le'",
     # mlx-vlm 0.6.8 drives MLX-quantized Qwen3.5/3.6 wrappers with correct
     # mRoPE state; 0.6.4 leaves it unset and garbles their output (#685).

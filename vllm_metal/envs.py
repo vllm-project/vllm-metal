@@ -123,6 +123,7 @@ if TYPE_CHECKING:
     VLLM_METAL_MLA_KERNEL: bool = False
     VLLM_METAL_DISABLE_NAX: bool = False
     VLLM_METAL_DISABLE_GQA_DECODE: bool = False
+    VLLM_METAL_SDPA_CONTIGUOUS_PREFILL: bool = False
     VLLM_METAL_TQ_PREFILL: str = "auto"
     VLLM_METAL_TQ_PREFILL_MAX_MIB: int | str = "auto"
     VLLM_METAL_SPEC_VERIFY_WINDOW: bool = False
@@ -191,6 +192,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # per-token / split-KV kernels. Mainly a benchmarking/A-B escape
     # hatch so controlled comparisons can run under the server topology.
     "VLLM_METAL_DISABLE_GQA_DECODE": _bool("VLLM_METAL_DISABLE_GQA_DECODE", False),
+    # Opt-in dense-cache prefill: gather request K/V for fused MLX SDPA.
+    "VLLM_METAL_SDPA_CONTIGUOUS_PREFILL": _bool(
+        "VLLM_METAL_SDPA_CONTIGUOUS_PREFILL", False
+    ),
     # TQ materialized prefill: auto enables only when NAX is available;
     # 1 explicitly opts into tiled prefill on older GPUs, 0 disables it.
     "VLLM_METAL_TQ_PREFILL": _choice("VLLM_METAL_TQ_PREFILL", "auto", TQ_PREFILL_MODES),

@@ -15,7 +15,8 @@ int64_t state_base = int64_t(slot) * conv_state_in_strides[0] + c;
 int state_out_base = req_idx * state_len * CONV_DIM + c;
 int weight_base = c * KERNEL_SIZE;
 
-// Active request: compute conv + SiLU and emit compact state update.
+// Round the convolution output before the wrapper applies MLX SiLU, matching
+// nn.silu(conv1d(x)) for half-precision activations.
 float inp = static_cast<float>(input[req_idx * CONV_DIM + c]);
 
 float acc = 0.0f;
@@ -25,7 +26,7 @@ for (int t = 0; t < state_len; ++t) {
 }
 acc += inp * static_cast<float>(weights[weight_base + state_len]);
 
-output[req_idx * CONV_DIM + c] = static_cast<T>(acc / (1.0f + metal::exp(-acc)));
+output[req_idx * CONV_DIM + c] = static_cast<T>(acc);
 
 for (int t = 0; t < state_len - 1; ++t) {
     conv_state_out[state_out_base + t * CONV_DIM] =

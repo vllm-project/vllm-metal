@@ -8,8 +8,8 @@ Covers:
 
 The ``prepare_sdpa_qkv`` tests use minimal fake attention modules rather
 than real mlx_lm Attention modules so they stay fast and deterministic.
-Metal kernel dispatch itself is covered by the end-to-end smoke tests,
-not here.
+Contiguous-prefill tests also exercise real cache writes and compare both
+attention implementations against an independent causal reference.
 """
 
 import logging
@@ -67,6 +67,13 @@ _CACHE_HEAD_DIM = 8  # Gemma4-style: cache wider than layer head_dim
 def _clear_attention_context() -> Iterator[None]:
     yield
     clear_context()
+
+
+@pytest.fixture(autouse=True)
+def _force_paged_prefill_kernel(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests capture paged-kernel calls; the contiguous prefill path
+    legitimately bypasses them, so pin it off."""
+    monkeypatch.setenv("VLLM_METAL_SDPA_CONTIGUOUS_PREFILL", "0")
 
 
 class _FakeLinear:
@@ -1817,3 +1824,429 @@ class TestPhiAttention:
         assert captured["scale"] == pytest.approx(head_dim**-0.5)
         # The output ran through PhiAttention.dense, not a missing o_proj.
         assert out is not None
+
+
+class TestContiguousPrefillPath:
+    """Routing and numerics for the contiguous flash-SDPA prefill read path."""
+
+    _NH = 2
+    _NKH = 2
+    _HD = 64
+    _HIDDEN = _NH * _HD
+    _SEQ = 64
+    _BS = 8
+    _NB = _SEQ // _BS
+
+    def _inner(self) -> SimpleNamespace:
+        def w(rows: int) -> mx.array:
+            return mx.random.normal((rows, self._HIDDEN)) * 0.05
+
+        return SimpleNamespace(
+            n_heads=self._NH,
+            n_kv_heads=self._NKH,
+            scale=self._HD**-0.5,
+            q_proj=_FakeLinear(w(self._NH * self._HD)),
+            k_proj=_FakeLinear(w(self._NKH * self._HD)),
+            v_proj=_FakeLinear(w(self._NKH * self._HD)),
+            rope=_identity_rope,
+            o_proj=lambda t: t,
+        )
+
+    def _ctx(self) -> PagedAttentionContext:
+        return PagedAttentionContext(
+            slot_mapping=list(range(self._SEQ)),
+            block_tables=[list(range(self._NB))],
+            context_lens=[self._SEQ],
+            offsets=[],
+            cu_seqlens=[0, self._SEQ],
+        )
+
+    def _cache(self) -> MetalPagedKVCache:
+        return MetalPagedKVCache(
+            num_layers=1,
+            num_kv_heads=self._NKH,
+            head_dim=self._HD,
+            num_blocks=self._NB,
+            block_size=self._BS,
+            dtype=mx.float16,
+        )
+
+    def _fake_ops(self, calls: list) -> type:
+        class _FakeOps(_PagedOpsCapsOff):
+            def reshape_and_cache(self, _k, _v, key_cache, value_cache, _sm):
+                return key_cache, value_cache
+
+            def paged_attention_primitive(self, *args, **kwargs) -> None:
+                calls.append(args)
+
+        return _FakeOps
+
+    def test_eligible_prefill_skips_paged_kernel(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("VLLM_METAL_SDPA_CONTIGUOUS_PREFILL", "1")
+        monkeypatch.setattr(sdpa_mod, "_MIN_FAST_PATH_FLOPS", 0.0)
+        calls: list = []
+        x = mx.random.normal((1, self._SEQ, self._HIDDEN))
+        with patch.object(sdpa_mod, "get_ops", return_value=self._fake_ops(calls)()):
+            out, _ = sdpa_forward(
+                self._inner(), x, self._ctx(), self._cache(), layer_idx=0
+            )
+        mx.eval(out)
+        assert out.shape == (1, self._SEQ, self._HIDDEN)
+        assert not calls
+
+    def test_flops_floor_falls_back_to_paged_kernel(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("VLLM_METAL_SDPA_CONTIGUOUS_PREFILL", "1")
+        monkeypatch.setattr(sdpa_mod, "_MIN_FAST_PATH_FLOPS", float("inf"))
+        calls: list = []
+        x = mx.random.normal((1, self._SEQ, self._HIDDEN))
+        with (
+            patch.object(sdpa_mod, "get_ops", return_value=self._fake_ops(calls)()),
+            patch.object(
+                sdpa_mod,
+                "truncate_padded_output",
+                return_value=mx.zeros((1, self._SEQ, self._HIDDEN)),
+            ),
+        ):
+            sdpa_forward(self._inner(), x, self._ctx(), self._cache(), layer_idx=0)
+        assert calls
+
+    def test_matches_paged_kernel_numerically(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mx.random.seed(0)
+        inner = self._inner()
+        x = mx.random.normal((1, self._SEQ, self._HIDDEN))
+        cache = self._cache()
+        monkeypatch.setenv("VLLM_METAL_SDPA_CONTIGUOUS_PREFILL", "0")
+        out_paged, _ = sdpa_forward(inner, x, self._ctx(), cache, layer_idx=0)
+        mx.eval(out_paged)
+        monkeypatch.setenv("VLLM_METAL_SDPA_CONTIGUOUS_PREFILL", "1")
+        monkeypatch.setattr(sdpa_mod, "_MIN_FAST_PATH_FLOPS", 0.0)
+        out_contig, _ = sdpa_forward(inner, x, self._ctx(), cache, layer_idx=0)
+        mx.eval(out_contig)
+        assert mx.allclose(out_paged, out_contig, atol=2e-2, rtol=2e-2)
+
+    @pytest.mark.parametrize(
+        ("head_dim", "query_len", "nax_supported"),
+        [
+            pytest.param(256, 512, True, id="wide-short-query"),
+            pytest.param(256, 1024, False, id="wide-without-nax"),
+            pytest.param(192, 1024, True, id="unfused-head192"),
+            pytest.param(512, 1024, True, id="unsupported-head512"),
+            pytest.param(64, 8, True, id="vector-query"),
+        ],
+    )
+    def test_unfused_geometries_stay_paged(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        head_dim: int,
+        query_len: int,
+        nax_supported: bool,
+    ) -> None:
+        monkeypatch.setenv("VLLM_METAL_SDPA_CONTIGUOUS_PREFILL", "1")
+        monkeypatch.setattr(sdpa_mod, "_MIN_FAST_PATH_FLOPS", 0.0)
+        seq_len = 2048
+        query = mx.zeros((query_len, 8, head_dim), dtype=mx.bfloat16)
+        cache = mx.zeros((64, 32, 2, head_dim), dtype=mx.bfloat16)
+        ctx = PagedAttentionContext(
+            slot_mapping=[],
+            context_lens=[seq_len],
+            cu_seqlens=[0, query_len],
+        )
+        with (
+            patch.object(
+                sdpa_mod,
+                "get_ops",
+                return_value=SimpleNamespace(nax_supported=lambda: nax_supported),
+            ),
+            patch.object(mx.fast, "scaled_dot_product_attention") as fused,
+        ):
+            out = sdpa_mod._contiguous_prefill_attention(
+                query,
+                cache,
+                cache,
+                mx.arange(64, dtype=mx.int32)[None],
+                mx.array(ctx.context_lens, dtype=mx.int32),
+                mx.array(ctx.cu_seqlens, dtype=mx.int32),
+                32,
+                2,
+                head_dim**-0.5,
+                -1,
+                None,
+                0.0,
+                ctx,
+            )
+        assert out is None
+        fused.assert_not_called()
+
+    @pytest.mark.parametrize("head_dim", [64, 72, 80, 96, 128, 256])
+    def test_eligible_geometry_requires_fused_attention(
+        self, monkeypatch: pytest.MonkeyPatch, head_dim: int
+    ) -> None:
+        monkeypatch.setenv("VLLM_METAL_SDPA_CONTIGUOUS_PREFILL", "1")
+        monkeypatch.setattr(sdpa_mod, "_MIN_FAST_PATH_FLOPS", 0.0)
+        query_len = 1024 if head_dim == 256 else 16
+        num_blocks = (query_len + 31) // 32
+        query = mx.zeros((query_len, 8, head_dim), dtype=mx.float16)
+        cache = mx.zeros((num_blocks, 32, 2, head_dim), dtype=mx.float16)
+        ctx = PagedAttentionContext(
+            slot_mapping=[],
+            context_lens=[query_len],
+            cu_seqlens=[0, query_len],
+        )
+        with (
+            patch.object(
+                sdpa_mod,
+                "get_ops",
+                return_value=SimpleNamespace(nax_supported=lambda: True),
+            ),
+            patch.object(
+                mx.fast,
+                "scaled_dot_product_attention",
+                side_effect=lambda q, *_args, **_kwargs: q,
+            ) as fused,
+        ):
+            out = sdpa_mod._contiguous_prefill_attention(
+                query,
+                cache,
+                cache,
+                mx.arange(num_blocks, dtype=mx.int32)[None],
+                mx.array(ctx.context_lens, dtype=mx.int32),
+                mx.array(ctx.cu_seqlens, dtype=mx.int32),
+                32,
+                2,
+                head_dim**-0.5,
+                -1,
+                None,
+                0.0,
+                ctx,
+            )
+        assert out is not None
+        assert out.shape == query.shape
+        fused.assert_called_once()
+        assert fused.call_args.kwargs["force_fused"] is True
+        assert fused.call_args.kwargs["mask"] == "causal"
+
+    @pytest.mark.parametrize(
+        "fallback",
+        [
+            "disabled",
+            "nax_disabled",
+            "float32",
+            "sliding_window",
+            "sinks",
+            "softcap",
+            "bidirectional",
+            "verification",
+            "decode_prefix",
+            "one_token_segment",
+        ],
+    )
+    def test_ineligible_attention_contract_stays_paged(
+        self, monkeypatch: pytest.MonkeyPatch, fallback: str
+    ) -> None:
+        monkeypatch.setenv(
+            "VLLM_METAL_SDPA_CONTIGUOUS_PREFILL",
+            "0" if fallback == "disabled" else "1",
+        )
+        monkeypatch.setenv(
+            "VLLM_METAL_DISABLE_NAX", "1" if fallback == "nax_disabled" else "0"
+        )
+        monkeypatch.setattr(sdpa_mod, "_MIN_FAST_PATH_FLOPS", 0.0)
+        dtype = mx.float32 if fallback == "float32" else mx.float16
+        query = mx.zeros((32, 8, 64), dtype=dtype)
+        cache = mx.zeros((2, 32, 2, 64), dtype=dtype)
+        ctx = PagedAttentionContext(
+            slot_mapping=[], context_lens=[64], cu_seqlens=[0, 32]
+        )
+        block_tables = mx.array([[0, 1]], dtype=mx.int32)
+        if fallback == "bidirectional":
+            ctx.segment_bidi_ranges = [[(32, 64)]]
+        elif fallback == "verification":
+            ctx.verify_window_q = 32
+        elif fallback == "decode_prefix":
+            ctx.num_decode_requests = 1
+        elif fallback == "one_token_segment":
+            ctx.context_lens = [1, 63]
+            ctx.cu_seqlens = [0, 1, 32]
+            block_tables = mx.array([[0, 0], [0, 1]], dtype=mx.int32)
+        with patch.object(mx.fast, "scaled_dot_product_attention") as fused:
+            out = sdpa_mod._contiguous_prefill_attention(
+                query,
+                cache,
+                cache,
+                block_tables,
+                mx.array(ctx.context_lens, dtype=mx.int32),
+                mx.array(ctx.cu_seqlens, dtype=mx.int32),
+                32,
+                2,
+                64**-0.5,
+                32 if fallback == "sliding_window" else -1,
+                mx.zeros((8,)) if fallback == "sinks" else None,
+                1.0 if fallback == "softcap" else 0.0,
+                ctx,
+            )
+        assert out is None
+        fused.assert_not_called()
+
+    @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+    @pytest.mark.parametrize(
+        ("head_dim", "block_size", "request_lengths"),
+        [
+            pytest.param(64, 32, ((17, 67), (33, 95)), id="prefix-small-pages"),
+            pytest.param(128, 544, ((35, 559), (17, 97)), id="chunk-large-pages"),
+            pytest.param(256, 784, ((1024, 1573), (1568, 2387)), id="nax-d256-prefix"),
+        ],
+    )
+    def test_upstream_gqa_prefix_matches_independent_causal_reference(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        dtype: mx.Dtype,
+        head_dim: int,
+        block_size: int,
+        request_lengths: tuple[tuple[int, int], ...],
+    ) -> None:
+        """Keep prefixes, page translation, tail masking and row order observable."""
+        if head_dim == 256 and not sdpa_mod.get_ops().nax_supported():
+            pytest.skip("D256 fused prefill requires NAX hardware")
+        mx.random.seed(11)
+        monkeypatch.setattr(sdpa_mod, "_MIN_FAST_PATH_FLOPS", 0.0)
+        n_heads, n_kv_heads = 8, 2
+        context_lens = [length for _, length in request_lengths]
+        block_counts = [
+            (length + block_size - 1) // block_size for length in context_lens
+        ]
+        num_blocks = sum(block_counts) + 2
+        spec = FullAttentionSpec(
+            block_size=block_size,
+            num_kv_heads=n_kv_heads,
+            head_size=head_dim,
+            dtype=torch.float16 if dtype == mx.float16 else torch.bfloat16,
+        )
+        vllm_config = VllmConfig()
+        vllm_config.cache_config.kv_cache_layout = "LBNHC"
+        config = get_kv_cache_config_from_groups(
+            vllm_config,
+            [KVCacheGroupSpec(layer_names=["attention"], kv_cache_spec=spec)],
+            num_blocks * spec.page_size_bytes,
+        )
+        config.kv_cache_layout = "LBNHC"
+        storage = KVCacheStorage(config)
+        cache = MetalPagedKVCache.from_upstream(storage, ["attention"])
+        # Unused physical pages and the last page's unwritten rows must never
+        # contribute. Retain the upstream interleaved K/V views and strides.
+        storage.buffers = [
+            mx.full(buffer.view(dtype).shape, float("nan"), dtype=dtype).view(
+                buffer.dtype
+            )
+            for buffer in storage.buffers
+        ]
+        physical_blocks = list(reversed(range(num_blocks)))
+        tables = []
+        cursor = 0
+        for count in block_counts:
+            tables.append(physical_blocks[cursor : cursor + count])
+            cursor += count
+
+        prefix_slots = []
+        prefix_indices = []
+        current_indices = []
+        current_slots = []
+        cu_seqlens = [0]
+        offsets = []
+        base = 0
+        for table, (query_len, context_len) in zip(
+            tables, request_lengths, strict=True
+        ):
+            slots = [
+                table[pos // block_size] * block_size + pos % block_size
+                for pos in range(context_len)
+            ]
+            prefix_len = context_len - query_len
+            prefix_slots.extend(slots[:prefix_len])
+            prefix_indices.extend(range(base, base + prefix_len))
+            current_indices.extend(range(base + prefix_len, base + context_len))
+            current_slots.extend(slots[prefix_len:])
+            offsets.append(prefix_len)
+            cu_seqlens.append(cu_seqlens[-1] + query_len)
+            base += context_len
+
+        total_q = cu_seqlens[-1]
+        q = mx.random.normal((total_q, n_heads, head_dim)).astype(dtype)
+        k = mx.random.normal((base, n_kv_heads, head_dim)).astype(dtype)
+        v = mx.random.normal((base, n_kv_heads, head_dim)).astype(dtype)
+        cached = mx.array(prefix_indices, dtype=mx.int32)
+        key_cache, value_cache = sdpa_mod.get_ops().reshape_and_cache(
+            k[cached],
+            v[cached],
+            cache.key_caches[0],
+            cache.value_caches[0],
+            mx.array(prefix_slots, dtype=mx.int64),
+        )
+        cache.replace_layer_cache(0, key_cache, value_cache)
+        mx.eval(*storage.buffers)
+
+        reference_parts = []
+        base = 0
+        for i, (query_len, context_len) in enumerate(request_lengths):
+            qi = q[cu_seqlens[i] : cu_seqlens[i + 1]].transpose(1, 0, 2)
+            ki = k[base : base + context_len].transpose(1, 0, 2)
+            vi = v[base : base + context_len].transpose(1, 0, 2)
+            ki = mx.repeat(ki.astype(mx.float32), n_heads // n_kv_heads, axis=0)
+            vi = mx.repeat(vi.astype(mx.float32), n_heads // n_kv_heads, axis=0)
+            scores = (qi.astype(mx.float32) * head_dim**-0.5) @ ki.transpose(0, 2, 1)
+            visible = (
+                mx.arange(context_len)[None, :]
+                <= mx.arange(context_len - query_len, context_len)[:, None]
+            )
+            scores = mx.where(visible, scores, -float("inf"))
+            reference_parts.append(
+                (mx.softmax(scores, axis=-1) @ vi).transpose(1, 0, 2)
+            )
+            base += context_len
+        reference = mx.concatenate(reference_parts).reshape(
+            1, total_q, n_heads * head_dim
+        )
+        selected = mx.array(current_indices, dtype=mx.int32)
+        queries = q.transpose(1, 0, 2)[None]
+        keys = k[selected].transpose(1, 0, 2)[None]
+        values = v[selected].transpose(1, 0, 2)[None]
+        ctx = PagedAttentionContext(
+            slot_mapping=current_slots,
+            block_tables=tables,
+            context_lens=context_lens,
+            offsets=offsets,
+            cu_seqlens=cu_seqlens,
+        )
+        inner = SimpleNamespace(
+            n_heads=n_heads,
+            n_kv_heads=n_kv_heads,
+            scale=head_dim**-0.5,
+            o_proj=lambda t: t,
+        )
+        x = mx.zeros((1, total_q, n_heads * head_dim), dtype=dtype)
+        with patch.object(
+            sdpa_mod,
+            "prepare_sdpa_qkv",
+            return_value=(queries, keys, values, None, (keys, values)),
+        ):
+            monkeypatch.setenv("VLLM_METAL_SDPA_CONTIGUOUS_PREFILL", "1")
+            with patch.object(
+                mx.fast,
+                "scaled_dot_product_attention",
+                wraps=mx.fast.scaled_dot_product_attention,
+            ) as fused:
+                contiguous, _ = sdpa_forward(inner, x, ctx, cache, layer_idx=0)
+                mx.eval(contiguous, reference)
+            monkeypatch.setenv("VLLM_METAL_SDPA_CONTIGUOUS_PREFILL", "0")
+            paged, _ = sdpa_forward(inner, x, ctx, cache, layer_idx=0)
+            mx.eval(paged)
+        assert fused.call_count == len(request_lengths)
+        assert all(call.kwargs["force_fused"] for call in fused.call_args_list)
+        assert bool(mx.all(mx.isfinite(contiguous)))
+        assert mx.allclose(contiguous, reference, atol=2e-2, rtol=2e-2)
+        assert mx.allclose(paged, reference, atol=2e-2, rtol=2e-2)

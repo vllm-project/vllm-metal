@@ -32,12 +32,13 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 
 import mlx.core as mx
 import mlx.nn as nn
 from vllm.logger import init_logger
 
+from vllm_metal import envs
 from vllm_metal.attention.attention_contracts import (
     DEFAULT_ATTENTION_CONTRACT,
     AttentionContract,
@@ -541,6 +542,94 @@ def _float32_sinks(inner: nn.Module) -> mx.array | None:
     return cached[1]
 
 
+# Conservative per-request floor from M5 Max measurements at D128/D256.
+# This is an admission policy, not a measured crossover for every device.
+_MIN_FAST_PATH_FLOPS = 1.5e10
+
+
+def _contiguous_prefill_attention(
+    q_3d: mx.array,
+    k_cache: mx.array,
+    v_cache: mx.array,
+    block_tables: mx.array,
+    seq_lens: mx.array,
+    cu_seqlens: mx.array,
+    block_size: int,
+    num_kv_heads: int,
+    scale: float,
+    sliding_window: int,
+    sinks: mx.array | None,
+    softcap: float,
+    ctx: PagedAttentionContext,
+) -> mx.array | None:
+    """Gather each eligible request's paged K/V for fused causal SDPA."""
+    if not envs.VLLM_METAL_SDPA_CONTIGUOUS_PREFILL or envs.VLLM_METAL_DISABLE_NAX:
+        return None
+    if (
+        sinks is not None
+        or softcap > 0
+        or sliding_window >= 0
+        or ctx.segment_bidi_ranges is not None
+        or ctx.verify_window_q != 1
+        or ctx.num_decode_requests > 0
+    ):
+        return None
+    if (
+        q_3d.dtype not in (mx.bfloat16, mx.float16)
+        or k_cache.dtype != q_3d.dtype
+        or v_cache.dtype != q_3d.dtype
+    ):
+        return None
+    total_q, n_heads, head_dim = q_3d.shape
+    num_seqs = seq_lens.shape[0]
+    if total_q <= num_seqs:
+        return None  # decode-shaped batch
+    # MLX 0.32.2's full-attention fused geometries. D192 defaults to the
+    # unfused implementation; D512 has no fused implementation at all.
+    if head_dim not in (64, 72, 80, 96, 128, 256):
+        return None
+    if head_dim == 256 and not get_ops().nax_supported():
+        return None
+
+    lens = cast(list[int], seq_lens.tolist())
+    cus = cast(list[int], cu_seqlens.tolist())
+    for i in range(num_seqs):
+        lq = cus[i + 1] - cus[i]
+        # Stay out of MLX's vector-attention route and its GQA limits.
+        # D256's NAX full-attention policy additionally requires Q >= 1024.
+        if lq <= 8 or (head_dim == 256 and lq < 1024):
+            return None
+        if 4 * n_heads * head_dim * lq * (lens[i] - lq / 2) < _MIN_FAST_PATH_FLOPS:
+            return None
+    # The cache may be viewed at the vLLM block size; the expanded block
+    # tables index kernel blocks in the flat kernel-block view.
+    k_flat = k_cache.reshape(-1, block_size, num_kv_heads, head_dim)
+    v_flat = v_cache.reshape(-1, block_size, num_kv_heads, head_dim)
+    parts = []
+    for i in range(num_seqs):
+        qs, qe = cus[i], cus[i + 1]
+        n_ctx = lens[i]
+        nblk = (n_ctx + block_size - 1) // block_size
+        blk = block_tables[i, :nblk]
+        k_all = k_flat[blk].reshape(nblk * block_size, num_kv_heads, head_dim)[:n_ctx]
+        v_all = v_flat[blk].reshape(nblk * block_size, num_kv_heads, head_dim)[:n_ctx]
+        # q rows are the trailing tokens of the request, so the non-square
+        # right-aligned causal mask is the correct prefill semantics.
+        y = mx.fast.scaled_dot_product_attention(
+            q_3d[qs:qe].transpose(1, 0, 2)[None],
+            k_all.transpose(1, 0, 2)[None],
+            v_all.transpose(1, 0, 2)[None],
+            scale=scale,
+            mask="causal",
+            # Never silently expand an H x Q x KV score matrix if MLX's
+            # dispatch heuristics change. The gates above keep unsupported
+            # geometries on the paged path.
+            force_fused=True,
+        )
+        parts.append(y[0].transpose(1, 0, 2))
+    return parts[0] if len(parts) == 1 else mx.concatenate(parts, axis=0)
+
+
 def sdpa_forward(
     inner: nn.Module,
     x: mx.array,
@@ -803,7 +892,26 @@ def sdpa_forward(
         {} if mm_prefix_ranges is None else {"mm_prefix_ranges": mm_prefix_ranges}
     )
     out = mx.array(0)
-    if kv_cache.turboquant:
+    contig_out = None
+    if not kv_cache.turboquant:
+        contig_out = _contiguous_prefill_attention(
+            q_3d,
+            kernel_k_cache,
+            kernel_v_cache,
+            block_tables,
+            seq_lens,
+            cu_seqlens_q,
+            kernel_block_size,
+            cache_kv_heads,
+            attn_scale,
+            layer_sliding_window,
+            sinks,
+            attn_softcap,
+            ctx,
+        )
+    if contig_out is not None:
+        out = contig_out
+    elif kv_cache.turboquant:
         # Preserve the compressed primitive's layout and rejection contracts
         # for decode, short continuations, verification, sinks and image rows.
         kernel_key_scale = new_key_scale_cache

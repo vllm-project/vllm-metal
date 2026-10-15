@@ -3,9 +3,10 @@
 // Outputs: output, conv_state_out
 // Grid: ((total_tokens + num_requests * (KERNEL_SIZE - 1)) * CONV_DIM, 1, 1)
 //
-// Prefill-containing depthwise conv counterpart to gdn_conv1d_silu_decode.metal.
-// The first total_tokens * CONV_DIM threads compute SiLU(depthwise conv) for
-// packed prefill tokens.  The tail threads emit compact updated conv state for
+// Prefill-containing depthwise conv counterpart to gdn_conv1d_decode.metal.
+// The first total_tokens * CONV_DIM threads compute depthwise conv for
+// packed prefill tokens. MLX SiLU runs after rounding to the activation dtype.
+// The tail threads emit compact updated conv state for
 // active request slots.
 
 uint tid = thread_position_in_grid.x;
@@ -43,7 +44,7 @@ if (tid < output_threads) {
         acc += val * static_cast<float>(weights[weight_base + j]);
     }
 
-    output[token_idx * CONV_DIM + c] = static_cast<T>(acc / (1.0f + metal::exp(-acc)));
+    output[token_idx * CONV_DIM + c] = static_cast<T>(acc);
     return;
 }
 
