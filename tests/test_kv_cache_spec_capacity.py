@@ -61,7 +61,8 @@ def test_mla_spec_matches_single_latent_cache() -> None:
     policy = _policy(num_layers=layers, is_mla=True, head_dim=latent, num_kv_heads=1)
     specs = policy.get_kv_cache_spec()
 
-    assert all(isinstance(s, MLAAttentionSpec) for s in specs.values())
+    # Exact type: KV offloading refuses MLAAttentionSpec subclasses.
+    assert all(type(s) is MLAAttentionSpec for s in specs.values())
 
     # _kv_factor() == 1 for MLA
     metal_per_block = 1 * BLOCK_SIZE * DTYPE.itemsize * layers * 1 * latent

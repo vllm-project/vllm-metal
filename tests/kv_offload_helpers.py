@@ -16,7 +16,11 @@ import torch
 from vllm.config import VllmConfig
 from vllm.v1.attention.backends.utils import record_kv_cache_layout
 from vllm.v1.core.kv_cache_utils import get_kv_cache_config_from_groups
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheGroupSpec,
+    MLAAttentionSpec,
+)
 from vllm.v1.kv_offload.base import GPULoadStoreSpec
 
 from vllm_metal.attention.caches.placement import KV_CACHE_LAYOUT
@@ -36,12 +40,20 @@ def make_storage(
     num_blocks: int = 8,
     block_size: int = 4,
     turboquant: bool = False,
+    mla: bool = False,
     k_quant: str = "q8_0",
     v_quant: str = "q3_0",
 ) -> KVCacheStorage:
-    """A single-group full-attention cache allocated by vLLM."""
-    if turboquant:
-        spec: FullAttentionSpec = TurboQuantAttentionSpec(
+    """A single-group full-attention cache allocated by vLLM.
+
+    With ``mla``, one latent head of ``head_dim`` per token, as MLA binds it.
+    """
+    if mla:
+        spec: FullAttentionSpec = MLAAttentionSpec(
+            block_size=block_size, num_kv_heads=1, head_size=head_dim, dtype=dtype
+        )
+    elif turboquant:
+        spec = TurboQuantAttentionSpec(
             block_size=block_size,
             num_kv_heads=num_kv_heads,
             head_size=head_dim,
