@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """MPS-stream dispatch parity, including KV layout, split decode and verification."""
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -39,6 +40,51 @@ assert sys.modules["_paged_ops"] is None
         text=True,
     )
     assert result.stderr.count("GPU core count is unknown") == 1
+
+
+def test_mps_tiled_prefill_binds_every_kernel_argument():
+    # Metal API validation logs each kernel argument a dispatch leaves unbound.
+    metallib = (
+        Path(__file__).resolve().parents[1]
+        / "vllm_metal"
+        / "metal"
+        / "paged_attention_v2_kern.metallib"
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import sys
+import torch
+from vllm_metal.pytorch_backend.mps_ops import get_mps_ops
+ops = type(get_mps_ops())(sys.argv[1], "", 20)  # No NAX library: tiled prefill.
+q = torch.randn(40, 16, 128, dtype=torch.bfloat16, device="mps")
+k, v = torch.randn(2, 40, 8, 128, dtype=torch.bfloat16, device="mps")
+cache = torch.zeros(4, 16, 8, 256, dtype=torch.bfloat16, device="mps")
+ops.forward(
+    q, k, v, cache[..., :128], cache[..., 128:],
+    torch.arange(16, 56, device="mps"),
+    torch.tensor([[1, 2, 3]], dtype=torch.int32, device="mps"),
+    torch.tensor([40], dtype=torch.int32, device="mps"),
+    torch.tensor([0, 40], dtype=torch.int32, device="mps"),
+    torch.empty_like(q), 40, 128**-0.5, -1, 0.0, 1,
+)
+torch.mps.synchronize()
+""",
+            str(metallib),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "MTL_DEBUG_LAYER": "1",
+            "MTL_DEBUG_LAYER_ERROR_MODE": "nslog",
+        },
+    )
+    assert "Metal API Validation Enabled" in result.stderr
+    assert "Compute Function(paged_attention" not in result.stderr
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
