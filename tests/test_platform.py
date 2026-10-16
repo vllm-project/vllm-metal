@@ -266,6 +266,28 @@ class TestMetalPlatform:
     def test_validate_request_accepts_min_p(self) -> None:
         MetalPlatform.validate_request({}, SamplingParams(min_p=0.2))
 
+    @pytest.mark.parametrize(
+        "omni,controls,unsupported",
+        [
+            (True, {}, None),
+            (True, {"temperature": 0.9}, "temperature"),
+            (True, {"repetition_penalty": 1.05}, None),
+            (False, {"repetition_penalty": 1.05}, "repetition_penalty"),
+            (True, {"frequency_penalty": 0.2}, "frequency_penalty"),
+            (True, {"presence_penalty": 0.2}, "presence_penalty"),
+            (True, {"allowed_token_ids": [0]}, "allowed_token_ids"),
+        ],
+    )
+    def test_mps_omni_sampling_controls(self, monkeypatch, omni, controls, unsupported):
+        monkeypatch.setattr("vllm_metal.envs.VLLM_METAL_BACKEND", "mps")
+        monkeypatch.setattr(MetalPlatform, "_serves_omni", omni)
+        params = SamplingParams(**({"temperature": 0} | controls))
+        if unsupported is None:
+            MetalPlatform.validate_request({}, params)
+        else:
+            with pytest.raises(VLLMValidationError, match=unsupported):
+                MetalPlatform.validate_request({}, params)
+
     def test_check_and_update_config_rejects_pipeline_with_tensor_parallel(
         self,
     ) -> None:
