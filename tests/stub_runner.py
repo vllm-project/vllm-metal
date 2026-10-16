@@ -81,7 +81,51 @@ def initialize_hybrid_runtime(
             for i in plan.layers.state_indices
         }
     )
-    config = SimpleNamespace(
+    config = _grouping_config(block_size, num_blocks)
+    groups = get_kv_cache_groups(config, specs)
+    cache = get_kv_cache_config_from_groups(
+        config, groups, num_blocks * page * len(specs)
+    )
+    cache.kv_cache_layout = "LBNHC"
+    runtime.initialize_from_config(cache)
+    return cache
+
+
+def initialize_mla_runtime(
+    num_blocks, *, num_layers, kv_lora_rank=512, rope_dim=64, block_size=16
+):
+    """Build a standalone MLA runtime through the cache policy, from vLLM's real
+    grouping and placement of the policy's specs."""
+    from vllm.v1.core.kv_cache_utils import (
+        get_kv_cache_config_from_groups,
+        get_kv_cache_groups,
+    )
+
+    runner = make_stub_runner(
+        model_args={"kv_lora_rank": kv_lora_rank, "qk_rope_head_dim": rope_dim},
+        num_layers=num_layers,
+        num_kv_cache_layers=num_layers,
+        num_kv_heads=1,
+        head_dim=kv_lora_rank + rope_dim,
+        kv_cache_dtype=mx.float16,
+        cache_config=make_cache_config(block_size=block_size),
+        model=SimpleNamespace(layers=[]),
+    )
+    specs = runner.get_kv_cache_spec()
+    page = next(iter(specs.values())).page_size_bytes
+    config = _grouping_config(block_size, num_blocks)
+    groups = get_kv_cache_groups(config, specs)
+    cache = get_kv_cache_config_from_groups(
+        config, groups, num_blocks * page * len(specs)
+    )
+    cache.kv_cache_layout = "LBNHC"
+    runner.initialize_kv_cache(cache)
+    return runner.paged_attention_runtime
+
+
+def _grouping_config(block_size: int, num_blocks: int) -> SimpleNamespace:
+    """The engine config fields vLLM's KV grouping and placement read."""
+    return SimpleNamespace(
         speculative_config=None,
         attention_config=AttentionConfig(),
         cache_config=make_cache_config(
@@ -90,13 +134,6 @@ def initialize_hybrid_runtime(
         scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
         model_config=SimpleNamespace(is_deepseek_v4=False),
     )
-    groups = get_kv_cache_groups(config, specs)
-    cache = get_kv_cache_config_from_groups(
-        config, groups, num_blocks * page * len(specs)
-    )
-    cache.kv_cache_layout = "LBNHC"
-    runtime.initialize_from_config(cache)
-    return cache
 
 
 def make_cache_config(**kwargs: Any) -> CacheConfig:

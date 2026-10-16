@@ -454,9 +454,7 @@ class ModelCachePolicy:
         return plan
 
     def _uses_upstream_storage(self) -> bool:
-        return self._runner.is_hybrid or (
-            not self._runner.is_mla and self._runner._draft_dims is None
-        )
+        return self._runner.is_hybrid or self._runner._draft_dims is None
 
     def _uses_grouped_attention(self) -> bool:
         """Return whether the scheduler keeps distinct attention-window groups."""
@@ -652,7 +650,7 @@ class ModelCachePolicy:
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """Bind layout-driven caches from the final engine configuration.
 
-        Count-initialized speculative/MLA runtimes adopt the engine's groups;
+        Count-initialized draft-model runtimes adopt the engine's groups;
         other runtimes bind the engine's shared backing here.
         """
         self._adopt_draft_scheduler_group(kv_cache_config)
@@ -714,8 +712,12 @@ class ModelCachePolicy:
             )
             return
         model_layer_names = self._attention_layer_names()
-        runtime = self._build_sdpa_backend(
-            block_size=self._runner.cache_config.block_size
+        runtime = (
+            self._build_mla_backend(self._runner.cache_config.block_size)
+            if self._runner.is_mla
+            else self._build_sdpa_backend(
+                block_size=self._runner.cache_config.block_size
+            )
         )
         runtime.initialize_from_config(kv_cache_config, model_layer_names)
         n_patched = runtime.patch_model(self._runner.model)
@@ -1067,9 +1069,9 @@ class WorkerCachePlanner:
         backend = self._worker.model_runner.build_paged_attention_runtime(
             block_size=plan.block_size
         )
-        # Hybrid models always size their cache from vLLM's KV cache config
+        # Only draft-model speculation still sizes its pool here
         # (``ModelCachePolicy._uses_upstream_storage``), so only the SDPA and
-        # MLA runtimes, which own ``initialize``, reach this path.
+        # MLA target runtimes, which own ``initialize``, reach this path.
         if not isinstance(
             backend, (SDPAPagedAttentionRuntime, MLAPagedAttentionRuntime)
         ):

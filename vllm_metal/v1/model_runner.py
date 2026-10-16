@@ -1017,9 +1017,9 @@ class MetalModelRunner:
         """Hand the runtime's KV storage to the KV connector, and build its driver.
 
         Called by the worker after ``initialize_kv_cache`` when a KV connector
-        is configured. Only the SDPA runtime binds vLLM's allocation as
-        ``KVCacheStorage``. Hybrid, MLA and count-based (draft model) caches
-        have nothing the connector can address.
+        is configured. Only the SDPA runtime's ``KVCacheStorage`` is registered.
+        Hybrid and count-based (draft model) caches have no layout the connector
+        can address, and KV offloading does not support MLA models yet.
         """
         from vllm_metal.attention.runtime.sdpa import SDPAPagedAttentionRuntime
 

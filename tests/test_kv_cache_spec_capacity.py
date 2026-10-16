@@ -68,6 +68,16 @@ def test_mla_spec_matches_single_latent_cache() -> None:
     assert _engine_blocks(specs, metal_per_block) == POOL_BLOCKS
 
 
+def test_mla_reports_layout_budget_unless_drafting() -> None:
+    """MLA binds vLLM's shared allocation; only draft-model speculation keeps
+    the count-based pool."""
+    policy = _policy(num_layers=2, is_mla=True, head_dim=576, num_kv_heads=1)
+    assert policy.scheduler_memory_reporting_mode() == "paged_attention_layout_budget"
+
+    policy._runner._draft_dims = SimpleNamespace(num_layers=1)
+    assert policy.scheduler_memory_reporting_mode() == "paged_attention_capacity"
+
+
 def test_yoco_shared_layers_get_no_spec() -> None:
     """Only the layers that own a cache may appear in the spec."""
     layers, owned = 35, 15

@@ -593,6 +593,67 @@ def test_batched_decode_matches_absorbed_loop(
     np.testing.assert_allclose(np.array(out), np.array(ref), atol=atol, rtol=1e-2)
 
 
+@pytest.mark.parametrize("kernel", [False, True], ids=["batched-sdpa", "kernel"])
+def test_shared_storage_matches_count_based_cache(
+    kernel: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Prefill, then the batched decode (or the single-pass kernel), over latent
+    views of vLLM's shared allocation must match a count-based cache."""
+    import vllm_metal.attention.impls.mla as mla_mod
+    from tests.stub_runner import initialize_mla_runtime
+
+    monkeypatch.setattr("vllm_metal.envs.VLLM_METAL_MLA_KERNEL", kernel)
+    monkeypatch.setattr(mla_mod, "_DECODE_BATCH_MIN_ROWS", 4)
+    inner, _, count_based = _make(num_blocks=16)
+    runtime = initialize_mla_runtime(
+        16, num_layers=1, kv_lora_rank=_KVL, rope_dim=_ROPE, block_size=_BLK
+    )
+    # torch.empty may hand back reused heap memory; start from the zeros the
+    # count-based cache has.
+    runtime.storage.zero_blocks(range(16))
+    shared = MLAPagedAttentionWrapper(inner, layer_idx=0, latent_cache=runtime._cache)
+
+    pasts = [5, 17, 30, 9, 21, 12]
+    tables = [[1 + 2 * i, 2 + 2 * i] for i in range(len(pasts))]
+
+    def slots(block_ids: list[int], start: int, num: int) -> list[int]:
+        return [
+            block_ids[pos // _BLK] * _BLK + pos % _BLK
+            for pos in range(start, start + num)
+        ]
+
+    prefill = pac.PagedAttentionContext(
+        slot_mapping=[
+            s for t, p in zip(tables, pasts, strict=True) for s in slots(t, 0, p)
+        ],
+        block_tables=tables,
+        context_lens=pasts,
+        cu_seqlens=[0] + [int(c) for c in np.cumsum(pasts)],
+        offsets=[0] * len(pasts),
+    )
+    decode = pac.PagedAttentionContext(
+        slot_mapping=[slots(t, p, 1)[0] for t, p in zip(tables, pasts, strict=True)],
+        block_tables=tables,
+        context_lens=[p + 1 for p in pasts],
+        cu_seqlens=list(range(len(pasts) + 1)),
+        offsets=pasts,
+        num_decode_requests=len(pasts),
+    )
+    x1 = mx.random.normal((1, sum(pasts), _HID)).astype(mx.float16)
+    x2 = mx.random.normal((1, len(pasts), _HID)).astype(mx.float16)
+
+    def run(wrapper: MLAPagedAttentionWrapper) -> mx.array:
+        pac.set_context(prefill)
+        mx.eval(wrapper(x1, mask=None, cache=None))
+        pac.set_context(decode)
+        out = wrapper(x2, mask=None, cache=None)
+        mx.eval(out)
+        pac.clear_context()
+        return out
+
+    np.testing.assert_array_equal(np.array(run(shared)), np.array(run(count_based)))
+
+
 @pytest.mark.parametrize("quantize", [False, True], ids=["dense", "quantized-4bit"])
 def test_absorbed_attention_folds_query_heads(
     quantize: bool, monkeypatch: pytest.MonkeyPatch

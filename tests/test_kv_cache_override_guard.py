@@ -3,16 +3,28 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
 import mlx.core as mx
 import pytest
-from vllm.v1.kv_cache_interface import KVCacheConfig
+import torch
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+)
 
 from tests.stub_runner import make_stub_runner
 from vllm_metal.attention.runtime.mla import MLAPagedAttentionRuntime
+from vllm_metal.v1.draft_model_proposer import DraftModelProposer
 
 
 def _make_policy(allocated_blocks: int | None):
-    """Build a stub runner whose paged runtime reports ``allocated_blocks``."""
+    """Build a stub runner whose paged runtime reports ``allocated_blocks``.
+
+    Only draft-model speculation still allocates a count-based pool.
+    """
     runtime = None
     if allocated_blocks is not None:
         runtime = MLAPagedAttentionRuntime(
@@ -25,15 +37,20 @@ def _make_policy(allocated_blocks: int | None):
     runner = make_stub_runner(
         model_args={"kv_lora_rank": 1},
         _paged_attention_runtime=runtime,
+        _draft_dims=SimpleNamespace(num_layers=1),
+        _drafter=MagicMock(spec=DraftModelProposer),
     )
     return runner._cache_policy
 
 
 def _kv_config(num_blocks: int) -> KVCacheConfig:
+    draft = FullAttentionSpec(
+        block_size=1, num_kv_heads=1, head_size=1, dtype=torch.bfloat16
+    )
     return KVCacheConfig(
         num_blocks=num_blocks,
         kv_cache_tensors=[],
-        kv_cache_groups=[],
+        kv_cache_groups=[KVCacheGroupSpec(["draft_layers.0.self_attn"], draft)],
     )
 
 

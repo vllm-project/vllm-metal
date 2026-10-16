@@ -13,7 +13,11 @@ import torch
 from mlx_lm.models.base import scaled_dot_product_attention
 
 import vllm_metal.attention.runtime.mla as mla_runtime
-from tests.stub_runner import initialize_hybrid_runtime, make_bailing_hybrid_plan
+from tests.stub_runner import (
+    initialize_hybrid_runtime,
+    initialize_mla_runtime,
+    make_bailing_hybrid_plan,
+)
 from vllm_metal.attention import context as pac
 from vllm_metal.attention.caches.mla_cache import MLAPagedLatentCache
 from vllm_metal.attention.impls.mla import MLAPagedAttentionWrapper
@@ -886,6 +890,42 @@ class TestSinglePassRouting:
             MLAPagedAttentionWrapper._pick_heads_per_tg(num_heads, batch_size)
             == expected_g
         )
+
+
+class TestSharedStorageRuntime:
+    """Standalone MLA binds latent views of vLLM's shared KV allocation."""
+
+    def _make_backend(self) -> MLAPagedAttentionRuntime:
+        return initialize_mla_runtime(6, num_layers=2)
+
+    def test_binds_dense_views_the_kernel_admits(self, monkeypatch) -> None:
+        monkeypatch.setattr("vllm_metal.envs.VLLM_METAL_MLA_KERNEL", True)
+        backend = self._make_backend()
+        cache = backend._cache
+
+        assert backend.num_blocks() == 6
+        assert backend.kv_scheduler_group_indices() == (0,)
+        assert backend.kv_group_block_sizes() == (16,)
+        assert cache.latent_caches[1].shape == (6, 16, _LATENT_DIM)
+        wrapper = MLAPagedAttentionWrapper(_KernelDimsAbsorbedInner(), 0, cache)
+        assert wrapper._can_use_kernel(wrapper._inner, cache, _make_decode_ctx())
+
+    def test_copy_blocks_reach_the_shared_backing(self) -> None:
+        backend = self._make_backend()
+        cache = backend._cache
+        rows = mx.random.normal((16, _LATENT_DIM)).astype(mx.float16)
+        for layer in range(2):
+            cache.write_slots(layer, mx.arange(16, 32), rows + layer)  # block 1
+
+        backend.copy_blocks([(1, 4)])
+        outputs: list[mx.array] = []
+        backend.extend_forward_eval_outputs(outputs)
+        mx.eval(*outputs)
+
+        names = ["layers.0.self_attn", "layers.1.self_attn"]
+        rebound = MLAPagedLatentCache.from_upstream(backend.storage, names)
+        for layer in range(2):
+            assert bool(mx.array_equal(rebound.latent_caches[layer][4], rows + layer))
 
 
 class TestMLAPerForwardMetadata:
