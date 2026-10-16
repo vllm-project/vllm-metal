@@ -59,6 +59,7 @@ import contextlib
 import ctypes
 import importlib.metadata
 import json
+import math
 import mmap
 import os
 import platform
@@ -83,12 +84,10 @@ KV_BUDGET_RE = re.compile(r"reporting ([\d.]+) GB KV budget")
 # offloaded block and a spilling workload can ask for tens of GB.
 DISK_HEADROOM_GB = 15.0
 
-# Leave this much RAM to the rest of the machine. Resident set is weights plus
-# the wired KV cache plus the host offload pool, and the host pool is pageable:
-# overcommit it and the machine swaps or dies rather than the server failing
-# cleanly. The pool is budgeted inside --gpu-memory-utilization, so the
-# fraction alone bounds weights, wired cache and pool together.
+# Scale the 40 GiB reserve used on 128 GiB Macs down on smaller machines.
+# The host pool comes out of --gpu-memory-utilization, not on top of it.
 RAM_HEADROOM_GB = 40.0
+RAM_HEADROOM_REFERENCE_GB = 128.0
 
 # TTFT only means "time to prefill" while the server is not saturated. Firing
 # every request at once measures admission queueing instead, and anything that
@@ -119,6 +118,7 @@ def environment_metadata(args: argparse.Namespace) -> dict[str, Any]:
         "free_disk_gb": round(shutil.disk_usage(work_root()).free / (1 << 30), 1),
         "memory_fraction": args.memory_fraction,
         "baseline_memory_fraction": args.baseline_memory_fraction or None,
+        "ram_headroom_gib": args.ram_headroom_gib,
         "offload_size_gib": args.offload_size_gib,
         "disk_tier": not args.no_disk_tier,
         "max_concurrency": args.concurrency,
@@ -141,25 +141,34 @@ def total_ram_gb() -> float:
 
 
 def preflight_memory(args: argparse.Namespace) -> list[str]:
-    """Refuse configurations that would take the machine down with them.
-
-    Reported as warnings rather than enforced: the caller knows what else the
-    machine is doing, and this cannot see it.
-    """
+    """Warn when estimated memory use leaves less than the requested reserve."""
     warnings: list[str] = []
     ram = total_ram_gb()
     if not ram:
         return warnings
     # The wired cache is sized off the recommended working set, itself about
     # 75% of RAM, so the fraction lands on that rather than on RAM directly.
-    projected = ram * 0.75 * args.memory_fraction
-    if projected > ram - RAM_HEADROOM_GB:
-        warnings.append(
-            f"--memory-fraction {args.memory_fraction} projects to "
-            f"~{projected:.0f} GB resident on a {ram:.0f} GB machine, host "
-            "pool included. The pool is pageable, so this swaps or OOMs "
-            "rather than failing cleanly. Lower --memory-fraction."
-        )
+    headroom = args.ram_headroom_gib
+    if headroom is None:
+        headroom = RAM_HEADROOM_GB * min(1.0, ram / RAM_HEADROOM_REFERENCE_GB)
+    fractions = [("--memory-fraction", args.memory_fraction)]
+    if (
+        args.baseline_memory_fraction
+        and args.baseline_memory_fraction != args.memory_fraction
+    ):
+        fractions.append(("--baseline-memory-fraction", args.baseline_memory_fraction))
+    for option, fraction in fractions:
+        projected = ram * 0.75 * fraction
+        remaining = ram - projected
+        if remaining < headroom:
+            warnings.append(
+                f"{option} {fraction} is estimated to use ~{projected:.1f} GiB "
+                f"on a {ram:.0f} GiB machine, host pool included, leaving "
+                f"~{remaining:.1f} GiB below the {headroom:.1f} GiB reserve. "
+                "Actual memory pressure depends on the workload and other apps; "
+                f"swapping or OOM may occur. Lower {option} or adjust "
+                "--ram-headroom-gib for your workload."
+            )
     return warnings
 
 
@@ -661,6 +670,13 @@ def main(argv: list[str] | None = None) -> int:
         "(default: 0.8)",
     )
     parser.add_argument(
+        "--ram-headroom-gib",
+        type=float,
+        help="RAM reserve for the estimated memory warning, in GiB. "
+        "Defaults to 40 GiB on Macs with at least 128 GiB, scaled down "
+        "proportionally on smaller Macs. Does not change server allocation.",
+    )
+    parser.add_argument(
         "--offload-size-gib",
         type=float,
         default=16.0,
@@ -726,6 +742,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--keep-logs", action="store_true")
     args = parser.parse_args(argv)
+    if args.ram_headroom_gib is not None and (
+        not math.isfinite(args.ram_headroom_gib) or args.ram_headroom_gib < 0
+    ):
+        parser.error("--ram-headroom-gib must be finite and non-negative")
     free_gib = shutil.disk_usage(work_root()).free / (1 << 30)
     args.store_cap_gib = round(max(1.0, free_gib - DISK_HEADROOM_GB), 1)
     print(f"disk store cap: {args.store_cap_gib} GiB", file=sys.stderr)
