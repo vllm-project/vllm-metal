@@ -115,9 +115,11 @@ class MetalSharedOffloadRegion(SharedOffloadRegion):
     def release_pages(self) -> None:
         """Return the pool's pages to the OS. Their contents are lost.
 
-        The views stay valid. Call ``reuse_pages`` before writing again, or
-        the kernel can drop the writes. Best effort: a failure keeps the
-        pages, so sleep still completes.
+        Only safe once nothing will read the pool. vLLM resets the connector,
+        which empties the pool's index, before it frees the KV cache. The
+        views stay valid. Call ``reuse_pages`` before writing again, or the
+        kernel can drop the writes. Best effort: a failure keeps the pages,
+        so sleep still completes.
         """
         if self._state is None:
             return
@@ -127,11 +129,16 @@ class MetalSharedOffloadRegion(SharedOffloadRegion):
             logger.warning("Could not free the KV offloading host pool", exc_info=True)
             return
         logger.info(
-            "Freed the KV offloading host pool (%.2f GB)", self.total_size_bytes / 1e9
+            "Freed the KV offloading host pool (up to %.2f GiB)",
+            self.total_size_bytes / (1 << 30),
         )
 
     def reuse_pages(self) -> None:
-        """Take back the pages freed by ``release_pages``."""
+        """Take back the pages freed by ``release_pages``.
+
+        Raises on failure, unlike ``release_pages``: the kernel can drop
+        writes to pages not taken back, so wake must not go on.
+        """
         if self._state is not None:
             self._state.mapping.madvise(mmap.MADV_FREE_REUSE)
 

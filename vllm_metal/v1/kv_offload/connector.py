@@ -79,8 +79,8 @@ class MetalOffloadingConnector(OffloadingConnector):
     def release_host_pool(self) -> None:
         """Free the host pool for sleep mode.
 
-        vLLM resets the connector before it discards the KV cache, so the
-        pool holds nothing, and nothing reads it until wake.
+        vLLM resets the connector before it discards the KV cache. That
+        empties the pool's index, so nothing reads the pool until wake.
         """
         if (worker := self._metal_worker()) is not None:
             worker.release_host_pool()
