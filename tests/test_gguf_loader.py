@@ -18,6 +18,7 @@ import numpy as np
 import pytest
 from huggingface_hub import constants as hf_constants
 from mlx.utils import tree_flatten
+from mlx_lm import utils as mlx_lm_utils
 
 gguf = pytest.importorskip("gguf")
 
@@ -861,8 +862,8 @@ def test_rejects_unsupported_qtype_before_model_allocation(tmp_path, monkeypatch
 
 
 def test_builds_the_skeleton_lazily(tmp_path, monkeypatch):
-    # The GGUF replaces every skeleton parameter, so the skeleton's own weights
-    # (random init, or dense safetensors in config_dir) must never be evaluated.
+    # The GGUF replaces every skeleton parameter, so the skeleton's random-init
+    # weights must never be evaluated.
     gguf_path, cfg_dir = _build_dense_fixture(tmp_path, "qwen3", has_qk_norm=True)
     real_load_model = gguf_loader.load_model
     lazy_flags = []
@@ -926,6 +927,38 @@ def test_lazy_skeleton_keeps_peak_memory_off_the_eager_path(tmp_path, monkeypatc
     # far below — the bound keeps slack for CI variance while still failing
     # the moment the flag is dropped (ratio -> 1).
     assert lazy_peak <= 0.75 * eager_peak
+
+
+def _mixed_precision_predicate(path: str, module: nn.Module) -> dict | bool:
+    # mlx_lm's mixed recipes record per-layer entries like this in the config.
+    return {"group_size": 64, "bits": 8} if path.endswith("down_proj") else True
+
+
+def test_mlx_quantized_companion_loads_like_plain_companion(tmp_path):
+    gguf_path, plain_dir = _build_dense_fixture(tmp_path, "qwen3", has_qk_norm=True)
+    quantized_dir = tmp_path / "mlx-quantized"
+    model, config = mlx_lm_utils.load_model(Path(plain_dir), strict=False)
+    model, quantized_config = mlx_lm_utils.quantize_model(
+        model,
+        config,
+        group_size=None,
+        bits=None,
+        quant_predicate=_mixed_precision_predicate,
+    )
+    mlx_lm_utils.save_model(quantized_dir, model)
+    mlx_lm_utils.save_config(quantized_config, quantized_dir / "config.json")
+    tokens = mx.array([[1, 2, 3]])
+    reference, _ = GGUFModelLoader(
+        gguf_path, config_dir=plain_dir, target_dtype=mx.float32
+    ).load()
+    expected = np.array(reference(tokens))
+
+    loaded, _ = GGUFModelLoader(
+        gguf_path, config_dir=quantized_dir, target_dtype=mx.float32
+    ).load()
+    actual = np.array(loaded(tokens))
+
+    np.testing.assert_array_equal(actual, expected)
 
 
 def test_rejects_unsupported_untied_output(tmp_path):
