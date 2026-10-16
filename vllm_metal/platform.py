@@ -327,8 +327,22 @@ class MetalPlatform(Platform):
         # Keep this import out of module scope: platform discovery imports this
         # module before vLLM finishes selecting the active platform.
         from vllm.exceptions import VLLMValidationError
+        from vllm.pooling_params import PoolingParams
         from vllm.sampling_params import SamplingParams
 
+        from vllm_metal.v1.pooling.options import unsupported_pooling_option
+
+        # The model runner also rejects these, but by then an exception is
+        # fatal to the engine; reject them here so the request gets a 400.
+        if isinstance(params, PoolingParams):
+            option = unsupported_pooling_option(params)
+            if option is not None:
+                parameter, description = option
+                raise VLLMValidationError(
+                    f"Metal pooling does not support {description}.",
+                    parameter=parameter,
+                )
+            return
         if not isinstance(params, SamplingParams):
             return
 

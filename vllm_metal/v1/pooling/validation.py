@@ -6,16 +6,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from vllm.pooling_params import PoolingParams
 from vllm.tasks import PoolingTask
 from vllm.v1.core.sched.output import NewRequestData
 
 from vllm_metal.v1.pooling.contract import (
     CLASSIFY_TASK,
     EMBED_TASK,
-    TOKEN_CLASSIFY_TASK,
     PoolingBackend,
 )
+from vllm_metal.v1.pooling.options import unsupported_pooling_option
 
 LAST_POOLING = (None, "LAST")
 EMBED_CONFIG_TASKS: tuple[PoolingTask | None, ...] = (None, EMBED_TASK)
@@ -136,27 +135,6 @@ class PoolingConfigView:
                 f"model={self.label}."
             )
 
-    def unsupported_pooling_option(self, pooling_params: PoolingParams) -> str | None:
-        if pooling_params.late_interaction_params is not None:
-            return "late-interaction parameters"
-        if (
-            pooling_params.requires_token_ids
-            and pooling_params.task != TOKEN_CLASSIFY_TASK
-        ):
-            return "token-level ALL pooling outputs"
-        if pooling_params.step_tag_id is not None:
-            return "STEP pooling parameters"
-        if pooling_params.returned_token_ids is not None:
-            return "returned_token_ids"
-        if pooling_params.extra_kwargs:
-            return "extra pooling kwargs"
-        if (
-            pooling_params.task not in (CLASSIFY_TASK, TOKEN_CLASSIFY_TASK)
-            and pooling_params.use_activation is False
-        ):
-            return "use_activation=False"
-        return None
-
 
 def validate_pooling_request(
     new_req: NewRequestData,
@@ -176,10 +154,10 @@ def validate_pooling_request(
             "Metal pooling requires runner_type='pooling'; got "
             f"{config.runner_type!r} for model={config.label}."
         )
-    unsupported_option = config.unsupported_pooling_option(pooling_params)
+    unsupported_option = unsupported_pooling_option(pooling_params)
     if unsupported_option is not None:
         raise NotImplementedError(
-            f"Metal pooling does not support {unsupported_option} "
+            f"Metal pooling does not support {unsupported_option[1]} "
             f"for model={config.label}."
         )
     pooling_backend.validate_params(pooling_params)

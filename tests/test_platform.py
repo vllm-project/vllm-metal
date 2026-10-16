@@ -19,6 +19,7 @@ from vllm.config import (
 )
 from vllm.config.multimodal import MultiModalConfig
 from vllm.exceptions import VLLMValidationError
+from vllm.pooling_params import LateInteractionParams, PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.selector import AttentionSelectorConfig
@@ -238,6 +239,74 @@ class TestMetalPlatform:
         with pytest.raises(VLLMValidationError, match=control) as exc_info:
             MetalPlatform.validate_request({}, sampling_params)
         assert exc_info.value.parameter == control
+
+    @pytest.mark.parametrize(
+        ("pooling_params", "parameter", "message"),
+        [
+            (
+                PoolingParams(
+                    task="embed",
+                    late_interaction_params=LateInteractionParams(
+                        mode="cache_query", query_key="query-0"
+                    ),
+                ),
+                "late_interaction_params",
+                "late-interaction",
+            ),
+            (
+                PoolingParams(task="embed", requires_token_ids=True),
+                "requires_token_ids",
+                "token-level ALL",
+            ),
+            (PoolingParams(task="embed", step_tag_id=1), "step_tag_id", "STEP"),
+            (
+                PoolingParams(task="embed", returned_token_ids=[1]),
+                "returned_token_ids",
+                "returned_token_ids",
+            ),
+            (
+                PoolingParams(task="embed", extra_kwargs={"foo": True}),
+                "extra_kwargs",
+                "extra pooling kwargs",
+            ),
+            (
+                PoolingParams(task="embed", use_activation=False),
+                "use_activation",
+                "use_activation=False",
+            ),
+        ],
+        ids=[
+            "late-interaction",
+            "token-ids",
+            "step-tag",
+            "returned-token-ids",
+            "extra-kwargs",
+            "embed-no-activation",
+        ],
+    )
+    def test_validate_request_rejects_unsupported_pooling_options(
+        self,
+        pooling_params: PoolingParams,
+        parameter: str,
+        message: str,
+    ) -> None:
+        """The engine treats runner exceptions as fatal, so reject up front."""
+        with pytest.raises(VLLMValidationError, match=message) as exc_info:
+            MetalPlatform.validate_request({}, pooling_params)
+        assert exc_info.value.parameter == parameter
+
+    @pytest.mark.parametrize(
+        "pooling_params",
+        [
+            PoolingParams(task="embed", use_activation=True),
+            PoolingParams(task="classify", use_activation=False),
+        ],
+        ids=["embed", "classify-no-activation"],
+    )
+    def test_validate_request_accepts_supported_pooling_options(
+        self, pooling_params: PoolingParams
+    ) -> None:
+        MetalPlatform.validate_request({}, pooling_params)
 
     def test_sleep_mode_is_available(self) -> None:
         assert MetalPlatform.is_sleep_mode_available()
