@@ -11,9 +11,12 @@ Handles models whose attention module exposes:
 - ``rope`` / ``rotary_emb`` for rotary position embeddings, or precomputed
   ``position_embeddings`` supplied by the caller
 - ``n_heads``, ``n_kv_heads`` head counts
-- Optionally ``q_norm``, ``k_norm``, ``v_norm`` RMSNorms
+- Optionally ``q_norm``, ``k_norm``, ``v_norm`` RMSNorms, or one ``qk_norm``
+  shared by Q and K
 - Optionally ``g_proj`` (+ ``gating=True``) for Laguna-style per-head
   softplus attention-output gating (see :func:`apply_g_proj_gate`)
+- Optionally ``gate_proj`` for a sigmoid attention-output gate and
+  ``qk_scale_factor`` for a query scale (Muse Glimmer)
 
 Gemma4 variants (see :func:`prepare_sdpa_qkv`):
 - **YOCO**: later layers reuse K/V from a reference layer via ``shared_kv``.
@@ -30,6 +33,7 @@ All operations use MLX arrays end-to-end — no PyTorch MPS bridge.
 
 from __future__ import annotations
 
+import functools
 import math
 from dataclasses import dataclass, field
 from typing import Any
@@ -298,7 +302,7 @@ def prepare_sdpa_qkv(
         - ``queries``, ``keys``, ``values``: ``(B, H, L, head_dim)`` tensors
           ready for the Metal kernel.
         - ``gate``: optional gate tensor for gated attention (Qwen3.5
-          Qwen3Next style), else ``None``.
+          Qwen3Next style, or Muse Glimmer's ``gate_proj``), else ``None``.
         - ``kv_for_sharing``: the post-norm+RoPE ``(keys, values)`` pair so
           the caller can forward them to the next YOCO layer.
 
@@ -309,8 +313,12 @@ def prepare_sdpa_qkv(
     """
     B, L, _ = x.shape  # noqa: N806
     norm_placement = attention_contract.qk_norm_placement
-    q_norm = _named_norm(inner, "q_norm", "query_layernorm", "q_layernorm")
-    k_norm = _named_norm(inner, "k_norm", "key_layernorm", "k_layernorm")
+    q_norm = _named_norm(inner, "q_norm", "query_layernorm", "q_layernorm", "qk_norm")
+    k_norm = _named_norm(inner, "k_norm", "key_layernorm", "k_layernorm", "qk_norm")
+    if attention_contract.scaleless_qk_norm:
+        q_norm = k_norm = functools.partial(
+            mx.fast.rms_norm, weight=None, eps=inner.eps
+        )
     if shared_kv is not None and read_existing_kv:
         raise ValueError("shared_kv and read_existing_kv are mutually exclusive")
 
@@ -429,6 +437,10 @@ def prepare_sdpa_qkv(
         )
         if norm_placement is QKNormPlacement.AFTER_ROPE:
             queries, keys = _apply_qk_norms(queries, keys, q_norm, k_norm)
+
+    # Muse Glimmer / AFMoE: sigmoid output gate projected from the layer input.
+    if gate is None and hasattr(inner, "gate_proj"):
+        gate = inner.gate_proj(x)
 
     kv_for_sharing = (keys, values)
     return queries, keys, values, gate, kv_for_sharing
@@ -620,6 +632,9 @@ def sdpa_forward(
         # StableLM computes the standard scale inline and exposes no scale
         # attribute. Use the projected query width before any cache padding.
         attn_scale = math.sqrt(1 / queries.shape[-1])
+    # Muse Glimmer scales normalized queries by ``qk_scale_factor``; RoPE is
+    # linear, so the factor folds into the softmax scale.
+    attn_scale *= getattr(inner, "qk_scale_factor", 1.0)
 
     # --- Metal kernel dispatch ---
     n_heads = queries.shape[1]

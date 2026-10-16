@@ -20,6 +20,7 @@ class AttentionContract:
     qk_norm_placement: QKNormPlacement = QKNormPlacement.BEFORE_ROPE
     derive_scale_from_query: bool = False
     use_rope: bool = True
+    scaleless_qk_norm: bool = False
 
 
 DEFAULT_ATTENTION_CONTRACT = AttentionContract()
@@ -45,6 +46,8 @@ _ATTENTION_CONTRACTS: dict[str, AttentionContract] = {
     "mlx_lm.models.phi": AttentionContract(derive_scale_from_query=True),
     # Nemotron-H attention is position-free: no rotary module, none expected.
     "mlx_lm.models.nemotron_h": AttentionContract(use_rope=False),
+    # Muse Glimmer normalizes Q/K inline with a weightless RMSNorm, no modules.
+    "mlx_lm.models.muse_glimmer": AttentionContract(scaleless_qk_norm=True),
 }
 
 
