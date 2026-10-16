@@ -474,7 +474,7 @@ class GDNLazyKernels:
             request.q.reshape(total_tokens, n_hk, d_k).astype(kernel_dtype),
             request.k.reshape(total_tokens, n_hk, d_k).astype(kernel_dtype),
             request.v.reshape(total_tokens, n_hv, d_v).astype(kernel_dtype),
-            request.g.reshape(total_tokens, n_hv).astype(kernel_dtype),
+            request.g.reshape(total_tokens, n_hv),
             request.beta.reshape(total_tokens, n_hv).astype(kernel_dtype),
             state_in,
             cu_seqlens_arr,

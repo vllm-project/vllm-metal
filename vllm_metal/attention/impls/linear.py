@@ -343,8 +343,11 @@ class GDNPagedAttentionWrapper(nn.Module):
         self, a: mx.array, b: mx.array, state: _GDNForwardState
     ) -> tuple[mx.array, mx.array]:
         # === Step 4: Gating (stateless) ===
-        # compute_g returns float32; cast to match kernel dispatch dtype.
-        g = compute_g(self._inner.A_log, a, self._inner.dt_bias).astype(state.x.dtype)
+        # compute_g returns FP32. Keep it: a near-one decay rounds to 1 in half
+        # precision, even when the recurrent cache is half. The lazy kernels
+        # read g as float; only the single-dtype fallback casts it.
+        # beta keeps the activation dtype.
+        g = compute_g(self._inner.A_log, a, self._inner.dt_bias)
         beta = mx.sigmoid(b).astype(state.x.dtype)
         return g, beta
 
@@ -475,7 +478,9 @@ class GDNPagedAttentionWrapper(nn.Module):
         # The native kernel uses one buffer dtype and accumulates in float32.
         # Promote only as needed to preserve input, state, and output precision.
         recurrent_pool = self._gdn_state_cache.recurrent_states[self._gdn_cache_idx]
-        kernel_dtype = mx.result_type(q, k, v, g, beta, recurrent_pool, state.x)
+        # g is FP32 from _compute_gates; exclude it so it does not promote the
+        # single-dtype native buffers. It is cast with the other inputs below.
+        kernel_dtype = mx.result_type(q, k, v, beta, recurrent_pool, state.x)
         if recurrent_pool.dtype != kernel_dtype:
             raise RuntimeError(
                 f"GDN fallback does not support {recurrent_pool.dtype} recurrent "

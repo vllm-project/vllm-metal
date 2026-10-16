@@ -43,7 +43,11 @@ if (tid < output_threads) {
         acc += val * static_cast<float>(weights[weight_base + j]);
     }
 
-    output[token_idx * CONV_DIM + c] = static_cast<T>(acc / (1.0f + metal::exp(-acc)));
+    // Match nn.silu(nn.Conv1d(...)): round the convolution and sigmoid to T.
+    T conv = static_cast<T>(acc);
+    auto sigmoid_tail = 1 / (1 + metal::exp(metal::abs(conv)));
+    T sigmoid = (conv < 0) ? sigmoid_tail : 1 - sigmoid_tail;
+    output[token_idx * CONV_DIM + c] = conv * sigmoid;
     return;
 }
 
