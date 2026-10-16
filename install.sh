@@ -160,6 +160,13 @@ download_and_install_wheel() {
     exit 1
   fi
 
+  # Use this wheel's Torch pins. Older releases retain vLLM's defaults.
+  local torch_requirements
+  torch_requirements=$(python -I -c 'from importlib.metadata import distribution; print(distribution("vllm-metal").locate_file("vllm_metal/requirements-torch.txt"))')
+  if [[ -f "$torch_requirements" ]]; then
+    uv pip install -r "$torch_requirements"
+  fi
+
   success "Installed ${package_name}"
 }
 
@@ -270,6 +277,7 @@ EOF
 
     # Source checkouts build native artifacts; release installs use the wheel.
     uv pip install -e .
+    uv pip install -r vllm_metal/requirements-torch.txt
     ensure_metal_toolchain
     build_native_artifacts
   else

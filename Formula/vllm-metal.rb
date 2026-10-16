@@ -37,9 +37,12 @@ class VllmMetal < Formula
     system libexec/"bin/pip", "install", vllm_wheel,
            buildpath/"vllm_metal-#{version}-cp312-cp312-macosx_15_0_arm64.whl"
 
+    site_packages = libexec/"lib/python3.12/site-packages"
+    torch_requirements = site_packages/"vllm_metal/requirements-torch.txt"
+    system libexec/"bin/pip", "install", "-r", torch_requirements if torch_requirements.exist?
+
     # TVM-FFI uses wheel RECORD files to locate its own and xgrammar's native
     # libraries. Save them outside site-packages before Homebrew cleans them.
-    site_packages = libexec/"lib/python3.12/site-packages"
     %w[apache_tvm_ffi xgrammar].each do |package|
       record = site_packages.glob("#{package}-*.dist-info/RECORD").fetch(0)
       (pkgshare/"#{package}.record").write record.read
