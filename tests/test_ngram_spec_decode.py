@@ -160,12 +160,16 @@ class TestNgramProposePropose:
 
         assert proposer.propose(ctx) is None
 
-    def test_draft_cap_trims_long_draft(self) -> None:
-        # A positional cap (hybrid state-block boundary) trims the matched
-        # draft instead of dropping the request.
+    @pytest.mark.parametrize("positional_cap,max_tokens", [(1, None), (1, 5), (3, 3)])
+    def test_draft_caps_take_the_tighter_bound(
+        self, positional_cap, max_tokens
+    ) -> None:
+        # The match yields three tokens. With one output already committed,
+        # max_tokens=5/3 leaves a draft budget of 3/1, respectively.
         proposer = _proposer(prompt_lookup_min=2, prompt_lookup_max=3)
         state = _request_state([1, 2, 3, 1, 2, 3, 1, 2])
-        ctx = _context(decode_reqs=[("r0", state)], draft_caps={"r0": 1})
+        state.sampling_params.max_tokens = max_tokens
+        ctx = _context(decode_reqs=[("r0", state)], draft_caps={"r0": positional_cap})
 
         drafts = proposer.propose(ctx)
 
@@ -193,6 +197,28 @@ class TestNgramProposePropose:
         assert drafts is not None
         assert drafts.draft_token_ids == [[3, 1, 2]]
 
+    @pytest.mark.parametrize("generated_tokens,expected_draft", [(2, [3]), (3, [])])
+    def test_remaining_output_tokens_bound_the_draft(
+        self, generated_tokens, expected_draft
+    ) -> None:
+        # max_tokens=4 with 2 generated leaves room for one draft plus the
+        # bonus token; with 3 generated there is no room. Each case starts
+        # fresh so a prior unverified proposal cannot leave pending state.
+        proposer = _proposer(prompt_lookup_min=2, prompt_lookup_max=3)
+        state = _request_state([1, 2, 3, 1, 2, 3, 1, 2])
+        state.sampling_params = SamplingParams(temperature=0.0, max_tokens=4)
+        state.generated_tokens = generated_tokens
+
+        drafts = proposer.propose(_context(decode_reqs=[("r0", state)]))
+        if expected_draft:
+            assert drafts is not None
+            assert drafts.req_ids == ["r0"]
+            assert drafts.draft_token_ids == [expected_draft]
+        else:
+            assert drafts is None
+            assert "r0" not in proposer._pending
+        assert proposer._miss_streak.get("r0", 0) == 0
+
     def test_empty_context_returns_none(self) -> None:
         assert _proposer().propose(_context()) is None
 
@@ -213,9 +239,15 @@ class TestNgramProposePropose:
 
         assert proposer.propose(ctx) is None
 
-    def test_finalized_prefill_participates(self) -> None:
+    @pytest.mark.parametrize("max_tokens,expected_draft", [(16, [6, 4, 5]), (2, [])])
+    def test_finalized_prefill_respects_output_budget(
+        self, max_tokens, expected_draft
+    ) -> None:
         proposer = _proposer(prompt_lookup_min=2)
         state = _request_state([4, 5, 6, 4, 5, 6, 4, 5])
+        # The first output is already committed. max_tokens=2 still passes
+        # eligibility but leaves no room for a draft plus a verifier token.
+        state.sampling_params.max_tokens = max_tokens
         prefill = SimpleNamespace(req_id="p0")
         ctx = _context(
             prefill_reqs=[prefill],
@@ -225,9 +257,12 @@ class TestNgramProposePropose:
 
         drafts = proposer.propose(ctx)
 
-        assert drafts is not None
-        assert drafts.req_ids == ["p0"]
-        assert drafts.draft_token_ids == [[6, 4, 5]]
+        if expected_draft:
+            assert drafts is not None
+            assert drafts.req_ids == ["p0"]
+            assert drafts.draft_token_ids == [expected_draft]
+        else:
+            assert drafts is None
 
     def test_skips_intermediate_prefill(self) -> None:
         proposer = _proposer(prompt_lookup_min=2)
@@ -253,6 +288,22 @@ class TestNgramProposePropose:
         assert drafts is not None
         assert drafts.req_ids == ["r0"]
         assert drafts.draft_token_ids == [[3, 1, 2]]
+
+    def test_mixed_output_budgets_preserve_request_alignment(self) -> None:
+        proposer = _proposer()
+        short = _request_state([1, 2, 3, 1, 2, 3, 1, 2])
+        last = _request_state([4, 5, 6, 4, 5, 6, 4, 5])
+        full = _request_state([7, 8, 9, 7, 8, 9, 7, 8])
+        short.sampling_params.max_tokens = 3  # Two output slots remain.
+        last.sampling_params.max_tokens = 2  # Only one output slot remains.
+        # Drop the middle row; distinct histories expose any shifted IDs.
+        ctx = _context(decode_reqs=[("r0", short), ("r1", last), ("r2", full)])
+
+        drafts = proposer.propose(ctx)
+
+        assert drafts is not None
+        assert drafts.req_ids == ["r0", "r2"]
+        assert drafts.draft_token_ids == [[3], [9, 7, 8]]
 
     def test_drops_prefill_already_seen_as_decode(self) -> None:
         # A request present in both decode and prefill lists must draft once.

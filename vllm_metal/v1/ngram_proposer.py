@@ -212,11 +212,16 @@ class NgramProposer(NoOwnKVProposer):
         draft_token_ids: list[list[int]] = []
         for (req_id, state), draft in zip(drafting, drafts, strict=True):
             cap = ctx.draft_caps.get(req_id) if ctx.draft_caps is not None else None
+            max_tokens = state.sampling_params.max_tokens
+            if max_tokens is not None:
+                # Verification also emits a correction or bonus token (#1078).
+                remaining = max(0, max_tokens - state.generated_tokens - 1)
+                cap = remaining if cap is None else min(cap, remaining)
             if cap is not None and len(draft) > cap:
                 draft = draft[:cap]
                 if not draft:
-                    # Trimmed by a positional cap, not by missing history:
-                    # not miss evidence for the cooldown.
+                    # Trimmed by a positional or length cap, not by missing
+                    # history: not miss evidence for the cooldown.
                     continue
             if not draft:
                 # A too-short history isn't evidence against repetition --
