@@ -2,7 +2,8 @@
 
 vllm-metal supports dense decoder GGUF checkpoints through the MLX runtime. A
 GGUF file carries weights only, so it needs a Hugging Face config and tokenizer
-source.
+source. That source can be a quantized checkpoint, such as an mlx-community
+4-bit, FP8, or AWQ repository; vllm-metal reads only its config and tokenizer.
 
 ## Installation
 

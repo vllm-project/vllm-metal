@@ -30,6 +30,7 @@ import importlib
 import importlib.util
 from functools import wraps
 from pathlib import Path
+from typing import Any
 
 import torch
 from vllm.model_executor.layers.quantization import (
@@ -82,6 +83,13 @@ class MetalGGUFConfig(QuantizationConfig):
     @classmethod
     def from_config(cls, config: dict) -> MetalGGUFConfig:
         return cls()
+
+    @classmethod
+    def override_quantization_method(
+        cls, hf_quant_cfg: dict[str, Any], user_quant: str | None, hf_config: Any = None
+    ) -> str | None:
+        # The .gguf carries its own quantization, so the config source's is ignored.
+        return "gguf" if user_quant == "gguf" else None
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str) -> None:
         # Never exercised: vllm-metal bypasses vLLM's model executor.
