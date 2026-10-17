@@ -464,19 +464,24 @@ def test_window_hint_rejected_past_head_size_bound() -> None:
         )
 
 
-def test_windowed_skips_masked_inf_v() -> None:
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("block_size", [8, 16, 32])
+@pytest.mark.parametrize("poison_row", [1, 2])
+def test_windowed_skips_masked_inf_v(
+    dtype: mx.Dtype, block_size: int, poison_row: int
+) -> None:
     """A ±inf V value at a position only later window rows may attend must not
     leak into earlier rows: the w == 0 skip keeps their accumulation sequence
     identical to the expanded dispatch (0 * inf would otherwise inject NaN)."""
     mx.random.seed(11)
     ctx, window = 48, 4
     total_len = ctx + window
-    blocks = (total_len + BLOCK_SIZE - 1) // BLOCK_SIZE
-    key_cache = _cache(blocks, 8, mx.float16)
-    value_cache = _cache(blocks, 8, mx.float16)
-    poison_pos = ctx + 2  # visible only to window rows 2 and 3
-    value_cache[poison_pos // BLOCK_SIZE, poison_pos % BLOCK_SIZE, :, :] = float("inf")
-    query = mx.random.normal(shape=(window, 16, HEAD_SIZE)).astype(mx.float16)
+    blocks = (total_len + block_size - 1) // block_size
+    key_cache = _cache(blocks, 8, dtype, block_size=block_size)
+    value_cache = _cache(blocks, 8, dtype, block_size=block_size)
+    poison_pos = ctx + poison_row
+    value_cache[poison_pos // block_size, poison_pos % block_size, :, :] = float("inf")
+    query = mx.random.normal(shape=(window, 16, HEAD_SIZE)).astype(dtype)
     mx.eval(key_cache, value_cache, query)
     table = list(range(blocks))
 
@@ -491,6 +496,7 @@ def test_windowed_skips_masked_inf_v() -> None:
         total_len,
         1,
         -1,
+        block_size=block_size,
     )
     windowed = _run(
         query,
@@ -503,12 +509,32 @@ def test_windowed_skips_masked_inf_v() -> None:
         total_len,
         window,
         -1,
+        block_size=block_size,
     )
-    # Rows 0-1 never see the poisoned position: bitwise parity must hold and
-    # the outputs must stay finite.  Rows 2-3 legitimately read the inf in
-    # both dispatches, so they are excluded (NaN compares unequal to itself).
-    assert mx.array_equal(expanded[:2], windowed[:2])
-    assert bool(mx.all(mx.isfinite(windowed[:2].astype(mx.float32))))
+    # Earlier rows must stay finite and exact. Later rows legitimately read
+    # the inf, so they are excluded (NaN compares unequal to itself).
+    assert mx.array_equal(expanded[:poison_row], windowed[:poison_row])
+    assert bool(mx.all(mx.isfinite(windowed[:poison_row].astype(mx.float32))))
+
+
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16, mx.float32])
+@pytest.mark.parametrize("block_size", [8, 16, 32])
+@pytest.mark.parametrize("sliding_window", [-1, 3])
+def test_windowed_matches_expanded_across_block_boundary(
+    dtype: mx.Dtype, block_size: int, sliding_window: int
+) -> None:
+    """Partial blocks and ragged tails preserve each row's causal/sliding mask."""
+    expanded, windowed, _ = _expanded_and_windowed(
+        32,
+        8,
+        dtype,
+        block_size - 2,
+        [1, 3, 5],
+        sliding_window,
+        seed=14,
+        block_size=block_size,
+    )
+    assert mx.array_equal(expanded, windowed)
 
 
 @pytest.mark.parametrize("sliding_window", [512])
