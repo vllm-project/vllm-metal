@@ -19,11 +19,12 @@ The source builders concatenate shaders in the order below, stripping local
 
 ### 1. C++ `_paged_ops` extension: `__init__.py` and `build.py`
 
-By default, `get_ops()` loads the prebuilt nanobind extension and three
+By default, `get_ops()` loads the prebuilt nanobind extension and
 required `.metallib` libraries, plus optional NAX support. With
-`VLLM_METAL_BUILD_FROM_SOURCE=1`, it builds the extension and compiles the
-shader sources in-process through MLX. Packaging uses the same source
-builders to precompile the `.metallib` files via `python -m vllm_metal.metal.build`.
+`VLLM_METAL_BUILD_FROM_SOURCE=1`, it rebuilds changed artifacts with
+`mlx.extension.MetalExtension`, then loads the generated `.metallib` files.
+Packaging uses the same build via `python -m vllm_metal.metal.build`.
+Source builds require the `build` extra and the Xcode Metal toolchain.
 
 | Library | Source builder | Concatenated sources (in order) |
 |---------|----------------|----------------------------------|

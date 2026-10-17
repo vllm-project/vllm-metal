@@ -31,7 +31,7 @@ dependencies = [
     # libmlx.dylib carries no SONAME version (compatibility version 0.0.0), so
     # a wheel built against one MLX is only ABI-safe against that exact MLX.
     # Rebuild and re-release the wheel on every MLX bump.
-    "mlx==0.32.2; platform_system == 'Darwin' and platform_machine == 'arm64'",
+    "mlx==0.32.4; platform_system == 'Darwin' and platform_machine == 'arm64'",
     # Git SHA (2026-08-25), not a version: this revision requires MLX >=0.32.1
     # and includes cache APIs not available in the latest release (0.31.3).
     "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@9e6acca691e64d6d8bb808c328fcdea459099cca ; platform_system == 'Darwin' and platform_machine == 'arm64'",
@@ -52,8 +52,6 @@ dependencies = [
     # Unbounded like upstream's own form: vLLM's requirements/common.txt pins
     # the effective range in every release and we re-derive it on each bump.
     "huggingface_hub>=1.31.0",
-    # Native Metal extension JIT build
-    "nanobind==2.10.2; platform_system == 'Darwin' and platform_machine == 'arm64'",
     # Core utilities
     "numpy>=1.24.0",
     "psutil>=5.9.0",
@@ -68,6 +66,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+build = [
+    "cmake>=3.25; platform_system == 'Darwin' and platform_machine == 'arm64'",
+    "nanobind==3.1.0; platform_system == 'Darwin' and platform_machine == 'arm64'",
+    "setuptools>=77; platform_system == 'Darwin' and platform_machine == 'arm64'",
+]
 gguf = [
     # Local GGUF model loading. Keep aligned with upstream vLLM's lower bound
     # unless a Metal-specific path needs a newer API.
@@ -79,6 +82,7 @@ stt = [
     "numba>=0.59.0",  # Required by librosa on Python 3.12+
 ]
 dev = [
+    "vllm-metal[build]",
     "pytest>=9.0.2",
     "pytest-asyncio>=0.21.0",
     "ruff==0.16.0",

@@ -29,14 +29,8 @@ _KERNELS_V2_DIR = _THIS_DIR / "kernels_v2"
 # The extension can be loaded for metadata before execution is initialized.
 _native_module: ModuleType | None = None
 
-# Cached after first get_ops() call.  By default both the .cpp extension and
-# the required Metal shader libraries are loaded prebuilt from the package,
-# so there is no first-request shader compile. Set VLLM_METAL_BUILD_FROM_SOURCE=1
-# to recompile the .so from source
-# AND compile the shaders in-process from .metal (for kernel developers
-# iterating on paged_ops.cpp or the .metal sources); editing .metal then
-# requires restarting the interpreter to pick up changes.  Either way the
-# libraries are held in MLX's cache for the lifetime of the process.
+# Cached after first get_ops() call. Source mode rebuilds artifacts before
+# loading them; both modes keep libraries in MLX's cache until process exit.
 _ops_module: ModuleType | None = None
 
 
@@ -138,8 +132,7 @@ def _try_init_nax_library(
     mod: ModuleType,
     *,
     disabled: bool,
-    build_from_source: bool,
-    prebuilt_path: Path | None = None,
+    prebuilt_path: Path,
 ) -> bool:
     """Load optional NAX support, returning False when unavailable."""
     if disabled:
@@ -149,18 +142,15 @@ def _try_init_nax_library(
     try:
         if not mod.nax_supported():
             return False
-        if build_from_source:
-            mod.init_nax_library(_build_nax_source())
-        else:
-            if prebuilt_path is None or not prebuilt_path.exists():
-                logger.warning(
-                    "NAX prefill attention is supported on this machine, but "
-                    "the prebuilt library is missing at %s; using the non-NAX "
-                    "fallback",
-                    prebuilt_path or "<unknown path>",
-                )
-                return False
-            mod.init_nax_library_path(str(prebuilt_path))
+        if not prebuilt_path.exists():
+            logger.warning(
+                "NAX prefill attention is supported on this machine, but "
+                "the prebuilt library is missing at %s; using the non-NAX "
+                "fallback",
+                prebuilt_path,
+            )
+            return False
+        mod.init_nax_library_path(str(prebuilt_path))
         return True
     except (OSError, RuntimeError) as exc:
         logger.warning(
@@ -237,12 +227,7 @@ def _load_native_module() -> ModuleType:
     if _native_module is not None:
         return _native_module
 
-    # The prebuilt .so links `-lmlx` with no rpath, so it records a dependency on
-    # `@rpath/libmlx.dylib` (libmlx's install name) that it cannot resolve on its
-    # own; dyld instead satisfies it against an already-resident libmlx, matched
-    # by install name (`-undefined dynamic_lookup` resolves any stragglers the
-    # same way; see build.py). Both need libmlx loaded first, so import mlx.core
-    # now to make it resident before the .so is dlopen'd below.
+    # Register MLX's nanobind types and load libmlx before the native extension.
     import mlx.core  # noqa: F401
 
     # 1. Locate the native extension: load the prebuilt artifact by default;
@@ -265,7 +250,7 @@ def _load_native_module() -> ModuleType:
                 f"Prebuilt native extension not found at {so_path}. Install a "
                 f"vllm-metal release wheel (which ships it prebuilt), or set "
                 f"VLLM_METAL_BUILD_FROM_SOURCE=1 to compile it from source "
-                f"(requires Xcode command-line tools)."
+                f"(requires CMake and the Xcode Metal toolchain)."
             )
         # Locally-built artifacts (the .so and the .metallib shaders) drift if a
         # developer edits paged_ops.cpp or a .metal file without rebuilding. Fail
@@ -305,12 +290,9 @@ def _load_native_module() -> ModuleType:
 def get_ops() -> ModuleType:
     """Import the native paged_ops extension and initialise its Metal libraries.
 
-    By default the prebuilt ``.so`` and required ``.metallib`` libraries are
-    loaded by path via MLX
-    (``Device::get_library(name, path)``). When ``VLLM_METAL_BUILD_FROM_SOURCE``
-    is set, the ``.so`` is rebuilt and the shader sources are read, pre-processed
-    (includes inlined) and JIT-compiled in-process via
-    ``mlx::core::metal::Device::get_library(name, builder)`` instead.
+    Both source and wheel installs load the ``.so`` and ``.metallib`` files
+    from the package. ``VLLM_METAL_BUILD_FROM_SOURCE`` rebuilds changed
+    artifacts before loading them.
 
     Returns:
         The ``_paged_ops`` module with ``paged_attention_primitive()`` and
@@ -321,45 +303,30 @@ def get_ops() -> ModuleType:
         return _ops_module
 
     from vllm_metal import envs
+    from vllm_metal.metal.build import (
+        METALLIB_NAMES,
+        NAX_METALLIB_NAME,
+        metallib_path,
+    )
 
     mod = _load_native_module()
 
-    # 3. Initialise the required Metal shader libraries (v2 online-softmax, GDN
-    #    linear attention, MLA paged attention).  By default we load the
-    #    precompiled .metallib files shipped in the wheel (no first-request
-    #    shader compile); only compile the shaders in-process when the developer
-    #    opts in via VLLM_METAL_BUILD_FROM_SOURCE (no silent fallback).
+    missing = [n for n in METALLIB_NAMES if not metallib_path(n).exists()]
+    if missing:
+        raise RuntimeError(
+            f"Prebuilt Metal libraries missing: {missing} (expected in "
+            f"{_THIS_DIR}). Install a vllm-metal release wheel, or set "
+            f"VLLM_METAL_BUILD_FROM_SOURCE=1 to compile shaders from source."
+        )
+    for name in METALLIB_NAMES:
+        mod.init_library_path(name, str(metallib_path(name)))
+
     # NAX is optional: unsupported hardware, missing artifacts, and load
     # failures retain the established dispatch path.
-    nax_prebuilt_path: Path | None = None
-    build_from_source = envs.VLLM_METAL_BUILD_FROM_SOURCE
-    if build_from_source:
-        mod.init_v2_library(_build_v2_paged_attention_source())
-        mod.init_gdn_library(_build_gdn_source())
-        mod.init_mla_library(_build_mla_paged_attention_source())
-    else:
-        from vllm_metal.metal.build import (
-            METALLIB_NAMES,
-            NAX_METALLIB_NAME,
-            metallib_path,
-        )
-
-        missing = [n for n in METALLIB_NAMES if not metallib_path(n).exists()]
-        if missing:
-            raise RuntimeError(
-                f"Prebuilt Metal libraries missing: {missing} (expected in "
-                f"{_THIS_DIR}). Install a vllm-metal release wheel, or set "
-                f"VLLM_METAL_BUILD_FROM_SOURCE=1 to compile shaders from source."
-            )
-        for name in METALLIB_NAMES:
-            mod.init_library_path(name, str(metallib_path(name)))
-        nax_prebuilt_path = metallib_path(NAX_METALLIB_NAME)
-
     nax_ready = _try_init_nax_library(
         mod,
         disabled=envs.VLLM_METAL_DISABLE_NAX,
-        build_from_source=build_from_source,
-        prebuilt_path=nax_prebuilt_path,
+        prebuilt_path=metallib_path(NAX_METALLIB_NAME),
     )
     if nax_ready:
         logger.info("NAX prefill attention kernels loaded (M5 tensor units)")
@@ -373,12 +340,9 @@ def warm_up_kernels() -> None:
     """Front-load v2 / GDN / MLA Metal library loading at startup.
 
     :func:`get_ops` imports the C++ ``_paged_ops`` extension and initialises the
-    v2 / GDN / MLA Metal libraries — by default loading the precompiled
-    ``.metallib`` files, or (under ``VLLM_METAL_BUILD_FROM_SOURCE``) compiling
-    the shader source synchronously inside each ``init_*_library`` call. Calling
-    it here moves that cost off the first request and fails fast at startup if
-    the libraries are missing or the shaders cannot compile on this macOS (e.g.
-    an unsupported Metal language version).
+    v2 / GDN / MLA Metal libraries from ``.metallib`` files, rebuilding first
+    under ``VLLM_METAL_BUILD_FROM_SOURCE``. Calling it here moves that cost
+    off the first request and fails fast if artifacts cannot be built or loaded.
 
     The load/compile is process-wide with no per-cache state, which is why this
     takes no arguments.

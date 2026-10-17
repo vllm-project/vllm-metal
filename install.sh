@@ -269,7 +269,7 @@ EOF
     install_vllm "$vllm_release_tag"
 
     # Source checkouts build native artifacts; release installs use the wheel.
-    uv pip install -e .
+    uv pip install -e ".[build]"
     ensure_metal_toolchain
     build_native_artifacts
   else
