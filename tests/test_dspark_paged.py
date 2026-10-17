@@ -418,13 +418,14 @@ def test_window_buckets_preserve_ragged_attention_during_growth_and_reuse(
     tables = [list(range(1 + row, cache.cache.num_blocks, 2)) for row in range(2)]
     tables[1].reverse()
     gathered_rows = []
-    gather = block_draft_paged.gather_kv
+    gather = block_draft_paged._gather_window_kv
 
-    def record_gather(values, slots, *args):
-        gathered_rows.append(slots.size)
-        return gather(values, slots, *args)
+    def record_gather(*args, **kwargs):
+        keys, values = gather(*args, **kwargs)
+        gathered_rows.append(keys.shape[0] * keys.shape[1])
+        return keys, values
 
-    monkeypatch.setattr(block_draft_paged, "gather_kv", record_gather)
+    monkeypatch.setattr(block_draft_paged, "_gather_window_kv", record_gather)
     draft = cache.compile_draft(num_draft_tokens=width)
     # Cross shape/reduction boundaries, then rewind into reused, poisoned pages.
     for step, span in enumerate(
@@ -473,6 +474,86 @@ def test_window_buckets_preserve_ragged_attention_during_growth_and_reuse(
             assert gathered_rows and max(gathered_rows) <= 2 * 256
         gathered_rows.clear()
         assert torch.all(cache.storage.tensors["target"] == 7)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("block_size", [8, 16, 32])
+@pytest.mark.parametrize("head_dim", [64, 96, 128, 256, 512])
+def test_window_gather_preserves_strided_values_and_zeros_poisoned_padding(
+    dtype, block_size, head_dim
+):
+    from vllm_metal.tensor_bridge import torch_to_mlx
+    from vllm_metal.v1.block_draft_paged import _gather_window_kv
+
+    width, window, span, heads = 3, 8, 14, 2
+    lengths = [block_size + 3, 2]
+    tables = [[6, 2, 4, 1], [3, 5, 1, 0]]
+    # K and V have different offsets, padding and noncontiguous head strides.
+    backing = torch.full(
+        (7, block_size, heads, 2 * (head_dim + 16)), float("nan"), dtype=dtype
+    )
+    key = backing[..., :head_dim]
+    value = backing[..., head_dim + 16 : 2 * head_dim + 16]
+    expected = np.zeros((2, 2, span, heads, head_dim), dtype=np.float32)
+    for batch, length in enumerate(lengths):
+        start = max(length - window, 0)
+        for row, position in enumerate(range(start, length + width)):
+            block = tables[batch][position // block_size]
+            offset = position % block_size
+            data = torch.arange(heads * head_dim).reshape(heads, head_dim) % 251
+            key[block, offset] = (data + row + 1).to(dtype)
+            value[block, offset] = (-data - row - 1).to(dtype)
+            expected[0, batch, row] = key[block, offset].float().numpy()
+            expected[1, batch, row] = value[block, offset].float().numpy()
+    actual = _gather_window_kv(
+        torch_to_mlx(key),
+        torch_to_mlx(value),
+        mx.repeat(mx.array(tables, dtype=mx.int32), 2, axis=1)[:, ::2],
+        mx.repeat(mx.array(lengths, dtype=mx.int32), 2)[::2],
+        width=width,
+        window=window,
+        span=span,
+        head_dim=head_dim,
+        block_size=block_size,
+    )
+    for got, wanted in zip(actual, expected, strict=True):
+        np.testing.assert_array_equal(np.array(got.astype(mx.float32)), wanted)
+
+
+def test_window_gather_reads_pooled_pages_past_32_bit_offsets():
+    from vllm_metal.metal import get_ops
+    from vllm_metal.tensor_bridge import torch_to_mlx
+    from vllm_metal.v1.block_draft_paged import _gather_window_kv
+
+    block_size, head_dim, stride = 16, 64, 1 << 16
+    blocks = (1 << 15) + 2
+    # Byte storage crosses the same INT32_MAX element offset without requiring
+    # a >4 GiB shared buffer. Only the two written pages are resident.
+    backing = torch.empty((blocks, stride), dtype=torch.uint8)
+    cache = get_ops().as_strided(
+        torch_to_mlx(backing),
+        (blocks, block_size, 1, head_dim),
+        (stride, stride // block_size, head_dim, 1),
+        0,
+    )
+    backing[1] = 1
+    backing[-1] = 2
+    key, value = _gather_window_kv(
+        cache,
+        cache,
+        mx.array([[1, blocks - 1]], dtype=mx.int32),
+        mx.array([25], dtype=mx.int32),
+        width=7,
+        window=2048,
+        span=32,
+        head_dim=head_dim,
+        block_size=block_size,
+    )
+    expected = np.broadcast_to(
+        np.repeat([1, 2], block_size)[None, :, None, None], (1, 32, 1, head_dim)
+    )
+    for actual in (key, value):
+        np.testing.assert_array_equal(np.array(actual), expected)
 
 
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])

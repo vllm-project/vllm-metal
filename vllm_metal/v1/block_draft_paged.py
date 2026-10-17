@@ -4,19 +4,91 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from typing import TypeVar
+from functools import lru_cache
+from typing import Any, TypeVar
 
 import mlx.core as mx
 
 from vllm_metal.attention.block_tables import build_block_tables
 from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
 from vllm_metal.attention.caches.storage import KVCacheStorage
-from vllm_metal.attention.impls.bidi_prefill import gather_kv
 from vllm_metal.metal import get_ops
 from vllm_metal.v1.dflash import DFlashModel
 from vllm_metal.v1.proposer import validate_scheduler_blocks
 
 _Result = TypeVar("_Result")
+
+
+@lru_cache(maxsize=1)
+def _window_kv_kernel() -> Any:
+    return mx.fast.metal_kernel(
+        name="block_draft_gather_window_kv",
+        input_names=["keys", "values", "tables", "offsets"],
+        output_names=["kout", "vout"],
+        ensure_row_contiguous=False,
+        source="""
+            const size_t elem = thread_position_in_grid.x;
+            const uint dim = elem % HEAD_DIM;
+            const uint head = (elem / HEAD_DIM) % KV_HEADS;
+            const uint token = (elem / (HEAD_DIM * KV_HEADS)) % SPAN;
+            const uint batch = elem / (HEAD_DIM * KV_HEADS * SPAN);
+            const int offset = offsets[batch * offsets_strides[0]];
+            const int end = offset + WIDTH;
+            const int pos = max(offset - WINDOW, 0) + int(token);
+            T key = T(0), value = T(0);
+            if (pos < end) {
+                const size_t page =
+                    tables[batch * tables_strides[0]
+                           + (pos / BLOCK_SIZE) * tables_strides[1]];
+                const size_t row = pos % BLOCK_SIZE;
+                const size_t ki = page * keys_strides[0] + row * keys_strides[1]
+                    + head * keys_strides[2] + dim * keys_strides[3];
+                const size_t vi = page * values_strides[0] + row * values_strides[1]
+                    + head * values_strides[2] + dim * values_strides[3];
+                key = keys[ki];
+                value = values[vi];
+            }
+            kout[elem] = key;
+            vout[elem] = value;
+        """,
+    )
+
+
+def _gather_window_kv(
+    keys: mx.array,
+    values: mx.array,
+    tables: mx.array,
+    offsets: mx.array,
+    *,
+    width: int,
+    window: int,
+    span: int,
+    head_dim: int,
+    block_size: int,
+) -> tuple[mx.array, mx.array]:
+    """Copy the block-anchored window and zero padding without reading it.
+
+    Read the original strided cache views with 64-bit offsets. The token-major
+    outputs retain the existing SDPA layout, with no arithmetic on valid K/V.
+    """
+    shape = (offsets.size, span, keys.shape[2], head_dim)
+    keys, values = _window_kv_kernel()(
+        inputs=[keys, values, tables, offsets],
+        template=[
+            ("T", keys.dtype),
+            ("HEAD_DIM", head_dim),
+            ("KV_HEADS", shape[2]),
+            ("SPAN", span),
+            ("WIDTH", width),
+            ("WINDOW", window),
+            ("BLOCK_SIZE", block_size),
+        ],
+        grid=(shape[0] * span * shape[2] * head_dim, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[shape, shape],
+        output_dtypes=[keys.dtype, values.dtype],
+    )
+    return keys, values
 
 
 class BlockDraftPagedCache:
@@ -224,7 +296,7 @@ class BlockDraftPagedCache:
                     )
                 else:
                     out = self._window_attention(
-                        q, k, v, tables, offsets, i, window, positions
+                        q, k, v, tables, offsets, window, positions
                     )
                 h = h + attn.o_proj(out.reshape(batch, width, -1))
                 h = h + layer.mlp(layer.post_attention_layernorm(h))
@@ -283,7 +355,7 @@ class BlockDraftPagedCache:
 
         return draft
 
-    def _window_attention(self, q, k, v, tables, offsets, layer_idx, window, indices):
+    def _window_attention(self, q, k, v, tables, offsets, window, indices):
         """Speculators' prefix window is anchored at the block's first row.
 
         The paged kernel's moving window has different semantics. Gather only
@@ -291,33 +363,29 @@ class BlockDraftPagedCache:
         """
         # TODO: Support block-anchored sliding masks in paged attention to avoid
         # gathering KV into dense tensors before SDPA.
-        batch, width, _, head_dim = q.shape
+        _, width, _, head_dim = q.shape
         span = min(window + width, indices.size)
         positions = mx.maximum(offsets - window, 0)[:, None] + indices[:span]
         valid = positions < (offsets + width)[:, None]
-        safe_positions = mx.where(valid, positions, 0)
-        blocks = mx.take_along_axis(tables, safe_positions // self.block_size, axis=1)
-        slots = (blocks * self.block_size + safe_positions % self.block_size).reshape(
-            -1
+        keys, values = _gather_window_kv(
+            k,
+            v,
+            tables,
+            offsets,
+            width=width,
+            window=window,
+            span=span,
+            head_dim=head_dim,
+            block_size=self.block_size,
         )
-        stride = self.cache.block_stride_for_layer(layer_idx)
-
-        def gather(cache):
-            rows = gather_kv(cache, slots, head_dim, stride).reshape(
-                batch, span, self.model.config.num_key_value_heads, head_dim
-            )
-            # Padding may read an uninitialized page. A mask alone cannot keep
-            # NaNs out of the softmax/value product.
-            return mx.where(valid[:, :, None, None], rows, 0).transpose(0, 2, 1, 3)
-
         mask = valid[:, None, None, :]
         if self.model.causal_blocks:
             queries = offsets[:, None] + mx.arange(width)
             mask = mask & (positions[:, None, None, :] <= queries[:, None, :, None])
         out = mx.fast.scaled_dot_product_attention(
             q.transpose(0, 2, 1, 3),
-            gather(k),
-            gather(v),
+            keys.transpose(0, 2, 1, 3),
+            values.transpose(0, 2, 1, 3),
             scale=head_dim**-0.5,
             mask=mask,
         )
