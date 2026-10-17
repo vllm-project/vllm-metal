@@ -439,6 +439,7 @@ class MetalModelRunner:
 
         # Request state cache for incremental decoding
         self._request_states: dict[str, RequestState] = {}
+        self._awaiting_readmission: set[str] = set()
 
         # Image-block state; lives outside RequestState because a
         # one-step prefill has no RequestState during its forward.
@@ -2803,6 +2804,10 @@ class MetalModelRunner:
                 batch.add_output(req_id, [0])
                 continue
 
+            if req_id in self._awaiting_readmission:
+                self._readmit_request(batch, new_req, scheduler_output)
+                continue
+
             generator = create_request_generator(sampling_params)
 
             if sampling_params.prompt_logprobs is not None:
@@ -2865,10 +2870,12 @@ class MetalModelRunner:
         updated later from cached scheduler metadata.
         """
         for new_req in scheduler_output.scheduled_new_reqs:
-            token_ids = list(new_req.prompt_token_ids or [])
+            token_ids = list(
+                new_req.prefill_token_ids or new_req.prompt_token_ids or []
+            )
             self._request_states[new_req.req_id] = RequestState(
                 token_ids=token_ids,
-                prompt_len=len(token_ids),
+                prompt_len=new_req.prompt_len,
                 sampling_params=new_req.sampling_params or SamplingParams(),
                 pooling_params=new_req.pooling_params,
                 block_ids=(
@@ -2937,6 +2944,82 @@ class MetalModelRunner:
             state.generated_tokens = 0
             self._paged_request_seq_lens.pop(req_id, None)
 
+    def _readmit_request(
+        self,
+        batch: _ExecutionBatch,
+        new_req: NewRequestData,
+        scheduler_output: SchedulerOutput,
+    ) -> None:
+        """Rebuild a preempted request from the scheduler's prefill tokens."""
+        req_id = new_req.req_id
+        self._awaiting_readmission.discard(req_id)
+        self._paged_request_seq_lens.pop(req_id, None)
+        self._mm_bidi_states.pop(req_id, None)
+        if self._paged_state_group_indices:
+            self._state_block_ids_by_req[req_id] = self._copy_state_block_ids(
+                new_req.block_ids
+            )
+        preempted = self._request_states[req_id]
+        sampling_params = new_req.sampling_params or SamplingParams()
+        state = RequestState(
+            token_ids=list(new_req.prefill_token_ids),
+            prompt_len=new_req.prompt_len,
+            sampling_params=sampling_params,
+            pooling_params=new_req.pooling_params,
+            generator=preempted.generator,
+            block_ids=self._copy_paged_block_ids(new_req.block_ids),
+            lora_id=_lora_id_from_request_data(new_req),
+            mrope_position_delta=preempted.mrope_position_delta,
+            num_computed_tokens=new_req.num_computed_tokens,
+        )
+        self._request_states[req_id] = state
+        # Same rule as MRv2: prompt logprobs are still owed while no output exists.
+        if (
+            sampling_params.prompt_logprobs is not None
+            and len(state.token_ids) == state.prompt_len
+        ):
+            self._prompt_logprobs_tracker.register(
+                req_id, sampling_params.prompt_logprobs
+            )
+        self._collect_prefill_continuation(
+            batch,
+            req_id,
+            state,
+            new_req.num_computed_tokens,
+            scheduler_output.num_scheduled_tokens[req_id],
+        )
+
+    def _collect_prefill_continuation(
+        self,
+        batch: _ExecutionBatch,
+        req_id: str,
+        state: RequestState,
+        computed_tokens: int,
+        scheduled_tokens: int,
+    ) -> None:
+        """Queue the next prefill chunk of a request whose state already exists."""
+        target_len = computed_tokens + scheduled_tokens
+        is_intermediate = target_len < len(state.token_ids)
+        output_idx = batch.add_output(req_id, [])
+        batch.paged_prefill_entries.append(
+            _PendingPrefillEntry(
+                output_idx=output_idx,
+                prefill=PrefillRequest(
+                    req_id=req_id,
+                    token_ids=state.token_ids[computed_tokens:target_len],
+                    sampling_params=state.sampling_params,
+                    pooling_params=state.pooling_params,
+                    block_ids=state.block_ids,
+                    generator=state.generator,
+                    prompt_len=state.prompt_len if not is_intermediate else None,
+                    start_pos=computed_tokens,
+                    full_prompt_token_ids=None,
+                    lora_id=state.lora_id,
+                ),
+                result_mode="intermediate" if is_intermediate else "cached_final",
+            )
+        )
+
     def _collect_cached_requests(
         self,
         batch: _ExecutionBatch,
@@ -2951,34 +3034,12 @@ class MetalModelRunner:
             state = self._request_states[req_id]
 
             if state.generated_tokens == 0:
-                computed_tokens = cached_reqs.num_computed_tokens[idx]
-                scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
-                target_len = computed_tokens + scheduled_tokens
-                is_intermediate = target_len < len(state.token_ids)
-
-                output_idx = batch.add_output(req_id, [])
-
-                batch.paged_prefill_entries.append(
-                    _PendingPrefillEntry(
-                        output_idx=output_idx,
-                        prefill=PrefillRequest(
-                            req_id=req_id,
-                            token_ids=state.token_ids[computed_tokens:target_len],
-                            sampling_params=state.sampling_params,
-                            pooling_params=state.pooling_params,
-                            block_ids=state.block_ids,
-                            generator=state.generator,
-                            prompt_len=(
-                                state.prompt_len if not is_intermediate else None
-                            ),
-                            start_pos=computed_tokens,
-                            full_prompt_token_ids=None,
-                            lora_id=state.lora_id,
-                        ),
-                        result_mode=(
-                            "intermediate" if is_intermediate else "cached_final"
-                        ),
-                    )
+                self._collect_prefill_continuation(
+                    batch,
+                    req_id,
+                    state,
+                    cached_reqs.num_computed_tokens[idx],
+                    scheduler_output.num_scheduled_tokens[req_id],
                 )
                 continue
 
@@ -3160,6 +3221,12 @@ class MetalModelRunner:
             # first_prefill_start is re-seeded by the next chunk.
             for req_id in resumed_req_ids:
                 self._mm_bidi_states.pop(req_id, None)
+
+        if preempted_req_ids:
+            self._awaiting_readmission.update(preempted_req_ids)
+        self._awaiting_readmission -= evicted_req_ids
+        if resumed_req_ids:
+            self._awaiting_readmission -= resumed_req_ids
 
         invalidated = set(evicted_req_ids)
         if preempted_req_ids:

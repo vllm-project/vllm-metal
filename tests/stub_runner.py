@@ -162,6 +162,7 @@ def make_stub_runner(
         "_paged_state_group_indices": (),
         "_state_block_ids_by_req": {},
         "_request_states": {},
+        "_awaiting_readmission": set(),
         "_mm_bidi_states": {},
         "_paged_request_seq_lens": {},
         "_intermediate_forward_supported": True,

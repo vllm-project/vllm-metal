@@ -4392,3 +4392,143 @@ class TestStateBlockIdLifecycle:
 
         assert runner._state_block_ids_by_req["r"] == [[50], [60], [70]]
         assert runner._request_states["r"].block_ids == [[80]]
+
+
+class TestPreemptedReadmission:
+    """Under MRv2 a preempted request comes back as a new request."""
+
+    def _new_req(
+        self,
+        prefill_token_ids: list[int],
+        *,
+        num_computed_tokens: int,
+        sampling_params: SamplingParams | None = None,
+    ) -> NewRequestData:
+        return NewRequestData(
+            req_id="r",
+            prompt_token_ids=prefill_token_ids[:4],
+            mm_features=[],
+            sampling_params=sampling_params or SamplingParams(),
+            pooling_params=None,
+            block_ids=([10, 11],),
+            num_computed_tokens=num_computed_tokens,
+            lora_request=None,
+            prefill_token_ids=prefill_token_ids,
+        )
+
+    def _scheduler_output(
+        self, new_req: NewRequestData, num_scheduled_tokens: int
+    ) -> SchedulerOutput:
+        return SchedulerOutput(
+            scheduled_new_reqs=[new_req],
+            scheduled_cached_reqs=CachedRequestData.make_empty(),
+            num_scheduled_tokens={new_req.req_id: num_scheduled_tokens},
+            total_num_scheduled_tokens=num_scheduled_tokens,
+            scheduled_spec_decode_tokens={},
+            scheduled_encoder_inputs={},
+            num_common_prefix_blocks=[],
+            finished_req_ids=set(),
+            free_encoder_mm_hashes=[],
+            preempted_req_ids=set(),
+            has_structured_output_requests=False,
+        )
+
+    def _admit(
+        self, runner: mr.MetalModelRunner, new_req: NewRequestData, num_scheduled: int
+    ) -> mr._PendingPrefillEntry:
+        batch = mr._ExecutionBatch()
+        runner._handle_new_requests(
+            batch, [new_req], self._scheduler_output(new_req, num_scheduled)
+        )
+        return batch.paged_prefill_entries[0]
+
+    def _preempted_runner(
+        self, generator: torch.Generator | None = None
+    ) -> mr.MetalModelRunner:
+        runner = make_stub_runner()
+        runner._request_states["r"] = mr.RequestState(
+            token_ids=[1, 2, 3, 4, 5, 6, 99],
+            prompt_len=4,
+            sampling_params=SamplingParams(),
+            generator=generator,
+            generated_tokens=3,
+        )
+        return runner
+
+    def test_readmission_continues_from_prefill_tokens(self) -> None:
+        generator = torch.Generator().manual_seed(0)
+        runner = self._preempted_runner(generator)
+        new_req = self._new_req([1, 2, 3, 4, 5, 6], num_computed_tokens=5)
+
+        runner._reconcile_request_lifecycle(set(), preempted_req_ids={"r"})
+        entry = self._admit(runner, new_req, 1)
+
+        state = runner._request_states["r"]
+        assert entry.prefill.token_ids == [6]
+        assert entry.prefill.start_pos == 5
+        assert entry.prefill.generator is generator
+        assert entry.result_mode == "cached_final"
+        assert state.token_ids == [1, 2, 3, 4, 5, 6]
+        assert state.prompt_len == 4
+
+    @pytest.mark.parametrize(
+        ("prefill_token_ids", "owes_prompt_logprobs"),
+        [([1, 2, 3, 4], True), ([1, 2, 3, 4, 5], False)],
+    )
+    def test_readmission_owes_prompt_logprobs_only_without_output(
+        self, prefill_token_ids: list[int], owes_prompt_logprobs: bool
+    ) -> None:
+        runner = self._preempted_runner()
+        new_req = self._new_req(
+            prefill_token_ids,
+            num_computed_tokens=0,
+            sampling_params=SamplingParams(prompt_logprobs=1),
+        )
+
+        runner._reconcile_request_lifecycle(set(), preempted_req_ids={"r"})
+        self._admit(runner, new_req, len(prefill_token_ids))
+
+        assert runner._prompt_logprobs_tracker.wants("r") is owes_prompt_logprobs
+
+    def test_finished_id_reentering_in_the_same_step_is_admitted_fresh(
+        self,
+    ) -> None:
+        runner = self._preempted_runner()
+        new_req = self._new_req([7, 8, 9, 10], num_computed_tokens=0)
+
+        runner._reconcile_request_lifecycle({"r"}, preempted_req_ids={"r"})
+        entry = self._admit(runner, new_req, 4)
+
+        assert entry.prefill.token_ids == [7, 8, 9, 10]
+        assert entry.prefill.prompt_len == 4
+        assert entry.result_mode == "new_final"
+
+    def test_v1_resumed_id_reentering_later_is_admitted_fresh(self) -> None:
+        runner = self._preempted_runner()
+        new_req = NewRequestData(
+            req_id="r",
+            prompt_token_ids=[7, 8, 9, 10],
+            mm_features=[],
+            sampling_params=SamplingParams(),
+            pooling_params=None,
+            block_ids=([10, 11],),
+            num_computed_tokens=0,
+            lora_request=None,
+        )
+
+        runner._reconcile_request_lifecycle(set(), preempted_req_ids={"r"})
+        runner._reconcile_request_lifecycle(set(), resumed_req_ids={"r"})
+        entry = self._admit(runner, new_req, 4)
+
+        assert entry.prefill.token_ids == [7, 8, 9, 10]
+        assert entry.result_mode == "new_final"
+
+    def test_non_last_pp_stage_keeps_the_prefill_tokens(self) -> None:
+        runner = make_stub_runner()
+        new_req = self._new_req([1, 2, 3, 4, 5, 6], num_computed_tokens=5)
+
+        runner._update_pp_stage_states(self._scheduler_output(new_req, 1))
+
+        state = runner._request_states["r"]
+        assert state.token_ids == [1, 2, 3, 4, 5, 6]
+        assert state.prompt_len == 4
