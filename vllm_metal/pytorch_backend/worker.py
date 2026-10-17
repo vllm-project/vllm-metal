@@ -3,12 +3,12 @@
 
 from functools import wraps
 
-import psutil
 import torch
 from vllm.config.utils import getattr_iter
 from vllm.utils.torch_utils import set_random_seed
 
 from vllm_metal.pytorch_backend.attention import MPSAttentionBackend
+from vllm_metal.pytorch_backend.mps_ops import _load_mps_module
 from vllm_metal.pytorch_backend.runner import MPSModelRunner
 from vllm_metal.v1.worker import MetalWorker, init_worker_distributed_environment
 
@@ -128,21 +128,25 @@ class MPSWorker(MetalWorker):
                 "set --kv-cache-memory-bytes explicitly."
             )
         # PoC estimate only; --kv-cache-memory-bytes bypasses this heuristic.
-        # TODO: budget against torch.mps.recommended_max_memory() and measure
-        # execution overhead at the configured prefill/concurrency limits
-        # instead of estimating it from model dimensions.
+        # TODO: measure execution overhead at the configured prefill/concurrency
+        # limits instead of estimating it from model dimensions.
         reserve = self.scheduler_config.max_num_batched_tokens * (
             intermediate_size * 2 + hidden_size * 8
         ) * 4 + (512 << 20)
+        # Like the MLX backend, budget against the GPU working set, not RAM.
         budget = int(
-            psutil.virtual_memory().total * self.cache_config.gpu_memory_utilization
+            torch.mps.recommended_max_memory()
+            * self.cache_config.gpu_memory_utilization
         )
         available = budget - torch.mps.driver_allocated_memory() - reserve
         if available <= 0:
             raise ValueError(
                 "MPS model and activation allowance exceed the memory budget"
             )
-        return available
+        # Upstream backs all KV layers with one MPS buffer. PyTorch rounds large
+        # heaps up to 2 MiB, and the heap must fit in maxBufferLength.
+        max_buffer = _load_mps_module().max_buffer_length() // (2 << 20) * (2 << 20)
+        return min(available, max_buffer)
 
     def synchronize_device(self):
         torch.mps.synchronize()

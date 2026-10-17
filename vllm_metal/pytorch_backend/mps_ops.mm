@@ -22,6 +22,10 @@ static bool nax_supported() {
       [device supportsFamily:static_cast<MTLGPUFamily>(hardware::kApple10)]);
 }
 
+static size_t max_buffer_length() {
+  return [at::mps::getCurrentMPSStream()->device() maxBufferLength];
+}
+
 class PagedAttention {
   id<MTLLibrary> library_;
   id<MTLLibrary> nax_library_ = nil;
@@ -225,6 +229,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("_override_detected_gpu_core_count_for_test",
         &hardware::override_detected_gpu_core_count_for_test);
   m.def("nax_supported", &nax_supported);
+  m.def("max_buffer_length", &max_buffer_length);
   pybind11::class_<PagedAttention>(m, "PagedAttention")
       .def(pybind11::init<const std::string&, const std::string&, int>())
       .def("forward", &PagedAttention::forward);

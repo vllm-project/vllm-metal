@@ -76,6 +76,24 @@ def test_request_slots_and_removed_request_writeback(state, num_groups):
     assert state.num_computed_tokens.gpu[0].item() == 18
 
 
+@pytest.fixture
+def mps_memory(monkeypatch):
+    """Fake a 4 GiB GPU working set with 128 MiB already allocated."""
+    from vllm_metal.pytorch_backend import worker
+
+    monkeypatch.setattr(torch.mps, "synchronize", lambda: None)
+    monkeypatch.setattr(torch.mps, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.mps, "driver_allocated_memory", lambda: 128 << 20)
+    monkeypatch.setattr(torch.mps, "recommended_max_memory", lambda: 4 << 30)
+
+    def set_max_buffer_length(nbytes):
+        module = SimpleNamespace(max_buffer_length=lambda: nbytes)
+        monkeypatch.setattr(worker, "_load_mps_module", lambda: module)
+
+    set_max_buffer_length(4 << 30)
+    return set_max_buffer_length
+
+
 @pytest.mark.parametrize(
     ("config_name", "fields", "width"),
     [
@@ -86,7 +104,7 @@ def test_request_slots_and_removed_request_writeback(state, num_groups):
         ("PretrainedConfig", {"hidden_size": 64}, None),
     ],
 )
-def test_cache_budget_handles_model_dimensions(monkeypatch, config_name, fields, width):
+def test_cache_budget_handles_model_dimensions(mps_memory, config_name, fields, width):
     import transformers
 
     from vllm_metal.pytorch_backend.worker import MPSWorker
@@ -101,10 +119,6 @@ def test_cache_budget_handles_model_dimensions(monkeypatch, config_name, fields,
         ),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=8),
     )
-    monkeypatch.setattr(torch.mps, "synchronize", lambda: None)
-    monkeypatch.setattr(torch.mps, "empty_cache", lambda: None)
-    monkeypatch.setattr(torch.mps, "driver_allocated_memory", lambda: 128 << 20)
-    monkeypatch.setattr("psutil.virtual_memory", lambda: SimpleNamespace(total=4 << 30))
     if width is None:
         with pytest.raises(ValueError, match="--kv-cache-memory-bytes"):
             MPSWorker.determine_available_memory(worker)
@@ -115,6 +129,26 @@ def test_cache_budget_handles_model_dimensions(monkeypatch, config_name, fields,
     worker.cache_config.kv_cache_memory_bytes = 1234
     worker.model_config = None
     assert MPSWorker.determine_available_memory(worker) == 1234
+
+
+def test_cache_budget_fits_one_metal_buffer(mps_memory):
+    """Upstream puts all KV layers in one buffer, so the budget must fit in it."""
+    import transformers
+
+    from vllm_metal.pytorch_backend.worker import MPSWorker
+
+    hf = transformers.Qwen3Config(hidden_size=64, intermediate_size=192)
+    worker = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            kv_cache_memory_bytes=None, gpu_memory_utilization=0.9
+        ),
+        model_config=SimpleNamespace(hf_text_config=hf, get_hidden_size=lambda: 64),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=8),
+    )
+    # PyTorch rounds the backing heap up to 2 MiB, so an unaligned limit
+    # still leaves only 1 GiB usable.
+    mps_memory((1 << 30) + (1 << 20))
+    assert MPSWorker.determine_available_memory(worker) <= 1 << 30
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
