@@ -22,7 +22,8 @@ best efficiency; this implementation does not adopt its wave-efficiency model.
 The supported `(query heads, KV heads, head dimension)` geometries are
 `(32,8,128)`, `(24,4,256)`, `(16,2,128)`, and `(16,2,256)`.
 Kernel block16 is supported for each; block32 is additionally supported for
-`(16,2,256)`. The existing scope is not inferred from a model-name list.
+`(24,4,256)` and `(16,2,256)`. The existing scope is not inferred from a model-name
+list.
 Geometry and kernel-page admission are checked at the native dispatch gate
 before occupancy planning, including when a private test forces a partition.
 One C++ table owns this domain. Numerical and routing tests read that table
@@ -106,10 +107,11 @@ conditions. Direct primitive callers can pass `gqa_length_plan` from
 `gqa_decode_length_plan(context_lens)`, or the original `gqa_context_lens` list;
 the two inputs are mutually exclusive and must agree with GPU `seq_lens`.
 
-Kernel block size is the view after hybrid-cache translation: a 1056-token
-scheduler page selects block32, while a 784- or 528-token page selects
-block16. Translated page IDs address their kernel-sized subpages even when
-upstream K/V storage remains unreshaped.
+Kernel block size is the view after hybrid-cache translation. The largest
+supported size that evenly divides the scheduler page is selected: an 800- or
+1056-token page selects block32, while a 784- or 528-token page selects block16.
+Translated page IDs address their kernel-sized subpages even when upstream
+K/V storage remains unreshaped.
 
 The GQA producer walks pages rather than tokens. Lane 0 preloads the next
 valid block-table entry and `simd_shuffle` broadcasts it within each SIMD

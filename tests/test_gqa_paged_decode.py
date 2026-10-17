@@ -303,7 +303,8 @@ def test_forced_partition_rejects_oversized_reducer(partition):
     + tuple(
         (q, kv, head, {16: 784, 32: 1056}[block])
         for q, kv, head, block in GQA_GEOMETRIES
-    ),
+    )
+    + ((24, 4, 256, 800),),
 )
 def test_gqa_reads_upstream_views_after_writes_and_block_copy(
     dtype, test_partition, q_heads, kv_heads, head, block_size
@@ -398,7 +399,7 @@ def test_gqa_reads_upstream_views_after_writes_and_block_copy(
             cache.replace_layer_cache(0, *written)
         query = mx.ones((1, q_heads, head), dtype=dtype)
         kernel_tables, kernel_block_size = build_block_tables([pages], block_size)
-        if block_size == 1056:
+        if block_size in (800, 1056):
             assert kernel_block_size == 32
         # Production keeps dense K/V in scheduler-page views. Translated
         # block IDs must use the kernel-token stride without reshaping them.

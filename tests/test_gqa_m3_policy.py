@@ -64,7 +64,8 @@ def _native_diagnostics():
         ((16, 2, 128, 16), [8192] * 5, 512),
         # Functional admission and malformed-length handling are unchanged.
         ((16, 4, 256, 16), [8192] * 4, 0),
-        ((24, 4, 256, 32), [8192] * 4, 0),
+        # (24, 4, 256) uses the existing head256/block32 M3 preference.
+        ((24, 4, 256, 32), [8192] * 4, 256),
         ((24, 4, 256, 16), [], 0),
         ((24, 4, 256, 16), [0, 8192], 0),
         ((24, 4, 256, 16), [-1, 8192], 0),

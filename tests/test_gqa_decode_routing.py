@@ -401,9 +401,10 @@ def test_mixed_decode_prefix_uses_gqa(mixed_family, lengths, partition, dtype):
     "geometry,cache_block,dtype,partition",
     [
         ((24, 4, 256, 16), 784, mx.float16, 512),
+        ((24, 4, 256, 32), 800, mx.bfloat16, 512),
         ((16, 2, 256, 32), 1056, mx.bfloat16, 256),
     ],
-    ids=["block16", "block32"],
+    ids=["block16", "block32-800", "block32"],
 )
 def test_mixed_decode_prefix_reads_translated_pages(
     mixed_family, geometry, cache_block, dtype, partition
@@ -602,7 +603,6 @@ def test_policy_has_no_fixed_long_context_ceiling(q, kv, head, block, n):
         (32, 8, 128, 32),
         (16, 2, 256, 8),
         (16, 4, 256, 32),
-        (24, 4, 256, 32),
     ],
 )
 def test_policy_rejects_unmeasured_geometries(q, kv, head, block):

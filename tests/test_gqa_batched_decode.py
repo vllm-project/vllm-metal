@@ -517,7 +517,8 @@ def test_host_lengths_are_captured_by_each_lazy_primitive(preplanned):
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
 @pytest.mark.parametrize("partition", GQA_PARTITIONS)
 @pytest.mark.parametrize(
-    "q,kv,head,cache_block", [(24, 4, 256, 784), (16, 2, 256, 1056)]
+    "q,kv,head,cache_block",
+    [(24, 4, 256, 784), (24, 4, 256, 800), (16, 2, 256, 1056)],
 )
 def test_batched_shared_prefix_and_strided_scheduler_pages(
     dtype, partition, q, kv, head, cache_block
@@ -557,6 +558,8 @@ def test_batched_shared_prefix_and_strided_scheduler_pages(
         mx.array(slots, mx.int64),
     )
     tables, block = build_block_tables(pages, cache_block)
+    if cache_block in (800, 1056):
+        assert block == 32
     query = mx.ones((2, q, head), dtype)
     out = mx.array(0)
     ops._gqa_paged_attention_for_test(
