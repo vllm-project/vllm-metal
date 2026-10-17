@@ -47,14 +47,14 @@ static int hardware_gpu_core_count() {
   return v;
 }
 
-static int detected_gpu_core_count() {
+int detected_gpu_core_count() {
   const int override =
       g_test_gpu_core_count.load(std::memory_order_relaxed);
   return override >= 0 ? override : hardware_gpu_core_count();
 }
 
 // Keep the established split-KV budget on VMs that omit gpu-core-count.
-static int gpu_core_count() {
+int gpu_core_count() {
   const int cores = detected_gpu_core_count();
   if (cores > 0) return cores;
   static std::atomic_flag warned = ATOMIC_FLAG_INIT;

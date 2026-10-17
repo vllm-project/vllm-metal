@@ -13,7 +13,7 @@ Verifies the full chain from model config to Metal KV cache:
 Kernel-level correctness (that a ``sliding_window`` value actually
 masks out-of-window tokens) is validated via the production
 ``paged_attention_primitive`` path which dispatches
-``paged_attention_v2_online`` (see ``paged_ops.cpp``).
+``paged_attention_v2_online`` (see ``paged_attention.cpp``).
 """
 
 from __future__ import annotations

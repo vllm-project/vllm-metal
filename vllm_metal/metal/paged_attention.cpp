@@ -1,66 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
-// C++ nanobind bridge for paged attention Metal kernels.
-//
-// Dispatches the v2 paged-attention / TurboQuant / GDN / MLA kernels through
-// MLX's own Metal command encoder, eliminating the PyTorch MPS bridge.
-//
-// Uses nb::handle + nb::inst_ptr<array>() to extract the C++ array from
-// the Python mlx.core.array object, bypassing nanobind's cross-module
-// RTTI matching which fails due to hidden symbol visibility in libmlx.
+// Paged attention dispatch, cache writes, and TurboQuant encoding.
+#include "ops_internal.h"
 
-#include <algorithm>
-#include <array>
-#include <atomic>
-#include <cstdint>
-#include <memory>
-#include <optional>
-#include <stdexcept>
-#include <string>
 #include <unordered_map>
-#include <vector>
-
-#include <nanobind/nanobind.h>
-#include <nanobind/stl/optional.h>
-#include <nanobind/stl/string.h>
-#include <nanobind/stl/vector.h>
-
-#include "metal_device.h"
-#include "paged_attention_kernels.h"
-
-#include "mlx/mlx.h"
-#include "mlx/backend/metal/device.h"
-#include "mlx/primitives.h"
-
-namespace nb = nanobind;
-namespace kernels = vllm_metal::kernels;
-namespace hardware = vllm_metal::hardware;
-using namespace mlx::core;
-
-void register_mlx_patch(nb::module_& m);
-
-#ifndef VLLM_METAL_PARTITION_SIZE
-#define VLLM_METAL_PARTITION_SIZE 512
-#endif
 
 // ---------------------------------------------------------------------------
 // Library caching
 // ---------------------------------------------------------------------------
 
 static std::string v2_paged_attention_source_;
-constexpr int kPartitionSize = VLLM_METAL_PARTITION_SIZE;
 
-// Process-wide diagnostic for tests; not a per-request trace or routing input.
-enum class PagedDispatch {
-  None, GqaDecode, PerToken, SplitKv, Window, WindowSplitKv, NaxPrefill,
-  TiledPrefill, MixedPrefillDecode, MixedNaxPrefillDecode, Count
-};
-static std::atomic<PagedDispatch> g_last_dispatch{PagedDispatch::None};
-static std::atomic<int> g_last_gqa_partition{0};
-static std::atomic<int> g_last_gqa_requests{0};
-static std::atomic<bool> g_dispatch_diagnostics_enabled{false};
+std::atomic<PagedDispatch> g_last_dispatch{PagedDispatch::None};
+std::atomic<int> g_last_gqa_partition{0};
+std::atomic<int> g_last_gqa_requests{0};
+std::atomic<bool> g_dispatch_diagnostics_enabled{false};
 // NAX prefill pipeline of the most recent recorded NAX launch: 1 split,
 // 0 original loop, -1 none (non-NAX dispatch or diagnostics off).
-static std::atomic<int> g_last_nax_split{-1};
+std::atomic<int> g_last_nax_split{-1};
 inline void record_paged_dispatch(PagedDispatch family, int gqa_partition = 0,
                                   int gqa_requests = 0) {
   if (!g_dispatch_diagnostics_enabled.load(std::memory_order_relaxed)) return;
@@ -72,17 +28,6 @@ inline void record_paged_dispatch(PagedDispatch family, int gqa_partition = 0,
   g_last_gqa_requests.store(gqa_requests, std::memory_order_relaxed);
 }
 
-static bool set_paged_dispatch_diagnostics(bool enabled) {
-  // Call only while evaluation is idle. Clear stale observations on both
-  // transitions so a disabled observer cannot report a previous request.
-  const bool previous =
-      g_dispatch_diagnostics_enabled.exchange(enabled, std::memory_order_relaxed);
-  g_last_dispatch.store(PagedDispatch::None, std::memory_order_relaxed);
-  g_last_gqa_partition.store(0, std::memory_order_relaxed);
-  g_last_gqa_requests.store(0, std::memory_order_relaxed);
-  g_last_nax_split.store(-1, std::memory_order_relaxed);
-  return previous;
-}
 // Split only after eight KV partitions amortize the extra dispatch.
 constexpr int kMixedDecodeMinPartitions = 8;
 constexpr int kMixedDecodeMinContext =
@@ -119,29 +64,8 @@ constexpr int kWindowMaxHeadSize = VLLM_METAL_PA_WINDOW_MAX_HEAD;
 // when the base grid underfills the GPU, so saturated high-concurrency serving
 // is untouched.
 
-using hardware::detected_gpu_core_count;
-using hardware::gpu_core_count;
-using hardware::override_detected_gpu_core_count_for_test;
 
-// One measured dispatch table, also exposed read-only to numerical/routing
-// tests. Include the kernel page view so geometry and page admission cannot
-// drift independently. Model names are not routing inputs; the calibrated
-// device preference below is separate from functional geometry admission.
-struct GqaDecodeGeometry {
-  int num_heads;
-  int num_kv_heads;
-  int head_size;
-  int block_size;
-};
-constexpr std::array<GqaDecodeGeometry, 5> kGqaDecodeGeometries = {{
-    {32, 8, 128, 16},
-    {24, 4, 256, 16},
-    {16, 2, 128, 16},
-    {16, 2, 256, 16},
-    {16, 2, 256, 32},
-}};
-
-static bool gqa_decode_geometry_supported(int num_heads, int num_kv_heads,
+bool gqa_decode_geometry_supported(int num_heads, int num_kv_heads,
                                            int head_size, int block_size) {
   return std::any_of(
       kGqaDecodeGeometries.begin(), kGqaDecodeGeometries.end(),
@@ -152,28 +76,7 @@ static bool gqa_decode_geometry_supported(int num_heads, int num_kv_heads,
       });
 }
 
-// Shared by production selection, private test dispatch and library checks.
-static_assert(kPartitionSize == 512,
-              "GQA partition list assumes the established 512-token split");
-constexpr std::array<int, 2> kGqaPartitionSizes = {512, 256};
-constexpr int64_t kGqaSimdGroupsPerCore = 33;
-// The ordinary GQA reducer specializes out the TurboQuant workspace, but
-// retains red_smem[2 * NUM_WARPS] (256 threads / 32 SIMD lanes). Reserve its
-// 64 bytes as well as the dynamic statistics; dispatch also checks the
-// compiled pipeline's actual static allocation before encoding the reducer.
-constexpr size_t kGqaReduceStaticMemoryBytes = 2 * (256 / 32) * sizeof(float);
-
-// M3 (10-core, g15g) batched calibration. Tighten short-context admission,
-// and avoid the slower P512 producer for measured long head256 layouts.
-// Single requests and other devices retain the existing selection.
-constexpr int kM3GqaGpuCores = 10;
-constexpr int kM3GqaShortHead128Batch = 6;
-constexpr int kM3GqaShortHead128MinContext = 704;
-constexpr int kM3GqaBlock16MinContext = 4096;
-constexpr int kM3GqaBlock32MinContext = 8192;
-constexpr size_t kM3GqaReducerMemoryBytes = 32 * 1024;
-
-static std::string gqa_decode_kernel_name(
+std::string gqa_decode_kernel_name(
     const std::string& dtype, int head_size, int block_size, int partition_size) {
   return "paged_attention_gqa_decode_" + dtype + "_hs" + std::to_string(head_size)
       + "_bs" + std::to_string(block_size) + "_ps" + std::to_string(partition_size);
@@ -184,9 +87,6 @@ static bool paged_reduce_memory_fits(
   return dynamic_bytes <= capacity && static_bytes <= capacity - dynamic_bytes;
 }
 
-// Bound partial outputs, both statistics and any compact-layout offsets.
-// This is a per-invocation ceiling, not a reservation or a process memory limit.
-constexpr size_t kGqaMaxScratchBytes = 512 * 1024 * 1024;
 static bool gqa_scratch_fits(
     int requests, int heads, int64_t partitions, int head_size, size_t item_size,
     const std::vector<int64_t>* offsets = nullptr) {
@@ -201,52 +101,6 @@ static bool gqa_scratch_fits(
     remaining /= static_cast<size_t>(count);
   }
   return true;
-}
-
-// Immutable CPU metadata shared by every attention layer of one forward.
-// No device reads or geometry-dependent policy are captured here.
-using GqaPartitionOffsets = std::array<std::vector<int64_t>, 2>;
-struct GqaDecodeLengthPlan {
-  int num_requests = 0;
-  int max_length = 0;
-  std::array<int64_t, 2> full_partitions = {};
-  std::shared_ptr<const GqaPartitionOffsets> partition_offsets;
-
-  bool operator==(const GqaDecodeLengthPlan& other) const {
-    return num_requests == other.num_requests && max_length == other.max_length &&
-        full_partitions == other.full_partitions &&
-        (partition_offsets == other.partition_offsets ||
-         (partition_offsets && other.partition_offsets &&
-          *partition_offsets == *other.partition_offsets));
-  }
-};
-
-template <typename Lengths>
-static GqaDecodeLengthPlan gqa_decode_length_plan(const Lengths& context_lens) {
-  GqaDecodeLengthPlan plan;
-  auto offsets = context_lens.size() > 1
-      ? std::make_shared<GqaPartitionOffsets>() : nullptr;
-  if (offsets) {
-    for (auto& row : *offsets) {
-      row.reserve(context_lens.size() + 1);
-      row.push_back(0);
-    }
-  }
-  for (int length : context_lens) {
-    if (length <= 0) return {};
-    ++plan.num_requests;
-    plan.max_length = std::max(plan.max_length, length);
-    for (size_t i = 0; i < kGqaPartitionSizes.size(); ++i) {
-      plan.full_partitions[i] += length / kGqaPartitionSizes[i];
-      if (offsets) {
-        auto& row = (*offsets)[i];
-        row.push_back(row.back() +
-            (int64_t(length) + kGqaPartitionSizes[i] - 1) / kGqaPartitionSizes[i]);
-      }
-    }
-  }
-  if (plan.num_requests > 0) plan.partition_offsets = std::move(offsets);
-  return plan;
 }
 
 static const std::vector<int64_t>* gqa_compact_offsets(
@@ -307,10 +161,10 @@ static int gqa_decode_partition_for_lengths(
       architecture, max_seq_len);
 }
 
-static int gqa_decode_plan_for_lengths(
+int gqa_decode_plan_for_lengths(
     int num_heads, int num_kv_heads, int head_size,
     const GqaDecodeLengthPlan& plan, int gpu_cores, int block_size,
-    const std::string& gpu_arch = "", int max_seq_len = 0) {
+    const std::string& gpu_arch, int max_seq_len) {
   const int partition = gqa_decode_partition_for_lengths(num_heads, num_kv_heads,
       head_size, plan, gpu_cores, block_size, gpu_arch, max_seq_len);
   if (partition == 0) return 0;
@@ -320,33 +174,6 @@ static int gqa_decode_plan_for_lengths(
   return gqa_scratch_fits(plan.num_requests, num_heads, partitions, head_size, 2,
                          gqa_compact_offsets(plan, partition, partitions))
       ? partition : 0;
-}
-
-static int gqa_decode_plan_for_shape(int num_heads, int num_kv_heads,
-                                     int head_size, int max_seq_len,
-                                     int gpu_cores, int block_size) {
-  return gqa_decode_plan_for_lengths(num_heads, num_kv_heads, head_size,
-      gqa_decode_length_plan(std::array<int, 1>{max_seq_len}), gpu_cores, block_size);
-}
-
-static int gqa_decode_batch_plan_for_shape(
-    int num_heads, int num_kv_heads, int head_size,
-    const std::vector<int>& context_lens, int gpu_cores, int block_size,
-    const std::string& gpu_arch = "", int max_seq_len = 0) {
-  return gqa_decode_plan_for_lengths(num_heads, num_kv_heads, head_size,
-      gqa_decode_length_plan(context_lens), gpu_cores, block_size,
-      gpu_arch, max_seq_len);
-}
-
-static bool gqa_decode_shape_eligible(int num_heads, int num_kv_heads,
-                                     int head_size, int max_seq_len,
-                                     int gpu_cores, int block_size) {
-  return gqa_decode_plan_for_shape(num_heads, num_kv_heads, head_size,
-                                   max_seq_len, gpu_cores, block_size) > 0;
-}
-
-static int min_decode_grid() {
-  return gpu_core_count() * kernels::kDecodeGroupsPerCore;
 }
 
 void init_v2_library(const std::string& v2_src) {
@@ -372,14 +199,8 @@ void init_library_path(const std::string& name, const std::string& path) {
 // ---------------------------------------------------------------------------
 
 static std::string nax_source_;
-static bool nax_lib_ready_ = false;   // a NAX library was registered
-static bool nax_enabled_ = true;      // test / A-B switch
-
-static bool nax_hardware_supported() {
-  auto* device = metal::device(Device::gpu).mtl_device();
-  return hardware::nax_supported(
-      device->supportsFamily(static_cast<MTL::GPUFamily>(hardware::kApple10)));
-}
+bool nax_lib_ready_ = false;   // a NAX library was registered
+bool nax_enabled_ = true;      // test / A-B switch
 
 void init_nax_library(const std::string& nax_src) {
   nax_source_ = nax_src;
@@ -407,7 +228,7 @@ static bool nax_eligible(
 // Helper: dtype → Metal type string
 // ---------------------------------------------------------------------------
 
-static std::string dtype_to_metal(Dtype dt) {
+std::string dtype_to_metal(Dtype dt) {
   switch (dt) {
     case float16:   return "half";
     case bfloat16:  return "bfloat16_t";
@@ -417,33 +238,6 @@ static std::string dtype_to_metal(Dtype dt) {
     default:
       throw std::runtime_error(
           "Unsupported dtype for paged attention kernel");
-  }
-}
-
-// MLA dispatchers pick a single Metal specialization from one tensor's
-// dtype (q_nope) but the kernel template binds the same `T` to every
-// fp16/bf16 buffer (q_nope, q_pe, latent_cache, out, tmp_out). If they
-// disagree the shader will reinterpret bytes — e.g. read a bf16 cache
-// as fp16 — and silently corrupt attention. Validate up front.
-static void mla_validate_t_dtypes(
-    const char* dispatcher_name,
-    std::initializer_list<std::pair<const char*, const array*>> tensors) {
-  if (tensors.size() == 0) return;
-  Dtype expected = tensors.begin()->second->dtype();
-  if (expected != float16 && expected != bfloat16) {
-    throw std::runtime_error(
-        std::string(dispatcher_name) +
-        ": T buffers must be fp16 or bf16; got " +
-        dtype_to_metal(expected) + " on " + tensors.begin()->first);
-  }
-  for (const auto& [name, arr] : tensors) {
-    if (arr->dtype() != expected) {
-      throw std::runtime_error(
-          std::string(dispatcher_name) +
-          ": all T buffers must share the same dtype; got " +
-          dtype_to_metal(expected) + " on " + tensors.begin()->first +
-          " but " + dtype_to_metal(arr->dtype()) + " on " + name);
-    }
   }
 }
 
@@ -1559,28 +1353,28 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
   int nax_prefill_split_hint_;
 };
 
-static array paged_attention_primitive_fn(
+array paged_attention_primitive_fn(
     const array& query,
     const array& key_cache, const array& value_cache,
     int num_kv_heads, float scale, float softcap,
     const array& block_tables, const array& seq_lens,
     const array& cu_seqlens_q,
     int block_size, int max_seq_len, int sliding_window,
-    bool use_turboquant = false, const std::string& quant_type = "",
-    const array* key_scale_cache = nullptr,
-    const array* value_scale_cache = nullptr,
-    const array* key_zero_cache = nullptr,
-    const array* v_centroids = nullptr,
-    int v_bits = 3, int window_seqlen_q = 1,
-    const array* sinks = nullptr,
-    const array* mm_prefix_ranges = nullptr,
-    int num_decode_requests = -1,
-    int num_decode_tokens = 0,
-    int max_decode_context_len = 0, bool gqa_disabled = false,
-    int gqa_test_partition = 0,
-    const std::vector<int>& gqa_context_lens = {},
-    const std::optional<GqaDecodeLengthPlan>& gqa_length_plan = std::nullopt,
-    int nax_split_hint = -1, int nax_prefill_split_hint = -1) {
+    bool use_turboquant, const std::string& quant_type,
+    const array* key_scale_cache,
+    const array* value_scale_cache,
+    const array* key_zero_cache,
+    const array* v_centroids,
+    int v_bits, int window_seqlen_q,
+    const array* sinks,
+    const array* mm_prefix_ranges,
+    int num_decode_requests,
+    int num_decode_tokens,
+    int max_decode_context_len, bool gqa_disabled,
+    int gqa_test_partition,
+    const std::vector<int>& gqa_context_lens,
+    const std::optional<GqaDecodeLengthPlan>& gqa_length_plan,
+    int nax_split_hint, int nax_prefill_split_hint) {
   if (nax_split_hint < -1 || nax_split_hint > 1)
     throw std::invalid_argument("nax_split_hint must be -1, 0 or 1");
   if (nax_prefill_split_hint < -1 || nax_prefill_split_hint > 1)
@@ -1922,7 +1716,7 @@ class TQEncodePrimitive : public Primitive {
   bool k_signed_;
 };
 
-static std::vector<array> tq_encode_primitive_fn(
+std::vector<array> tq_encode_primitive_fn(
     const array& key, const array& value,
     const array& key_cache, const array& value_cache,
     const array& key_scale_cache, const array& value_scale_cache,
@@ -2073,7 +1867,7 @@ class ReshapeAndCachePrimitive : public Primitive {
   }
 };
 
-static std::vector<array> reshape_and_cache_primitive_fn(
+std::vector<array> reshape_and_cache_primitive_fn(
     const array& key, const array& value,
     const array& key_cache, const array& value_cache,
     const array& slot_mapping) {
@@ -2084,1114 +1878,4 @@ static std::vector<array> reshape_and_cache_primitive_fn(
       {key_cache.dtype(), value_cache.dtype()},
       prim,
       {key, value, key_cache, value_cache, slot_mapping});
-}
-
-// ---------------------------------------------------------------------------
-// GDN linear attention — in-place paged state
-// ---------------------------------------------------------------------------
-
-static std::string gdn_source_;
-
-void init_gdn_library(const std::string& src) {
-  gdn_source_ = src;
-  auto& d = metal::device(Device::gpu);
-  d.get_library("gdn_kern", [&]() { return gdn_source_; });
-}
-
-// MLX Scatter/SliceUpdate copy their destination unless it is donatable; GDN
-// pools are aliased across sibling layers, so pool[ids] = rows copies the full
-// pool. mx.fast.metal_kernel allocates fresh outputs, so this Primitive aliases
-// the pool with copy_shared_buffer; callers rebind the output so downstream
-// readers depend on the write. Destination slots must be distinct.
-
-class GDNStateScatterPrimitive : public Primitive {
- public:
-  explicit GDNStateScatterPrimitive(
-      Stream stream, bool zero = false, bool paged = false)
-      : Primitive(stream), zero_(zero), paged_(paged) {}
-
-  void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
-    throw std::runtime_error("GDNStateScatterPrimitive only supports GPU");
-  }
-
-  void eval_gpu(
-      const std::vector<array>& inputs,
-      std::vector<array>& outputs) override {
-    // inputs:  0=pool_in, 1=src_rows, 2=dst_ids
-    // outputs: 0=pool_out (aliases pool_in; the kernel writes in place)
-    const array& pool    = inputs[0];
-    const array& src     = inputs[1];
-    const array& dst_ids = inputs[2];
-    outputs[0].copy_shared_buffer(pool);
-
-    int n = static_cast<int>(dst_ids.size());
-    if (n == 0) {
-      return;
-    }
-    int tokens_per_page = paged_ ? pool.shape(1) : 1;
-    int row_elems = static_cast<int>(
-        pool.size() / pool.shape(0) / tokens_per_page);
-
-    // Both GPU kernels scatter the same rows. Select four elements per thread
-    // for dense, vector-aligned rows, or one element per thread for other views.
-    // This selection happens before launch.
-    bool dense_row = true;
-    size_t inner_stride = 1;
-    for (int axis = pool.ndim() - 1; axis >= (paged_ ? 2 : 1); --axis) {
-      dense_row &= pool.shape(axis) == 1 || pool.strides()[axis] == inner_stride;
-      inner_stride *= pool.shape(axis);
-    }
-    // Row sizes alone do not guarantee aligned vector access to sliced views.
-    const size_t vector_bytes = 4 * pool.itemsize();
-    bool vec4 = dense_row && (row_elems % 4) == 0 && (pool.strides()[0] % 4) == 0
-        && (!paged_ || (pool.strides()[1] % 4) == 0)
-        && reinterpret_cast<uintptr_t>(pool.data<char>()) % vector_bytes == 0
-        && (zero_ || reinterpret_cast<uintptr_t>(src.data<char>()) % vector_bytes == 0);
-    int lanes = vec4 ? row_elems / 4 : row_elems;
-
-    auto s = stream();
-    auto& d = metal::device(s.device);
-    auto dt = dtype_to_metal(pool.dtype());
-    std::string kname =
-        std::string("gdn_state_scatter_rows_") + (vec4 ? "vec4_" : "") + dt;
-    auto* lib = d.get_library("gdn_kern");
-    auto* kernel = d.get_kernel(kname, lib, kname, {});
-
-    auto& enc = metal::get_command_encoder(s);
-    enc.set_compute_pipeline_state(kernel);
-    enc.set_output_array(outputs[0], 0);
-    enc.set_input_array(src,         1);
-    enc.set_input_array(dst_ids,     2);
-    enc.set_bytes(lanes,             3);
-    int64_t row_stride = pool.strides()[0] / (vec4 ? 4 : 1);
-    int64_t token_stride = paged_ ? pool.strides()[1] / (vec4 ? 4 : 1) : 0;
-    enc.set_bytes(row_stride,        4);
-    enc.set_bytes(zero_,             8);
-    enc.set_bytes(tokens_per_page,   9);
-    enc.set_bytes(token_stride,     10);
-    if (!vec4) {
-      auto row_shape = pool.shape();
-      auto row_strides = pool.strides();
-      if (paged_) {
-        row_shape.erase(row_shape.begin());
-        row_strides.erase(row_strides.begin());
-      }
-      enc.set_vector_bytes(row_shape, 5);
-      enc.set_vector_bytes(row_strides, 6);
-      int ndim = dense_row ? 0 : static_cast<int>(row_shape.size());
-      enc.set_bytes(ndim, 7);
-    }
-
-    // 2D thread grid: x walks the row, y selects the update row. One
-    // threadgroup per row leaves most of the GPU idle on a 1 MiB slab.
-    //
-    // dispatch_threads maps to Metal's non-uniform dispatchThreads, so exactly
-    // `lanes` threads run along x and the kernels need no bounds check. This is
-    // the only dispatch_threads call in this file; the others round up through
-    // dispatch_threadgroups, which here would write past the end of a row.
-    int tg_x = std::min<int>(
-        lanes, static_cast<int>(kernel->maxTotalThreadsPerThreadgroup()));
-    enc.dispatch_threads(
-        MTL::Size::Make(lanes, n, 1),
-        MTL::Size::Make(tg_x, 1, 1));
-  }
-
-  const char* name() const override { return "GDNStateScatter"; }
-
-  bool is_equivalent(const Primitive& other) const override {
-    auto* rhs = dynamic_cast<const GDNStateScatterPrimitive*>(&other);
-    return rhs && rhs->zero_ == zero_ && rhs->paged_ == paged_;
-  }
- private:
-  bool zero_;
-  bool paged_;
-};
-
-static array gdn_state_scatter_primitive_fn(
-    const array& pool, const array& src, const array& dst_ids,
-    bool zero = false, bool paged = false) {
-  if (pool.ndim() < (paged ? 3 : 2)) {
-    throw std::runtime_error(
-        "gdn_state_scatter: pool must be [num_slots, ...] or "
-        "[num_blocks, block_size, ...] with paged=True");
-  }
-  if (paged && (zero || pool.shape(1) == 0)) {
-    throw std::runtime_error(
-        "gdn_state_scatter: paged writes require a positive block size and zero=False");
-  }
-  if (pool.dtype() != float16 &&
-      pool.dtype() != bfloat16 &&
-        pool.dtype() != float32 && pool.dtype() != uint8 && pool.dtype() != int8) {
-    throw std::runtime_error(
-        "gdn_state_scatter: pool dtype must be float16, bfloat16 or float32");
-  }
-  if (src.dtype() != pool.dtype()) {
-    throw std::runtime_error("gdn_state_scatter: src and pool dtypes differ");
-  }
-  if (dst_ids.dtype() != int32) {
-    throw std::runtime_error("gdn_state_scatter: dst_ids must be int32");
-  }
-  if (dst_ids.ndim() != 1) {
-    throw std::runtime_error("gdn_state_scatter: dst_ids must be 1-D");
-  }
-  if (src.ndim() != pool.ndim() - (paged ? 1 : 0) ||
-      !std::equal(
-          pool.shape().begin() + (paged ? 2 : 1), pool.shape().end(),
-          src.shape().begin() + 1)) {
-    throw std::runtime_error(
-        "gdn_state_scatter: src row shape does not match pool row shape");
-  }
-  if (!zero && static_cast<size_t>(src.shape(0)) != dst_ids.size()) {
-    throw std::runtime_error(
-        "gdn_state_scatter: one dst id per src row required");
-  }
-  // State components have dense inner rows but a padded physical page stride.
-  // Never materialize the destination: that would break shared cache storage.
-  auto contiguous_src = zero ? pool : contiguous(src);
-  auto contiguous_ids = contiguous(dst_ids);
-  auto prim = std::make_shared<GDNStateScatterPrimitive>(
-      default_stream(Device::gpu), zero, paged);
-  return array::make_arrays(
-      {pool.shape()}, {pool.dtype()}, prim,
-      {pool, contiguous_src, contiguous_ids})[0];
-}
-
-// ---------------------------------------------------------------------------
-// MLA paged attention (RFC #360)
-// ---------------------------------------------------------------------------
-
-static std::string mla_source_;
-
-void init_mla_library(const std::string& src) {
-  mla_source_ = src;
-  auto& d = metal::device(Device::gpu);
-  d.get_library("paged_mla_kern", [&]() { return mla_source_; });
-}
-
-// Dispatch the MLA paged attention kernel.
-//
-// Buffer slot map (must match kernels_v2/mla.metal):
-//   2: out          [total_q_tokens, num_heads, KV_LORA_RANK]
-//   3: q_nope       [total_q_tokens, num_heads, KV_LORA_RANK]
-//   4: q_pe         [total_q_tokens, num_heads, QK_ROPE_HEAD_DIM]
-//   5: latent_cache [num_blocks, BLOCK_SIZE, KV_LORA_RANK + QK_ROPE_HEAD_DIM]
-//   6: block_tables 7: context_lens 8: cu_seqlens_q
-//   9: num_seqs 10: max_num_blocks_per_seq 11: scale
-// The instantiated MLA specialization space — one row per distinct shape the
-// instantiate_mla call sites in kernels_v2/mla.metal declare. The dispatch
-// gate below and the drift test in tests/test_block_size_translation.py both
-// read this one table, so keep the row format stable:
-//   {kv_lora_rank, qk_rope_head_dim, block_size, heads_per_tg, num_threads,
-//    partition_size}
-// Each variant keeps the per-thread register footprint roughly constant
-// (NUM_THREADS scaled inversely to G):
-//   G=1 → NUM_THREADS=1024 (32 simdgroups, current sdpa_vector layout).
-//   G=2 → NUM_THREADS=512  (16 simdgroups, 2× cross-head amortization).
-struct MlaKernelSpec {
-  int kv_lora_rank;
-  int qk_rope_head_dim;
-  int block_size;
-  int heads_per_tg;
-  int num_threads;
-  int partition_size;
-};
-static constexpr MlaKernelSpec kMlaKernelSpecs[] = {
-    {512, 64, 16, 1, 1024, 0},
-    {512, 64, 32, 1, 1024, 0},
-    {512, 64, 16, 2, 512, 0},
-    {512, 64, 32, 2, 512, 0},
-};
-
-static const MlaKernelSpec& select_mla_kernel_spec(
-    int kv_lora_rank, int qk_rope_head_dim, int block_size,
-    int heads_per_tg, int num_heads) {
-  // The shape must match a kernel template instantiation — see
-  // kMlaKernelSpecs for the admitted space.
-  const MlaKernelSpec* spec = nullptr;
-  for (const auto& candidate : kMlaKernelSpecs) {
-    if (candidate.kv_lora_rank == kv_lora_rank &&
-        candidate.qk_rope_head_dim == qk_rope_head_dim &&
-        candidate.block_size == block_size &&
-        candidate.heads_per_tg == heads_per_tg) {
-      spec = &candidate;
-      break;
-    }
-  }
-  if (spec == nullptr) {
-    throw std::runtime_error(
-        "MLA kernel: no instantiation for kv_lora_rank=" +
-        std::to_string(kv_lora_rank) + " qk_rope_head_dim=" +
-        std::to_string(qk_rope_head_dim) + " block_size=" +
-        std::to_string(block_size) + " heads_per_tg=" +
-        std::to_string(heads_per_tg));
-  }
-
-  if (spec->partition_size != 0) {
-    throw std::runtime_error(
-        "MLA kernel: matched kv_lora_rank=" +
-        std::to_string(spec->kv_lora_rank) + " qk_rope_head_dim=" +
-        std::to_string(spec->qk_rope_head_dim) + " block_size=" +
-        std::to_string(spec->block_size) + " heads_per_tg=" +
-        std::to_string(spec->heads_per_tg) + " but partition_size=" +
-        std::to_string(spec->partition_size) + " is not dispatchable");
-  }
-
-  if (num_heads % heads_per_tg != 0) {
-    throw std::runtime_error(
-        "MLA kernel: num_heads (" + std::to_string(num_heads) +
-        ") must be divisible by heads_per_tg (" +
-        std::to_string(heads_per_tg) + ")");
-  }
-  return *spec;
-}
-
-struct MlaAttentionPlan {
-  std::string kernel_name;
-  std::string hash_name;
-  bool use_partitioning;
-  size_t shmem;
-  int grid_x;
-  int grid_y;
-  int threads_x;
-};
-
-static MlaAttentionPlan make_mla_attention_plan(
-    const MlaKernelSpec& spec, Dtype dtype,
-    int num_heads, int heads_per_tg, int total_q_tokens) {
-  auto dt = dtype_to_metal(dtype);
-  std::string kname = "paged_mla_attention_" + dt + "_kvr" +
-                      std::to_string(spec.kv_lora_rank) + "_pe" +
-                      std::to_string(spec.qk_rope_head_dim) + "_bs" +
-                      std::to_string(spec.block_size) + "_g" +
-                      std::to_string(spec.heads_per_tg) + "_nt" +
-                      std::to_string(spec.num_threads) + "_nsl32_ps" +
-                      std::to_string(spec.partition_size);
-  bool use_partitioning = false;
-  std::string hash_name = kname + "_part" + (use_partitioning ? "1" : "0");
-  // Threadgroup memory:
-  //   max_scores[G * BN] + sum_exp_scores[G * BN] + outputs[BD * BD]
-  // The outputs buffer must be sized for the maximum write offset
-  // `lane*BD + sg`, which reaches (BD-1)*BD + (BN-1). Using BD*BD always
-  // (rather than BN*BD) gives enough room across all G; on G=1 (BN=BD=32)
-  // they coincide.
-  // For G=1, NT=1024: 2*32 + 32*32 = 1088 fp32 ≈ 4.3 KB.
-  // For G=2, NT=512:  2*2*16 + 32*32 = 1088 fp32 ≈ 4.3 KB.
-  const int BD = 32;
-  const int BN = spec.num_threads / BD;
-  size_t shmem =
-      static_cast<size_t>((2 * heads_per_tg * BN + BD * BD) * sizeof(float));
-  return {std::move(kname), std::move(hash_name), use_partitioning, shmem,
-          num_heads / heads_per_tg, total_q_tokens, spec.num_threads};
-}
-
-static void dispatch_mla_paged_attention(
-    array& out,
-    const array& q_nope,
-    const array& q_pe,
-    const array& latent_cache,
-    const array& block_tables,
-    const array& context_lens,
-    const array& cu_seqlens_q,
-    int block_size,
-    float scale,
-    int heads_per_tg,
-    Stream s) {
-  auto& d = metal::device(s.device);
-
-  int total_q_tokens = static_cast<int>(q_nope.shape(0));
-  int num_heads = static_cast<int>(q_nope.shape(1));
-  int kv_lora_rank = static_cast<int>(q_nope.shape(2));
-  int qk_rope_head_dim = static_cast<int>(q_pe.shape(2));
-  int max_num_blocks_per_seq = static_cast<int>(block_tables.shape(1));
-  int num_seqs = static_cast<int>(cu_seqlens_q.shape(0)) - 1;
-
-  const auto& spec = select_mla_kernel_spec(
-      kv_lora_rank, qk_rope_head_dim, block_size, heads_per_tg, num_heads);
-  mla_validate_t_dtypes("MLA kernel", {
-      {"q_nope", &q_nope},
-      {"q_pe", &q_pe},
-      {"latent_cache", &latent_cache},
-      {"out", &out},
-  });
-  auto plan = make_mla_attention_plan(
-      spec, q_nope.dtype(), num_heads, heads_per_tg, total_q_tokens);
-
-  auto* lib = d.get_library("paged_mla_kern");
-  auto* kernel = d.get_kernel(
-      plan.kernel_name,
-      lib,
-      plan.hash_name,
-      {{&plan.use_partitioning, MTL::DataType::DataTypeBool, NS::UInteger(10)}});
-
-  auto& enc = metal::get_command_encoder(s);
-  enc.set_compute_pipeline_state(kernel);
-  enc.set_threadgroup_memory_length(plan.shmem, 0);
-
-  enc.set_output_array(out, 2);
-  enc.set_input_array(q_nope, 3);
-  enc.set_input_array(q_pe, 4);
-  enc.set_input_array(latent_cache, 5);
-  enc.set_input_array(block_tables, 6);
-  enc.set_input_array(context_lens, 7);
-  enc.set_input_array(cu_seqlens_q, 8);
-
-  int32_t num_seqs_i = static_cast<int32_t>(num_seqs);
-  int32_t max_blocks_i = static_cast<int32_t>(max_num_blocks_per_seq);
-  enc.set_bytes(num_seqs_i, 9);
-  enc.set_bytes(max_blocks_i, 10);
-  enc.set_bytes(scale, 11);
-
-  // Grid: (num_heads / G, total_q_tokens, 1). Each TG owns G consecutive
-  // query heads sharing the same latent KV.
-  enc.dispatch_threadgroups(
-      MTL::Size::Make(plan.grid_x, plan.grid_y, 1),
-      MTL::Size::Make(plan.threads_x, 1, 1));
-
-  // No add_temporary calls: the only caller is MlaPagedAttentionPrimitive,
-  // and inside a primitive MLX manages array lifetimes via the completion
-  // handler.
-}
-
-// MLA single-pass paged attention as an MLX Primitive so the kernel
-// dispatch participates in the lazy graph (no per-call mx.eval boundary).
-class MlaPagedAttentionPrimitive : public UnaryPrimitive {
- public:
-  MlaPagedAttentionPrimitive(
-      Stream stream, int block_size, float scale, int heads_per_tg)
-      : UnaryPrimitive(stream),
-        block_size_(block_size),
-        scale_(scale),
-        heads_per_tg_(heads_per_tg) {}
-
-  void eval_cpu(const std::vector<array>&, array&) override {
-    throw std::runtime_error("MlaPagedAttentionPrimitive only supports GPU");
-  }
-
-  void eval_gpu(const std::vector<array>& inputs, array& out) override {
-    // Inputs match the single-pass dispatcher's positional order:
-    //   [q_nope, q_pe, latent_cache, block_tables, context_lens, cu_seqlens_q]
-    out.set_data(allocator::malloc(out.nbytes()));
-    dispatch_mla_paged_attention(
-        out,
-        inputs[0], inputs[1], inputs[2],
-        inputs[3], inputs[4], inputs[5],
-        block_size_, scale_, heads_per_tg_,
-        stream());
-  }
-
-  const char* name() const override { return "MlaPagedAttention"; }
-
-  bool is_equivalent(const Primitive& other) const override {
-    auto* rhs = dynamic_cast<const MlaPagedAttentionPrimitive*>(&other);
-    return rhs && rhs->block_size_ == block_size_
-        && rhs->scale_ == scale_ && rhs->heads_per_tg_ == heads_per_tg_;
-  }
-
- private:
-  int block_size_;
-  float scale_;
-  int heads_per_tg_;
-};
-
-static array mla_paged_attention_primitive_fn(
-    const array& q_nope,
-    const array& q_pe,
-    const array& latent_cache,
-    const array& block_tables,
-    const array& context_lens,
-    const array& cu_seqlens_q,
-    int block_size,
-    float scale,
-    int heads_per_tg) {
-  auto prim = std::make_shared<MlaPagedAttentionPrimitive>(
-      default_stream(Device::gpu), block_size, scale, heads_per_tg);
-  // Output shape matches q_nope: (total_q_tokens, num_heads, kv_lora_rank).
-  return array(
-      q_nope.shape(),
-      q_nope.dtype(),
-      std::move(prim),
-      {q_nope, q_pe, latent_cache, block_tables, context_lens, cu_seqlens_q});
-}
-
-struct GDNLinearAttentionPlan {
-  std::string kernel_name;
-  int grid_x;
-  int grid_z;
-  int threads_x;
-};
-
-static GDNLinearAttentionPlan make_gdn_linear_attention_plan(
-    Dtype dtype, int num_requests, int Hv, int Dv) {
-  auto dt = dtype_to_metal(dtype);
-  return {"gdn_linear_attention_" + dt, Dv, num_requests * Hv, 32};
-}
-
-// TODO: Remove the Python per-request convolution once its batched replacement
-// covers the required cases and its performance is verified.
-// TODO: Once optimized recurrence covers every required case, remove the native
-// fallback, this primitive, its kernel binding, and VLLM_METAL_GDN_LAZY_KERNELS.
-class GDNLinearAttentionPrimitive : public Primitive {
- public:
-  GDNLinearAttentionPrimitive(Stream stream, int Hk, int Hv, int Dk, int Dv)
-      : Primitive(stream), Hk_(Hk), Hv_(Hv), Dk_(Dk), Dv_(Dv) {}
-
-  void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
-    throw std::runtime_error("GDNLinearAttentionPrimitive only supports GPU");
-  }
-
-  void eval_gpu(
-      const std::vector<array>& inputs,
-      std::vector<array>& outputs) override {
-    // Each recurrence owns its output; only persistent state aliases an input.
-    outputs[0].set_data(allocator::malloc(outputs[0].nbytes()));
-    outputs[1].copy_shared_buffer(inputs[5]);
-    const auto& q = inputs[0];
-    const auto& k = inputs[1];
-    const auto& v = inputs[2];
-    const auto& g = inputs[3];
-    const auto& beta = inputs[4];
-    const auto& cu_seqlens = inputs[6];
-    const auto& slot_mapping = inputs[7];
-    auto& y = outputs[0];
-    auto& state_pool = outputs[1];
-    int num_requests = static_cast<int>(cu_seqlens.shape(0)) - 1;
-    auto s = stream();
-    auto& d = metal::device(Device::gpu);
-
-    auto plan = make_gdn_linear_attention_plan(
-        q.dtype(), num_requests, Hv_, Dv_);
-    auto* lib = d.get_library("gdn_kern");
-    auto* kernel = d.get_kernel(
-        plan.kernel_name, lib, plan.kernel_name, {});
-
-    auto& enc = metal::get_command_encoder(s);
-    enc.set_compute_pipeline_state(kernel);
-
-    enc.set_input_array(q, 0);
-    enc.set_input_array(k, 1);
-    enc.set_input_array(v, 2);
-    enc.set_input_array(g, 3);
-    enc.set_input_array(beta, 4);
-    enc.set_output_array(state_pool, 5);
-    enc.set_input_array(cu_seqlens, 6);
-    enc.set_input_array(slot_mapping, 7);
-    enc.set_output_array(y, 8);
-
-    enc.set_bytes(num_requests, 9);
-    enc.set_bytes(Hk_, 10);
-    enc.set_bytes(Hv_, 11);
-    enc.set_bytes(Dk_, 12);
-    enc.set_bytes(Dv_, 13);
-    int64_t state_stride = state_pool.strides()[0];
-    enc.set_bytes(state_stride, 14);
-
-    // Grid: (Dv, 1, num_requests * Hv)  Threadgroup: (32, 1, 1)
-    enc.dispatch_threadgroups(
-        MTL::Size::Make(plan.grid_x, 1, plan.grid_z),
-        MTL::Size::Make(plan.threads_x, 1, 1));
-  }
-
-  const char* name() const override { return "GDNLinearAttention"; }
-
-  bool is_equivalent(const Primitive& other) const override {
-    auto* rhs = dynamic_cast<const GDNLinearAttentionPrimitive*>(&other);
-    return rhs && rhs->Hk_ == Hk_ && rhs->Hv_ == Hv_
-        && rhs->Dk_ == Dk_ && rhs->Dv_ == Dv_;
-  }
-
- private:
-  int Hk_, Hv_, Dk_, Dv_;
-};
-
-static std::vector<array> gdn_linear_attention_primitive_fn(
-    const array& q, const array& k, const array& v,
-    const array& g, const array& beta, const array& state_pool,
-    const array& cu_seqlens, const array& slot_mapping,
-    int Hk, int Hv, int Dk, int Dv) {
-  if (Dk <= 0 || Dk > 256 || Dk % 32 != 0) {
-    throw std::runtime_error(
-        "GDN kernel requires Dk to be a positive multiple of 32, at most 256. "
-        "Got Dk=" + std::to_string(Dk));
-  }
-  auto prim = std::make_shared<GDNLinearAttentionPrimitive>(
-      default_stream(Device::gpu), Hk, Hv, Dk, Dv);
-  return array::make_arrays(
-      {{q.shape(0), Hv, Dv}, state_pool.shape()},
-      {q.dtype(), state_pool.dtype()}, prim,
-      {q, k, v, g, beta, state_pool, cu_seqlens, slot_mapping});
-}
-// ---------------------------------------------------------------------------
-// nanobind module
-// ---------------------------------------------------------------------------
-
-NB_MODULE(_paged_ops, m) {
-  register_mlx_patch(m);
-  m.attr("PARTITION_SIZE") = nb::int_(kPartitionSize);
-  m.def("detected_gpu_core_count", &detected_gpu_core_count,
-        "Detected GPU core count, or zero when detection is unavailable.");
-  m.def("_override_detected_gpu_core_count_for_test",
-        &override_detected_gpu_core_count_for_test, nb::arg("cores"),
-        "Test-only. A positive count replaces hardware detection; zero simulates "
-        "failure and -1 restores detection. Production must not call this.");
-  m.def("_set_paged_dispatch_diagnostics", &set_paged_dispatch_diagnostics,
-        nb::arg("enabled"),
-        "Private process-wide diagnostic opt-in; disabled by default. "
-        "Call with evaluation idle, in the worker that executes attention. "
-        "Clears the last family/partition and returns the previous enabled state. "
-        "This does not change attention routing or numerical computation.");
-  nb::class_<GqaDecodeLengthPlan>(m, "GqaDecodeLengthPlan")
-      .def_ro("num_requests", &GqaDecodeLengthPlan::num_requests)
-      .def_ro("max_length", &GqaDecodeLengthPlan::max_length);
-  m.def("gqa_decode_length_plan", &gqa_decode_length_plan<std::vector<int>>,
-        nb::arg("context_lens"),
-        "Immutable CPU length statistics and partition offsets shared across layers. "
-        "Does not select a partition or read GPU arrays.");
-  m.def("gqa_decode_partition_size", &gqa_decode_plan_for_shape,
-        nb::arg("num_heads"), nb::arg("num_kv_heads"), nb::arg("head_size"),
-        nb::arg("max_seq_len"), nb::arg("gpu_cores"), nb::arg("block_size") = 16,
-        "Default GQA partition for a supported decode geometry, or zero. "
-        "Geometry, work and scratch-budget planning; dtype, feature and reducer "
-        "eligibility are enforced separately by gqa_decode dispatch.");
-  m.def("gqa_decode_batch_partition_size", &gqa_decode_batch_plan_for_shape,
-        nb::arg("num_heads"), nb::arg("num_kv_heads"), nb::arg("head_size"),
-        nb::arg("context_lens"), nb::arg("gpu_cores"), nb::arg("block_size") = 16,
-        nb::arg("gpu_arch") = "", nb::arg("max_seq_len") = 0,
-        "GQA partition from per-request KV lengths, or zero. Empty gpu_arch "
-        "uses the executing GPU; an explicit architecture is a read-only planning "
-        "input and does not override dispatch. max_seq_len optionally supplies "
-        "the dispatch bound; compact scratch uses actual lengths. Dispatch separately "
-        "checks features and compiled reducer resources.");
-  m.def("last_gqa_partition_size", []() {
-    return g_last_gqa_partition.load(std::memory_order_relaxed);
-  }, "Partition selected by the most recent recorded paged eval, or zero "
-     "when disabled, cleared or on a fallback. "
-     "Process-wide diagnostic; not a request trace or routing input.");
-  m.def("last_gqa_num_requests", []() {
-    return g_last_gqa_requests.load(std::memory_order_relaxed);
-  }, "Number of requests in the most recent recorded GQA dispatch, or zero "
-     "when disabled, cleared or on a fallback. Not per-request telemetry.");
-  m.def("gqa_decode_shape_eligible", &gqa_decode_shape_eligible,
-        nb::arg("num_heads"), nb::arg("num_kv_heads"), nb::arg("head_size"),
-        nb::arg("max_seq_len"), nb::arg("gpu_cores"), nb::arg("block_size") = 16,
-        "Measured default scope with a conservative grid guard; geometry "
-        "work and scratch-budget planning. Functional dispatch checks dtype, "
-        "feature and resource eligibility separately.");
-  m.def("min_decode_grid", &min_decode_grid,
-        "Decode-grid threshold (threadgroups) below which split-KV decode "
-        "engages on this machine.");
-  m.def("_gqa_decode_config_for_test", []() {
-    nb::dict config;
-    nb::list geometries;
-    for (const auto& geometry : kGqaDecodeGeometries) {
-      geometries.append(nb::make_tuple(geometry.num_heads, geometry.num_kv_heads,
-                                       geometry.head_size, geometry.block_size));
-    }
-    nb::list partitions;
-    for (int partition : kGqaPartitionSizes) partitions.append(nb::int_(partition));
-    config["geometries"] = geometries;
-    config["partitions"] = partitions;
-    config["simd_groups_per_core"] = kGqaSimdGroupsPerCore;
-    config["max_scratch_bytes"] = kGqaMaxScratchBytes;
-    nb::dict m3;
-    m3["architecture"] = "applegpu_g15g";
-    m3["gpu_cores"] = kM3GqaGpuCores;
-    m3["short_head128_batch"] = kM3GqaShortHead128Batch;
-    m3["short_head128_min_context"] = kM3GqaShortHead128MinContext;
-    m3["long_head_size"] = 256;
-    m3["block16_min_context"] = kM3GqaBlock16MinContext;
-    m3["block32_min_context"] = kM3GqaBlock32MinContext;
-    m3["preferred_partition"] = 256;
-    m3["reducer_memory_bytes"] = kM3GqaReducerMemoryBytes;
-    m3["reducer_static_memory_bytes"] = kGqaReduceStaticMemoryBytes;
-    config["m3_batched_preference"] = m3;
-    return config;
-  }, "Read-only test metadata from the native dispatch table and planner. "
-     "Does not create pipelines, override policy or inspect hardware.");
-  m.def(
-      "_has_gqa_decode_kernel",
-      []() {
-        try {
-          auto& d = metal::device(Device::gpu);
-          auto* lib = d.get_library("paged_attention_v2_kern");
-          // Check every layout admitted by the dispatch table. Duplicate
-          // layouts reuse the same cached pipelines.
-          for (const char* dtype : {"half", "bfloat16_t"}) {
-            for (int part : kGqaPartitionSizes) {
-              for (const auto& layout : kGqaDecodeGeometries) {
-                const auto reducer = kernels::paged_reduce_kernel_name(
-                    dtype, layout.head_size, part);
-                bool no = false;
-                if (d.get_kernel(reducer, lib, reducer + "_gqa_check",
-                    {{&no, MTL::DataType::DataTypeBool, NS::UInteger(40)},
-                     {&no, MTL::DataType::DataTypeBool, NS::UInteger(50)},
-                     {&no, MTL::DataType::DataTypeBool, NS::UInteger(130)}})
-                    == nullptr) return false;
-                const auto name = gqa_decode_kernel_name(
-                    dtype, layout.head_size, layout.block_size, part);
-                if (d.get_kernel(name, lib, name + "_compact0",
-                    {{&no, MTL::DataType::DataTypeBool, NS::UInteger(130)}})
-                    == nullptr) return false;
-              }
-            }
-          }
-          return true;
-        } catch (const std::exception&) {
-          return false;
-        }
-      },
-      "Private test-only probe. Creates pipelines for all shipped GQA "
-      "specializations; never call from a production latency-sensitive path.");
-  m.def("paged_attention_capabilities", []() {
-    nb::dict caps;
-    caps["gqa_decode"] = true;
-    caps["gqa_disable"] = true;
-    caps["decode_routing_metadata"] = true;
-    caps["gqa_batch_context_lens"] = true;
-    caps["gqa_length_plan"] = true;
-    caps["gqa_mixed_decode_plan"] = true;
-    caps["nax_split_hint"] = true;
-    caps["nax_prefill_split_hint"] = true;
-    return caps;
-  }, "Capabilities of the public paged attention interface. Private test "
-     "kernels do not imply an enabled production route.");
-
-  m.def("tile_config",
-        [](int head_size) -> nb::object {
-          auto cfg = kernels::select_tile_config(head_size);
-          if (!cfg) return nb::none();
-          return nb::make_tuple(cfg->BQ, cfg->TILE_KV);
-        },
-        nb::arg("head_size"),
-        "The tiled-prefill kernel's (BQ, TILE_KV) tile config for a head "
-        "size, or None when that head size has no tiled instantiation.");
-
-  m.def("init_v2_library", &init_v2_library,
-        nb::arg("v2_src"),
-        "JIT-compile the v2 online-softmax Metal shader.");
-
-  m.def("init_library_path", &init_library_path,
-        nb::arg("name"), nb::arg("path"),
-        "Load a precompiled .metallib from disk, cached under `name`.");
-
-  m.def("init_gdn_library", &init_gdn_library,
-        nb::arg("gdn_src"),
-        "JIT-compile the GDN linear attention Metal shader.");
-
-  m.def("init_nax_library", &init_nax_library,
-        nb::arg("nax_src"),
-        "JIT-compile the NAX prefill attention Metal shader.");
-
-  m.def("init_nax_library_path", &init_nax_library_path,
-        nb::arg("path"),
-        "Load the precompiled NAX prefill .metallib from disk.");
-
-  m.def("nax_supported", &nax_hardware_supported,
-        "True when the OS and GPU expose NAX tensor units.");
-
-  m.def("nax_ready", []() { return nax_lib_ready_ && nax_enabled_; },
-        "True when the NAX prefill kernel is loaded and enabled.");
-
-  m.def("set_nax_enabled", [](bool enabled) { nax_enabled_ = enabled; },
-        nb::arg("enabled"),
-        "Runtime kill-switch for the NAX prefill kernel (tests / A-B runs).");
-
-  m.def("supports_mm_prefix", []() { return true; },
-        "True when paged_attention_primitive accepts mm_prefix_ranges "
-        "(Gemma 4 vision image-block attention in the tiled prefill kernel).");
-
-  m.def("tq_encode",
-        [](nb::handle key_h, nb::handle value_h,
-           nb::handle key_cache_h, nb::handle value_cache_h,
-           nb::handle key_scale_cache_h, nb::handle value_scale_cache_h,
-           nb::handle key_zero_cache_h,
-           nb::handle slot_mapping_h,
-           nb::handle v_centroids_h,
-           int v_bits, int k_bits, bool k_signed) {
-          auto results = tq_encode_primitive_fn(
-              *nb::inst_ptr<array>(key_h),
-              *nb::inst_ptr<array>(value_h),
-              *nb::inst_ptr<array>(key_cache_h),
-              *nb::inst_ptr<array>(value_cache_h),
-              *nb::inst_ptr<array>(key_scale_cache_h),
-              *nb::inst_ptr<array>(value_scale_cache_h),
-              *nb::inst_ptr<array>(key_zero_cache_h),
-              *nb::inst_ptr<array>(slot_mapping_h),
-              *nb::inst_ptr<array>(v_centroids_h),
-              v_bits, k_bits, k_signed);
-
-          // Mint five Python mx.core.array placeholders inside the binding
-          // (callers never see the placeholder dance).  We go through the
-          // Python-side mlx.core.array constructor because cross-module
-          // nanobind RTTI for nb::class_<array> from libmlx is broken under
-          // hidden symbol visibility; overwrite_descriptor is the same
-          // escape hatch used by paged_attention_primitive below.
-          nb::object mx_core  = nb::module_::import_("mlx.core");
-          nb::object arr_cls  = mx_core.attr("array");
-          nb::object zero_arg = nb::int_(0);
-          nb::object out_k    = arr_cls(zero_arg);
-          nb::object out_v    = arr_cls(zero_arg);
-          nb::object out_ks   = arr_cls(zero_arg);
-          nb::object out_vs   = arr_cls(zero_arg);
-          nb::object out_kz   = arr_cls(zero_arg);
-          nb::inst_ptr<array>(out_k)->overwrite_descriptor(results[0]);
-          nb::inst_ptr<array>(out_v)->overwrite_descriptor(results[1]);
-          nb::inst_ptr<array>(out_ks)->overwrite_descriptor(results[2]);
-          nb::inst_ptr<array>(out_vs)->overwrite_descriptor(results[3]);
-          nb::inst_ptr<array>(out_kz)->overwrite_descriptor(results[4]);
-          return nb::make_tuple(out_k, out_v, out_ks, out_vs, out_kz);
-        },
-        nb::arg("key"), nb::arg("value"),
-        nb::arg("key_cache"), nb::arg("value_cache"),
-        nb::arg("key_scale_cache"), nb::arg("value_scale_cache"),
-        nb::arg("key_zero_cache"),
-        nb::arg("slot_mapping"),
-        nb::arg("v_centroids"),
-        nb::arg("v_bits"),
-        nb::arg("k_bits"),
-        nb::arg("k_signed"),
-        "Fused TurboQuant encode + paged scatter.  Wraps a real MLX "
-        "Primitive so its five cache writes carry graph provenance — "
-        "downstream paged_attention_primitive and the next decode step's "
-        "tq_encode depend on this op through the lazy graph instead of "
-        "racing it on a separate command buffer.  Returns a 5-tuple "
-        "(new_key_cache, new_value_cache, new_key_scale_cache, "
-        "new_value_scale_cache, new_key_zero_cache); each aliases the "
-        "corresponding input buffer in place and the caller MUST rebind "
-        "kv_cache.<cache>[layer_idx] to the returned value so subsequent "
-        "ops see the post-write provenance.  Supports all K quants in "
-        "QUANT_PARAMS (signed q8_0/int8 at k_bits=8; unsigned uint8/q5_0/"
-        "q4_0/int4/uint4/int2/uint2 at k_bits in {2,3,4,5,8}). V supports "
-        "any v_bits in [1, 8] via the v_centroids buffer.");
-
-  m.def("reshape_and_cache",
-        [](nb::handle key_h, nb::handle value_h,
-           nb::handle key_cache_h, nb::handle value_cache_h,
-           nb::handle slot_mapping_h) {
-          auto results = reshape_and_cache_primitive_fn(
-              *nb::inst_ptr<array>(key_h),
-              *nb::inst_ptr<array>(value_h),
-              *nb::inst_ptr<array>(key_cache_h),
-              *nb::inst_ptr<array>(value_cache_h),
-              *nb::inst_ptr<array>(slot_mapping_h));
-
-          // Same placeholder dance as tq_encode: mint mx.core.array objects and
-          // overwrite_descriptor to bypass cross-module nanobind RTTI.
-          nb::object mx_core  = nb::module_::import_("mlx.core");
-          nb::object arr_cls  = mx_core.attr("array");
-          nb::object zero_arg = nb::int_(0);
-          nb::object out_k    = arr_cls(zero_arg);
-          nb::object out_v    = arr_cls(zero_arg);
-          nb::inst_ptr<array>(out_k)->overwrite_descriptor(results[0]);
-          nb::inst_ptr<array>(out_v)->overwrite_descriptor(results[1]);
-          return nb::make_tuple(out_k, out_v);
-        },
-        nb::arg("key"), nb::arg("value"),
-        nb::arg("key_cache"), nb::arg("value_cache"),
-        nb::arg("slot_mapping"),
-        "Fused K/V paged scatter for non-quantized (fp16/bf16/fp32) caches. "
-        "Wraps an MLX Primitive whose two cache writes carry graph provenance "
-        "for the downstream paged_attention read; each output aliases its input "
-        "cache buffer in place, so the caller MUST rebind "
-        "kv_cache.<cache>[layer_idx] to the returned value. key/value are "
-        "[num_tokens, num_kv_heads, head_size]; caches are "
-        "[num_blocks, block_size, num_kv_heads, head_size].");
-
-  m.def("gdn_state_scatter",
-        [](nb::handle pool_h, nb::handle src_h, nb::handle ids_h,
-           bool zero, bool paged) {
-          // inst_ptr<array> on a non-array is undefined behaviour, so check
-          // before dereferencing: a wrong type must raise, not crash.
-          nb::object mx_array_cls =
-              nb::module_::import_("mlx.core").attr("array");
-          for (nb::handle h : {pool_h, src_h, ids_h}) {
-            if (!nb::isinstance(h, mx_array_cls)) {
-              throw std::runtime_error(
-                  "gdn_state_scatter: pool, src and dst_ids must be "
-                  "mlx.core.array");
-            }
-          }
-          auto result = gdn_state_scatter_primitive_fn(
-              *nb::inst_ptr<array>(pool_h),
-              *nb::inst_ptr<array>(src_h),
-              *nb::inst_ptr<array>(ids_h), zero, paged);
-
-          // Same placeholder dance as tq_encode / reshape_and_cache: mint an
-          // mx.core.array and overwrite_descriptor to bypass cross-module
-          // nanobind RTTI.
-          nb::object mx_core  = nb::module_::import_("mlx.core");
-          nb::object arr_cls  = mx_core.attr("array");
-          nb::object zero_arg = nb::int_(0);
-          nb::object out      = arr_cls(zero_arg);
-          nb::inst_ptr<array>(out)->overwrite_descriptor(result);
-          return out;
-        },
-        nb::arg("pool"), nb::arg("src"), nb::arg("dst_ids"), nb::arg("zero") = false,
-        nb::arg("paged") = false,
-        "In-place row scatter into a slot-indexed GDN state pool. Writes "
-        "src[i] into pool[dst_ids[i]] without MLX's whole-pool copy preamble; "
-        "source rows and indices are made contiguous; destination strides and "
-        "backing storage are preserved, so the caller MUST rebind its pool "
-        "reference. dst_ids must be distinct int32 slots; src is "
-        "[n, *pool.shape[1:]] with pool's dtype. With paged=True, pool is "
-        "[num_blocks, block_size, ...], src is [n, *pool.shape[2:]], and "
-        "dst_ids address flattened token slots while preserving page padding.");
-
-  // Private numerical-test entry: bypass only the performance selector, never
-  // mutate process-wide policy or expose an override on the production API.
-  m.def("_gqa_paged_attention_for_test",
-        [](nb::handle query_h, nb::handle key_h, nb::handle value_h,
-           float scale, nb::handle tables_h, nb::handle lengths_h,
-           int block_size, int max_seq_len, int partition_size,
-           nb::handle out_h, const std::vector<int>& context_lens) {
-          const auto& q = *nb::inst_ptr<array>(query_h);
-          const auto& k = *nb::inst_ptr<array>(key_h);
-          const auto& v = *nb::inst_ptr<array>(value_h);
-          const auto& tables = *nb::inst_ptr<array>(tables_h);
-          const auto& lengths = *nb::inst_ptr<array>(lengths_h);
-          if (std::find(kGqaPartitionSizes.begin(), kGqaPartitionSizes.end(),
-                        partition_size) == kGqaPartitionSizes.end()) {
-            throw std::invalid_argument("GQA test partition must be 256/512");
-          }
-          if (q.ndim() != 3 || q.shape(0) < 1 || k.ndim() != 4 ||
-              k.shape() != v.shape() || k.strides() != v.strides() ||
-              (q.dtype() != float16 && q.dtype() != bfloat16) ||
-              k.dtype() != q.dtype() || v.dtype() != q.dtype() ||
-              k.shape(3) != q.shape(2) ||
-              !gqa_decode_geometry_supported(q.shape(1), k.shape(2),
-                                             q.shape(2), block_size) ||
-              k.shape(1) % block_size != 0 ||
-              tables.ndim() != 2 || tables.shape(0) != q.shape(0) ||
-              tables.dtype() != int32 || lengths.ndim() != 1 ||
-              lengths.shape(0) != q.shape(0) || lengths.dtype() != int32 ||
-              max_seq_len <= 0 ||
-              max_seq_len > static_cast<int64_t>(tables.shape(1)) * block_size) {
-            throw std::invalid_argument("GQA test entry requires supported one-token decode rows");
-          }
-          const int64_t num_partitions =
-              (static_cast<int64_t>(max_seq_len) + partition_size - 1) /
-              partition_size;
-          if (kernels::paged_reduce_threadgroup_bytes(num_partitions) >
-              metal::device(Device::gpu).mtl_device()->maxThreadgroupMemoryLength()) {
-            throw std::invalid_argument(
-                "GQA test partition exceeds the device threadgroup memory limit");
-          }
-          auto cu = arange(q.shape(0) + 1, int32);
-          auto result = paged_attention_primitive_fn(
-              q, k, v, k.shape(2), scale, 0.f, tables, lengths, cu,
-              block_size, max_seq_len, -1, false, "", nullptr, nullptr,
-              nullptr, nullptr, 3, 1, nullptr, nullptr, q.shape(0), q.shape(0),
-              max_seq_len, false,
-              partition_size, context_lens);
-          nb::inst_ptr<array>(out_h)->overwrite_descriptor(result);
-        }, nb::arg("query"), nb::arg("key_cache"), nb::arg("value_cache"),
-        nb::arg("scale"), nb::arg("block_tables"), nb::arg("seq_lens"),
-        nb::arg("block_size"), nb::arg("max_seq_len"), nb::arg("partition_size"),
-        nb::arg("out"), nb::arg("gqa_context_lens") = std::vector<int>{},
-        "Private test-only one-token-per-request GQA dispatch with an explicit partition. "
-        "Page IDs and sequence lengths must describe valid cache contents. "
-        "Does not change the default selector or require GPU core detection.");
-
-  // Paged attention primitive (read-only): dispatches paged_attention_v2_online.
-  // Cache writes are handled by MLX-native scatter upstream.
-  // Uses overwrite_descriptor to bypass cross-module nanobind RTTI.
-  m.def("paged_attention_primitive",
-        [](nb::handle query_h,
-           nb::handle key_cache_h, nb::handle value_cache_h,
-           int num_kv_heads, float scale, float softcap,
-           nb::handle block_tables_h, nb::handle seq_lens_h,
-           nb::handle cu_seqlens_q_h,
-           int block_size, int max_seq_len, int sliding_window,
-           nb::handle out_h,
-           nb::object key_scale_cache_h,
-           nb::object value_scale_cache_h,
-           nb::object key_zero_cache_h,
-           nb::object v_centroids_h,
-           bool use_turboquant,
-           const std::string& quant_type,
-           int v_bits,
-           int window_seqlen_q,
-           nb::object sinks_h,
-           nb::object mm_prefix_ranges_h,
-           int num_decode_requests,
-           int num_decode_tokens,
-           int max_decode_context_len, bool gqa_disabled,
-           const std::vector<int>& gqa_context_lens,
-           const std::optional<GqaDecodeLengthPlan>& gqa_length_plan,
-           int nax_split_hint, int nax_prefill_split_hint) {
-          const array* sk = sinks_h.is_none()
-              ? nullptr : nb::inst_ptr<array>(sinks_h);
-          const array* mp = mm_prefix_ranges_h.is_none()
-              ? nullptr : nb::inst_ptr<array>(mm_prefix_ranges_h);
-          const array* ks = use_turboquant
-              ? nb::inst_ptr<array>(key_scale_cache_h) : nullptr;
-          const array* vs = use_turboquant
-              ? nb::inst_ptr<array>(value_scale_cache_h) : nullptr;
-          const array* kz = use_turboquant
-              ? nb::inst_ptr<array>(key_zero_cache_h) : nullptr;
-          const array* vc = use_turboquant
-              ? nb::inst_ptr<array>(v_centroids_h) : nullptr;
-          auto result = paged_attention_primitive_fn(
-              *nb::inst_ptr<array>(query_h),
-              *nb::inst_ptr<array>(key_cache_h),
-              *nb::inst_ptr<array>(value_cache_h),
-              num_kv_heads, scale, softcap,
-              *nb::inst_ptr<array>(block_tables_h),
-              *nb::inst_ptr<array>(seq_lens_h),
-              *nb::inst_ptr<array>(cu_seqlens_q_h),
-              block_size, max_seq_len, sliding_window,
-              use_turboquant, quant_type, ks, vs, kz, vc, v_bits,
-              window_seqlen_q, sk, mp, num_decode_requests,
-              num_decode_tokens, max_decode_context_len, gqa_disabled,
-              0, gqa_context_lens, gqa_length_plan, nax_split_hint,
-              nax_prefill_split_hint);
-          nb::inst_ptr<array>(out_h)->overwrite_descriptor(result);
-        },
-        nb::arg("query"),
-        nb::arg("key_cache"), nb::arg("value_cache"),
-        nb::arg("num_kv_heads"), nb::arg("scale"), nb::arg("softcap"),
-        nb::arg("block_tables"), nb::arg("seq_lens"),
-        nb::arg("cu_seqlens_q"),
-        nb::arg("block_size"), nb::arg("max_seq_len"),
-        nb::arg("sliding_window"),
-        nb::arg("out"),
-        nb::arg("key_scale_cache") = nb::none(),
-        nb::arg("value_scale_cache") = nb::none(),
-        nb::arg("key_zero_cache") = nb::none(),
-        nb::arg("v_centroids") = nb::none(),
-        nb::arg("use_turboquant") = false,
-        nb::arg("quant_type") = "",
-        nb::arg("v_bits") = 3,
-        nb::arg("window_seqlen_q") = 1,
-        nb::arg("sinks") = nb::none(),
-        nb::arg("mm_prefix_ranges") = nb::none(),
-        nb::arg("num_decode_requests") = -1,
-        nb::arg("num_decode_tokens") = 0,
-        nb::arg("max_decode_context_len") = 0,
-        nb::arg("gqa_disabled") = false,
-        nb::arg("gqa_context_lens") = std::vector<int>{},
-        nb::arg("gqa_length_plan") = nb::none(),
-        nb::arg("nax_split_hint") = -1,
-        nb::arg("nax_prefill_split_hint") = -1,
-        "Paged attention primitive (read-only). Cache writes are handled "
-        "by MLX-native scatter upstream.  window_seqlen_q must equal the "
-        "longest cu_seqlens_q segment (validated when > 1); small "
-        "multi-token batches (spec-decode verification windows) route to "
-        "the per-token kernel's window mode.  sinks is an optional float32 "
-        "array of one learned logit per query head (GPT-OSS style attention "
-        "sinks); it joins the softmax denominator without contributing a "
-        "value row, and is rejected together with TurboQuant.  "
-        "mm_prefix_ranges is an optional (query rows, 2) int32 array of "
-        "inclusive absolute image-block bounds per query row, (-1, -1) "
-        "elsewhere (Gemma 4 vision): the tiled prefill kernel unmasks the "
-        "block on top of the causal rule and ANDs the sliding window; "
-        "rejected with TurboQuant, float32 queries, verification windows and "
-        "pure-decode batches.  "
-        "max_decode_context_len must bound the decode rows' seq_lens: a "
-        "mixed batch that splits its decode prefix sizes that prefix's "
-        "split-KV work by it rather than by max_seq_len.  "
-        "gqa_disabled mirrors VLLM_METAL_DISABLE_GQA_DECODE and keeps "
-        "eligible batches off the GQA-shared decode kernel. "
-        "gqa_context_lens is the CPU copy of seq_lens for a whole ordinary "
-        "decode batch, used for planning without a GPU readback; the caller "
-        "must keep both consistent. Alternatively pass a gqa_length_plan "
-        "built once per forward; its immutable offsets are shared by the nodes. "
-        "Omit both to retain legacy batch routing. "
-        "nax_split_hint (M5 NAX prefill only) selects the split full-tile "
-        "pipeline (1) or the original loop (0); -1 uses the batch-average "
-        "rule. nax_prefill_split_hint optionally overrides it only when "
-        "native dispatch separates the ordinary decode prefix from NAX "
-        "prefill; -1 retains nax_split_hint. The override describes only "
-        "the remaining prefill sequences. Outputs are identical either "
-        "way; head_size 512 ignores both hints.");
-
-  m.def(
-      "last_nax_split_pipeline",
-      []() { return g_last_nax_split.load(std::memory_order_relaxed); },
-      "NAX prefill pipeline used by the most recent recorded NAX launch: 1 for "
-      "the split full-tile pipeline, 0 for the original loop, -1 when the last "
-      "recorded dispatch was not NAX or diagnostics are disabled.");
-
-  m.def(
-      "last_paged_dispatch",
-      []() {
-        static constexpr const char* names[] = {
-            "", "gqa_decode", "per_token_ps0", "per_token_ps512", "window_ps0",
-            "window_ps512", "nax_prefill", "tiled_prefill", "mixed_prefill_decode",
-            "mixed_nax_prefill_decode"};
-        static_assert(std::size(names) == static_cast<size_t>(PagedDispatch::Count),
-                      "PagedDispatch and its diagnostic names must stay in sync");
-        return names[static_cast<size_t>(
-            g_last_dispatch.load(std::memory_order_relaxed))];
-      },
-      "Dispatch family chosen by the most recent recorded paged_attention_primitive "
-      "eval (\"gqa_decode\", \"per_token_ps0\", \"per_token_ps512\", "
-      "\"window_ps0\", \"window_ps512\", \"nax_prefill\", "
-      "\"tiled_prefill\", \"mixed_prefill_decode\", \"mixed_nax_prefill_decode\"). "
-      "Diagnostic surface for routing tests; empty "
-      "when diagnostics are disabled, cleared or before the first recorded eval.");
-
-  m.def("gdn_linear_attention",
-        [](nb::handle q, nb::handle k, nb::handle v,
-           nb::handle g, nb::handle beta, nb::handle state_pool,
-           nb::handle cu_seqlens, nb::handle slot_mapping,
-           int Hk, int Hv, int Dk, int Dv) {
-          auto results = gdn_linear_attention_primitive_fn(
-              *nb::inst_ptr<array>(q), *nb::inst_ptr<array>(k),
-              *nb::inst_ptr<array>(v), *nb::inst_ptr<array>(g),
-              *nb::inst_ptr<array>(beta), *nb::inst_ptr<array>(state_pool),
-              *nb::inst_ptr<array>(cu_seqlens),
-              *nb::inst_ptr<array>(slot_mapping),
-              Hk, Hv, Dk, Dv);
-          auto arr_cls = nb::module_::import_("mlx.core").attr("array");
-          nb::object out_y = arr_cls(nb::int_(0));
-          nb::object out_state = arr_cls(nb::int_(0));
-          nb::inst_ptr<array>(out_y)->overwrite_descriptor(results[0]);
-          nb::inst_ptr<array>(out_state)->overwrite_descriptor(results[1]);
-          return nb::make_tuple(out_y, out_state);
-        },
-        nb::arg("q"), nb::arg("k"), nb::arg("v"),
-        nb::arg("g"), nb::arg("beta"),
-        nb::arg("state_pool"), nb::arg("cu_seqlens"),
-        nb::arg("slot_mapping"),
-        nb::arg("Hk"), nb::arg("Hv"), nb::arg("Dk"), nb::arg("Dv"),
-        "Lazy GDN recurrence returning (y, updated_state_pool). Only the "
-        "state output aliases its input. Callers must use both returned "
-        "handles so output reads and state reuse depend on the native writes.");
-
-  m.def("init_mla_library", &init_mla_library,
-        nb::arg("src"),
-        "JIT-compile the MLA paged attention Metal shader (RFC #360).");
-
-  m.def("mla_paged_attention_primitive",
-        [](nb::handle q_nope_h,
-           nb::handle q_pe_h,
-           nb::handle latent_cache_h,
-           nb::handle block_tables_h,
-           nb::handle context_lens_h,
-           nb::handle cu_seqlens_q_h,
-           int block_size, float scale, int heads_per_tg,
-           nb::handle out_h) {
-          auto result = mla_paged_attention_primitive_fn(
-              *nb::inst_ptr<array>(q_nope_h),
-              *nb::inst_ptr<array>(q_pe_h),
-              *nb::inst_ptr<array>(latent_cache_h),
-              *nb::inst_ptr<array>(block_tables_h),
-              *nb::inst_ptr<array>(context_lens_h),
-              *nb::inst_ptr<array>(cu_seqlens_q_h),
-              block_size, scale, heads_per_tg);
-          nb::inst_ptr<array>(out_h)->overwrite_descriptor(result);
-        },
-        nb::arg("q_nope"), nb::arg("q_pe"),
-        nb::arg("latent_cache"),
-        nb::arg("block_tables"), nb::arg("context_lens"),
-        nb::arg("cu_seqlens_q"),
-        nb::arg("block_size"), nb::arg("scale"),
-        nb::arg("heads_per_tg") = 1,
-        nb::arg("out"),
-        "Paged MLA (single-pass), wrapped as an MLX Primitive — fills "
-        "``out`` with a lazy descriptor so the kernel call participates "
-        "in the wrapper's lazy graph and avoids the per-call mx.eval "
-        "boundary the eager binding requires. Saves ~200 μs at B=1 "
-        "small-H cells where dispatch overhead dominates.");
-
 }

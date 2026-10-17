@@ -951,7 +951,7 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
   // floats) has been removed — the TurboQuant V dequant path now runs
   // register-only via `tq_load_and_accumulate_v` + `inverse_fwht_in_place`,
   // so no threadgroup memory is needed for V reconstruction.  The host-side
-  // shmem-size calculation in paged_ops.cpp no longer adds the TQ bonus.
+  // shmem-size calculation in paged_attention.cpp no longer adds the TQ bonus.
 
   const device uint32_t *block_table =
       block_tables + seq_idx * max_num_blocks_per_seq;
@@ -1375,7 +1375,7 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
   // floats) has been removed — the TurboQuant V dequant path now runs
   // register-only via `tq_load_and_accumulate_v` + `inverse_fwht_in_place`,
   // so no threadgroup memory is needed for V reconstruction.  The host-side
-  // shmem-size calculation in paged_ops.cpp no longer adds the TQ bonus.
+  // shmem-size calculation in paged_attention.cpp no longer adds the TQ bonus.
 
   const device uint32_t *block_table =
       block_tables + seq_idx * max_num_blocks_per_seq;
@@ -2109,7 +2109,7 @@ inline uint32_t gqa_broadcast_page_id(device const uint32_t *bt, int page,
 // epsilon-normalised partial at tmp_out[token, head, partition, :], so the
 // existing reduce pass merges them unchanged.  Engaged only for pure-decode
 // batches without TurboQuant/FP8/sinks/softcap/sliding-window (dispatch gate
-// in paged_ops.cpp); everything else keeps the established paths.
+// in paged_attention.cpp); everything else keeps the established paths.
 template <typename T, int HEAD_SIZE, int BLOCK_SIZE, int PARTITION_SIZE>
 [[kernel]] void paged_attention_gqa_decode(
     device float *exp_sums [[buffer(0)]], device float *max_logits [[buffer(1)]],

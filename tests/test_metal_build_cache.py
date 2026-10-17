@@ -17,6 +17,10 @@ from vllm_metal.metal import build
 @dataclass
 class _Paths:
     src: Path
+    paged_attention: Path
+    gdn: Path
+    mla: Path
+    internal: Path
     patch: Path
     kernels: Path
     device: Path
@@ -31,7 +35,11 @@ class _Paths:
 
 @pytest.fixture
 def patched(tmp_path, monkeypatch) -> _Paths:
-    src = tmp_path / "paged_ops.cpp"
+    src = tmp_path / "mlx_bindings.cpp"
+    paged_attention = tmp_path / "paged_attention.cpp"
+    gdn = tmp_path / "gdn.cpp"
+    mla = tmp_path / "mla.cpp"
+    internal = tmp_path / "ops_internal.h"
     patch = tmp_path / "mlx_patch.cpp"
     kernels = tmp_path / "paged_attention_kernels.h"
     device = tmp_path / "metal_device.h"
@@ -52,6 +60,14 @@ def patched(tmp_path, monkeypatch) -> _Paths:
     ver.write_text("0.0.0\n")
 
     monkeypatch.setattr(build, "_SRC", src)
+    for attr, path in (
+        ("_PAGED_ATTENTION", paged_attention),
+        ("_GDN", gdn),
+        ("_MLA", mla),
+        ("_INTERNAL", internal),
+    ):
+        path.write_bytes(b"// source v1")
+        monkeypatch.setattr(build, attr, path)
     monkeypatch.setattr(build, "_MLX_PATCH", patch)
     monkeypatch.setattr(build, "_KERNELS", kernels)
     monkeypatch.setattr(build, "_DEVICE", device)
@@ -72,7 +88,23 @@ def patched(tmp_path, monkeypatch) -> _Paths:
     )
     monkeypatch.setattr(build, "_build_spec", lambda: spec)
 
-    return _Paths(src, patch, kernels, device, bld, consts, nb_src, out, hsh, ver, spec)
+    return _Paths(
+        src,
+        paged_attention,
+        gdn,
+        mla,
+        internal,
+        patch,
+        kernels,
+        device,
+        bld,
+        consts,
+        nb_src,
+        out,
+        hsh,
+        ver,
+        spec,
+    )
 
 
 def test_needs_rebuild_when_so_missing(patched):
@@ -115,7 +147,10 @@ def test_old_content_with_newer_so_mtime_still_rebuilds(patched):
     assert build.needs_rebuild() is True
 
 
-@pytest.mark.parametrize("source_name", ["src", "patch", "kernels", "device"])
+@pytest.mark.parametrize(
+    "source_name",
+    ["src", "patch", "kernels", "device", "paged_attention", "gdn", "mla", "internal"],
+)
 def test_hash_changes_with_source_bytes(patched, source_name):
     h1 = build._input_hash(patched.spec)
     getattr(patched, source_name).write_bytes(b"// source v2")
@@ -316,7 +351,7 @@ def test_stale_artifacts_empty_without_stamps_skips_build_deps(stale_env, monkey
 
 def test_stale_artifacts_flags_edited_so(stale_env):
     _seed_fresh()
-    build._stamp_path(build._OUT).write_text("STALE")  # paged_ops.cpp edited
+    build._stamp_path(build._OUT).write_text("STALE")  # mlx_bindings.cpp edited
     assert build.stale_artifacts() == [build._OUT]
 
 
