@@ -15,6 +15,7 @@ from collections.abc import Callable
 from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
+import pytest
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -316,32 +317,38 @@ def _make_cached_scheduler_output(
 
 
 class TestCachedRequestBlockUpdates:
-    def test_resumed_request_replaces_blocks_and_resets_prefill_state(self):
+    @pytest.mark.parametrize("include_token_history", [False, True])
+    @pytest.mark.parametrize("num_output_tokens", [0, 1, 2])
+    def test_resumed_request_replaces_blocks_and_resets_prefill_state(
+        self, include_token_history, num_output_tokens
+    ):
         runner = _make_paged_runner()
+        retained = [10, 20, 30, 40, 50, 60][: 4 + num_output_tokens]
         runner._request_states["req-1"] = mr.RequestState(
-            token_ids=[10, 20, 30, 40, 50],
+            token_ids=[10, 20, 30, 40, 50, 60],
             prompt_len=4,
             sampling_params=_greedy_sp(),
             generator=None,
-            generated_tokens=1,
+            generated_tokens=2,
             block_ids=[[0, 1]],
         )
-        runner._paged_request_seq_lens["req-1"] = 5
+        runner._paged_request_seq_lens["req-1"] = 6
 
         cached_reqs = CachedRequestData(
             req_ids=["req-1"],
             new_block_ids=[([7, 8],)],
             resumed_req_ids={"req-1"},
             new_token_ids=[],
-            all_token_ids={"req-1": [10, 20, 30, 40]},
+            # vLLM omits this payload for requests scheduled in the last step.
+            all_token_ids={"req-1": retained} if include_token_history else {},
             num_computed_tokens=[0],
-            num_output_tokens=[0],
+            num_output_tokens=[num_output_tokens],
         )
 
         runner._update_cached_request_blocks(cached_reqs)
 
         state = runner._request_states["req-1"]
-        assert state.token_ids == [10, 20, 30, 40]
+        assert state.token_ids == retained
         assert state.block_ids == [[7, 8]]
         assert state.generated_tokens == 0
         assert "req-1" not in runner._paged_request_seq_lens

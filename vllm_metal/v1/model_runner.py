@@ -2928,7 +2928,13 @@ class MetalModelRunner:
 
             assert new_block_ids is not None
             # The scheduler can drop an in-flight output we already appended.
-            state.token_ids = cached_reqs.all_token_ids[req_id]
+            if req_id in cached_reqs.all_token_ids:
+                state.token_ids = cached_reqs.all_token_ids[req_id]
+            else:
+                # vLLM omits full histories for requests scheduled in the
+                # previous step; their tokens are still cached locally.
+                end = state.prompt_len + cached_reqs.num_output_tokens[i]
+                del state.token_ids[end:]
             state.block_ids = self._copy_paged_block_ids(new_block_ids)
             if self._paged_state_group_indices:
                 self._state_block_ids_by_req[req_id] = self._copy_state_block_ids(
