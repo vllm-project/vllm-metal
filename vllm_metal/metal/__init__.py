@@ -34,7 +34,7 @@ _native_module: ModuleType | None = None
 # so there is no first-request shader compile. Set VLLM_METAL_BUILD_FROM_SOURCE=1
 # to recompile the .so from source
 # AND compile the shaders in-process from .metal (for kernel developers
-# iterating on paged_ops.cpp or the .metal sources); editing .metal then
+# iterating on the Metal ops C++ sources or the .metal sources); editing .metal then
 # requires restarting the interpreter to pick up changes.  Either way the
 # libraries are held in MLX's cache for the lifetime of the process.
 _ops_module: ModuleType | None = None
@@ -268,7 +268,7 @@ def _load_native_module() -> ModuleType:
                 f"(requires Xcode command-line tools)."
             )
         # Locally-built artifacts (the .so and the .metallib shaders) drift if a
-        # developer edits paged_ops.cpp or a .metal file without rebuilding. Fail
+        # developer edits the Metal ops C++ sources or a .metal file without rebuilding. Fail
         # loudly rather than run stale kernels — but do NOT auto-build, which
         # would reintroduce the silent compile this design removed. No-op for
         # wheel installs (no stamps), so end users are never affected.

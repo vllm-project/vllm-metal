@@ -183,12 +183,10 @@ class TestMLAKernelBlockSizes:
         / "kernels_v2"
         / "mla.metal"
     )
-    _PAGED_OPS = (
-        Path(__file__).resolve().parent.parent
-        / "vllm_metal"
-        / "metal"
-        / "paged_ops.cpp"
+    _MLA_OPS = (
+        Path(__file__).resolve().parent.parent / "vllm_metal" / "metal" / "mla.cpp"
     )
+    _PAGED_ATTENTION_OPS = _MLA_OPS.with_name("paged_attention.cpp")
 
     def _instantiations(self) -> set[tuple[str, int, int, int, int, int, int]]:
         """The full (type, kvr, pe, bs, g, nt, ps) tuple per call site.
@@ -219,12 +217,12 @@ class TestMLAKernelBlockSizes:
     def _gate_rows(self) -> list[tuple[int, int, int, int, int, int]]:
         """The (kvr, pe, bs, g, nt, ps) rows of the shared spec table.
 
-        ``kMlaKernelSpecs`` in paged_ops.cpp is the single source of truth
+        ``kMlaKernelSpecs`` in mla.cpp is the single source of truth
         the dispatch gate validates against — one ``{kvr, pe, bs, g, nt,
         ps}`` row per instantiated shape. A list (not a set) so duplicate
         rows stay visible to the geometry-uniqueness check.
         """
-        cpp = self._PAGED_OPS.read_text()
+        cpp = self._MLA_OPS.read_text()
         table = cpp[cpp.index("kMlaKernelSpecs") :]
         rows = [
             tuple(int(v) for v in m.groups())
@@ -251,14 +249,17 @@ class TestMLAKernelBlockSizes:
         row without an instantiation throws at runtime. The call sites
         must be exactly the table's admitted space.
         """
-        cpp = self._PAGED_OPS.read_text()
+        cpp = self._MLA_OPS.read_text()
 
         # mla_validate_t_dtypes admits only fp16/bf16 for the T buffers; map
         # them through dtype_to_metal to the instantiated type names.
         dtype_map = dict(
             re.findall(
                 r'case (\w+):\s*return "(\w+)";',
-                self._fn_body(cpp, "static std::string dtype_to_metal"),
+                self._fn_body(
+                    self._PAGED_ATTENTION_OPS.read_text(),
+                    "std::string dtype_to_metal",
+                ),
             )
         )
         gate_dtypes = {
@@ -296,7 +297,7 @@ class TestMLAKernelBlockSizes:
 class TestNaxKernelInstantiations:
     """The NAX prefill gate and its kernel instantiations cannot drift.
 
-    ``nax_eligible`` in paged_ops.cpp admits a (dtype, head_size, block_size)
+    ``nax_eligible`` in paged_attention.cpp admits a (dtype, head_size, block_size)
     space; ``instantiate_paged_attention_nax_all`` in
     pagedattention_nax.metal compiles one specialization per admitted row.
     An instantiation beyond the gate compiles dead binary; a gate value
@@ -310,7 +311,7 @@ class TestNaxKernelInstantiations:
         / "kernels_v2"
         / "pagedattention_nax.metal"
     )
-    _PAGED_OPS = TestMLAKernelBlockSizes._PAGED_OPS
+    _PAGED_ATTENTION_OPS = TestMLAKernelBlockSizes._PAGED_ATTENTION_OPS
 
     def _instantiations(self) -> set[tuple[str, int, int]]:
         """The (metal-type, head_size, block_size) rows the library compiles.
@@ -339,7 +340,7 @@ class TestNaxKernelInstantiations:
         return {(t, hs, bs) for t in dtypes for hs, bs in shapes}
 
     def test_instantiations_match_the_cpp_gate(self) -> None:
-        cpp = self._PAGED_OPS.read_text()
+        cpp = self._PAGED_ATTENTION_OPS.read_text()
         gate = TestMLAKernelBlockSizes._fn_body(cpp, "static bool nax_eligible")
 
         head_sizes = {int(v) for v in re.findall(r"head_size == (\d+)", gate)}
@@ -347,9 +348,7 @@ class TestNaxKernelInstantiations:
         dtype_map = dict(
             re.findall(
                 r'case (\w+):\s*return "(\w+)";',
-                TestMLAKernelBlockSizes._fn_body(
-                    cpp, "static std::string dtype_to_metal"
-                ),
+                TestMLAKernelBlockSizes._fn_body(cpp, "std::string dtype_to_metal"),
             )
         )
         gate_dtypes = {dtype_map[d] for d in re.findall(r"dtype == (\w+)", gate)}

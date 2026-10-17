@@ -30,7 +30,7 @@ toolchain if needed. Restart the server after editing Python files.
 
 ## Editing the Metal kernels
 
-When changing `.metal` shaders or `paged_ops.cpp`, enable source builds:
+When changing `.metal` shaders or the Metal ops C++ sources, enable source builds:
 
 ```bash
 VLLM_METAL_BUILD_FROM_SOURCE=1 vllm serve <model>

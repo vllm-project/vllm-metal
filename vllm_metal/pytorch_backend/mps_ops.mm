@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Host-only launcher for the SAME shaders used by metal/paged_ops.cpp.
+// Host-only launcher for the SAME shaders used by metal/paged_attention.cpp.
 // Encode on PyTorch's stream so projections, KV writes and attention are ordered
 // without a framework bridge, a CPU round trip, or a per-layer GPU wait.
 #include <torch/extension.h>

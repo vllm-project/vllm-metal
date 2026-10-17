@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Build shared Metal shader artifacts and both native launchers.
 
-Compiles ``paged_ops.cpp``, ``mlx_patch.cpp``, and nanobind into a shared library that dispatches
+Compiles the Metal ops sources, ``mlx_patch.cpp``, and nanobind into a shared library that dispatches
 Metal shaders through MLX's own command encoder.
 """
 
@@ -25,7 +25,11 @@ from vllm_metal.metal.constants import (
 logger = logging.getLogger(__name__)
 
 _THIS_DIR = Path(__file__).resolve().parent
-_SRC = _THIS_DIR / "paged_ops.cpp"
+_SRC = _THIS_DIR / "mlx_bindings.cpp"
+_PAGED_ATTENTION = _THIS_DIR / "paged_attention.cpp"
+_GDN = _THIS_DIR / "gdn.cpp"
+_MLA = _THIS_DIR / "mla.cpp"
+_INTERNAL = _THIS_DIR / "ops_internal.h"
 _MLX_PATCH = _THIS_DIR / "mlx_patch.cpp"
 _KERNELS = _THIS_DIR / "paged_attention_kernels.h"
 _DEVICE = _THIS_DIR / "metal_device.h"
@@ -395,6 +399,9 @@ def _build_spec() -> _BuildSpec:
         "dynamic_lookup",
         str(nb_src),
         str(_SRC),
+        str(_PAGED_ATTENTION),
+        str(_GDN),
+        str(_MLA),
         str(_MLX_PATCH),
         "-o",
         str(_OUT),
@@ -422,7 +429,19 @@ def _input_hash(spec: _BuildSpec) -> str:
     # so editing a flag still busts the hash.
     # Versions catch in-place upgrades where the install path is reused.
     h.update(f"mlx={spec.mlx_version}\0nb={spec.nb_version}\0".encode())
-    for p in (_SRC, _MLX_PATCH, _KERNELS, _DEVICE, _BUILD, _CONSTANTS, spec.nb_src):
+    for p in (
+        _SRC,
+        _PAGED_ATTENTION,
+        _GDN,
+        _MLA,
+        _INTERNAL,
+        _MLX_PATCH,
+        _KERNELS,
+        _DEVICE,
+        _BUILD,
+        _CONSTANTS,
+        spec.nb_src,
+    ):
         h.update(p.name.encode())
         h.update(b"\0")
         h.update(p.read_bytes())
@@ -488,7 +507,7 @@ def mlx_version_mismatch() -> tuple[str, str] | None:
 
 def stale_artifacts() -> list[Path]:
     """Prebuilt artifacts whose stamp no longer matches the current sources —
-    the ``_paged_ops`` ``.so`` (vs ``paged_ops.cpp`` et al.) and each
+    the ``_paged_ops`` ``.so`` (vs the Metal ops sources et al.) and each
     ``.metallib`` (vs its ``.metal`` shaders) — checked through the single
     :func:`is_stale` mechanism. Returns ``[]`` for wheel installs (no stamps)
     without importing the build deps.
