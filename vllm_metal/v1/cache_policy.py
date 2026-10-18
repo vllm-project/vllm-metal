@@ -34,6 +34,7 @@ from vllm_metal.attention.impls.dsa import (
     INDEXER_CACHE_SUFFIX,
     indexer_cache_spec,
     is_sparse_mla,
+    sparse_mla_reserve_bytes,
 )
 from vllm_metal.attention.impls.turboquant_prefill import (
     dtype_head_reason,
@@ -427,6 +428,35 @@ class ModelCachePolicy:
                     value_bits=V_QUANT_PARAMS[config.v_quant]["bits"],
                 )
         return prefill_workspace_bytes(max_bytes=cap)
+
+    def sparse_mla_reserve_bytes(self, *, max_running_requests: int) -> int:
+        """What GLM-5-Next's sparse layers hold beyond profile_run's peak.
+
+        vLLM reserves its own inline in a CUDA op, so it is computed here, with
+        vLLM's worst decode count capped by the requests that fit at once.
+        """
+        runner = self._runner
+        if not self._is_sparse_mla():
+            return 0
+        scheduler = runner.scheduler_config
+        decode_rows = min(
+            scheduler.max_num_seqs,
+            scheduler.max_num_batched_tokens,
+            max_running_requests,
+        )
+        reserve = sparse_mla_reserve_bytes(
+            runner.model_args,
+            max_model_len=runner.model_config.max_model_len,
+            max_decode_rows=decode_rows,
+            itemsize=self._require_kv_cache_dtype().size,
+        )
+        logger.info_once(
+            "GLM-5-Next sparse MLA: reserving %.2f MiB before KV sizing, for the "
+            "indexer scores and %d decode rows.",
+            reserve / 2**20,
+            decode_rows,
+        )
+        return reserve
 
     def _is_sparse_mla(self) -> bool:
         return self._runner.is_mla and is_sparse_mla(self._runner.model_args)
@@ -1290,6 +1320,17 @@ class WorkerCachePlanner:
                 overhead,
             )
         )
+        # Profiling cannot observe sparse MLA's indexer scores over a long
+        # history or its decode rows either; reserve them the same way. Every
+        # running request holds at least a latent and a KDA state block.
+        sparse_reserve = self._worker.model_runner.sparse_mla_reserve_bytes(
+            max_running_requests=max(1, kv_budget // (2 * per_block_bytes))
+        )
+        if sparse_reserve:
+            overhead += sparse_reserve
+            future_reserved_bytes += sparse_reserve
+            if explicit is None:
+                kv_budget -= sparse_reserve
         kv_offload_pool = self._resolve_kv_offload_pool(kv_budget, per_block_bytes)
         # Explicit bytes budget the paged storage alone. The offload host pool
         # and other future allocations still count in the physical commit probe.
