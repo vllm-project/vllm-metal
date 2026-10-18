@@ -22,7 +22,9 @@ from vllm_metal.attention.caches.storage import KVCacheStorage
 from vllm_metal.attention.context import PagedAttentionContext
 from vllm_metal.attention.impls.dsa import (
     INDEXER_CACHE_SUFFIX,
+    DSAPagedAttentionWrapper,
     SparseIndexerCaches,
+    is_dsa_attention,
 )
 from vllm_metal.attention.impls.mla import (
     MLAPagedAttentionWrapper,
@@ -170,9 +172,20 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
                 )
             cache_idx = layer_plan.attention_cache_index(layer_idx)
             if isinstance(attention_cache, MLAPagedLatentCache):
+                if isinstance(attn, DSAPagedAttentionWrapper):
+                    attn.rebind_cache(
+                        attention_cache,
+                        cache_idx=cache_idx,
+                        indexer_caches=self.indexer_caches,
+                    )
+                    return attn
                 if isinstance(attn, MLAPagedAttentionWrapper):
                     attn.rebind_cache(attention_cache, cache_idx=cache_idx)
                     return attn
+                if is_dsa_attention(attn):
+                    return DSAPagedAttentionWrapper(
+                        attn, cache_idx, attention_cache, self.indexer_caches
+                    )
                 if is_mla_attention(attn):
                     return MLAPagedAttentionWrapper(attn, cache_idx, attention_cache)
                 raise RuntimeError(
