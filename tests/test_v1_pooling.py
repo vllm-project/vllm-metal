@@ -11,6 +11,8 @@ import numpy as np
 import pytest
 import torch
 from torch.nn.functional import normalize
+from transformers import RobertaConfig as TorchRobertaConfig
+from transformers import RobertaModel as TorchRobertaModel
 from transformers import XLMRobertaConfig as TorchXLMRobertaConfig
 from transformers import XLMRobertaModel as TorchXLMRobertaModel
 
@@ -253,8 +255,11 @@ def _bge_m3_model_config(**overrides):
     return _pooling_model_config(**values)
 
 
-def _tiny_xlm_roberta_config() -> TorchXLMRobertaConfig:
-    return TorchXLMRobertaConfig(
+def _tiny_encoder_config(model_type="xlm-roberta"):
+    config_cls = (
+        TorchRobertaConfig if model_type == "roberta" else TorchXLMRobertaConfig
+    )
+    return config_cls(
         vocab_size=17,
         hidden_size=8,
         num_hidden_layers=1,
@@ -269,10 +274,20 @@ def _tiny_xlm_roberta_config() -> TorchXLMRobertaConfig:
     )
 
 
-def _save_tiny_xlm_roberta_checkpoint(tmp_path, architecture: str | None = None):
-    torch_config = _tiny_xlm_roberta_config()
-    transformers_model = TorchXLMRobertaModel(torch_config).eval()
-    transformers_model.save_pretrained(tmp_path, safe_serialization=True)
+def _save_tiny_encoder_checkpoint(
+    tmp_path,
+    architecture: str | None = None,
+    *,
+    model_type="xlm-roberta",
+    pytorch_weights=False,
+):
+    torch_config = _tiny_encoder_config(model_type)
+    model_cls = TorchRobertaModel if model_type == "roberta" else TorchXLMRobertaModel
+    transformers_model = model_cls(torch_config).eval()
+    if pytorch_weights:
+        torch.save(transformers_model.state_dict(), tmp_path / "pytorch_model.bin")
+    else:
+        transformers_model.save_pretrained(tmp_path, safe_serialization=True)
     if architecture is not None:
         torch_config.architectures = [architecture]
     return torch_config, transformers_model
@@ -699,19 +714,25 @@ class TestMetalPoolingCapabilities:
                 (_SupportedEmbedPooler(), _SupportedEmbedPooler()),
             )
 
-    @pytest.mark.parametrize("pooling_type", ["CLS", "MEAN"])
+    @pytest.mark.parametrize("model_type", ["xlm-roberta", "roberta"])
+    @pytest.mark.parametrize("pooling_type", ["CLS", "LAST", "MEAN"])
     @pytest.mark.parametrize("dimensions", [None, 4])
-    def test_xlm_roberta_checkpoint_matches_transformers(
+    def test_encoder_checkpoint_preserves_loading_and_pooling_contract(
         self,
         tmp_path,
         dimensions,
         pooling_type,
+        model_type,
     ) -> None:
         torch.manual_seed(0)
-        torch_config, transformers_model = _save_tiny_xlm_roberta_checkpoint(tmp_path)
+        torch_config, transformers_model = _save_tiny_encoder_checkpoint(
+            tmp_path, model_type=model_type
+        )
 
         model_config = _encoder_model_config(
-            model=str(tmp_path),
+            model="encoder-checkpoint",
+            revision="model-revision",
+            trust_remote_code=True,
             tokenizer="custom-tokenizer",
             tokenizer_revision="tokenizer-revision",
             hf_config=torch_config,
@@ -724,11 +745,17 @@ class TestMetalPoolingCapabilities:
             embedding_size=torch_config.hidden_size,
         )
 
-        with patch(
-            "vllm_metal.v1.pooling.backends.encoder.models.xlm_roberta."
-            "AutoTokenizer.from_pretrained",
-            return_value=object(),
-        ) as load_tokenizer:
+        with (
+            patch(
+                "vllm_metal.v1.pooling.backends.encoder.models.loading.snapshot_download",
+                return_value=str(tmp_path),
+            ) as download,
+            patch(
+                "vllm_metal.v1.pooling.backends.encoder.models.xlm_roberta."
+                "AutoTokenizer.from_pretrained",
+                return_value=object(),
+            ) as load_tokenizer,
+        ):
             loaded_backend = load_xlm_roberta_backend(model_config)
 
         input_ids = torch.tensor(
@@ -745,7 +772,7 @@ class TestMetalPoolingCapabilities:
                 attention_mask=attention_mask,
             ).last_hidden_state
 
-        actual_hidden = loaded_backend.model(
+        actual_hidden = loaded_backend.pooling_backend.forward_padded(
             mx.array(input_ids.numpy(), dtype=mx.int32),
             mx.array(attention_mask.numpy(), dtype=mx.int32),
         )
@@ -773,7 +800,7 @@ class TestMetalPoolingCapabilities:
         expected_pooled = (
             expected_tokens.mean(dim=0)
             if pooling_type == "MEAN"
-            else expected_tokens[0]
+            else expected_tokens[-1 if pooling_type == "LAST" else 0]
         )
         expected_embedding = normalize(expected_pooled, dim=0)
 
@@ -784,11 +811,93 @@ class TestMetalPoolingCapabilities:
             atol=1e-5,
             rtol=1e-5,
         )
+        assert download.call_count == 1
+        assert download.call_args.kwargs["repo_id"] == "encoder-checkpoint"
+        assert download.call_args.kwargs["revision"] == "model-revision"
         load_tokenizer.assert_called_once_with(
             "custom-tokenizer",
             revision="tokenizer-revision",
-            trust_remote_code=False,
+            trust_remote_code=True,
         )
+
+    @pytest.mark.parametrize("model_type", ["xlm-roberta", "roberta"])
+    @pytest.mark.parametrize(
+        "torch_dtype,mlx_dtype,atol",
+        [
+            (torch.float32, mx.float32, 1e-5),
+            (torch.float16, mx.float16, 1e-3),
+            (torch.bfloat16, mx.bfloat16, 1e-2),
+        ],
+    )
+    def test_encoder_pytorch_checkpoint_preserves_dtype_and_padding(
+        self,
+        tmp_path,
+        model_type,
+        torch_dtype,
+        mlx_dtype,
+        atol,
+    ) -> None:
+        """The loader/adapter must return hidden states, preserving masked tokens."""
+        torch.manual_seed(0)
+        config, reference = _save_tiny_encoder_checkpoint(
+            tmp_path,
+            model_type=model_type,
+            pytorch_weights=True,
+        )
+        model_config = _encoder_model_config(
+            model=str(tmp_path),
+            hf_config=config,
+            dtype=torch_dtype,
+        )
+        with patch(
+            "vllm_metal.v1.pooling.backends.encoder.models.xlm_roberta."
+            "AutoTokenizer.from_pretrained",
+            return_value=object(),
+        ):
+            backend = load_encoder_pooling_backend(model_config).pooling_backend
+        ids = torch.tensor([[0, 5, 6, 2, 1, 1], [1, 1, 0, 7, 8, 2]])
+        mask = ids != config.pad_token_id
+        with torch.no_grad():
+            expected = reference(ids, attention_mask=mask).last_hidden_state
+        actual = backend.forward_padded(mx.array(ids.numpy()), mx.array(mask.numpy()))
+        assert actual.dtype == mlx_dtype
+        actual_numpy = np.array(actual.astype(mx.float32))
+        np.testing.assert_allclose(actual_numpy, expected.numpy(), atol=atol, rtol=atol)
+        for row in range(2):
+            unpadded = mx.array(ids[row, mask[row]].numpy()[None])
+            hidden = backend.profile_forward(unpadded)
+            np.testing.assert_allclose(
+                actual_numpy[row, mask[row].numpy()],
+                np.array(hidden[0].astype(mx.float32)),
+                atol=atol,
+                rtol=atol,
+            )
+
+    @pytest.mark.parametrize(
+        "invalid_weights,error",
+        [
+            ("missing", "Missing .* parameters"),
+            ("unexpected", "parameters not in model"),
+        ],
+    )
+    def test_encoder_loader_rejects_incomplete_or_extra_weights(
+        self,
+        tmp_path,
+        invalid_weights,
+        error,
+    ) -> None:
+        config, reference = _save_tiny_encoder_checkpoint(
+            tmp_path, pytorch_weights=True
+        )
+        weights = reference.state_dict()
+        if invalid_weights == "missing":
+            del weights["embeddings.word_embeddings.weight"]
+        else:
+            weights["unexpected.weight"] = torch.ones(1)
+        torch.save(weights, tmp_path / "pytorch_model.bin")
+        model_config = _encoder_model_config(model=str(tmp_path), hf_config=config)
+        with pytest.raises(ValueError, match=error):
+            load_xlm_roberta_backend(model_config)
 
     def test_xlm_roberta_loader_rejects_quantization_before_download(self) -> None:
         model_config = _encoder_model_config(
@@ -814,7 +923,7 @@ class TestMetalPoolingCapabilities:
 
     def test_bge_m3_dense_pooling_uses_encoder_backbone(self, tmp_path) -> None:
         torch.manual_seed(0)
-        torch_config, transformers_model = _save_tiny_xlm_roberta_checkpoint(
+        torch_config, transformers_model = _save_tiny_encoder_checkpoint(
             tmp_path,
             "BgeM3EmbeddingModel",
         )
@@ -855,13 +964,43 @@ class TestMetalPoolingCapabilities:
             rtol=1e-5,
         )
 
-    def test_bge_m3_token_classify_uses_sparse_head(self, tmp_path) -> None:
+    def test_bge_m3_loader_rejects_missing_sparse_head(self, tmp_path) -> None:
+        config, _ = _save_tiny_encoder_checkpoint(tmp_path, "BgeM3EmbeddingModel")
+        model_config = _bge_m3_model_config(model=str(tmp_path), hf_config=config)
+
+        with (
+            patch(
+                "vllm_metal.v1.pooling.backends.encoder.models.xlm_roberta."
+                "AutoTokenizer.from_pretrained",
+                return_value=object(),
+            ),
+            pytest.raises(FileNotFoundError, match="Missing BGE-M3 sparse head"),
+        ):
+            load_encoder_pooling_backend(model_config)
+
+    @pytest.mark.parametrize("use_activation", [True, False])
+    @pytest.mark.parametrize(
+        "token_ids,kept_indices",
+        [([0, 5, 6, 2], [1, 2]), ([5, 6], [0, 1]), ([0, 2], [])],
+    )
+    def test_bge_m3_token_classify_uses_sparse_head(
+        self,
+        tmp_path,
+        use_activation,
+        token_ids,
+        kept_indices,
+    ) -> None:
         torch.manual_seed(0)
-        torch_config, transformers_model = _save_tiny_xlm_roberta_checkpoint(
+        torch_config, transformers_model = _save_tiny_encoder_checkpoint(
             tmp_path,
             "BgeM3EmbeddingModel",
         )
         sparse_linear = _save_bge_m3_sparse_head(tmp_path, torch_config.hidden_size)
+        if not use_activation:
+            # Negative scores make an unwanted ReLU observable.
+            with torch.no_grad():
+                sparse_linear.bias.fill_(-2.0)
+            torch.save(sparse_linear.state_dict(), tmp_path / "sparse_linear.pt")
         model_config = _bge_m3_model_config(
             model=str(tmp_path),
             tokenizer=str(tmp_path),
@@ -876,14 +1015,16 @@ class TestMetalPoolingCapabilities:
         ):
             loaded_backend = load_encoder_pooling_backend(model_config)
 
-        input_ids = torch.tensor([[0, 5, 6, 2]], dtype=torch.long)
+        input_ids = torch.tensor([token_ids], dtype=torch.long)
         attention_mask = (input_ids != torch_config.pad_token_id).to(torch.long)
         with torch.no_grad():
             hidden_states = transformers_model(
                 input_ids,
                 attention_mask=attention_mask,
             ).last_hidden_state
-            expected_scores = torch.relu(sparse_linear(hidden_states[0]))
+            expected_scores = sparse_linear(hidden_states[0])
+            if use_activation:
+                expected_scores = torch.relu(expected_scores)
 
         request = _new_req(
             "req-0",
@@ -891,6 +1032,7 @@ class TestMetalPoolingCapabilities:
             pooling_params=_pooling_params(
                 task="token_classify",
                 requires_token_ids=True,
+                use_activation=use_activation,
             ),
         )
         outputs = loaded_backend.pooling_backend.pool_scheduler_output(
@@ -899,9 +1041,10 @@ class TestMetalPoolingCapabilities:
         )
 
         assert len(outputs) == 1
+        assert outputs[0].pooler_output.device.type == "cpu"
         assert torch.allclose(
             outputs[0].pooler_output,
-            expected_scores.squeeze(-1)[1:-1],
+            expected_scores.squeeze(-1)[kept_indices],
             atol=1e-5,
             rtol=1e-5,
         )
