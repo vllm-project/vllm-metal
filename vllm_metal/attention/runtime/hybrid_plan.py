@@ -162,6 +162,11 @@ class HybridRuntimePlan:
     def for_layers(self, start: int, end: int) -> HybridRuntimePlan:
         """Restrict the plan to layers ``[start, end)``, one pipeline stage."""
         layers = HybridLayerPlan(self.layers.layer_roles[start:end])
+        if layers.num_state and not layers.num_attention:
+            raise ValueError(
+                "a pipeline stage has mamba layers but no attention layer to share "
+                "slots with; realign the stage boundaries (VLLM_PP_LAYER_PARTITION)"
+            )
         return replace(self, layers=layers)
 
     def state_cache_spec(
