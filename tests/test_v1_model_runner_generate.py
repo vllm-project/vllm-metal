@@ -1877,8 +1877,14 @@ class TestV1MetalModelRunnerGDNSubmit:
         for actual, expected in zip(submitted[0][1:], runtime._arrays, strict=True):
             assert actual is expected
 
-    def test_non_last_pp_send_submits_runtime_outputs(self, monkeypatch) -> None:
+    @pytest.mark.parametrize("prefill", [True, False])
+    def test_non_last_pp_send_submits_runtime_outputs(
+        self, monkeypatch, prefill: bool
+    ) -> None:
+        # The stage waits for its receive before the submit; a prefill step
+        # waits before building its forward, which may submit mid-graph.
         submitted: list[tuple[object, ...]] = []
+        events: list[object] = []
         runtime = self.make_runtime_with_side_effects()
         runner = make_stub_runner(
             _paged_attention_runtime=runtime,
@@ -1888,13 +1894,26 @@ class TestV1MetalModelRunnerGDNSubmit:
         runner.pp = SimpleNamespace(size=2, is_last=False)
         stage_output = mx.array([[[1.0]]], dtype=mx.float32)
         send_handle = mx.array([2.0], dtype=mx.float32)
-        runner._pp_model = lambda input_ids, cache: stage_output
-        monkeypatch.setattr(mr, "pipeline_send", lambda output, pp: send_handle)
-        monkeypatch.setattr(mr.mx, "async_eval", lambda *args: submitted.append(args))
 
-        runner._start_paged_forward(
-            mr._ExecutionBatch(),
-            prefill_reqs=[
+        class _Stage:
+            def __call__(self, input_ids, *, cache, recv_first):
+                events.append(("forward", recv_first))
+                return stage_output
+
+            def wait_for_recv(self) -> None:
+                events.append("wait")
+
+        def submit(*args) -> None:
+            events.append("submit")
+            submitted.append(args)
+
+        runner._pp_model = _Stage()
+        monkeypatch.setattr(mr, "pipeline_send", lambda output, pp: send_handle)
+        monkeypatch.setattr(mr.mx, "async_eval", submit)
+        prefill_reqs: list[mr.PrefillRequest] = []
+        decode_reqs: list[tuple[str, mr.RequestState]] = []
+        if prefill:
+            prefill_reqs.append(
                 mr.PrefillRequest(
                     req_id="pp-0",
                     token_ids=[1],
@@ -1905,11 +1924,27 @@ class TestV1MetalModelRunnerGDNSubmit:
                     start_pos=0,
                     full_prompt_token_ids=[1],
                 )
-            ],
-            decode_reqs=[],
+            )
+        else:
+            decode_state = mr.RequestState(
+                token_ids=[5, 6],
+                prompt_len=1,
+                sampling_params=SamplingParams(),
+                generator=None,
+                generated_tokens=1,
+            )
+            decode_state.block_ids = [[0]]
+            decode_reqs.append(("pp-0", decode_state))
+            runner._paged_request_seq_lens["pp-0"] = 1
+
+        runner._start_paged_forward(
+            mr._ExecutionBatch(),
+            prefill_reqs=prefill_reqs,
+            decode_reqs=decode_reqs,
             scheduler_output=SchedulerOutput.make_empty(),
         )
 
+        assert events == [("forward", prefill), "wait", "submit"]
         assert len(submitted) == 1
         assert submitted[0][0] is send_handle
         for actual, expected in zip(submitted[0][1:], runtime._arrays, strict=True):

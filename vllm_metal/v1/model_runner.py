@@ -904,6 +904,8 @@ class MetalModelRunner:
         runtime = self._paged_attention_runtime
         if runtime is not None:
             runtime.extend_forward_eval_outputs(eval_outputs)
+        if self._pp_model is not None:
+            self._pp_model.wait_for_recv()
         mx.async_eval(*eval_outputs)
 
     def _extract_logits(self, model_output: Any) -> mx.array:
@@ -1700,9 +1702,13 @@ class MetalModelRunner:
                 # layer slice -> final norm + head on the last stage). The runner
                 # owns the downstream send: only the last stage has logits; every
                 # other stage hands its raw hidden state to pipeline_send, whose
-                # lazy op is forced by the async_eval below.
+                # lazy op is forced by the async_eval below. A decode forward is
+                # built while the previous stage still runs; prefill attention
+                # may submit mid-forward, so a prefill step receives first.
                 assert self._pp_model is not None
-                stage_output = self._pp_model(input_ids, cache=offset_caches)
+                stage_output = self._pp_model(
+                    input_ids, cache=offset_caches, recv_first=bool(prefill_reqs)
+                )
                 if self.pp.is_last:
                     logits = self._extract_logits(stage_output)
                 else:

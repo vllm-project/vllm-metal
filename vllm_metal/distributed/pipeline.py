@@ -207,17 +207,14 @@ def pipeline_recv(
     hidden: int,
     dtype: mx.Dtype,
 ) -> mx.array:
-    """Receive the hidden state from the previous stage as ``(1, n_tokens, hidden)``.
+    """Receive the previous stage's compact 2D ``(n_tokens, hidden)`` activation.
 
-    The wire carries the compact 2D ``(n_tokens, hidden)`` activation; this adds
-    the batch axis back so the result feeds straight into the model forward as
-    ``input_embeddings``. Lazy: the transfer only happens on ``mx.eval`` of the
-    returned array. The declared ``(shape, dtype)`` MUST exactly match the
-    sender's wire array — a mismatch deadlocks (the ring backend does not
-    validate across peers).
+    Lazy: the transfer only happens on ``mx.eval`` of the returned array, which
+    has no inputs, so evaluating it alone runs nothing else. The declared
+    ``(shape, dtype)`` MUST exactly match the sender's wire array — a mismatch
+    deadlocks (the ring backend does not validate across peers).
     """
-    wire = mx.distributed.recv((n_tokens, hidden), dtype, pp.rank - 1, group=pp.group)
-    return wire[None]
+    return mx.distributed.recv((n_tokens, hidden), dtype, pp.rank - 1, group=pp.group)
 
 
 def pipeline_send(h: mx.array, pp: PipelineGroup) -> mx.array:
@@ -226,7 +223,7 @@ def pipeline_send(h: mx.array, pp: PipelineGroup) -> mx.array:
     ``h`` is the model-native ``(1, n_tokens, hidden)`` activation; the batch
     axis (always 1 under Phase 0 single-sequence batching) is dropped so the
     wire carries the compact 2D ``(n_tokens, hidden)`` that :func:`pipeline_recv`
-    restores. Lazy: returns an array that performs the send when evaluated, so
+    receives. Lazy: returns an array that performs the send when evaluated, so
     the caller MUST ``mx.eval`` (or otherwise materialize) it or the bytes never
     move.
     """
@@ -258,6 +255,7 @@ class PipelinedModel:
     def __init__(self, model: Any, pp: PipelineGroup) -> None:
         self._model = model
         self._pp = pp
+        self._pending_recv: mx.array | None = None
 
     # Wire descriptor: (hidden, dtype) of the activation that crosses stages, read
     # from state every stage owns (config width + a stage-owned compute parameter),
@@ -283,13 +281,36 @@ class PipelinedModel:
             param.dtype for _, param in flat if mx.issubdtype(param.dtype, mx.floating)
         )
 
-    def __call__(self, input_ids: mx.array, *, cache: Any = None) -> mx.array:
+    def __call__(
+        self, input_ids: mx.array, *, cache: Any = None, recv_first: bool = False
+    ) -> mx.array:
+        """Build this stage's forward; a later stage's receive stays pending.
+
+        The caller calls :meth:`wait_for_recv` before it submits the forward.
+        ``recv_first`` waits before the build instead, for a forward that may
+        submit GPU work itself, as prefill attention does.
+        """
         h_in: mx.array | None = None
         if not self._pp.is_first:
-            h_in = pipeline_recv(
+            self._pending_recv = pipeline_recv(
                 self._pp, input_ids.shape[1], self._wire_hidden, self._wire_dtype
             )
+            h_in = self._pending_recv[None]
+            if recv_first:
+                self.wait_for_recv()
         return self._stage_forward(input_ids, h_in, cache=cache)
+
+    def wait_for_recv(self) -> None:
+        """Wait on the host until the pending upstream hidden state has arrived.
+
+        The ring backend receives on the CPU, so a GPU command buffer that read
+        the hidden state first would wait inside itself through the previous
+        stage's whole step, and the Metal watchdog counts that wait. vLLM's later
+        ranks likewise wait for their receive just before the forward reads it.
+        """
+        if self._pending_recv is not None:
+            mx.eval(self._pending_recv)
+            self._pending_recv = None
 
     def dummy_forward(self, input_ids: mx.array) -> mx.array:
         """Run this stage's forward locally for profiling/warm-up: no ring I/O.
