@@ -34,6 +34,7 @@ from vllm_metal.attention.impls.dsa import (
     INDEXER_CACHE_SUFFIX,
     indexer_cache_spec,
     is_sparse_mla,
+    max_latent_blocks,
     sparse_mla_reserve_bytes,
 )
 from vllm_metal.attention.impls.turboquant_prefill import (
@@ -276,6 +277,8 @@ class _PagedAttentionPlan:
     kv_offload_pool_auto: bool = False
     sized_down_by_probe: bool = False
     explicit_kv_budget: int | None = None
+    # Sparse MLA only: the most blocks mlx-vlm's indexed kernel can address.
+    sparse_mla_max_blocks: int | None = None
 
     def format_breakdown(self) -> str:
         if self.explicit_kv_budget is not None:
@@ -1240,12 +1243,22 @@ class WorkerCachePlanner:
         if mode == "paged_attention_layout_budget":
             overhead = self._worker.model_runner.profile_run()
             plan = self._paged_attention_plan(overhead=overhead)
+            budget = plan.kv_budget
             if self._worker.vllm_config.cache_config.num_gpu_blocks_override is None:
                 self._validate_paged_attention_plan(
                     plan,
                     require_min_blocks=False,
                 )
-            budget = plan.kv_budget
+                # An explicit --num-gpu-blocks-override is the user's pool: it
+                # fails at bind instead.
+                cap = plan.sparse_mla_max_blocks
+                if cap is not None and budget > cap * plan.per_block_bytes:
+                    budget = cap * plan.per_block_bytes
+                    logger.warning(
+                        "GLM-5-Next sparse MLA: capping the KV pool at %d blocks, "
+                        "the indexed attention kernel's 32-bit range.",
+                        cap,
+                    )
             logger.info(
                 "Upstream cache layout: reporting %.2f GB KV budget; "
                 "runtime allocation deferred until vLLM KVCacheConfig",
@@ -1326,11 +1339,16 @@ class WorkerCachePlanner:
         sparse_reserve = self._worker.model_runner.sparse_mla_reserve_bytes(
             max_running_requests=max(1, kv_budget // (2 * per_block_bytes))
         )
+        sparse_max_blocks = None
         if sparse_reserve:
             overhead += sparse_reserve
             future_reserved_bytes += sparse_reserve
             if explicit is None:
                 kv_budget -= sparse_reserve
+            sparse_max_blocks = max_latent_blocks(
+                block_size=block_size,
+                latent_dim=self._worker.model_runner.mla_latent_dim,
+            )
         kv_offload_pool = self._resolve_kv_offload_pool(kv_budget, per_block_bytes)
         # Explicit bytes budget the paged storage alone. The offload host pool
         # and other future allocations still count in the physical commit probe.
@@ -1358,6 +1376,7 @@ class WorkerCachePlanner:
                 kv_offload_pool=kv_offload_pool,
                 kv_offload_pool_auto=self._auto_pool_extra() is not None,
                 explicit_kv_budget=explicit,
+                sparse_mla_max_blocks=sparse_max_blocks,
             ),
             future_reserved_bytes=future_reserved_bytes,
         )
