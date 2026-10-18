@@ -125,6 +125,7 @@ if TYPE_CHECKING:
     VLLM_METAL_DISABLE_GQA_DECODE: bool = False
     VLLM_METAL_TQ_PREFILL: str = "auto"
     VLLM_METAL_TQ_PREFILL_MAX_MIB: int | str = "auto"
+    VLLM_METAL_SPARSE_INDEXER_MAX_SCORES_MIB: int = 512
     VLLM_METAL_SPEC_VERIFY_WINDOW: bool = False
     VLLM_METAL_SPEC_INGEST_CHUNK: int = 1024
     VLLM_METAL_BUILD_FROM_SOURCE: bool = False
@@ -199,6 +200,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # sets an explicit MiB limit; 0 disables. Set before worker startup.
     "VLLM_METAL_TQ_PREFILL_MAX_MIB": _auto_or_nonnegative_int(
         "VLLM_METAL_TQ_PREFILL_MAX_MIB", unit="MiB"
+    ),
+    # GLM-5-Next sparse MLA: the most per-head float32 indexer scores one
+    # prefill query part may hold (vLLM's VLLM_SPARSE_INDEXER_MAX_LOGITS_MB
+    # bounds logits summed over the heads).
+    "VLLM_METAL_SPARSE_INDEXER_MAX_SCORES_MIB": _int(
+        "VLLM_METAL_SPARSE_INDEXER_MAX_SCORES_MIB",
+        512,
+        minimum=0,
+        note=" (0 scores one row per part)",
     ),
     # Spec-decode verification window mode (issue #465). Off by default —
     # verify windows keep the expanded per-token layout (main behavior)

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import itertools
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -16,6 +17,7 @@ from mlx_vlm.models.linear import DECODE_BLOCK_SIZE, linear
 from mlx_vlm.models.sparse_attention import indexed_sparse_attention
 from vllm.v1.kv_cache_interface import MLAAttentionSpec, SparseCacheRole
 
+import vllm_metal.envs as envs
 from vllm_metal.attention.caches.mla_cache import MLAPagedLatentCache
 from vllm_metal.attention.caches.storage import KVCacheStorage
 from vllm_metal.attention.context import PagedAttentionContext, get_context
@@ -72,9 +74,39 @@ def indexer_cache_spec(
     )
 
 
+def sparse_mla_reserve_bytes(
+    model_args: Mapping[str, Any],
+    *,
+    max_model_len: int,
+    max_decode_rows: int,
+    itemsize: int,
+) -> int:
+    """What a step's sparse layers hold that profile_run's unpaged run misses."""
+    heads = int(model_args["index_n_heads"])
+    head_dim = int(model_args["index_head_dim"])
+    kpool = int(model_args["index_kpool"])
+    cap = _score_cap_bytes()
+    # One query part: per-head float32 scores at the cap, plus four [rows, pools]
+    # float32 temporaries (head sum, mask, argpartition's values and indices).
+    part = cap + 4 * cap // heads
+    # Per pool of one max_model_len request: its key in the cache dtype and as
+    # float32, its per-head float32 decode scores, and about 16 B of per-pool
+    # rows (head-summed score, end position, validity, argpartition index).
+    per_pool = (itemsize + 4) * head_dim + 4 * heads + 16
+    # Each decode row's index_topk selected rows plus kpool - 1 tail rows.
+    width = int(model_args["index_topk"]) + kpool - 1
+    decode_rows = max_decode_rows * width * int(model_args["kv_lora_rank"]) * itemsize
+    return part + max_model_len // kpool * per_pool + decode_rows
+
+
 def max_latent_blocks(*, block_size: int, latent_dim: int) -> int:
     """The most latent blocks mlx-vlm's kernel can address with 32-bit offsets."""
     return (2**31 - 1) // (block_size * latent_dim)
+
+
+def _score_cap_bytes() -> int:
+    """The most bytes of per-head float32 scores one query part may hold."""
+    return envs.VLLM_METAL_SPARSE_INDEXER_MAX_SCORES_MIB * 2**20
 
 
 @dataclass(frozen=True)
@@ -226,6 +258,20 @@ class _PageWrites:
             )
 
 
+def query_parts(length: int, heads: int, pools: int) -> list[int]:
+    """Row bounds of a chunk's indexer query parts.
+
+    vLLM's ``_split_indexer_prefill_chunks`` for one request; private, so not
+    imported. It bounds logits summed over the heads, while mlx-vlm keeps a
+    float32 score per head, so it gets the per-head cap divided by the heads.
+    """
+    cap = _score_cap_bytes() // heads
+    if length * pools * 4 <= cap:
+        return [0, length]
+    step = max(1, cap // 4 // pools)
+    return [*range(0, length, step), length]
+
+
 def _global_slots(
     topk: mx.array, block_table: mx.array, block_size: int
 ) -> tuple[mx.array, mx.array]:
@@ -254,7 +300,21 @@ class DSAPagedAttentionWrapper(nn.Module):
         indexer_caches: SparseIndexerCaches,
     ) -> None:
         super().__init__()
+        from mlx_vlm.models.glm5_next import language
+
+        # Query parts call these private mlx-vlm 0.7.6 names; binding them here
+        # fails at wrap time on an install that lacks one.
+        indexer = inner.indexer
         object.__setattr__(self, "_inner", inner)
+        try:
+            object.__setattr__(self, "_pool_select", language._exact_pool_select)
+            object.__setattr__(self, "_project_keys", indexer._project_keys)
+            object.__setattr__(self, "_project_queries", indexer._project_queries)
+            object.__setattr__(self, "_compress_pools", indexer._compress_pools)
+        except AttributeError as error:
+            raise RuntimeError(
+                f"GLM-5-Next sparse MLA: needs mlx-vlm 0.7.6's {error.name}."
+            ) from error
         self.rebind_cache(
             latent_cache, cache_idx=layer_idx, indexer_caches=indexer_caches
         )
@@ -381,8 +441,88 @@ class DSAPagedAttentionWrapper(nn.Module):
     def _request_topk(
         self, x: mx.array, q_resid: mx.array, pool: PoolingCache, past: int
     ) -> mx.array:
-        """mlx-vlm's indexer for one request, on its restored caches."""
-        return self._inner.indexer(x, q_resid, None, _key_validity(past), pool, past)
+        """mlx-vlm's indexer for one request, in one call or in query parts.
+
+        One row is always one part, so a decode-only step evaluates nothing.
+        """
+        indexer = self._inner.indexer
+        length = x.shape[1]
+        pools = (past + length) // indexer.index_kpool
+        bounds = query_parts(length, indexer.n_heads, pools)
+        if len(bounds) == 2:
+            return indexer(x, q_resid, None, _key_validity(past), pool, past)
+        return self._topk_in_parts(x, q_resid, pool, past, bounds)
+
+    def _topk_in_parts(
+        self,
+        x: mx.array,
+        q_resid: mx.array,
+        pool: PoolingCache,
+        past: int,
+        bounds: Sequence[int],
+    ) -> mx.array:
+        """mlx-vlm's single-call top-k of one prefill chunk, scored in parts.
+
+        The chunk is pooled and projected once; each part is selected against
+        that pool set and evaluated before the next.
+        """
+        indexer = self._inner.indexer
+        kpool, length = indexer.index_kpool, x.shape[1]
+        kv_length = past + length
+        keys, gates = self._project_keys(x)
+        ready_keys, ready_gates, _ = pool.accumulate_windows(
+            keys, gates.astype(keys.dtype), past
+        )
+        pool_keys = pool.update_and_fetch(self._compress_pools(ready_keys, ready_gates))
+        count = pool_keys.shape[1]
+        pool_end = mx.minimum(mx.arange(1, count + 1) * kpool - 1, kv_length - 1)[None]
+        pool_valid = mx.ones((1, count), dtype=mx.bool_)
+        positions = past + mx.arange(length)
+        select_k = min(indexer.index_topk // kpool, count)
+        # mlx-vlm scores pools only when it must choose among them.
+        scored = select_k < count
+        q, weights = self._project_queries(x, q_resid)
+        parts = []
+        for start, end in itertools.pairwise(bounds):
+            part = self._pool_select(
+                q[:, start:end] if scored else None,
+                pool_keys,
+                weights[:, start:end] if scored else None,
+                pool_ends=pool_end,
+                pool_valid=pool_valid,
+                query_positions=positions[start:end],
+                select_k=select_k,
+                scale=indexer.softmax_scale,
+                chunk_size=end - start,
+            )
+            mx.eval(part)
+            mx.synchronize()
+            parts.append(part)
+        selected = mx.concatenate([part[0] for part in parts], axis=1)
+        selected_valid = mx.concatenate([part[1] for part in parts], axis=1)
+
+        order = mx.argsort(mx.where(selected_valid, selected, count), axis=-1)
+        selected = mx.take_along_axis(selected, order, axis=-1)
+        selected_valid = mx.take_along_axis(selected_valid, order, axis=-1)
+        safe = mx.clip(selected, 0, count - 1)
+        topk = (safe[..., None] * kpool + mx.arange(kpool)).reshape(1, length, -1)
+        valid = mx.repeat(selected_valid[..., None], kpool, axis=-1)
+        topk = mx.where(valid.reshape(1, length, -1), topk, -1)
+        width = indexer.index_topk
+        if topk.shape[-1] < width:
+            pad = [(0, 0), (0, 0), (0, width - topk.shape[-1])]
+            topk = mx.pad(topk, pad, constant_values=-1)
+        topk = topk[..., :width]
+        # vLLM's config refuses index_kpool_always_select_tail other than True.
+        if kpool > 1:
+            visible = positions + 1
+            tail_count = visible % kpool
+            tail = (visible - tail_count)[:, None] + mx.arange(kpool - 1)
+            tail_valid = (mx.arange(kpool - 1) < tail_count[:, None]) & (
+                tail < kv_length
+            )
+            topk = mx.concatenate([topk, mx.where(tail_valid, tail, -1)[None]], axis=-1)
+        return topk.astype(mx.int32)
 
     def _decode_attention(
         self,

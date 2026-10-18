@@ -21,7 +21,7 @@ from tests.stub_runner import (
 )
 from vllm_metal.attention import context as pac
 from vllm_metal.attention.caches.mla_cache import MLAPagedLatentCache
-from vllm_metal.attention.impls.dsa import DSAPagedAttentionWrapper
+from vllm_metal.attention.impls.dsa import DSAPagedAttentionWrapper, query_parts
 from vllm_metal.attention.impls.mla import MLAPagedAttentionWrapper
 from vllm_metal.attention.runtime.hybrid import HybridPagedAttentionRuntime
 from vllm_metal.attention.runtime.mla import MLAPagedAttentionRuntime
@@ -1274,3 +1274,63 @@ class TestGlm5NextSparseAttention:
             )
             _assert_output_matches(actual, expected, num_tokens, second.alone)
             _assert_pages_match(runtime, second)
+
+    @pytest.mark.parametrize(
+        ("cap_mib", "ties", "block_size", "history", "chunk"),
+        [
+            (512, False, 32, 21, 19),
+            (0, True, 32, 21, 19),
+            # At 2 MiB, 1400 rows over 350 pools split 748 + 652, and 600 rows
+            # over 500 pools 524 + 76.
+            (2, False, 64, 1400, 600),
+        ],
+        ids=["one_part", "row_parts_ties", "multi_row_parts"],
+    )
+    def test_prefill_matches_mlx_vlms_kernel(
+        self, monkeypatch, cap_mib, ties, block_size, history, chunk
+    ) -> None:
+        """A bf16 prefill chunk over paged history, its indexer scored in one
+        part or in query parts (a cap of 0 makes every row a part), is bitwise
+        mlx-vlm's indexed kernel on the contiguous latent with the selection
+        of mlx-vlm's single indexer call, and close to mlx-vlm's projected
+        prefill."""
+        # mlx-vlm's own kernel call, private in mlx-vlm 0.7.6, is the reference.
+        from mlx_vlm.models.glm5_next.language import _sparse_prefill_attention
+        from mlx_vlm.models.linear import linear
+
+        monkeypatch.setenv("VLLM_METAL_SPARSE_INDEXER_MAX_SCORES_MIB", str(cap_mib))
+        inner = _glm5_next_layer(ties=ties)
+        runtime, wrapper = _glm5_next_paged(inner, num_blocks=40, block_size=block_size)
+        blocks = list(range(math.ceil((history + chunk) / block_size), 0, -1))
+        request = _GlmRequest(blocks)
+        _glm_step(inner, runtime, wrapper, [(request, history)])
+
+        ((actual, projected, selected, x),) = _glm_step(
+            inner, runtime, wrapper, [(request, chunk)]
+        )
+
+        q_a, _ = mx.split(linear(inner.qkv_a_proj, x), (inner.q_lora_rank,), axis=-1)
+        q = (
+            linear(inner.q_b_proj, inner.q_a_layernorm(q_a))
+            .reshape(1, chunk, inner.num_heads, inner.q_head_dim)
+            .transpose(0, 2, 1, 3)
+        )
+        latent = request.reference[0].state[0]
+        out = _sparse_prefill_attention(
+            inner.embed_q(q), latent, latent, selected, inner.scale
+        )
+        absorbed = linear(
+            inner.o_proj,
+            inner.unembed_out(out).transpose(0, 2, 1, 3).reshape(1, chunk, -1),
+        )
+        assert bool(mx.array_equal(actual, absorbed))
+        assert _relative_error(actual, projected) < 3e-2
+        _assert_pages_match(runtime, request)
+
+    def test_query_parts_stay_within_the_cap(self, monkeypatch) -> None:
+        """At the default cap and 32 index heads, a 1024-row chunk after 17k
+        tokens (4352 pools) splits into parts of 512 MiB // (4 * 32 * 4352)
+        rows, the part the reserve covers."""
+        monkeypatch.setenv("VLLM_METAL_SPARSE_INDEXER_MAX_SCORES_MIB", "512")
+
+        assert query_parts(1024, 32, 4352) == [0, 963, 1024]
