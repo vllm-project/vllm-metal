@@ -100,7 +100,19 @@ def test_plain_attention_spec_is_unchanged() -> None:
     assert _engine_blocks(specs, metal_per_block) == POOL_BLOCKS
 
 
-def test_hybrid_spec_omits_stateless_layers() -> None:
+@pytest.mark.parametrize(
+    ("first_layer_idx", "expected"),
+    [
+        (0, {"layers.0.mixer", "layers.2.self_attn", "layers.3.mixer"}),
+        # A pipeline stage names its layers globally: vLLM merges every
+        # stage's spec by name.
+        (1, {"layers.2.self_attn", "layers.3.mixer"}),
+    ],
+    ids=["whole_model", "pipeline_stage"],
+)
+def test_hybrid_spec_omits_stateless_layers(
+    first_layer_idx: int, expected: set[str]
+) -> None:
     runner = make_stub_runner(
         model_config=SimpleNamespace(
             runner_type="generate",
@@ -108,8 +120,11 @@ def test_hybrid_spec_omits_stateless_layers() -> None:
             max_model_len=2048,
             is_hybrid=True,
         ),
-        num_layers=4,
-        hybrid_runtime_plan=make_nemotron_hybrid_plan("M-*M"),
+        num_layers=4 - first_layer_idx,
+        first_layer_idx=first_layer_idx,
+        hybrid_runtime_plan=make_nemotron_hybrid_plan("M-*M").for_layers(
+            first_layer_idx, 4
+        ),
         num_kv_heads=1,
         head_dim=128,
         kv_cache_dtype=mx.float16,
@@ -123,11 +138,7 @@ def test_hybrid_spec_omits_stateless_layers() -> None:
 
     specs = runner._cache_policy.get_kv_cache_spec()
 
-    assert set(specs) == {
-        "layers.0.mixer",
-        "layers.2.self_attn",
-        "layers.3.mixer",
-    }
+    assert set(specs) == expected
 
 
 def test_hybrid_mamba_spec_reserves_one_state_block_per_request() -> None:

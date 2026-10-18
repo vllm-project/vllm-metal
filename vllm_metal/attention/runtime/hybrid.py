@@ -50,11 +50,14 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
         *,
         hybrid_plan: HybridRuntimePlan,
         dtype: mx.Dtype,
+        # Global index of the plan's first layer (a pipeline stage's offset).
+        first_layer_idx: int = 0,
         # Scheduler-side mamba caching strategy.
         mamba_cache_mode: str = "none",
     ) -> None:
         self._hybrid_plan = hybrid_plan
         self._dtype = dtype
+        self._first_layer_idx = first_layer_idx
         state_family = self._hybrid_plan.family
         if mamba_cache_mode not in state_family.supported_cache_modes:
             raise NotImplementedError(
@@ -73,11 +76,12 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
         """Use the upstream allocation for both KV and recurrent state."""
         self.storage = KVCacheStorage(config)
         layer_plan = self._hybrid_plan.layers
+        first = self._first_layer_idx
         attention_names = [
-            f"layers.{i}.self_attn" for i in layer_plan.attention_indices
+            f"layers.{first + i}.self_attn" for i in layer_plan.attention_indices
         ]
         state_names = [
-            f"layers.{i}.{self._hybrid_plan.family.layer_name}"
+            f"layers.{first + i}.{self._hybrid_plan.family.layer_name}"
             for i in layer_plan.state_indices
         ]
         attention_specs = [self.storage.specs[name] for name in attention_names]

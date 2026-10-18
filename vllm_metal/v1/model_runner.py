@@ -476,6 +476,9 @@ class MetalModelRunner:
         # both to this stage's local slice under pipeline parallelism).
         self.num_layers: int = 0
         self.num_kv_cache_layers: int = 0
+        # Global index of this stage's first layer. KV cache specs name layers
+        # globally: vLLM merges every stage's specs by name.
+        self.first_layer_idx: int = 0
 
         # Per-layer KV cache shapes (None = uniform across layers)
         self.kv_heads_per_layer: list[int] | None = None
@@ -875,12 +878,16 @@ class MetalModelRunner:
                 "supported under PP yet."
             )
 
-        self._model_adapter.apply_pipeline_split(self.model, pp)
+        span = self._model_adapter.apply_pipeline_split(self.model, pp)
+        assert span is not None  # a multi-stage group always splits
         # Mirror the sliced backbone's local layer count onto the runner so
         # offset_caches and KV-cache sizing cover only this stage's layers.
-        local_num_layers = len(self._forward_model.model.layers)
-        self.num_layers = local_num_layers
-        self.num_kv_cache_layers = local_num_layers
+        start, end = span
+        self.first_layer_idx = start
+        self.num_layers = end - start
+        self.num_kv_cache_layers = end - start
+        if self.hybrid_runtime_plan is not None:
+            self.hybrid_runtime_plan = self.hybrid_runtime_plan.for_layers(start, end)
 
         # Install the PP-aware forward wrapper for this stage. It owns the stage
         # forward (recv -> local layers -> final norm + head on the last stage);
