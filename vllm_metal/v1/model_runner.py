@@ -1002,6 +1002,11 @@ class MetalModelRunner:
     def tq_prefill_workspace_bytes(self) -> int:
         return self._cache_policy.tq_prefill_workspace_bytes
 
+    def sparse_mla_reserve_bytes(self, *, max_running_requests: int) -> int:
+        return self._cache_policy.sparse_mla_reserve_bytes(
+            max_running_requests=max_running_requests
+        )
+
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """Get KV cache specification.
 

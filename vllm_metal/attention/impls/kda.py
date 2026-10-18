@@ -15,9 +15,19 @@ from vllm_metal.attention.caches.state_cache import (
 from vllm_metal.attention.context import PagedAttentionContext, get_context
 
 
-def is_kda_attention(module: nn.Module) -> bool:
-    """Return whether a module exposes the KDA interface used by the wrapper."""
-    return all(
+@dataclass(frozen=True, slots=True)
+class _KDALayout:
+    projection_size: int
+    conv_kernel_size: int
+    conv_dtype: mx.Dtype
+    # Per-stream split of the packed conv state; ``None`` keeps one fused
+    # q/k/v stream.
+    conv_widths: tuple[int, ...] | None
+
+
+def _resolve_kda_layout(module: nn.Module) -> _KDALayout | None:
+    """Read the KDA dims from MLX-LM's split or mlx-vlm's fused q/k/v layout."""
+    if all(
         hasattr(module, name)
         for name in (
             "q_proj",
@@ -29,7 +39,30 @@ def is_kda_attention(module: nn.Module) -> bool:
             "projection_size",
             "conv_kernel_size",
         )
-    )
+    ):
+        projection_size = int(module.projection_size)
+        return _KDALayout(
+            projection_size=projection_size,
+            conv_kernel_size=int(module.conv_kernel_size),
+            conv_dtype=module.q_conv1d.weight.dtype,
+            conv_widths=(projection_size,) * 3,
+        )
+    if all(
+        hasattr(module, name)
+        for name in ("qkv_proj", "qkv_conv", "projection_dim", "conv_kernel")
+    ):
+        return _KDALayout(
+            projection_size=int(module.projection_dim),
+            conv_kernel_size=int(module.conv_kernel),
+            conv_dtype=module.qkv_conv.conv.weight.dtype,
+            conv_widths=None,
+        )
+    return None
+
+
+def is_kda_attention(module: nn.Module) -> bool:
+    """Return whether a module exposes the KDA interface used by the wrapper."""
+    return _resolve_kda_layout(module) is not None
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,9 +84,11 @@ class KDAPagedAttentionWrapper(nn.Module):
         state_cache: PagedStateCache,
     ) -> None:
         super().__init__()
-        if not is_kda_attention(inner):
+        layout = _resolve_kda_layout(inner)
+        if layout is None:
             raise TypeError(f"{type(inner).__name__} is not a KDA module")
         object.__setattr__(self, "_inner", inner)
+        object.__setattr__(self, "_kda_layout", layout)
         object.__setattr__(self, "_kda_layer_idx", layer_idx)
         self.rebind_state_cache(state_cache, cache_idx=cache_idx)
 
@@ -61,8 +96,8 @@ class KDAPagedAttentionWrapper(nn.Module):
         self, state_cache: PagedStateCache, cache_idx: int
     ) -> None:
         inner = self._inner
-        projection_size = int(inner.projection_size)
-        expected_conv = (int(inner.conv_kernel_size) - 1, 3 * projection_size)
+        layout = self._kda_layout
+        expected_conv = (layout.conv_kernel_size - 1, 3 * layout.projection_size)
         actual_conv = state_cache.conv_states[cache_idx].shape[1:]
         if actual_conv != expected_conv:
             raise RuntimeError(
@@ -80,7 +115,7 @@ class KDAPagedAttentionWrapper(nn.Module):
                 f"{expected_recurrent}"
             )
         state_cache.require_mixer_dtype(
-            inner.q_conv1d.weight.dtype, layer_idx=self._kda_layer_idx
+            layout.conv_dtype, layer_idx=self._kda_layer_idx
         )
 
     def rebind_state_cache(
@@ -140,10 +175,9 @@ class KDAPagedAttentionWrapper(nn.Module):
         return mx.concatenate(outputs, axis=1)
 
     def _slot_cache(self, slot_ids: mx.array) -> StateSlotArraysCache:
-        projection_size = int(self._inner.projection_size)
         return StateSlotArraysCache(
             self._kda_state_cache,
             self._kda_cache_idx,
             slot_ids,
-            conv_widths=(projection_size,) * 3,
+            conv_widths=self._kda_layout.conv_widths,
         )

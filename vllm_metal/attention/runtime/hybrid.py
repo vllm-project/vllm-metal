@@ -20,6 +20,12 @@ from vllm_metal.attention.caches.mla_cache import MLAPagedLatentCache
 from vllm_metal.attention.caches.state_cache import PagedStateCache
 from vllm_metal.attention.caches.storage import KVCacheStorage
 from vllm_metal.attention.context import PagedAttentionContext
+from vllm_metal.attention.impls.dsa import (
+    INDEXER_CACHE_SUFFIX,
+    DSAPagedAttentionWrapper,
+    SparseIndexerCaches,
+    is_dsa_attention,
+)
 from vllm_metal.attention.impls.mla import (
     MLAPagedAttentionWrapper,
     is_mla_attention,
@@ -57,6 +63,7 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
                 f"family (supported: {state_family.supported_cache_modes})"
             )
         self._cache = None
+        self._indexer_caches: SparseIndexerCaches | None = None
         self._state_cache: PagedStateCache | None = None
         self._state_manager: AlignStateManager | None = None
         self._scheduler_group_indices: tuple[int, ...] = ()
@@ -92,6 +99,13 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
             for i, group in enumerate(config.kv_cache_groups)
             if any(name in attention_names for name in group.layer_names)
         )
+        if isinstance(self._cache, MLAPagedLatentCache) and (
+            attention_names[0] + INDEXER_CACHE_SUFFIX in self.storage.specs
+        ):
+            # GLM-5-Next: the pooled keys share the latent's group.
+            self._indexer_caches = SparseIndexerCaches.from_upstream(
+                self.storage, attention_names, latent=self._cache
+            )
         self._group_block_sizes = tuple(
             config.kv_cache_groups[i].kv_cache_spec.block_size
             for i in self._scheduler_group_indices
@@ -158,9 +172,20 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
                 )
             cache_idx = layer_plan.attention_cache_index(layer_idx)
             if isinstance(attention_cache, MLAPagedLatentCache):
+                if isinstance(attn, DSAPagedAttentionWrapper):
+                    attn.rebind_cache(
+                        attention_cache,
+                        cache_idx=cache_idx,
+                        indexer_caches=self.indexer_caches,
+                    )
+                    return attn
                 if isinstance(attn, MLAPagedAttentionWrapper):
                     attn.rebind_cache(attention_cache, cache_idx=cache_idx)
                     return attn
+                if is_dsa_attention(attn):
+                    return DSAPagedAttentionWrapper(
+                        attn, cache_idx, attention_cache, self.indexer_caches
+                    )
                 if is_mla_attention(attn):
                     return MLAPagedAttentionWrapper(attn, cache_idx, attention_cache)
                 raise RuntimeError(
@@ -197,6 +222,16 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
         )
 
     @property
+    def indexer_caches(self) -> SparseIndexerCaches:
+        """The sparse indexer's caches (GLM-5-Next)."""
+        if self._indexer_caches is None:
+            raise RuntimeError(
+                "GLM-5-Next sparse MLA: the KV cache config has no pooled-key "
+                "specs for the sparse layers"
+            )
+        return self._indexer_caches
+
+    @property
     def kv_cache(self) -> MetalPagedKVCache | MLAPagedLatentCache:
         return self._require_initialized("kv_cache")
 
@@ -226,6 +261,8 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
 
     def copy_blocks(self, block_copies: Sequence[tuple[int, int]]) -> None:
         """Apply scheduler CoW copies to attention KV and align-mode state."""
+        # GLM-5-Next's tail rows are not copied: a copy's source is a prefix
+        # hit, which ends on a whole pool, so the destination reads no tail.
         self.state_cache.apply_pending_states(
             [slot for pair in block_copies for slot in pair]
         )
@@ -249,6 +286,9 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
     def extend_forward_eval_outputs(self, outputs: list[mx.array]) -> None:
         self.storage.depend(outputs)
         outputs.extend(self.storage.buffers)
+        if self._indexer_caches is not None:
+            # GLM-5-Next's tail rows live outside the storage buffers.
+            outputs.extend(self._indexer_caches.tail.latent_caches)
         self.state_manager.extend_forward_eval_outputs(outputs)
 
     def release_requests(self, req_ids: set[str]) -> None:

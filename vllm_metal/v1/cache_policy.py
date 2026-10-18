@@ -30,6 +30,13 @@ from vllm_metal.attention.caches.turboquant import (
     packed_dim,
     prefill_workspace_bytes,
 )
+from vllm_metal.attention.impls.dsa import (
+    INDEXER_CACHE_SUFFIX,
+    indexer_cache_spec,
+    is_sparse_mla,
+    max_latent_blocks,
+    sparse_mla_reserve_bytes,
+)
 from vllm_metal.attention.impls.turboquant_prefill import (
     dtype_head_reason,
     workspace_upper_bound,
@@ -269,6 +276,8 @@ class _PagedAttentionPlan:
     kv_offload_pool: int = 0
     kv_offload_pool_auto: bool = False
     sized_down_by_probe: bool = False
+    # Sparse MLA only: the most blocks mlx-vlm's indexed kernel can address.
+    sparse_mla_max_blocks: int | None = None
 
     def format_breakdown(self) -> str:
         parts = [
@@ -408,6 +417,53 @@ class ModelCachePolicy:
                 )
         return prefill_workspace_bytes(max_bytes=cap)
 
+    def sparse_mla_reserve_bytes(self, *, max_running_requests: int) -> int:
+        """What GLM-5-Next's sparse layers hold beyond profile_run's peak.
+
+        vLLM reserves its own inline in a CUDA op, so it is computed here, with
+        vLLM's worst decode count capped by the requests that fit at once.
+        """
+        runner = self._runner
+        if not self._is_sparse_mla():
+            return 0
+        scheduler = runner.scheduler_config
+        decode_rows = min(
+            scheduler.max_num_seqs,
+            scheduler.max_num_batched_tokens,
+            max_running_requests,
+        )
+        reserve = sparse_mla_reserve_bytes(
+            runner.model_args,
+            max_model_len=runner.model_config.max_model_len,
+            max_decode_rows=decode_rows,
+            itemsize=self._require_kv_cache_dtype().size,
+        )
+        logger.info_once(
+            "GLM-5-Next sparse MLA: reserving %.2f MiB before KV sizing, for the "
+            "indexer scores and %d decode rows.",
+            reserve / 2**20,
+            decode_rows,
+        )
+        return reserve
+
+    def _is_sparse_mla(self) -> bool:
+        return self._runner.is_mla and is_sparse_mla(self._runner.model_args)
+
+    def _sparse_indexer_spec(
+        self, *, block_size: int, torch_dtype: torch.dtype
+    ) -> MLAAttentionSpec | None:
+        """vLLM's pooled-key spec for each sparse MLA layer."""
+        if not self._is_sparse_mla():
+            return None
+        if self._runner.vllm_config.speculative_config is not None:
+            raise NotImplementedError(
+                "GLM-5-Next sparse MLA: speculative decoding is not supported; "
+                "rejected drafts would stay in the pooled keys and tails."
+            )
+        return indexer_cache_spec(
+            self._runner.model_args, block_size=block_size, dtype=torch_dtype
+        )
+
     def validate_paged_attention_support(self) -> None:
         """Validate that the loaded model can run on the paged-attention path."""
         self._require_supported_per_layer_shapes()
@@ -522,13 +578,17 @@ class ModelCachePolicy:
         if self._runner.is_hybrid:
             hybrid_plan = self._hybrid_plan()
             state_spec = self._state_layer_spec(hybrid_plan)
+            pooled = self._sparse_indexer_spec(
+                block_size=block_size, torch_dtype=torch_dtype
+            )
             for layer_idx in range(num_spec_layers):
+                name = f"layers.{layer_idx}"
                 if hybrid_plan.layers.is_state_layer(layer_idx):
-                    specs[f"layers.{layer_idx}.{hybrid_plan.family.layer_name}"] = (
-                        state_spec
-                    )
+                    specs[f"{name}.{hybrid_plan.family.layer_name}"] = state_spec
                 elif hybrid_plan.layers.is_attention_layer(layer_idx):
-                    specs[f"layers.{layer_idx}.self_attn"] = attention_spec(layer_idx)
+                    specs[f"{name}.self_attn"] = attention_spec(layer_idx)
+                    if pooled is not None:
+                        specs[f"{name}.self_attn{INDEXER_CACHE_SUFFIX}"] = pooled
         else:
             for layer_idx in range(num_spec_layers):
                 specs[f"layers.{layer_idx}.self_attn"] = attention_spec(layer_idx)
@@ -855,6 +915,14 @@ class ModelCachePolicy:
                 + self._draft_cache_block_size_bytes()
             )
 
+        if self._is_sparse_mla() and self._runner.is_hybrid:
+            # vLLM's GLM-5-Next layout: the latent and pooled-key pages, which
+            # the KDA pages alias.
+            return sum(
+                spec.page_size_bytes
+                for spec in self.get_kv_cache_spec().values()
+                if type(spec) is MLAAttentionSpec
+            )
         return (
             self._kv_factor() * block_size * dtype_size * self._kv_layer_size_sum()
             + self._draft_cache_block_size_bytes()
@@ -1146,12 +1214,22 @@ class WorkerCachePlanner:
         if mode == "paged_attention_layout_budget":
             overhead = self._worker.model_runner.profile_run()
             plan = self._paged_attention_plan(overhead=overhead)
+            budget = plan.kv_budget
             if self._worker.vllm_config.cache_config.num_gpu_blocks_override is None:
                 self._validate_paged_attention_plan(
                     plan,
                     require_min_blocks=False,
                 )
-            budget = plan.kv_budget
+                # An explicit --num-gpu-blocks-override is the user's pool: it
+                # fails at bind instead.
+                cap = plan.sparse_mla_max_blocks
+                if cap is not None and budget > cap * plan.per_block_bytes:
+                    budget = cap * plan.per_block_bytes
+                    logger.warning(
+                        "GLM-5-Next sparse MLA: capping the KV pool at %d blocks, "
+                        "the indexed attention kernel's 32-bit range.",
+                        cap,
+                    )
             logger.info(
                 "Upstream cache layout: reporting %.2f GB KV budget; "
                 "runtime allocation deferred until vLLM KVCacheConfig",
@@ -1207,6 +1285,21 @@ class WorkerCachePlanner:
             fraction,
             overhead,
         )
+        # Profiling cannot observe sparse MLA's indexer scores over a long
+        # history or its decode rows either; reserve them the same way. Every
+        # running request holds at least a latent and a KDA state block.
+        sparse_reserve = self._worker.model_runner.sparse_mla_reserve_bytes(
+            max_running_requests=max(1, base_kv_budget // (2 * per_block_bytes))
+        )
+        sparse_max_blocks = None
+        if sparse_reserve:
+            overhead += sparse_reserve
+            future_reserved_bytes += sparse_reserve
+            base_kv_budget -= sparse_reserve
+            sparse_max_blocks = max_latent_blocks(
+                block_size=block_size,
+                latent_dim=self._worker.model_runner.mla_latent_dim,
+            )
         kv_offload_pool = self._resolve_kv_offload_pool(base_kv_budget, per_block_bytes)
         kv_budget = base_kv_budget - kv_offload_pool
         plan, room = self._probe_committed_pool(
@@ -1222,6 +1315,7 @@ class WorkerCachePlanner:
                 num_blocks=max(0, kv_budget // per_block_bytes),
                 kv_offload_pool=kv_offload_pool,
                 kv_offload_pool_auto=self._auto_pool_extra() is not None,
+                sparse_mla_max_blocks=sparse_max_blocks,
             ),
             future_reserved_bytes=future_reserved_bytes,
         )
