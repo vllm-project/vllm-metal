@@ -594,11 +594,12 @@ class ModelCachePolicy:
                 use_grouped_attention=use_grouped_attention,
             )
 
+        first = self._runner.first_layer_idx
         if self._runner.is_hybrid:
             hybrid_plan = self._hybrid_plan()
             state_spec = self._state_layer_spec(hybrid_plan)
             for layer_idx in range(num_spec_layers):
-                name = f"layers.{layer_idx}"
+                name = f"layers.{first + layer_idx}"
                 if hybrid_plan.layers.is_state_layer(layer_idx):
                     specs[f"{name}.{hybrid_plan.family.layer_name}"] = state_spec
                 elif hybrid_plan.layers.is_attention_layer(layer_idx):
@@ -607,7 +608,9 @@ class ModelCachePolicy:
                     )
         else:
             for layer_idx in range(num_spec_layers):
-                specs[f"layers.{layer_idx}.self_attn"] = attention_spec(layer_idx)
+                specs[f"layers.{first + layer_idx}.self_attn"] = attention_spec(
+                    layer_idx
+                )
 
         specs.update(
             self._draft_layer_specs(block_size=block_size, torch_dtype=torch_dtype)
@@ -901,7 +904,10 @@ class ModelCachePolicy:
 
     def _attention_layer_names(self) -> tuple[str, ...]:
         num_layers, _ = self._cache_layer_mapping()
-        return tuple(f"layers.{layer_idx}.self_attn" for layer_idx in range(num_layers))
+        first = self._runner.first_layer_idx
+        return tuple(
+            f"layers.{first + layer_idx}.self_attn" for layer_idx in range(num_layers)
+        )
 
     def get_cache_block_size_bytes(self) -> int:
         """Return the byte size of one cache block.
@@ -1003,6 +1009,7 @@ class ModelCachePolicy:
         model_args = self._runner.model_args
         return HybridPagedAttentionRuntime(
             hybrid_plan=self._hybrid_plan(),
+            first_layer_idx=self._runner.first_layer_idx,
             dtype=self._require_kv_cache_dtype(),
             mamba_cache_mode=self._runner.cache_config.mamba_cache_mode,
             pooled_keys=(
