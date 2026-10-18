@@ -10,6 +10,7 @@ import mlx.nn as nn
 import numpy as np
 import pytest
 from vllm.sampling_params import SamplingParams
+from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.outputs import LogprobsLists
 
 import vllm_metal.compat as compat
@@ -337,14 +338,21 @@ def _scheduler_output(
 
 
 def _new_req(
-    req_id: str, params: SamplingParams | None = None, prompt=(7, 8)
-) -> SimpleNamespace:
-    return SimpleNamespace(
+    req_id: str,
+    params: SamplingParams | None = None,
+    prompt=(7, 8),
+    prefill_token_ids: list[int] | None = None,
+) -> NewRequestData:
+    return NewRequestData(
         req_id=req_id,
         prompt_token_ids=list(prompt),
+        mm_features=[],
         sampling_params=params,
+        pooling_params=None,
         block_ids=([0],),
         num_computed_tokens=0,
+        lora_request=None,
+        prefill_token_ids=prefill_token_ids,
     )
 
 
@@ -404,13 +412,7 @@ class TestRuntimeStepProtocol:
         rt, forwards = runtime
         runner = rt._runner
         prompt = [7, 8, 9]
-        new_req = SimpleNamespace(
-            req_id="r",
-            prompt_token_ids=prompt,
-            sampling_params=None,
-            block_ids=([0],),
-            num_computed_tokens=0,
-        )
+        new_req = _new_req("r", prompt=prompt)
 
         # Prefill: encoder pass, nothing sampled, a random canvas as drafts.
         out = rt.execute_model(
@@ -448,13 +450,7 @@ class TestRuntimeStepProtocol:
 
     def test_intermediate_prefill_chunk_hands_back_no_drafts(self, runtime) -> None:
         rt, _ = runtime
-        new_req = SimpleNamespace(
-            req_id="r",
-            prompt_token_ids=[1, 2, 3, 4],
-            sampling_params=None,
-            block_ids=([0],),
-            num_computed_tokens=0,
-        )
+        new_req = _new_req("r", prompt=[1, 2, 3, 4])
 
         rt.execute_model(_scheduler_output(new_reqs=[new_req], scheduled={"r": 2}))
 
@@ -462,13 +458,7 @@ class TestRuntimeStepProtocol:
 
     def test_rejects_drafts_that_differ_from_the_canvas(self, runtime) -> None:
         rt, _ = runtime
-        new_req = SimpleNamespace(
-            req_id="r",
-            prompt_token_ids=[1, 2],
-            sampling_params=None,
-            block_ids=([0],),
-            num_computed_tokens=0,
-        )
+        new_req = _new_req("r", prompt=[1, 2])
         rt.execute_model(_scheduler_output(new_reqs=[new_req], scheduled={"r": 2}))
 
         with pytest.raises(RuntimeError, match="out of sync"):
@@ -481,13 +471,7 @@ class TestRuntimeStepProtocol:
     def test_clipped_denoise_step_keeps_the_full_canvas(self, runtime) -> None:
         rt, forwards = runtime
         runner = rt._runner
-        new_req = SimpleNamespace(
-            req_id="r",
-            prompt_token_ids=[1, 2],
-            sampling_params=None,
-            block_ids=([0],),
-            num_computed_tokens=0,
-        )
+        new_req = _new_req("r", prompt=[1, 2])
         rt.execute_model(_scheduler_output(new_reqs=[new_req], scheduled={"r": 2}))
         canvas = runner._draft_token_ids.draft_token_ids[0]
 
@@ -508,13 +492,7 @@ class TestRuntimeStepProtocol:
         rt, _ = runtime
         runner = rt._runner
         rt.settings = _settings(max_denoising_steps=1)
-        new_req = SimpleNamespace(
-            req_id="r",
-            prompt_token_ids=[1, 2],
-            sampling_params=None,
-            block_ids=([0],),
-            num_computed_tokens=0,
-        )
+        new_req = _new_req("r", prompt=[1, 2])
         rt.execute_model(_scheduler_output(new_reqs=[new_req], scheduled={"r": 2}))
         canvas = runner._draft_token_ids.draft_token_ids[0]
 
@@ -577,19 +555,24 @@ class TestRuntimeStepProtocol:
 
     def test_finished_requests_drop_their_canvas(self, runtime) -> None:
         rt, _ = runtime
-        new_req = SimpleNamespace(
-            req_id="r",
-            prompt_token_ids=[1, 2],
-            sampling_params=None,
-            block_ids=([0],),
-            num_computed_tokens=0,
-        )
+        new_req = _new_req("r", prompt=[1, 2])
         rt.execute_model(_scheduler_output(new_reqs=[new_req], scheduled={"r": 2}))
 
         rt.execute_model(_scheduler_output(scheduled={}, finished={"r"}))
 
         assert rt._requests == {}
         assert "r" not in rt._runner._request_states
+
+    def test_readmitted_request_prefills_its_committed_tokens(self, runtime) -> None:
+        rt, forwards = runtime
+        new_req = _new_req("r", prompt=[1, 2], prefill_token_ids=[1, 2, 3, 1])
+
+        rt.execute_model(_scheduler_output(new_reqs=[new_req], scheduled={"r": 4}))
+
+        state = rt._runner._request_states["r"]
+        assert forwards == [(False, [(0, [1, 2, 3, 1])])]
+        assert state.token_ids == [1, 2, 3, 1]
+        assert state.prompt_len == 2
 
 
 class TestEncoderHiddenStates:

@@ -457,12 +457,14 @@ class DiffusionGemmaRuntime:
 
         num_computed: dict[str, int] = {}
         for new_req in scheduler_output.scheduled_new_reqs:
-            token_ids = list(new_req.prompt_token_ids or [])
+            token_ids = list(
+                new_req.prefill_token_ids or new_req.prompt_token_ids or []
+            )
             sampling_params = new_req.sampling_params or SamplingParams()
             _warn_ignored_sampling_params(sampling_params)
             runner._request_states[new_req.req_id] = RequestState(
                 token_ids=token_ids,
-                prompt_len=len(token_ids),
+                prompt_len=new_req.prompt_len,
                 sampling_params=sampling_params,
                 block_ids=runner._copy_paged_block_ids(new_req.block_ids),
                 num_computed_tokens=new_req.num_computed_tokens,
