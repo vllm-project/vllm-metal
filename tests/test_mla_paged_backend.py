@@ -1252,3 +1252,25 @@ class TestGlm5NextSparseAttention:
             ):
                 _assert_output_matches(actual, expected, num_tokens, request.alone)
                 _assert_pages_match(runtime, request)
+
+    def test_prefix_hit_starts_on_the_shared_blocks(self) -> None:
+        """A prefix-cache hit: the second request starts on the first
+        request's whole first block. It reads that
+        block's latent rows and pools, and matches mlx-vlm fed the same
+        prefix rows."""
+        inner = _glm5_next_layer()
+        runtime, wrapper = _glm5_next_paged(inner)
+        first = _GlmRequest([4, 1])
+        ((_, _, _, prefix),) = _glm_step(inner, runtime, wrapper, [(first, 32)])
+        # The first request goes on, into its own second block.
+        _glm_step(inner, runtime, wrapper, [(first, 5)])
+
+        second = _GlmRequest([4, 6])
+        inner(prefix, cache=second.reference)
+        second.offset = 32
+        for num_tokens in (7, 1, 1):
+            ((actual, expected, _, _),) = _glm_step(
+                inner, runtime, wrapper, [(second, num_tokens)]
+            )
+            _assert_output_matches(actual, expected, num_tokens, second.alone)
+            _assert_pages_match(runtime, second)
