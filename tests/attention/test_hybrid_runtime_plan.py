@@ -205,6 +205,11 @@ class TestGdnPlanRejection:
             build_gdn_hybrid_plan(args, num_layers, STATE_DTYPES)
         assert str(excinfo.value) == expected
 
+    def test_pipeline_stage_without_attention_layers_rejects(self) -> None:
+        # Layer 0 is a state layer; the first attention layer is layer 1.
+        with pytest.raises(ValueError, match="realign the stage boundaries"):
+            _make_tiny_plan().for_layers(0, 1)
+
 
 class TestStateFamilyFactory:
     @pytest.mark.parametrize(
