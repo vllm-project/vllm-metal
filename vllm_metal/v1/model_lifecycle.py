@@ -14,7 +14,6 @@ from mlx_lm import load as mlx_lm_load
 from mlx_vlm import load as mlx_vlm_load
 from vllm.logger import init_logger
 
-from vllm_metal.attention.impls.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
 from vllm_metal.attention.runtime.factory import build_hybrid_runtime_plan
 from vllm_metal.compat import apply_compat_patches, embedding_load_scope
 from vllm_metal.compiled_mlp import CompiledMLPBlocks
@@ -550,9 +549,7 @@ class ModelLifecycle:
 
         if runner.is_mla:
             runner.num_kv_heads = 1
-            runner.head_dim = int(args["kv_lora_rank"]) + int(
-                args.get("qk_rope_head_dim", MLA_DEFAULT_QK_ROPE_HEAD_DIM)
-            )
+            runner.head_dim = runner.mla_latent_dim
         return int(default_head_dim) if default_head_dim is not None else None
 
     def _install_yoco_cache_mapping(self, args: dict[str, Any]) -> None:
