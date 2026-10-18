@@ -56,6 +56,7 @@ unsupported; leave `--video-pruning-rate` unset.
 | LFM2-VL / LFM2.5-VL | 🔵 | 🔵 | native multimodal paged generation on the ShortConv text tower | image input, no video; one tile grid plus thumbnail per image; needs a checkpoint packaged for Transformers, which the MLX conversions are not | `LiquidAI/LFM2.5-VL-1.6B` |
 | LFM3-VL | 🔵 | | native multimodal paged generation on the LFM3 text tower | image input, no video; needs `--trust-remote-code`; the image processor comes from mlx-vlm | `LiquidAI/LFM3-VL-2B-MLX-4bit` |
 | Gemma 4 | 🔵 | | mlx_lm text backbone + mlx-vlm encoder sidecar, paged generation | image input; audio and video input on E2B/E4B; bidirectional attention inside image blocks on sliding-window layers | `mlx-community/unsloth-gemma-4-26B-A4B-it-qat-oQ4`, `mlx-community/gemma-4-e2b-it-4bit` (audio, video) |
+| GLM-5.3-Flash | 🟡 | | native multimodal paged generation | image input, no video | — |
 
 Gemma 4 keeps its text path exactly as on the text-only table (mlx_lm model,
 selective logits, intermediate forward); only `vision_tower` and `embed_vision`
@@ -107,6 +108,13 @@ load time in sidecar mode because neither image-attention path supports it: the
 tiled kernel has no TurboQuant variant, and the recompute reads K/V back from
 the paged cache unquantized.
 
+GLM-5.3-Flash images need the checkpoint's `processor_config.json`. At
+startup the engine encodes one maximal image (7,921 tokens, a few seconds),
+whose peak comes out of the KV cache. Text-only servers should pass
+`--limit-mm-per-prompt '{"image": 0}'` (`--language-model-only` fails: it
+loads mlx_lm, which has no `glm5_next`): nothing is profiled, and under
+pipeline parallelism the vision tower is never loaded.
+
 ## Text-Only Language Models
 
 Prefix caching is enabled by default where supported, as shown in the table
@@ -150,13 +158,13 @@ image input. DFlash and DSpark speculative decoding need a Qwen3 target, so
 Glimmer's DFlash assistant is not supported; n-gram and draft-model speculation
 and TurboQuant are not validated.
 
-GLM-5.3-Flash loads through mlx-vlm's `glm5_next` text model and serves text
-only; image and video requests are refused. The verified checkpoint was
+GLM-5.3-Flash loads through mlx-vlm's `glm5_next` model. The verified checkpoint was
 converted from `zai-org/GLM-5.3-Flash-BF16` with `mlx_vlm.convert`: routed
 experts 4-bit affine (`down_proj` 5-bit), other linear layers 8-bit affine,
-group size 64, hyper-connection and indexer modules unquantized. A custom
+group size 64, hyper-connection, indexer and vision modules unquantized. A custom
 `quant_predicate` replaces mlx-vlm's own, so it must keep that predicate's
-exclusions (`attn_hc`, `ffn_hc`, `index_kpool_compress`).
+exclusions (`attn_hc`, `ffn_hc`, `index_kpool_compress`) and must also skip the
+vision tower.
 
 Its sparse attention layers keep vLLM's GLM-5-Next latent rows and pooled
 indexer keys (in the model dtype), with the unfinished pool's raw keys beside
