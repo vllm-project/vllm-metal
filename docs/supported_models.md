@@ -132,6 +132,23 @@ Ling-3.0 Tiny supports the official BF16 checkpoint and MLX-native MXFP8
 checkpoints converted from it. Direct loading of the official serialized
 block-FP8 checkpoint is not supported.
 
+GLM-5.3-Flash loads through mlx-vlm's `glm5_next` text model and serves text
+only; image and video requests are refused. The verified checkpoint was
+converted from `zai-org/GLM-5.3-Flash-BF16` with `mlx_vlm.convert`: routed
+experts 4-bit affine (`down_proj` 5-bit), other linear layers 8-bit affine,
+group size 64, hyper-connection and indexer modules unquantized. A custom
+`quant_predicate` replaces mlx-vlm's own, so it must keep that predicate's
+exclusions (`attn_hc`, `ffn_hc`, `index_kpool_compress`).
+
+Its sparse attention layers keep vLLM's GLM-5-Next latent rows and pooled
+indexer keys (in the model dtype), with the unfinished pool's raw keys beside
+its latent block, and each step reads only the latent rows the indexer selects.
+Long prefill chunks are scored in query parts under
+`VLLM_METAL_SPARSE_INDEXER_MAX_SCORES_MIB`. mlx-vlm's indexed attention kernel
+addresses at most 963 blocks of 4352 tokens: a larger automatic pool
+is capped, and a larger `--num-gpu-blocks-override` is refused. Speculative
+decoding and RoPE latents are refused at startup.
+
 | Model | MLX | PyTorch MPS | Attention Kernel | Automatic Prefix Cache | Example checkpoint |
 | --- | --- | --- | --- | --- | --- |
 | Qwen3 | ✅ | 🔵 | GQA (paged) | ✅ | `Qwen/Qwen3-0.6B` |
@@ -149,6 +166,7 @@ block-FP8 checkpoint is not supported.
 | Phi 1.5 / Phi 2 | ✅ | | MHA + partial RoPE (paged) | ✅ | `mlx-community/phi-2-hf-4bit-mlx` |
 | GPT-OSS | 🔵 | | Sink attention (paged) | ✅ | `openai/gpt-oss-20b` |
 | Ling-3.0 Tiny | 🔵 | | Hybrid MLA + KDA (paged latent + recurrent state) | 🔵 | `inclusionAI/Ling-3.0-tiny` (BF16 or converted MXFP8) |
+| GLM-5.3-Flash | 🔵 | | Hybrid sparse NoPE MLA + KDA (paged latent + indexer + recurrent state) | 🔵 | — |
 | GLM-4.5 | Not verified | | MLA (paged latent cache, MLX SDPA — no Metal kernel) | Not verified | — |
 | MiniCPM3-4B | ✅ | | MLA (paged latent cache) | ✅ | `mlx-community/MiniCPM3-4B-4bit` |
 | GLM-4.7-Flash | 🔵 | | GQA (paged) | ✅ | `mlx-community/GLM-4.7-Flash-4bit` |
