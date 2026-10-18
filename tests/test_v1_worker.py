@@ -260,6 +260,30 @@ class TestWorkerRunnerBoundaryDelegation:
         assert available == 2_900_000_000
         worker.model_runner.profile_run.assert_called_once_with()
 
+    @pytest.mark.parametrize(
+        ("override", "expected"),
+        [(None, 963 * 2_000_000), (2000, 2_800_000_000)],
+        ids=["automatic", "override"],
+    )
+    def test_layout_budget_caps_an_automatic_sparse_mla_pool(
+        self, monkeypatch: pytest.MonkeyPatch, override, expected
+    ) -> None:
+        """An automatic sparse-MLA pool is reported at the 963 blocks of 4352
+        tokens that mlx-vlm's indexed kernel addresses at a 512-wide latent,
+        so the server starts; an explicit override is left to fail at bind."""
+        worker = self._make_layout_budget_worker(
+            monkeypatch, gpu_memory_utilization=0.5
+        )
+        worker.cache_config.block_size = 4352
+        worker.cache_config.num_gpu_blocks_override = override
+        worker.get_cache_block_size_bytes = MagicMock(return_value=2_000_000)
+        worker.model_runner.sparse_mla_reserve_bytes = MagicMock(
+            return_value=100_000_000
+        )
+        worker.model_runner.mla_latent_dim = 512
+
+        assert MetalWorker.determine_available_memory(worker) == expected
+
     def test_layout_budget_oom_reports_breakdown_and_mitigations(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
