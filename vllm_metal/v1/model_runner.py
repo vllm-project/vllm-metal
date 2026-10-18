@@ -71,6 +71,7 @@ from vllm_metal.config import get_config
 from vllm_metal.distributed import (
     PipelinedModel,
     PipelineGroup,
+    is_glm5_next,
     is_non_last_stage,
     pipeline_send,
 )
@@ -852,9 +853,10 @@ class MetalModelRunner:
         (``_start_paged_forward``) and the KV-cache spec size only this stage's
         layers — not the full model.
 
-        Only the validated paths (uniform SDPA attention, e.g. Qwen3, and GDN
-        hybrids, e.g. Qwen3.5) are supported under pipeline parallelism: fail
-        loud on other YOCO / hybrid / MLA / pooling / VLM configs.
+        Only the validated paths (uniform SDPA attention, e.g. Qwen3, GDN
+        hybrids, e.g. Qwen3.5, and GLM-5-Next) are supported under pipeline
+        parallelism: fail loud on other YOCO / hybrid / MLA / pooling / VLM
+        configs.
         """
         if pp.size == 1:
             return
@@ -865,18 +867,19 @@ class MetalModelRunner:
         )
         unsupported = (
             self._yoco_cache_mapping is not None
-            or (self.is_hybrid and not gdn_hybrid)
-            or self.is_mla
             or self._is_pooling
-            or self._is_vlm
+            or (
+                ((self.is_hybrid and not gdn_hybrid) or self.is_mla or self._is_vlm)
+                and not is_glm5_next(self._forward_model)
+            )
         )
         if unsupported:
             raise NotImplementedError(
                 "Pipeline parallelism on Metal is validated only for uniform-"
                 "attention and GDN hybrid generation on the paged path (e.g. "
-                "Qwen3, or Qwen3.5 with --language-model-only); other YOCO / "
-                "hybrid / MLA / pooling / VLM (multimodal) configs are not "
-                "supported under PP yet."
+                "Qwen3, or Qwen3.5 with --language-model-only) and GLM-5-Next; "
+                "other YOCO / hybrid / MLA / pooling / VLM (multimodal) configs "
+                "are not supported under PP yet."
             )
 
         span = self._model_adapter.apply_pipeline_split(self.model, pp)

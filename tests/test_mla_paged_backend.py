@@ -1392,3 +1392,23 @@ class TestGlm5NextSparseAttention:
         tokens (4352 pools) splits into parts of 512 MiB // (4 * 32 * 4352)
         rows, the part the reserve covers."""
         assert query_parts(1024, 32, 4352) == [0, 963, 1024]
+
+    def test_decode_build_submits_no_gpu_work(self, monkeypatch) -> None:
+        """A later pipeline stage builds a decode-only forward before its
+        receive wait, so building one must evaluate nothing."""
+        inner = _glm5_next_layer()
+        runtime, wrapper = _glm5_next_paged(inner)
+        request = _GlmRequest([1, 2])
+        _glm_step(inner, runtime, wrapper, [(request, 21)])
+        calls: list[str] = []
+        for name in ("eval", "async_eval", "synchronize"):
+            monkeypatch.setattr(mx, name, lambda *_, _n=name, **__: calls.append(_n))
+        pac.prepare_grouped(
+            [([request.blocks], 21)], [], runtime.kv_group_block_sizes()
+        )
+        try:
+            wrapper(mx.random.normal((1, 1, _GLM_HIDDEN)).astype(mx.bfloat16))
+        finally:
+            pac.clear_context()
+
+        assert calls == []
