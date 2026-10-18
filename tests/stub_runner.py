@@ -136,6 +136,46 @@ def _grouping_config(block_size: int, num_blocks: int) -> SimpleNamespace:
     )
 
 
+def make_glm5_next_stub_runner(
+    *, block_size: int = 32, speculative_config: Any = None, **model_args: Any
+) -> mr.MetalModelRunner:
+    """A bf16 GLM-5-Next stage: three KDA layers, then one sparse MLA layer."""
+    from vllm_metal.attention.runtime.families.glm5_next import (
+        build_glm5_next_hybrid_plan,
+    )
+
+    model_args = {
+        "kv_lora_rank": 32,
+        "qk_rope_head_dim": 0,
+        "index_kpool": 4,
+        "index_head_dim": 16,
+        "layer_types": ["linear_attention"] * 3 + ["deepseek_sparse_attention"],
+        "linear_num_heads": 1,
+        "linear_head_dim": 4,
+        "linear_conv_kernel_dim": 2,
+        **model_args,
+    }
+    runner = make_stub_runner(
+        model_args=model_args,
+        is_hybrid=True,
+        num_layers=4,
+        hybrid_runtime_plan=build_glm5_next_hybrid_plan(
+            model_args, 4, (torch.bfloat16, torch.float32)
+        ),
+        num_kv_heads=1,
+        head_dim=model_args["kv_lora_rank"],
+        kv_cache_dtype=mx.bfloat16,
+        cache_config=SimpleNamespace(
+            block_size=block_size,
+            mamba_block_size=4096,
+            mamba_page_size_padded=None,
+            mamba_cache_mode="none",
+        ),
+    )
+    runner.vllm_config.speculative_config = speculative_config
+    return runner
+
+
 def make_cache_config(**kwargs: Any) -> CacheConfig:
     """Build a real ``CacheConfig`` with Metal's KV cache layout already resolved."""
     cache_config = CacheConfig(**kwargs)

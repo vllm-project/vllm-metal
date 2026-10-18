@@ -21,7 +21,10 @@ class MLAPagedLatentCache:
 
     @classmethod
     def from_upstream(cls, storage, names) -> MLAPagedLatentCache:
-        """Bind latent views from vLLM's resolved cache layout."""
+        """Bind latent views from vLLM's resolved cache layout.
+
+        A block holds one row per stored state.
+        """
         if not names:
             raise ValueError("MLA cache requires at least one layer")
 
@@ -46,7 +49,7 @@ class MLAPagedLatentCache:
             num_layers=len(names),
             latent_dim=first.head_size,
             num_blocks=storage.config.num_blocks,
-            block_size=first.block_size,
+            block_size=first.num_states,
             _allocate=False,
         )
         latent_tensors = []

@@ -30,6 +30,11 @@ from vllm_metal.attention.caches.turboquant import (
     packed_dim,
     prefill_workspace_bytes,
 )
+from vllm_metal.attention.impls.dsa import (
+    INDEXER_CACHE_SUFFIX,
+    indexer_cache_spec,
+    is_sparse_mla,
+)
 from vllm_metal.attention.impls.turboquant_prefill import (
     dtype_head_reason,
     workspace_upper_bound,
@@ -423,6 +428,24 @@ class ModelCachePolicy:
                 )
         return prefill_workspace_bytes(max_bytes=cap)
 
+    def _is_sparse_mla(self) -> bool:
+        return self._runner.is_mla and is_sparse_mla(self._runner.model_args)
+
+    def _sparse_indexer_spec(
+        self, *, block_size: int, torch_dtype: torch.dtype
+    ) -> MLAAttentionSpec | None:
+        """vLLM's pooled-key spec for each sparse MLA layer."""
+        if not self._is_sparse_mla():
+            return None
+        if self._runner.vllm_config.speculative_config is not None:
+            raise NotImplementedError(
+                "GLM-5-Next sparse MLA: speculative decoding is not supported; "
+                "rejected drafts would stay in the pooled keys and tails."
+            )
+        return indexer_cache_spec(
+            self._runner.model_args, block_size=block_size, dtype=torch_dtype
+        )
+
     def validate_paged_attention_support(self) -> None:
         """Validate that the loaded model can run on the paged-attention path."""
         self._require_supported_per_layer_shapes()
@@ -535,13 +558,17 @@ class ModelCachePolicy:
         if self._runner.is_hybrid:
             hybrid_plan = self._hybrid_plan()
             state_spec = self._state_layer_spec(hybrid_plan)
+            pooled = self._sparse_indexer_spec(
+                block_size=block_size, torch_dtype=torch_dtype
+            )
             for layer_idx in range(num_spec_layers):
+                name = f"layers.{layer_idx}"
                 if hybrid_plan.layers.is_state_layer(layer_idx):
-                    specs[f"layers.{layer_idx}.{hybrid_plan.family.layer_name}"] = (
-                        state_spec
-                    )
+                    specs[f"{name}.{hybrid_plan.family.layer_name}"] = state_spec
                 elif hybrid_plan.layers.is_attention_layer(layer_idx):
-                    specs[f"layers.{layer_idx}.self_attn"] = attention_spec(layer_idx)
+                    specs[f"{name}.self_attn"] = attention_spec(layer_idx)
+                    if pooled is not None:
+                        specs[f"{name}.self_attn{INDEXER_CACHE_SUFFIX}"] = pooled
         else:
             for layer_idx in range(num_spec_layers):
                 specs[f"layers.{layer_idx}.self_attn"] = attention_spec(layer_idx)
@@ -872,6 +899,14 @@ class ModelCachePolicy:
                 + self._draft_cache_block_size_bytes()
             )
 
+        if self._is_sparse_mla() and self._runner.is_hybrid:
+            # vLLM's GLM-5-Next layout: the latent and pooled-key pages, which
+            # the KDA pages alias.
+            return sum(
+                spec.page_size_bytes
+                for spec in self.get_kv_cache_spec().values()
+                if type(spec) is MLAAttentionSpec
+            )
         return (
             self._kv_factor() * block_size * dtype_size * self._kv_layer_size_sum()
             + self._draft_cache_block_size_bytes()
