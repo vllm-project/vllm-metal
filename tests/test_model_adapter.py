@@ -1661,7 +1661,7 @@ class TestNormalizeModelConfigSidecar:
         assert config.multimodal_config is None
 
 
-def test_glm5_next_keeps_the_vlm_load_and_refuses_media() -> None:
+def test_glm5_next_keeps_the_vlm_load_and_refuses_video() -> None:
     config = SimpleNamespace(
         model="x",
         revision=None,
@@ -1681,8 +1681,7 @@ def test_glm5_next_keeps_the_vlm_load_and_refuses_media() -> None:
 
     assert config.multimodal_config is not None
     limits = config.multimodal_config.limit_per_prompt
-    assert isinstance(limits["image"], ImageDummyOptions)
-    assert limits["image"].count == 0
+    assert "image" not in limits
     assert isinstance(limits["video"], VideoDummyOptions)
     assert limits["video"].count == 0
 

@@ -238,8 +238,9 @@ def pipeline_send(h: mx.array, pp: PipelineGroup) -> mx.array:
 class PipelinedModel:
     """PP-aware forward wrapper: runs an mlx_lm model as a single pipeline stage.
 
-    Owns the stage *forward*: the first stage embeds ``input_ids``; every later
-    stage receives the upstream hidden state and feeds it in as
+    Owns the stage *forward*: the first stage embeds ``input_ids`` unless the
+    caller passes ``inputs_embeds`` (a multimodal splice); every later stage
+    receives the upstream hidden state and feeds it in as
     ``input_embeddings``; the local (already-sliced) layers run, and the last
     stage applies the final norm + head. Returns this stage's raw model output
     on the last rank (the caller extracts logits), otherwise the raw hidden
@@ -282,7 +283,12 @@ class PipelinedModel:
         )
 
     def __call__(
-        self, input_ids: mx.array, *, cache: Any = None, recv_first: bool = False
+        self,
+        input_ids: mx.array,
+        *,
+        cache: Any = None,
+        inputs_embeds: mx.array | None = None,
+        recv_first: bool = False,
     ) -> mx.array:
         """Build this stage's forward; a later stage's receive stays pending.
 
@@ -290,7 +296,7 @@ class PipelinedModel:
         ``recv_first`` waits before the build instead, for a forward that may
         submit GPU work itself, as prefill attention does.
         """
-        h_in: mx.array | None = None
+        h_in = inputs_embeds
         if not self._pp.is_first:
             self._pending_recv = pipeline_recv(
                 self._pp, input_ids.shape[1], self._wire_hidden, self._wire_dtype
@@ -349,15 +355,15 @@ class PipelinedModel:
 
         The backbone expands the embedding into ``hc_mult`` streams before its
         first layer and averages them after its last, so the stage runs its
-        layers itself and the wire carries every stream.
+        layers itself and the wire carries every stream. On the first stage,
+        ``h_in`` is the caller's input embeddings, if any.
         """
         from mlx_vlm.models.linear import linear
 
         backbone = self._model.model
-        if h_in is None:
-            h = mx.repeat(
-                backbone.embed_tokens(input_ids)[:, :, None], self._streams, 2
-            )
+        if h_in is None or self._pp.is_first:
+            embeds = backbone.embed_tokens(input_ids) if h_in is None else h_in
+            h = mx.repeat(embeds[:, :, None], self._streams, 2)
         else:
             h = h_in.reshape(*h_in.shape[:2], self._streams, -1)
         layer_caches = cache or [None] * len(backbone.layers)

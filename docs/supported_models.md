@@ -53,6 +53,7 @@ unsupported; leave `--video-pruning-rate` unset.
 | Qwen3.5 (dense) | 🔵 | | native multimodal paged generation | image and video input; FP8 checkpoints stay text-only | `mlx-community/Qwen3.5-4B-MLX-4bit` |
 | PaddleOCR-VL | 🔵 | | native multimodal paged generation | image input, no video | `PaddlePaddle/PaddleOCR-VL-1.6` |
 | Gemma 4 | 🔵 | | mlx_lm text backbone + mlx-vlm vision sidecar, paged generation | image input, no video/audio, bidirectional attention inside image blocks on sliding-window layers | `mlx-community/unsloth-gemma-4-26B-A4B-it-qat-oQ4` |
+| GLM-5.3-Flash | 🟡 | | native multimodal paged generation | image input, no video | — |
 
 Gemma 4 keeps its text path exactly as on the text-only table (mlx_lm model,
 selective logits, intermediate forward); only `vision_tower` and `embed_vision`
@@ -97,6 +98,13 @@ load time in sidecar mode because neither image-attention path supports it: the
 tiled kernel has no TurboQuant variant, and the recompute reads K/V back from
 the paged cache unquantized.
 
+GLM-5.3-Flash images need the checkpoint's `processor_config.json`. At
+startup the engine encodes one maximal image (7,921 tokens, a few seconds),
+whose peak comes out of the KV cache. Text-only servers should pass
+`--limit-mm-per-prompt '{"image": 0}'` (`--language-model-only` fails: it
+loads mlx_lm, which has no `glm5_next`): nothing is profiled, and under
+pipeline parallelism the vision tower is never loaded.
+
 ## Text-Only Language Models
 
 Prefix caching is enabled by default where supported, as shown in the table
@@ -132,13 +140,13 @@ Ling-3.0 Tiny supports the official BF16 checkpoint and MLX-native MXFP8
 checkpoints converted from it. Direct loading of the official serialized
 block-FP8 checkpoint is not supported.
 
-GLM-5.3-Flash loads through mlx-vlm's `glm5_next` text model and serves text
-only; image and video requests are refused. The verified checkpoint was
+GLM-5.3-Flash loads through mlx-vlm's `glm5_next` model. The verified checkpoint was
 converted from `zai-org/GLM-5.3-Flash-BF16` with `mlx_vlm.convert`: routed
 experts 4-bit affine (`down_proj` 5-bit), other linear layers 8-bit affine,
-group size 64, hyper-connection and indexer modules unquantized. A custom
+group size 64, hyper-connection, indexer and vision modules unquantized. A custom
 `quant_predicate` replaces mlx-vlm's own, so it must keep that predicate's
-exclusions (`attn_hc`, `ffn_hc`, `index_kpool_compress`).
+exclusions (`attn_hc`, `ffn_hc`, `index_kpool_compress`) and must also skip the
+vision tower.
 
 Its sparse attention layers keep vLLM's GLM-5-Next latent rows and pooled
 indexer keys (in the model dtype), with the unfinished pool's raw keys beside

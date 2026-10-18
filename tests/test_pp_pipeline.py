@@ -523,13 +523,19 @@ def _micro_glm5_next() -> nn.Module:
 
 
 class TestHyperConnectionStages:
-    def test_two_stages_reproduce_the_full_model_logits(self) -> None:
+    # Spliced input embeddings stand in for a multimodal prompt's.
+    @pytest.mark.parametrize("spliced", [False, True])
+    def test_two_stages_reproduce_the_full_model_logits(self, spliced: bool) -> None:
         # GLM-5-Next keeps hc_mult residual streams between layers, so the wire
         # must carry all of them for the split to match the unsplit model.
         mx.random.seed(0)
         full = _micro_glm5_next()
         input_ids = mx.array([[1, 5, 9, 2, 7, 3]])
-        expected = full(input_ids).logits
+        inputs_embeds = None
+        if spliced:
+            inputs_embeds = full.model.embed_tokens(input_ids)
+            inputs_embeds[:, 1:3] = mx.random.normal((1, 2, 32))
+        expected = full(input_ids, inputs_embeds=inputs_embeds).logits
 
         stages = []
         for rank in range(2):
@@ -538,7 +544,7 @@ class TestHyperConnectionStages:
             pp = _pp(rank, 2)
             apply_pipeline_split(model, pp)
             stages.append(PipelinedModel(model, pp))
-        wire = stages[0]._stage_forward(input_ids, None)
+        wire = stages[0](input_ids, inputs_embeds=inputs_embeds)
         logits = stages[1]._stage_forward(input_ids, wire)
 
         assert wire.shape == (1, 6, stages[1]._wire_hidden)

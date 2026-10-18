@@ -324,6 +324,16 @@ class _PagedLogitsLayout(NamedTuple):
     cu_seqlens: list[int]
 
 
+class _MMPagedInputs(NamedTuple):
+    """Packed language-model inputs of a multimodal paged step."""
+
+    inputs_embeds: mx.array
+    position_ids: mx.array
+    visual_pos_masks: mx.array
+    deepstack_visual_embeds: Any | None
+    mm_prefill_deltas: dict[str, int]
+
+
 def text_path_selective_logits_allowed(is_vlm: bool, adapter: Any | None) -> bool:
     """Whether the split backbone/head path may serve this model's text batches.
 
@@ -1671,7 +1681,7 @@ class MetalModelRunner:
                     input_ids,
                     offset_caches,
                 )
-            elif use_mm_forward:
+            elif use_mm_forward and (self.pp is None or self.pp.size == 1):
                 assert adapter is not None
                 selects = self._mm_forward_selects_rows(adapter)
                 if selects and not self._needs_prompt_logprob_rows(prefill_reqs):
@@ -1705,9 +1715,19 @@ class MetalModelRunner:
                 # lazy op is forced by the async_eval below. A decode forward is
                 # built while the previous stage still runs; prefill attention
                 # may submit mid-forward, so a prefill step receives first.
+                # Only the first stage holds a multimodal adapter, so only it
+                # splices encoder rows.
                 assert self._pp_model is not None
+                inputs_embeds = None
+                if use_mm_forward:
+                    inputs_embeds = self._mm_paged_inputs(
+                        input_ids, prefill_reqs, decode_segments
+                    ).inputs_embeds
                 stage_output = self._pp_model(
-                    input_ids, cache=offset_caches, recv_first=bool(prefill_reqs)
+                    input_ids,
+                    cache=offset_caches,
+                    inputs_embeds=inputs_embeds,
+                    recv_first=bool(prefill_reqs),
                 )
                 if self.pp.is_last:
                     logits = self._extract_logits(stage_output)
@@ -2353,6 +2373,9 @@ class MetalModelRunner:
         """
         if not scheduled_encoder_inputs:
             return
+        # Only the first pipeline stage embeds tokens, so only it encodes.
+        if self.pp is not None and not self.pp.is_first:
+            return
         adapter = self._multimodal_adapter
         if adapter is None or not adapter.forward_ready:
             raise RuntimeError(
@@ -2495,6 +2518,32 @@ class MetalModelRunner:
 
         ``hidden_states_only`` calls ``adapter.call_lm_hidden_states`` instead
         and returns the final hidden states, for the caller's selective head.
+        """
+        adapter = self._multimodal_adapter
+        assert adapter is not None
+        inputs = self._mm_paged_inputs(input_ids, prefill_reqs, decode_segments)
+        call_lm = (
+            cast(Any, adapter).call_lm_hidden_states
+            if hidden_states_only
+            else adapter.call_lm
+        )
+        model_output = call_lm(
+            input_ids,
+            inputs.inputs_embeds,
+            offset_caches,
+            inputs.position_ids,
+            visual_pos_masks=inputs.visual_pos_masks,
+            deepstack_visual_embeds=inputs.deepstack_visual_embeds,
+        )
+        return model_output, inputs.mm_prefill_deltas
+
+    def _mm_paged_inputs(
+        self,
+        input_ids: mx.array,
+        prefill_reqs: list[PrefillRequest],
+        decode_segments: tuple[PagedDecodeSegment, ...],
+    ) -> _MMPagedInputs:
+        """Packed language-model inputs of a multimodal paged step.
 
         Builds per-segment M-RoPE positions (sliced out of the full-prompt
         positions for mm prefill chunks, computed as ``cache_start_pos +
@@ -2733,21 +2782,13 @@ class MetalModelRunner:
         mm_prefill_deltas = {
             req_id: int(meta[1]) for req_id, meta in mm_request_meta.items()
         }
-
-        call_lm = (
-            cast(Any, adapter).call_lm_hidden_states
-            if hidden_states_only
-            else adapter.call_lm
-        )
-        model_output = call_lm(
-            input_ids,
+        return _MMPagedInputs(
             inputs_embeds,
-            offset_caches,
             position_ids,
-            visual_pos_masks=visual_pos_masks,
-            deepstack_visual_embeds=deepstack_visual_embeds,
+            visual_pos_masks,
+            deepstack_visual_embeds,
+            mm_prefill_deltas,
         )
-        return model_output, mm_prefill_deltas
 
     def _bidi_ranges_for_chunk(
         self, pr: PrefillRequest, features: list[MultiModalFeatureSpec]

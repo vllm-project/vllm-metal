@@ -496,11 +496,16 @@ class ModelLifecycle:
         runner._is_vlm = request.is_vlm
 
         # Adapter state follows the effective VLM mode, not the raw config flag.
+        # Under pipeline parallelism only the first stage embeds tokens, so
+        # only it encodes and splices multimodal inputs.
         multimodal_adapter = (
             self._model_adapter.build_multimodal_adapter(
-                loaded_model.model, request.hf_config, sidecar=loaded_model.sidecar
+                loaded_model.model,
+                request.hf_config,
+                sidecar=loaded_model.sidecar,
+                vllm_config=runner.vllm_config,
             )
-            if request.is_vlm
+            if request.is_vlm and (runner.pp is None or runner.pp.is_first)
             else None
         )
         runner._multimodal_adapter = multimodal_adapter

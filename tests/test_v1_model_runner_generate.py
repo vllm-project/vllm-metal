@@ -1896,7 +1896,7 @@ class TestV1MetalModelRunnerGDNSubmit:
         send_handle = mx.array([2.0], dtype=mx.float32)
 
         class _Stage:
-            def __call__(self, input_ids, *, cache, recv_first):
+            def __call__(self, input_ids, *, cache, inputs_embeds, recv_first):
                 events.append(("forward", recv_first))
                 return stage_output
 
