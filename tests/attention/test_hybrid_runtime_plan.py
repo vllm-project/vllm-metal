@@ -256,6 +256,26 @@ class TestStateFamilyFactory:
         assert plan.layers.state_indices == (0, 2)
         assert plan.geometry.state_shapes == ((2, 24), (2, 4, 4))
 
+    def test_routes_glm5_next_layer_types_to_the_kda_family(self) -> None:
+        args = {
+            "model_type": "glm5_next_text",
+            "layer_types": [
+                "linear_attention",
+                "deepseek_sparse_attention",
+                "linear_attention",
+            ],
+            "linear_num_heads": 2,
+            "linear_head_dim": 4,
+            "linear_conv_kernel_dim": 3,
+        }
+
+        plan = build_hybrid_runtime_plan(args, 3, STATE_DTYPES)
+
+        assert plan.family.label == "kda"
+        assert plan.layers.attention_indices == (1,)
+        assert plan.layers.state_indices == (0, 2)
+        assert plan.geometry.state_shapes == ((2, 24), (2, 4, 4))
+
 
 class TestNemotronHPlanDecision:
     def test_string_pattern_reads_as_characters(self) -> None:
