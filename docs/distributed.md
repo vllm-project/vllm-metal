@@ -162,7 +162,7 @@ mlx.launch -n 2 --backend ring tools/pp_parity_check.py Qwen/Qwen3-0.6B
 - **Co-located stages oversubscribe the KV budget.** Each stage applies `--gpu-memory-utilization` to the whole device independently; neither knows the other exists, so two stages on one Mac claim roughly twice the fraction. Lower it when stacking. Separate Macs are unaffected.
 - **Synchronous scheduling required.** vLLM disables async scheduling for PP by default; an explicit `--async-scheduling` fails loud.
 - **TP=1 only.** PP+TP is rejected; tensor parallelism (`--tensor-parallel-size > 1`) is not implemented.
-- **Model support.** YOCO / hybrid / MLA / pooling / VLM / speculative decoding / LoRA are rejected; other shapes (sliding-window, MoE) are untested.
+- **Model support.** YOCO / pooling / speculative decoding / LoRA are rejected, and so are hybrid / MLA / VLM models other than GLM-5.3-Flash, whose stages pass all `hc_mult` hyper-connection streams (`hc_mult` × the hidden width per token). Other sliding-window and MoE models are untested.
 
 ## Data parallelism
 

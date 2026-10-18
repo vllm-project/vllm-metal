@@ -447,3 +447,57 @@ class TestDummyForwardMlxLmContract:
 
         assert out.shape == (1, 4, 32)
         assert out.dtype == wrapper._wire_dtype
+
+
+def _micro_glm5_next() -> nn.Module:
+    from mlx_vlm.models.glm5_next.config import TextConfig
+    from mlx_vlm.models.glm5_next.language import LanguageModel
+
+    return LanguageModel(
+        TextConfig(
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=32,
+            moe_intermediate_size=16,
+            num_hidden_layers=4,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            n_routed_experts=4,
+            num_experts_per_tok=2,
+            first_k_dense_replace=1,
+            q_lora_rank=16,
+            kv_lora_rank=16,
+            qk_nope_head_dim=8,
+            qk_head_dim=8,
+            v_head_dim=8,
+            index_n_heads=2,
+            index_head_dim=8,
+            index_topk=8,
+            index_kpool=4,
+            linear_num_heads=2,
+            linear_head_dim=8,
+        )
+    )
+
+
+class TestHyperConnectionStages:
+    def test_two_stages_reproduce_the_full_model_logits(self) -> None:
+        # GLM-5-Next keeps hc_mult residual streams between layers, so the wire
+        # must carry all of them for the split to match the unsplit model.
+        mx.random.seed(0)
+        full = _micro_glm5_next()
+        input_ids = mx.array([[1, 5, 9, 2, 7, 3]])
+        expected = full(input_ids).logits
+
+        stages = []
+        for rank in range(2):
+            model = _micro_glm5_next()
+            model.update(full.parameters())
+            pp = _pp(rank, 2)
+            apply_pipeline_split(model, pp)
+            stages.append(PipelinedModel(model, pp))
+        wire = stages[0]._stage_forward(input_ids, None)
+        logits = stages[1]._stage_forward(input_ids, wire)
+
+        assert wire.shape == (1, 6, stages[1]._wire_hidden)
+        assert bool(mx.allclose(logits, expected, rtol=1e-5, atol=1e-5))

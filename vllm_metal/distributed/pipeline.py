@@ -31,6 +31,7 @@ from mlx.utils import tree_flatten
 from vllm.distributed.utils import get_pp_indices
 
 import vllm_metal.envs as envs
+from vllm_metal.attention.runtime.families.glm5_next import GLM5_NEXT_MODEL_TYPES
 
 logger = logging.getLogger(__name__)
 
@@ -195,6 +196,11 @@ def apply_pipeline_split(model: nn.Module, pp: PipelineGroup) -> tuple[int, int]
     return start, end
 
 
+def is_glm5_next(model: Any) -> bool:
+    """Whether ``model`` is mlx-vlm's GLM-5-Next text model."""
+    return getattr(model, "model_type", None) in GLM5_NEXT_MODEL_TYPES
+
+
 def pipeline_recv(
     pp: PipelineGroup,
     n_tokens: int,
@@ -259,7 +265,12 @@ class PipelinedModel:
     # own. Lazy: a singleton stage crosses no wire, so it never reads either half.
     @cached_property
     def _wire_hidden(self) -> int:
-        return self._model.args.hidden_size
+        return self._model.args.hidden_size * self._streams
+
+    @cached_property
+    def _streams(self) -> int:
+        # GLM-5-Next passes ``hc_mult`` residual streams per token between layers.
+        return self._model.args.hc_mult if is_glm5_next(self._model) else 1
 
     @cached_property
     def _wire_dtype(self) -> mx.Dtype:
@@ -300,13 +311,45 @@ class PipelinedModel:
     def _stage_forward(
         self, input_ids: mx.array, h_in: mx.array | None, *, cache: Any = None
     ) -> mx.array:
+        if is_glm5_next(self._model):
+            return self._glm5_next_stage_forward(input_ids, h_in, cache)
         if self._pp.is_last:
             # full backbone + final norm + tied/explicit head -> model output
             return self._model(input_ids, cache=cache, input_embeddings=h_in)
         # backbone only (norm is nn.Identity on non-last) -> raw hidden state.
+        return self._check_wire_dtype(
+            self._model.model(input_ids, cache=cache, input_embeddings=h_in)
+        )
+
+    def _glm5_next_stage_forward(
+        self, input_ids: mx.array, h_in: mx.array | None, cache: Any
+    ) -> mx.array:
+        """Run this stage's GLM-5-Next layers on all residual streams.
+
+        The backbone expands the embedding into ``hc_mult`` streams before its
+        first layer and averages them after its last, so the stage runs its
+        layers itself and the wire carries every stream.
+        """
+        from mlx_vlm.models.linear import linear
+
+        backbone = self._model.model
+        if h_in is None:
+            h = mx.repeat(
+                backbone.embed_tokens(input_ids)[:, :, None], self._streams, 2
+            )
+        else:
+            h = h_in.reshape(*h_in.shape[:2], self._streams, -1)
+        layer_caches = cache or [None] * len(backbone.layers)
+        topk = None
+        for layer, layer_cache in zip(backbone.layers, layer_caches, strict=True):
+            h, topk = layer(h, None, layer_cache, topk)
+        if self._pp.is_last:
+            return linear(self._model.lm_head, backbone.norm(h.mean(axis=2)))
+        return self._check_wire_dtype(h.reshape(*h.shape[:2], -1))
+
+    def _check_wire_dtype(self, h_out: mx.array) -> mx.array:
         # The downstream stage receives at the wire dtype (pipeline_recv); a
         # mismatch deadlocks the ring, which does not validate across peers.
-        h_out = self._model.model(input_ids, cache=cache, input_embeddings=h_in)
         if h_out.dtype != self._wire_dtype:
             raise TypeError(
                 f"PP stage produced hidden {h_out.dtype}, but the wire dtype "
