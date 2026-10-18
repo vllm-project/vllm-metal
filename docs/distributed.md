@@ -163,6 +163,7 @@ mlx.launch -n 2 --backend ring tools/pp_parity_check.py Qwen/Qwen3-0.6B
 - **Synchronous scheduling required.** vLLM disables async scheduling for PP by default; an explicit `--async-scheduling` fails loud.
 - **TP=1 only.** PP+TP is rejected; tensor parallelism (`--tensor-parallel-size > 1`) is not implemented.
 - **Model support.** YOCO / pooling / speculative decoding / LoRA are rejected, and so are hybrid / MLA / VLM models other than GLM-5.3-Flash, whose stages pass all `hc_mult` hyper-connection streams (`hc_mult` × the hidden width per token). Other sliding-window and MoE models are untested.
+- **GLM-5.3-Flash prefill chunk.** On two 128 GB Macs (validated with `iogpu.wired_limit_mb=120000`) with MLX 0.32.2, pass `--max-num-batched-tokens 1024`. On M5, MLX 0.32.2's sorted `gather_qmm` kernel leaves rows unwritten in steps above 4,096 tokens (ml-explore/mlx#3922, fixed in 0.32.3), and four concurrent prompts at the default 8192 gave wrong answers. 1024 completed two concurrent ~58k-token prompts.
 
 ## Data parallelism
 
