@@ -1833,6 +1833,37 @@ class TestMetalPlatform:
         finally:
             reset_config()
 
+    def test_kept_multimodal_config_normalizes_pixels_on_the_host(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """MLX vision towers take the processor's normalized pixels."""
+        self._patch_stt_resolution(monkeypatch, is_stt=False)
+        multimodal_config = MultiModalConfig(mm_device_do_normalize=True)
+        model_config = SimpleNamespace(
+            enable_sleep_mode=False,
+            model="test-model",
+            tokenizer=None,
+            max_model_len=128,
+            multimodal_config=multimodal_config,
+            hf_config=SimpleNamespace(
+                model_type="qwen3_vl",
+                architectures=["Qwen3VLForConditionalGeneration"],
+            ),
+            is_hybrid=False,
+        )
+        reset_config()
+        try:
+            vllm_config = self._platform_config(
+                model_config=model_config,
+                cache_config=SimpleNamespace(enable_prefix_caching=False),
+            )
+
+            MetalPlatform.check_and_update_config(vllm_config)
+        finally:
+            reset_config()
+
+        assert multimodal_config.merge_mm_processor_kwargs({}) == {}
+
     def test_synchronize_runs_mlx_barrier(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

@@ -989,6 +989,9 @@ class MetalPlatform(Platform):
                         "Video token pruning is not supported on Metal. "
                         "Remove --video-pruning-rate."
                     )
+                # MLX vision towers take the processor's normalized pixels;
+                # vLLM's device-side normalization only runs in its own models.
+                model_config.multimodal_config.mm_device_do_normalize = False
                 mode = DefaultModelAdapter().multimodal_backbone_mode(
                     model_config, speculative_config=vllm_config.speculative_config
                 )
