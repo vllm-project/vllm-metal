@@ -1216,11 +1216,9 @@ class MetalPlatform(Platform):
         else-branch would have, instead of failing a default launch.
         """
         cache_config = vllm_config.cache_config
-        if cache_config.user_specified_mamba_block_size:
-            # --mamba-block-size requires prefix caching (upstream's
-            # validate_mamba_block_size rejects it once APC is off), so the
-            # user's two explicit choices conflict; fail with the Metal
-            # constraint before upstream's misleading error fires.
+        # With prefix caching on, vLLM fills an unset mamba_block_size with
+        # block_size before this hook, so any other value is the user's.
+        if cache_config.mamba_block_size != cache_config.block_size:
             raise NotImplementedError(
                 "Prefix caching for hybrid models on Metal cannot serve "
                 f"this configuration ({reason}), and --mamba-block-size "

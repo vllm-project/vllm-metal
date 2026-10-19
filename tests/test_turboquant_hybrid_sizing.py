@@ -179,7 +179,6 @@ class TestTurboQuantHybridAlignment:
                 block_size=block_size,
                 mamba_cache_mode="none",
                 mamba_block_size=None,
-                user_specified_mamba_block_size=False,
                 mamba_page_size_padded=block_size * 2 * KV_HEADS * HEAD_DIM * 2,
             ),
             parallel_config=SimpleNamespace(),

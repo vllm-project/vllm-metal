@@ -2,6 +2,7 @@
 """Tests for Metal platform."""
 
 import importlib
+import json
 import os
 import platform
 import re
@@ -18,6 +19,7 @@ from vllm.config import (
     VllmConfig,
 )
 from vllm.config.multimodal import MultiModalConfig
+from vllm.engine.arg_utils import EngineArgs
 from vllm.exceptions import VLLMValidationError
 from vllm.pooling_params import LateInteractionParams, PoolingParams
 from vllm.sampling_params import SamplingParams
@@ -41,6 +43,24 @@ from vllm_metal.config import reset_config
 from vllm_metal.platform import MetalPlatform
 from vllm_metal.v1.cache_policy import WorkerCachePlanner
 from vllm_metal.v1.model_adapter import DefaultModelAdapter
+
+_TINY_NEMOTRON_H_CONFIG = {
+    "architectures": ["NemotronHForCausalLM"],
+    "model_type": "nemotron_h",
+    "hidden_size": 64,
+    "intermediate_size": 128,
+    "num_hidden_layers": 2,
+    "hybrid_override_pattern": "M*",
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "head_dim": 16,
+    "mamba_num_heads": 4,
+    "mamba_head_dim": 8,
+    "ssm_state_size": 16,
+    "n_groups": 1,
+    "vocab_size": 256,
+    "max_position_embeddings": 4096,
+}
 
 
 @pytest.fixture(autouse=True)
@@ -1552,36 +1572,56 @@ class TestMetalPlatform:
         assert cache_config.mamba_cache_mode == "align"
         assert cache_config.mamba_block_size == 16
 
+    @pytest.mark.parametrize(("block_size", "mamba_block_size"), [(16, 64), (32, 16)])
     def test_hybrid_prefix_caching_downgrade_rejects_user_mamba_block_size(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, block_size: int, mamba_block_size: int
     ) -> None:
         """An explicit --mamba-block-size fails fast when APC must be downgraded.
 
         The remaining APC downgrade is for state families without align-mode
-        support (e.g. slot-keyed nemotron_h). Once the hook disables prefix
-        caching, upstream's validate_mamba_block_size (an after-validator)
-        would reject the kept value with a misleading message; the Metal
-        constraint wins instead.
+        support (e.g. slot-keyed nemotron_h). vLLM fills an unset
+        mamba_block_size with block_size before the hook, so any other value
+        is the user's, which needs prefix caching.
         """
         self._patch_stt_resolution(monkeypatch, is_stt=False)
         reset_config()
         try:
             vllm_config = self._hybrid_vllm_config(
                 SimpleNamespace(
-                    block_size=16,
+                    block_size=block_size,
                     kv_cache_dtype_skip_layers=[],
                     enable_prefix_caching=True,
                     mamba_cache_mode="align",
-                    mamba_block_size=64,
+                    mamba_block_size=mamba_block_size,
                     mamba_ssm_cache_dtype="float32",
                 ),
                 model_type="nemotron_h",
             )
-            assert vllm_config.cache_config.user_specified_mamba_block_size is True
             with pytest.raises(NotImplementedError, match="mamba-block-size"):
                 MetalPlatform.check_and_update_config(vllm_config)
         finally:
             reset_config()
+
+    def test_hybrid_prefix_caching_downgrade_when_mamba_block_size_is_omitted(
+        self, tmp_path
+    ) -> None:
+        """vLLM fills an omitted mamba_block_size before the platform hook, so a
+        default Nemotron-H launch downgrades instead of reading it as the user's."""
+        (tmp_path / "config.json").write_text(json.dumps(_TINY_NEMOTRON_H_CONFIG))
+        reset_config()
+        try:
+            vllm_config = EngineArgs(
+                model=str(tmp_path), max_model_len=4096
+            ).create_engine_config()
+        finally:
+            reset_config()
+
+        cache_config = vllm_config.cache_config
+        assert (
+            cache_config.enable_prefix_caching,
+            cache_config.mamba_cache_mode,
+            cache_config.mamba_block_size,
+        ) == (False, "none", 4096)
 
     @pytest.mark.parametrize("model_type", ["nemotron_h", "granitemoehybrid"])
     def test_check_and_update_config_downgrades_prefix_caching_for_slot_keyed_families(
