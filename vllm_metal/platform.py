@@ -969,12 +969,10 @@ class MetalPlatform(Platform):
                 scheduler_config.max_num_batched_tokens,
             )
 
-        # Disable cascade attention (not supported), then let the adapter
-        # apply any model-specific normalisations (e.g. clearing
+        # Let the adapter apply any model-specific normalisations (e.g. clearing
         # ``multimodal_config`` for model types served on the text-only
         # backbone — see ``DefaultModelAdapter.normalize_model_config``).
         if model_config is not None:
-            model_config.disable_cascade_attn = True
             from vllm_metal.v1.model_adapter import DefaultModelAdapter
 
             DefaultModelAdapter().normalize_model_config(
