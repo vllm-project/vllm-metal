@@ -733,7 +733,6 @@ class TestPlatformDiffusionConfig:
         [
             {"logprobs": 2},
             {"logprob_token_ids": [1, 2]},
-            {"extra_args": {"diffusion_canvas_length": _CANVAS}},
         ],
     )
     def test_accepts_sample_logprobs_while_serving_diffusion(
@@ -752,6 +751,8 @@ class TestPlatformDiffusionConfig:
             *(
                 ({"extra_args": {name: value}}, name)
                 for name, value in (
+                    ("diffusion_canvas_length", _CANVAS // 2),
+                    ("diffusion_canvas_length", _CANVAS),
                     ("diffusion_seed_canvas", [1] * _CANVAS),
                     ("diffusion_pinned", [0]),
                     ("diffusion_max_steps", 1),

@@ -46,9 +46,9 @@ _METAL_DENSE_KV_CACHE_DTYPE_NAMES: dict[torch.dtype, str] = {
     dtype: name for name, dtype in _METAL_DENSE_KV_CACHE_DTYPES.items()
 }
 # Structured-read extra_args (vllm#57250) that DiffusionGemmaRuntime does not
-# read yet. A diffusion_canvas_length that reaches validate_request equals the
-# served canvas (narrower ones need async scheduling), so it is a no-op.
+# read yet.
 _UNSUPPORTED_DIFFUSION_ARGS = (
+    "diffusion_canvas_length",
     "diffusion_seed_canvas",
     "diffusion_pinned",
     "diffusion_max_steps",
