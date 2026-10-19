@@ -277,28 +277,20 @@ class TestMetalPlatform:
             MetalPlatform.validate_request({}, sampling_params)
         assert exc_info.value.parameter == control
 
-    @pytest.mark.parametrize(
-        ("sampling_params", "control"),
-        [
-            (
-                SamplingParams(thinking_token_budget=64),
-                "thinking_token_budget",
-            ),
-            (
-                SamplingParams(thinking_token_budget=0),
-                "thinking_token_budget",
-            ),
-        ],
-        ids=["thinking-budget", "thinking-budget-zero"],
-    )
-    def test_validate_request_rejects_thinking_token_budget(
-        self,
-        sampling_params: SamplingParams,
-        control: str,
+    def test_validate_request_accepts_thinking_budget_on_mlx(self) -> None:
+        MetalPlatform.validate_request({}, SamplingParams(thinking_token_budget=64))
+
+    def test_validate_request_rejects_thinking_budget_on_mps(
+        self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        with pytest.raises(VLLMValidationError, match=control) as exc_info:
-            MetalPlatform.validate_request({}, sampling_params)
-        assert exc_info.value.parameter == control
+        monkeypatch.setattr("vllm_metal.envs.VLLM_METAL_BACKEND", "mps")
+        with pytest.raises(
+            VLLMValidationError, match="thinking_token_budget"
+        ) as exc_info:
+            MetalPlatform.validate_request(
+                {}, SamplingParams(temperature=0.0, thinking_token_budget=64)
+            )
+        assert exc_info.value.parameter == "thinking_token_budget"
 
     @pytest.mark.parametrize(
         ("backend", "diffusion", "use_v2"),

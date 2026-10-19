@@ -219,6 +219,7 @@ def make_stub_runner(
         "_sampler": None,
         "_native_sampling_enabled": False,
         "_native_sampling_step": 0,
+        "_thinking_budget": None,
         "_structured_output_applier": MetalStructuredOutputApplier(mask_stride=1),
         "_prompt_logprobs_tracker": PromptLogprobsTracker(),
         "_lora": MetalLoRARuntime(),
