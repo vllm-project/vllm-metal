@@ -57,7 +57,7 @@ jobs:
           version = tag.removeprefix("v")
           metadata = api(f"repos/{repo}/contents/.github/vllm-release-tag.commit?ref={tag}")
           core_tag = base64.b64decode(metadata["content"]).decode().strip()
-          core_name = f"vllm-{core_tag.removeprefix('v')}+cpu-cp312-cp312-macosx_11_0_arm64.whl"
+          core_name = f"vllm-{core_tag.removeprefix('v')}+cpu-cp38-abi3-macosx_11_0_arm64.whl"
           plugin_url, plugin_sha = wheel(release, f"vllm_metal-{version}-cp312-cp312-macosx_15_0_arm64.whl")
           core_url, core_sha = wheel(api(f"repos/vllm-project/vllm/releases/tags/{core_tag}"), core_name)
 

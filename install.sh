@@ -113,10 +113,33 @@ fetch_release_vllm_tag() {
 install_vllm() {
   local vllm_release_tag="$1"
   local vllm_version="${vllm_release_tag#v}"
-  local vllm_wheel_url="https://github.com/vllm-project/vllm/releases/download/${vllm_release_tag}/vllm-${vllm_version}%2Bcpu-cp312-cp312-macosx_11_0_arm64.whl"
+  local download_url="https://github.com/vllm-project/vllm/releases/download/${vllm_release_tag}"
+  local vllm_wheel_url="" wheel_tag candidate_url status
 
   echo ""
   section "Installing vLLM core"
+
+  # vLLM 0.32 tags its macOS wheel cp38-abi3; earlier releases use cp312-cp312.
+  # SCAFFOLDING: remove cp312-cp312 when the latest stable release pins vLLM >= 0.32.
+  for wheel_tag in cp38-abi3 cp312-cp312; do
+    candidate_url="${download_url}/vllm-${vllm_version}%2Bcpu-${wheel_tag}-macosx_11_0_arm64.whl"
+    status=$(curl -sIL --retry 3 -o /dev/null -w '%{http_code}' "$candidate_url" || true)
+    if [[ "$status" == 200 ]]; then
+      vllm_wheel_url="$candidate_url"
+      break
+    fi
+    if [[ "$status" != 404 ]]; then
+      error "Failed to reach ${candidate_url} (HTTP ${status})."
+      echo "Please check your internet connection and try again." >&2
+      exit 1
+    fi
+  done
+
+  if [[ -z "$vllm_wheel_url" ]]; then
+    error "vLLM ${vllm_release_tag} has no prebuilt macOS arm64 wheel."
+    exit 1
+  fi
+
   echo "Wheel: vLLM ${vllm_version} (prebuilt macOS arm64)"
 
   if ! uv pip install "$vllm_wheel_url"; then
