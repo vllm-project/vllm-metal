@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Temporary Torch replacements for vLLM 0.31 MRv2 input/state kernels on MPS.
+"""Temporary Torch replacements for vLLM 0.32 MRv2 input/state kernels on MPS.
 
 Upstream launches Triton kernels without a Torch fallback at these entry points.
 These implementations cover the supported non-speculative path. Replace the
@@ -139,7 +139,7 @@ def compute_slot_mappings(self, mapping, cu, positions, num_tokens_padded, out=N
         if not self._slot_mapping_enabled[i]:
             out[i, :padded].fill_(-1)
             continue
-        block_size = self.kernel_block_sizes[i]
+        block_size = self.block_sizes[i]
         physical = table.gpu[slots, (positions // block_size).long()]
         values = physical.long() * block_size + positions % block_size
         out[i, : positions.numel()] = torch.where(offsets < cu[-1], values, -1)

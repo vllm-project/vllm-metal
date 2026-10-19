@@ -30,7 +30,6 @@ def test_request_slots_and_removed_request_writeback(state, num_groups):
         16,
         [4] * num_groups,
         torch.device("mps"),
-        [16] * num_groups,
     )
     tables.append_block_ids(3, ([8, 9], [12, 13])[:num_groups], True)
     tables.append_block_ids(0, ([2, 4], [6, 7])[:num_groups], True)

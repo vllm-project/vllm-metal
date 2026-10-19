@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Device adapters for vLLM 0.31's upstream MRV2 runner.
+"""Device adapters for vLLM 0.32's upstream MRV2 runner.
 
 PyTorch's native streams and events use the single MPS default queue. Staging
 buffers use explicit CPU-to-MPS copies.
@@ -113,13 +113,13 @@ def install():
         # Reuse upstream Torch ops without its CPU/CUDA custom-op wrapper.
         forward = ShortConv.forward_native
 
-    # MRV2 0.31 uses these CUDA names even with an MPS device. Use native
+    # MRV2 0.32 uses these CUDA names even with an MPS device. Use native
     # PyTorch objects; partial avoids duplicate Dynamo handler registration.
     torch.cuda.Stream = torch.Stream
     torch.cuda.Event = partial(torch.Event, device="mps")
     torch.cuda.current_stream = partial(torch.accelerator.current_stream)
     torch.cuda.set_stream = partial(torch.accelerator.set_stream)
-    # Explicit vLLM 0.31 bindings for the supported single-device path.
+    # Explicit vLLM 0.32 bindings for the supported single-device path.
     buffer_utils.NonUvaBuffer = MPSStagingBuffer
     model_runner.async_tensor_h2d = copy_to_device
     buffer_utils.StagedWriteTensor.apply_write = staged_write
