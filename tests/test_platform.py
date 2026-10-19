@@ -1412,27 +1412,6 @@ class TestMetalPlatform:
 
         assert vllm_config.scheduler_config.async_scheduling is False
 
-    def test_check_and_update_config_rejects_hybrid_all_cache_mode(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """mamba_cache_mode='all' fails fast on every path, before downgrades."""
-        self._patch_stt_resolution(monkeypatch, is_stt=False)
-        reset_config()
-        try:
-            vllm_config = self._hybrid_vllm_config(
-                SimpleNamespace(
-                    block_size=None,
-                    kv_cache_dtype_skip_layers=[],
-                    enable_prefix_caching=True,
-                    mamba_cache_mode="all",
-                    mamba_ssm_cache_dtype="float32",
-                ),
-            )
-            with pytest.raises(NotImplementedError, match="mamba_cache_mode='all'"):
-                MetalPlatform.check_and_update_config(vllm_config)
-        finally:
-            reset_config()
-
     def test_check_and_update_config_rejects_non_ngram_hybrid_speculation(
         self,
         monkeypatch: pytest.MonkeyPatch,

@@ -741,15 +741,6 @@ class MetalPlatform(Platform):
 
         if model_config is not None and model_config.is_hybrid:
             cache_config = vllm_config.cache_config
-            if cache_config.mamba_cache_mode == "all":
-                # Before the downgrades below, which overwrite the mode: an
-                # explicit --mamba-cache-mode all must fail fast on every path.
-                raise NotImplementedError(
-                    "mamba_cache_mode='all' is not supported for hybrid "
-                    "models on Metal (nor upstream, which falls back to "
-                    "'align' for models without SupportsMambaPrefixCaching). "
-                    "Use align mode: --enable-prefix-caching resolves to it."
-                )
             from vllm_metal.attention.runtime.factory import (
                 state_family_for_model_type,
             )
