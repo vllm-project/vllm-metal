@@ -70,6 +70,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+omni = [
+    # Preview of Omni PRs #8943, #8946 and #8949; use upstream once merged.
+    "vllm-omni @ git+https://github.com/WindChimeRan/vllm-omni@4bb27684864c2989a8db0c8e3f212a16f20f2357",
+]
 gguf = [
     # Local GGUF model loading. Keep aligned with upstream vLLM's lower bound
     # unless a Metal-specific path needs a newer API.
@@ -88,7 +92,7 @@ dev = [
     "gguf>=0.17.0",
 ]
 all = [
-    "vllm-metal[gguf,stt,dev]",
+    "vllm-metal[gguf,stt,omni,dev]",
 ]
 
 [project.urls]
@@ -97,6 +101,9 @@ Repository = "https://github.com/vllm-project/vllm-metal"
 Issues = "https://github.com/vllm-project/vllm-metal/issues"
 
 # vLLM Plugin Entry Points
+[project.entry-points."vllm_omni.platform_plugins"]
+metal = "vllm_metal:register_omni"
+
 [project.entry-points."vllm.platform_plugins"]
 metal = "vllm_metal:register"
 

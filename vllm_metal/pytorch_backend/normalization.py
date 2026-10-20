@@ -23,7 +23,6 @@ def _supports_rms_norm(x, weight, epsilon, variance_size=None):
     )
 
 
-@ir.ops.rms_norm.register_impl("torch_mps", supports_args=_supports_rms_norm)
 def rms_norm(
     x: torch.Tensor,
     weight: torch.Tensor | None,
@@ -31,6 +30,9 @@ def rms_norm(
     variance_size: int | None = None,
 ) -> torch.Tensor:
     return torch.nn.functional.rms_norm(x, (x.shape[-1],), weight, epsilon)
+
+
+ir.ops.rms_norm.register_impl("torch_mps", supports_args=_supports_rms_norm)(rms_norm)
 
 
 def _supports_add_rms_norm(x, x_residual, weight, epsilon, variance_size=None):
