@@ -45,6 +45,8 @@ _ATTENTION_CONTRACTS: dict[str, AttentionContract] = {
     "mlx_lm.models.phi": AttentionContract(derive_scale_from_query=True),
     # Nemotron-H attention is position-free: no rotary module, none expected.
     "mlx_lm.models.nemotron_h": AttentionContract(use_rope=False),
+    # mlx-vlm's copy, the text model of Nemotron Nano VL.
+    "mlx_vlm.models.nemotron_h.language": AttentionContract(use_rope=False),
 }
 
 

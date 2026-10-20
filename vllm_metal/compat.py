@@ -39,6 +39,7 @@ def apply_compat_patches() -> None:
     _apply_bytelevel_patch_during_registration()
     _patch_mlx_lm_qwen35_fp8_sanitize()
     _patch_mlx_lm_qwen3_flat_weight_prefix()
+    _patch_mlx_vlm_nemotron_nano_vl_v2()
     _patch_transformers_exaone4_config()
 
 
@@ -1051,4 +1052,75 @@ def _patch_mlx_lm_qwen3_flat_weight_prefix() -> bool:
     )
     if patched:
         logger.debug("Patched mlx_lm Qwen3 flat weight prefix compatibility")
+    return patched
+
+
+_NEMOTRON_NANO_VL_V2_MODEL_TYPE = "nemotronh_nano_vl_v2"
+_NEMOTRON_NANO_VIDEO_EMBEDDER_KEY = (
+    "vision_model.radio_model.model.patch_generator.video_embedder.weight"
+)
+
+
+def _drop_unshipped_video_embedder(
+    model: Any, weights: Mapping[str, Any]
+) -> Mapping[str, Any]:
+    """Remove the video embedder a checkpoint does not ship.
+
+    mlx-vlm's RADIO patch generator always builds ``video_embedder`` for the
+    Omni V3 tubelet path.  Nano VL V2 embeds video frames with the image
+    embedder and ships no such tensor, so ``load_weights(strict=True)``
+    would reject the checkpoint for a missing key.
+    """
+    if _NEMOTRON_NANO_VIDEO_EMBEDDER_KEY not in weights:
+        patch_generator = model.vision_model.radio_model.model.patch_generator
+        if "video_embedder" in patch_generator:
+            delattr(patch_generator, "video_embedder")
+    return weights
+
+
+def _patch_mlx_vlm_nemotron_nano_vl_v2() -> bool:
+    """Load Nemotron Nano VL V2 checkpoints through mlx-vlm's Omni module.
+
+    ``NemotronH_Nano_VL_V2`` shares the Omni V3 image path (RADIO tower, v2
+    pixel shuffle, RMSNorm/SquaredReLU ``mlp1`` projector and the Nemotron-H
+    text model), but mlx-vlm 0.7.6 only maps the Omni model type to
+    ``nemotron_h_nano_omni``.  Add the V2 model type to the same module and
+    let it load without the Omni-only video embedder.
+
+    ``mlx_vlm.load`` also builds an ``AutoProcessor``, and V2 checkpoints
+    name a remote-code processor that MLX conversions do not ship.  Route V2
+    to the Omni processor so the load completes; vllm-metal preprocesses
+    images with vLLM's ``NanoNemotronVLProcessor`` and never calls it.
+
+    TODO: remove when the pinned mlx-vlm maps ``nemotronh_nano_vl_v2``.
+    """
+    from importlib import import_module
+    from importlib.util import find_spec
+
+    if find_spec("mlx_vlm.models.nemotron_h_nano_omni") is None:
+        return False
+    try:
+        mlx_vlm_utils = import_module("mlx_vlm.utils")
+        omni = import_module("mlx_vlm.models.nemotron_h_nano_omni")
+    except ImportError as exc:
+        logger.warning(
+            "Could not import mlx_vlm while installing the Nemotron Nano VL V2 "
+            "compatibility patch: %s",
+            exc,
+        )
+        return False
+    if _NEMOTRON_NANO_VL_V2_MODEL_TYPE not in mlx_vlm_utils.MODEL_REMAPPING:
+        mlx_vlm_utils.MODEL_REMAPPING[_NEMOTRON_NANO_VL_V2_MODEL_TYPE] = (
+            "nemotron_h_nano_omni"
+        )
+        import_module("mlx_vlm.models.base").install_auto_processor_patch(
+            [_NEMOTRON_NANO_VL_V2_MODEL_TYPE], omni.NemotronHNanoOmniProcessor
+        )
+    patched = _wrap_model_sanitize(
+        omni.Model,
+        "_vllm_metal_nemotron_nano_vl_v2_patch",
+        _drop_unshipped_video_embedder,
+    )
+    if patched:
+        logger.debug("Patched mlx_vlm Nemotron Nano VL V2 loading compatibility")
     return patched

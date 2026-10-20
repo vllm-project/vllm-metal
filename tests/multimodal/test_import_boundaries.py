@@ -18,6 +18,8 @@ def test_multimodal_helpers_do_not_import_v1_worker() -> None:
         import vllm_metal.multimodal.gemma4.adapter
         import vllm_metal.multimodal.gemma4.geometry
         import vllm_metal.multimodal.gemma4.sidecar
+        import vllm_metal.multimodal.nemotron_nano_vl
+        import vllm_metal.multimodal.nemotron_nano_vl.adapter
         import vllm_metal.multimodal.qwen3_vl
         import vllm_metal.multimodal.qwen3_vl.adapter
         import vllm_metal.v1.mm.encoder_cache

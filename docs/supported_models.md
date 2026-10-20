@@ -53,6 +53,15 @@ unsupported; leave `--video-pruning-rate` unset.
 | Qwen3.5 (dense) | 🔵 | | native multimodal paged generation | image and video input; FP8 checkpoints stay text-only | `mlx-community/Qwen3.5-4B-MLX-4bit` |
 | PaddleOCR-VL | 🔵 | | native multimodal paged generation | image input, no video | `PaddlePaddle/PaddleOCR-VL-1.6` |
 | Gemma 4 | 🔵 | | mlx_lm text backbone + mlx-vlm vision sidecar, paged generation | image input, no video/audio, bidirectional attention inside image blocks on sliding-window layers | `mlx-community/unsloth-gemma-4-26B-A4B-it-qat-oQ4` |
+| Nemotron Nano VL V2 | 🔵 | | native multimodal paged generation (hybrid Mamba-2/attention) | image input, no video; needs `--trust-remote-code` | `ekryski/Nemotron-Nano-12B-v2-VL-4bit` (see note) |
+
+Nemotron Nano VL V2 loads through mlx-vlm's `nemotron_h_nano_omni` module
+and uses vLLM's own tiling (512 px tiles plus a thumbnail). vLLM reads its
+configuration with remote code, so the checkpoint directory needs
+`configuration.py`, `configuration_nemotron_h.py` and `configuration_radio.py`
+from `nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16`; the example MLX conversion
+does not ship them. The Omni V3 checkpoints, which tile dynamically, stay
+unsupported.
 
 Gemma 4 keeps its text path exactly as on the text-only table (mlx_lm model,
 selective logits, intermediate forward); only `vision_tower` and `embed_vision`

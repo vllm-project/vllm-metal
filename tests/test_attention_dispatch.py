@@ -122,6 +122,17 @@ def test_nemotron_h_attention_detected_as_sdpa():
     assert attention_contract_for(attn).use_rope is False
 
 
+def test_mlx_vlm_nemotron_h_attention_is_position_free():
+    """Nemotron Nano VL's text model is mlx-vlm's copy of Nemotron-H."""
+    from mlx_vlm.models.nemotron_h.config import ModelConfig
+    from mlx_vlm.models.nemotron_h.language import NemotronHAttention
+
+    attn = NemotronHAttention(ModelConfig(**NEMOTRON_H_TINY_ARGS))
+
+    assert is_sdpa(attn)
+    assert attention_contract_for(attn).use_rope is False
+
+
 def test_gemma4_attention_contract_detected_as_sdpa():
     """Gemma4-like SDPA modules should match the dispatch contract.
 

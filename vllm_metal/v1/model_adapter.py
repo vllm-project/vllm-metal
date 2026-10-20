@@ -422,6 +422,8 @@ _PADDLEOCR_VL_MODEL_TYPES: frozenset[str] = frozenset({"paddleocr_vl"})
 _PADDLEOCR_VL_ARCHITECTURES: frozenset[str] = frozenset(
     {"PaddleOCRVLForConditionalGeneration"}
 )
+# Fixed-tile Nano VL V2 only; the Omni V3 checkpoints tile dynamically.
+_NEMOTRON_NANO_VL_ARCHITECTURES: frozenset[str] = frozenset({"NemotronH_Nano_VL_V2"})
 
 
 class DefaultModelAdapter(ModelAdapter):
@@ -574,8 +576,9 @@ class DefaultModelAdapter(ModelAdapter):
         setup. When the mode is ``text_sidecar`` (Gemma 4), the config is
         kept but restricted to images only, so the frontend rejects video
         and audio inputs the sidecar cannot serve. ``native`` leaves the
-        config untouched. :meth:`multimodal_backbone_mode` is the single
-        source of truth for which mode applies.
+        config untouched, except that image-only native adapters (Nemotron
+        Nano VL) get the same restriction. :meth:`multimodal_backbone_mode`
+        is the single source of truth for which mode applies.
         """
         if model_config.multimodal_config is None:
             return
@@ -594,14 +597,18 @@ class DefaultModelAdapter(ModelAdapter):
             )
             return
         if mode == "text_sidecar":
-            self._restrict_to_images(model_config.multimodal_config)
+            self._restrict_to_images(model_config.multimodal_config, "Gemma 4")
             logger.info(
                 "Metal: Gemma 4 serves images through the vision sidecar on the "
                 "mlx_lm text backbone; video and audio inputs are refused"
             )
+            return
+        architectures = getattr(hf_config, "architectures", ()) or ()
+        if any(arch in _NEMOTRON_NANO_VL_ARCHITECTURES for arch in architectures):
+            self._restrict_to_images(model_config.multimodal_config, "Nemotron Nano VL")
 
     @staticmethod
-    def _restrict_to_images(multimodal_config: Any) -> None:
+    def _restrict_to_images(multimodal_config: Any, model_label: str) -> None:
         """Set video/audio limits to 0 so the frontend rejects them (idempotent)."""
         from vllm.config.multimodal import AudioDummyOptions, VideoDummyOptions
 
@@ -613,9 +620,10 @@ class DefaultModelAdapter(ModelAdapter):
             current = limits.get(modality)
             if current is not None and int(getattr(current, "count", 0)) > 0:
                 logger.warning(
-                    "Metal: %s inputs are unsupported on the Gemma 4 sidecar path; "
+                    "Metal: %s inputs are unsupported for %s; "
                     "overriding --limit-mm-per-prompt %s=%s with 0",
                     modality,
+                    model_label,
                     modality,
                     current.count,
                 )
@@ -968,6 +976,16 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
             return cast(
                 MultimodalRuntimeAdapter,
                 PaddleOCRVLMultimodalAdapter.from_loaded_model(model),
+            )
+
+        if any(arch in _NEMOTRON_NANO_VL_ARCHITECTURES for arch in architectures):
+            from vllm_metal.multimodal.nemotron_nano_vl import (
+                NemotronNanoVLMultimodalAdapter,
+            )
+
+            return cast(
+                MultimodalRuntimeAdapter,
+                NemotronNanoVLMultimodalAdapter.from_loaded_model(model),
             )
 
         return None

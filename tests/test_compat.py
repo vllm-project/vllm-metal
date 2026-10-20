@@ -329,10 +329,20 @@ class TestGemma4MTPConfigCompatPatch:
             "_patch_mlx_lm_qwen3_flat_weight_prefix",
             lambda: calls.append("qwen3_flat_prefix"),
         )
+        monkeypatch.setattr(
+            compat,
+            "_patch_mlx_vlm_nemotron_nano_vl_v2",
+            lambda: calls.append("nemotron_nano_vl_v2"),
+        )
 
         compat.apply_compat_patches()
 
-        assert calls == ["bytelevel", "qwen35_fp8", "qwen3_flat_prefix"]
+        assert calls == [
+            "bytelevel",
+            "qwen35_fp8",
+            "qwen3_flat_prefix",
+            "nemotron_nano_vl_v2",
+        ]
 
 
 def _install_fake_qwen35_modules(monkeypatch, *, include_moe: bool):

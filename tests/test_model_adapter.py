@@ -17,6 +17,7 @@ from vllm.config.multimodal import (
 import vllm_metal.envs as envs
 import vllm_metal.v1.model_adapter as model_adapter_module
 from vllm_metal.config import reset_config
+from vllm_metal.multimodal.nemotron_nano_vl import NemotronNanoVLMultimodalAdapter
 from vllm_metal.multimodal.paddleocr_vl import PaddleOCRVLMultimodalAdapter
 from vllm_metal.multimodal.qwen3_vl import Qwen3VLMultimodalAdapter
 from vllm_metal.v1.model_adapter import (
@@ -898,6 +899,46 @@ class TestBuildMultimodalAdapter:
 
         assert isinstance(adapter, PaddleOCRVLMultimodalAdapter)
 
+    def test_builds_nemotron_nano_vl_adapter_from_architecture(self) -> None:
+        language_model = SimpleNamespace(
+            backbone=SimpleNamespace(embeddings=lambda ids: ids)
+        )
+        model = SimpleNamespace(
+            config=SimpleNamespace(force_image_size=512, downsample_ratio=0.5),
+            language_model=language_model,
+            vision_model=SimpleNamespace(
+                radio_model=SimpleNamespace(
+                    model=SimpleNamespace(
+                        patch_generator=SimpleNamespace(patch_size=16)
+                    )
+                )
+            ),
+            mlp1=object(),
+            _extract_feature_single=lambda pixel_values: pixel_values,
+        )
+        hf_config = SimpleNamespace(
+            model_type="NemotronH_Nano_VL_V2",
+            architectures=["NemotronH_Nano_VL_V2"],
+        )
+
+        adapter = DefaultModelAdapter().build_multimodal_adapter(model, hf_config)
+
+        assert isinstance(adapter, NemotronNanoVLMultimodalAdapter)
+        assert adapter.text_model() is language_model
+
+    def test_dynamic_resolution_nemotron_omni_has_no_adapter(self) -> None:
+        """Omni V3 tiles dynamically, which the V2 adapter does not encode."""
+        hf_config = SimpleNamespace(
+            model_type="NemotronH_Nano_Omni_Reasoning_V3",
+            architectures=["NemotronH_Nano_Omni_Reasoning_V3"],
+        )
+
+        adapter = DefaultModelAdapter().build_multimodal_adapter(
+            SimpleNamespace(), hf_config
+        )
+
+        assert adapter is None
+
     def test_generic_vlm_has_no_model_owned_adapter(self) -> None:
         model = SimpleNamespace()
         hf_config = SimpleNamespace(model_type="phi3_v")
@@ -1651,6 +1692,26 @@ class TestNormalizeModelConfigSidecar:
             DefaultModelAdapter().normalize_model_config(config)
         assert config.multimodal_config.limit_per_prompt["video"].count == 0
         assert caplog.text.count("overriding") == 1
+
+    def test_nemotron_nano_vl_refuses_video_and_audio(self) -> None:
+        """Its adapter encodes images only; refuse the rest at the frontend."""
+        config = SimpleNamespace(
+            multimodal_config=SimpleNamespace(
+                language_model_only=False,
+                limit_per_prompt={"video": VideoDummyOptions(count=1)},
+            ),
+            hf_config=SimpleNamespace(
+                model_type="NemotronH_Nano_VL_V2",
+                architectures=["NemotronH_Nano_VL_V2"],
+            ),
+        )
+
+        DefaultModelAdapter().normalize_model_config(config)
+
+        limits = config.multimodal_config.limit_per_prompt
+        assert limits["video"].count == 0
+        assert limits["audio"].count == 0
+        assert "image" not in limits
 
     def test_text_only_clears_config(self, tmp_path: Path, _sidecar_ready) -> None:
         config = _gemma4_model_config(tmp_path)
