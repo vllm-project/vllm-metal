@@ -28,5 +28,5 @@ python structured_server.py \
 ```
 
 Set `--canvas` and `--canvas-step` to the served `canvas_length`; smaller
-per-request canvases are unsupported on Metal with vLLM 0.31.0.
+per-request canvases are unsupported on Metal.
 DiffusionGemma currently accepts text input only and uses the MLX backend.

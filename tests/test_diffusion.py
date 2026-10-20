@@ -963,8 +963,24 @@ class TestPlatformDiffusionConfig:
         self, monkeypatch, params
     ) -> None:
         monkeypatch.setattr(MetalPlatform, "_serves_diffusion", True)
+        monkeypatch.setattr(MetalPlatform, "_diffusion_canvas_length", _CANVAS)
 
         MetalPlatform.validate_request(None, SamplingParams(**params))
+
+    def test_rejects_a_canvas_smaller_than_the_served_one(self, monkeypatch) -> None:
+        from vllm.exceptions import VLLMValidationError
+
+        monkeypatch.setattr(MetalPlatform, "_serves_diffusion", True)
+        # Restored after the test; the config check records the served canvas.
+        monkeypatch.setattr(MetalPlatform, "_diffusion_canvas_length", None)
+        MetalPlatform._check_diffusion_config(_vllm_config())
+        params = SamplingParams(extra_args={"diffusion_canvas_length": _CANVAS - 1})
+
+        with pytest.raises(
+            VLLMValidationError, match="smaller than the served canvas"
+        ) as exc_info:
+            MetalPlatform.validate_request(None, params)
+        assert exc_info.value.parameter == "diffusion_canvas_length"
 
     @pytest.mark.parametrize(
         ("params", "parameter"),

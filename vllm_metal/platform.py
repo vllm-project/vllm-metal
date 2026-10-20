@@ -112,6 +112,8 @@ class MetalPlatform(Platform):
     # Whether the configured model is a block-diffusion LM, whose runner has
     # its own sampler; set by check_and_update_config for validate_request.
     _serves_diffusion: ClassVar[bool] = False
+    # Its served canvas_length, recorded by _check_diffusion_config.
+    _diffusion_canvas_length: ClassVar[int | None] = None
 
     # --- Ray distributed executor support (Phase 1) ---
     # Advertise the Apple GPU as a custom Ray resource named "mlx".  Because this
@@ -396,6 +398,15 @@ class MetalPlatform(Platform):
                         f"{name} is not supported for diffusion models on Metal yet.",
                         parameter=name,
                     )
+            # DiffusionGemmaRuntime always denoises the served canvas, and since
+            # vllm#59107 vLLM no longer refuses a smaller one without async scheduling.
+            width = (params.extra_args or {}).get("diffusion_canvas_length")
+            if width is not None and width < cls._diffusion_canvas_length:
+                raise VLLMValidationError(
+                    "A diffusion_canvas_length smaller than the served canvas is "
+                    "not supported for diffusion models on Metal.",
+                    parameter="diffusion_canvas_length",
+                )
 
     @classmethod
     def get_torch_device(cls, device_id: int = 0) -> torch.device:
@@ -1122,6 +1133,7 @@ class MetalPlatform(Platform):
                 "Diffusion models on Metal require --diffusion-config with a "
                 "canvas_length, e.g. --diffusion-config '{\"canvas_length\": 32}'."
             )
+        cls._diffusion_canvas_length = diffusion_config.canvas_length
         if vllm_config.speculative_config is not None:
             raise NotImplementedError(
                 "Speculative decoding is not supported with diffusion models."
