@@ -74,8 +74,7 @@ def _run_decode(
     mx.eval(key_cache, value_cache, query)
 
     scale = head_size**-0.5
-    out = mx.array(0)
-    get_ops().paged_attention_primitive(
+    out = get_ops().paged_attention_primitive(
         query,
         key_cache,
         value_cache,
@@ -88,7 +87,6 @@ def _run_decode(
         BLOCK_SIZE,
         ctx,
         -1,
-        out,
         sinks=sinks,
     )
     mx.eval(out)
@@ -133,8 +131,7 @@ def _run_prefill(
     mx.eval(key_cache, value_cache, query)
 
     scale = head_size**-0.5
-    out = mx.array(0)
-    get_ops().paged_attention_primitive(
+    out = get_ops().paged_attention_primitive(
         query,
         key_cache,
         value_cache,
@@ -147,7 +144,6 @@ def _run_prefill(
         BLOCK_SIZE,
         kv_len,
         -1,
-        out,
         sinks=sinks,
     )
     mx.eval(out)
@@ -270,8 +266,7 @@ def _run_window(
     tables = [list(range(s * bps, (s + 1) * bps)) for s in range(len(windows))]
 
     def dispatch(tab, seq, cu, wq):
-        out = mx.array(0)
-        get_ops().paged_attention_primitive(
+        out = get_ops().paged_attention_primitive(
             query,
             key_cache,
             value_cache,
@@ -284,7 +279,6 @@ def _run_window(
             BLOCK_SIZE,
             max_kv,
             -1,
-            out,
             window_seqlen_q=wq,
             sinks=sinks,
         )
@@ -346,7 +340,6 @@ class TestSinkValidation:
         kc = mx.zeros((blocks, BLOCK_SIZE, nkv, HEAD_SIZE))
         vc = mx.zeros((blocks, BLOCK_SIZE, nkv, HEAD_SIZE))
         q = mx.zeros((1, nq, HEAD_SIZE))
-        out = mx.array(0)
         get_ops().paged_attention_primitive(
             q,
             kc,
@@ -360,7 +353,6 @@ class TestSinkValidation:
             BLOCK_SIZE,
             ctx,
             -1,
-            out,
             sinks=sinks,
             **kwargs,
         )

@@ -84,9 +84,8 @@ class CacheViewPrimitive : public Primitive {
 };
 
 void register_mlx_patch(nb::module_& m) {
-  m.def("as_strided", [](nb::handle buffer_h, const std::vector<int>& shape,
+  m.def("as_strided", [](const array& buffer, const std::vector<int>& shape,
                           const std::vector<size_t>& strides, size_t offset) {
-    const auto& buffer = *nb::inst_ptr<array>(buffer_h);
     if (shape.size() != strides.size()) {
       throw std::invalid_argument("as_strided: shape/stride rank mismatch");
     }
@@ -97,14 +96,11 @@ void register_mlx_patch(nb::module_& m) {
     // for large arenas. Bind the existing backing without that flatten.
     Shape view_shape(shape.begin(), shape.end());
     Strides view_strides(strides.begin(), strides.end());
-    auto result = array::make_arrays(
+    return array::make_arrays(
         {view_shape}, {buffer.dtype()},
         std::make_shared<CacheViewPrimitive>(
             default_stream(Device::gpu), view_shape, view_strides, offset),
         {buffer})[0];
-    nb::object out = nb::module_::import_("mlx.core").attr("array")(0);
-    nb::inst_ptr<array>(out)->overwrite_descriptor(result);
-    return out;
   }, nb::arg(), nb::arg("shape"), nb::arg("strides"), nb::arg("offset") = 0,
      "Create a shared cache view without flattening or copying its backing. "
      "Shape is explicit; strides and offset are in elements. The backing must "

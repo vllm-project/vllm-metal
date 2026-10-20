@@ -273,6 +273,55 @@ def test_turboquant_cache_accepts_head_dim_512() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "missing",
+    [None, "key_scale_cache", "value_scale_cache", "key_zero_cache", "v_centroids"],
+)
+def test_paged_attention_rejects_missing_turboquant_arrays(missing: str | None) -> None:
+    """Missing TurboQuant arrays must raise instead of dereferencing null pointers."""
+    cache = MetalPagedKVCache(
+        num_layers=1,
+        num_blocks=1,
+        block_size=16,
+        num_kv_heads=1,
+        head_dim=128,
+        dtype=mx.float16,
+        turboquant=True,
+        k_quant="q8_0",
+        v_quant="q3_0",
+    )
+    arrays = {
+        "key_scale_cache": cache.key_scale_caches[0],
+        "value_scale_cache": cache.value_scale_caches[0],
+        "key_zero_cache": cache.key_zero_caches[0],
+        "v_centroids": get_v_centroids(cache.v_bits),
+    }
+    if missing is None:
+        arrays.clear()
+    else:
+        arrays[missing] = None
+
+    with pytest.raises(ValueError, match="TurboQuant requires"):
+        get_ops().paged_attention_primitive(
+            mx.zeros((1, 1, 128), dtype=mx.float16),
+            cache.key_caches[0],
+            cache.value_caches[0],
+            1,
+            128**-0.5,
+            0.0,
+            mx.array([[0]], dtype=mx.int32),
+            mx.array([16], dtype=mx.int32),
+            mx.array([0, 1], dtype=mx.int32),
+            16,
+            16,
+            -1,
+            use_turboquant=True,
+            quant_type="q8_0",
+            v_bits=cache.v_bits,
+            **arrays,
+        )
+
+
 def test_turboquant_512_head_dim_matches_python_reference() -> None:
     """The 512-dim TurboQuant kernel path should match Python dequant attention."""
     num_blocks = 4
@@ -334,7 +383,7 @@ def test_turboquant_512_head_dim_matches_python_reference() -> None:
     attn_scale = 1.0 / math.sqrt(head_dim)
     v_centroids = get_v_centroids(cache.v_bits)
     ops = get_ops()
-    ops.paged_attention_primitive(
+    out_metal = ops.paged_attention_primitive(
         q,
         cache.key_caches[0],
         cache.value_caches[0],
@@ -347,7 +396,6 @@ def test_turboquant_512_head_dim_matches_python_reference() -> None:
         block_size,
         num_tokens,
         -1,
-        out_metal,
         key_scale_cache=cache.key_scale_caches[0],
         value_scale_cache=cache.value_scale_caches[0],
         key_zero_cache=cache.key_zero_caches[0],

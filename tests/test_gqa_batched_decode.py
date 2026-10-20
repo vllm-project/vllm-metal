@@ -460,8 +460,7 @@ def test_host_lengths_are_captured_by_each_lazy_primitive():
     cu = mx.array([0, 1, 2], mx.int32)
     host_lengths = [10752, 10752]
     routing = {"gqa_length_plan": ops.gqa_decode_length_plan(host_lengths)}
-    selected, fallback = mx.array(0), mx.array(0)
-    ops.paged_attention_primitive(
+    selected = ops.paged_attention_primitive(
         q,
         k,
         v,
@@ -474,7 +473,6 @@ def test_host_lengths_are_captured_by_each_lazy_primitive():
         16,
         10752,
         -1,
-        selected,
         num_decode_requests=2,
         num_decode_tokens=2,
         **routing,
@@ -482,7 +480,7 @@ def test_host_lengths_are_captured_by_each_lazy_primitive():
     # Neither caller-side mutation nor destruction may change the saved plan.
     del routing
     host_lengths.clear()
-    ops.paged_attention_primitive(
+    fallback = ops.paged_attention_primitive(
         q,
         k,
         v,
@@ -495,7 +493,6 @@ def test_host_lengths_are_captured_by_each_lazy_primitive():
         16,
         10752,
         -1,
-        fallback,
         num_decode_requests=2,
         num_decode_tokens=2,
     )
@@ -554,8 +551,7 @@ def test_batched_shared_prefix_and_strided_scheduler_pages(
     if cache_block in (800, 1056):
         assert block == 32
     query = mx.ones((2, q, head), dtype)
-    out = mx.array(0)
-    ops._gqa_paged_attention_for_test(
+    out = ops._gqa_paged_attention_for_test(
         query,
         key,
         value,
@@ -565,7 +561,6 @@ def test_batched_shared_prefix_and_strided_scheduler_pages(
         block,
         length,
         partition,
-        out,
     )
     mx.eval(out)  # No evaluation boundary between scatter and attention.
     ref = _grouped_paged_reference(
@@ -672,6 +667,5 @@ def test_precomputed_length_plan_is_immutable_and_validated():
             16,
             10752,
             -1,
-            mx.array(0),
             gqa_length_plan=plan,
         )

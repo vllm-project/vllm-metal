@@ -338,8 +338,7 @@ def test_native_selection_keeps_resource_feasible_partition(
     np.testing.assert_allclose(np.array(out.astype(mx.float32)), 2, atol=2e-3, rtol=0)
     # Exercise the selected M3 specialization on non-M3 CI as well. Only
     # occupancy/preference is forced; real pipeline resource checks remain.
-    selected = mx.array(0)
-    ops._gqa_paged_attention_for_test(
+    selected = ops._gqa_paged_attention_for_test(
         query,
         keys,
         values,
@@ -349,7 +348,6 @@ def test_native_selection_keeps_resource_feasible_partition(
         block,
         maximum,
         m3_partition,
-        selected,
     )
     mx.eval(selected)
     assert ops.last_gqa_partition_size() == m3_partition

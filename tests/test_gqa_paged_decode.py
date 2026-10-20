@@ -232,7 +232,6 @@ def test_private_gqa_entry_rejects_mismatched_cache_dtype(
             16,
             17,
             256,
-            mx.array(0),
         )
 
 
@@ -244,25 +243,27 @@ def test_private_gqa_partition_is_local_to_lazy_primitive():
     v = mx.full(k.shape, 2, dtype=mx.float16)
     tables = mx.arange(40, dtype=mx.int32)[None]
     lengths = mx.array([513], dtype=mx.int32)
-    outputs = [mx.array(0) for _ in range(3)]
-    for part, out in zip([256, 512], outputs[:2], strict=True):
+    outputs = [
         ops._gqa_paged_attention_for_test(
-            q, k, v, 128**-0.5, tables, lengths, 16, 513, part, out
+            q, k, v, 128**-0.5, tables, lengths, 16, 513, part
         )
-    ops.paged_attention_primitive(
-        q,
-        k,
-        v,
-        8,
-        128**-0.5,
-        0.0,
-        tables,
-        lengths,
-        mx.array([0, 1], dtype=mx.int32),
-        16,
-        513,
-        -1,
-        outputs[2],
+        for part in (256, 512)
+    ]
+    outputs.append(
+        ops.paged_attention_primitive(
+            q,
+            k,
+            v,
+            8,
+            128**-0.5,
+            0.0,
+            tables,
+            lengths,
+            mx.array([0, 1], dtype=mx.int32),
+            16,
+            513,
+            -1,
+        )
     )
     for part, out in zip([256, 512, 0], outputs, strict=True):
         mx.eval(out)
@@ -281,14 +282,13 @@ def test_forced_partition_rejects_oversized_reducer(partition):
     value = mx.full(key.shape, 2, mx.float16)
     table = mx.zeros((1, (n + 15) // 16), mx.int32)
     lengths = mx.array([n], mx.int32)
-    out = mx.array(0)
     with pytest.raises(ValueError, match="threadgroup memory limit"):
         ops._gqa_paged_attention_for_test(
-            query, key, value, 128**-0.5, table, lengths, 16, n, partition, out
+            query, key, value, 128**-0.5, table, lengths, 16, n, partition
         )
     # A larger partition fits the same history and still computes every token.
-    ops._gqa_paged_attention_for_test(
-        query, key, value, 128**-0.5, table, lengths, 16, n, 512, out
+    out = ops._gqa_paged_attention_for_test(
+        query, key, value, 128**-0.5, table, lengths, 16, n, 512
     )
     mx.eval(out)
     assert ops.last_gqa_partition_size() == 512
@@ -405,8 +405,7 @@ def test_gqa_reads_upstream_views_after_writes_and_block_copy(
         # block IDs must use the kernel-token stride without reshaping them.
         kernel_keys = cache.key_caches[0]
         kernel_values = cache.value_caches[0]
-        out = mx.array(0)
-        ops._gqa_paged_attention_for_test(
+        out = ops._gqa_paged_attention_for_test(
             query,
             kernel_keys,
             kernel_values,
@@ -416,7 +415,6 @@ def test_gqa_reads_upstream_views_after_writes_and_block_copy(
             kernel_block_size,
             length,
             test_partition,
-            out,
         )
         mx.eval(out)
         assert _dispatch_family() == "gqa_decode"

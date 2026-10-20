@@ -73,8 +73,7 @@ def _run(
     head_size: int = HEAD_SIZE,
     block_size: int = BLOCK_SIZE,
 ) -> mx.array:
-    out = mx.array(0)
-    get_ops().paged_attention_primitive(
+    out = get_ops().paged_attention_primitive(
         query,
         key_cache,
         value_cache,
@@ -87,7 +86,6 @@ def _run(
         block_size,
         max_kv,
         sliding_window,
-        out,
         window_seqlen_q=window_seqlen_q,
     )
     mx.eval(out)
@@ -414,7 +412,6 @@ def test_window_hint_rejects_non_int32_cu() -> None:
     value_cache = _cache(4, 8, mx.float16)
     query = mx.random.normal(shape=(window, 16, HEAD_SIZE)).astype(mx.float16)
     mx.eval(key_cache, value_cache, query)
-    out = mx.array(0)
     with pytest.raises(
         ValueError, match="cu_seqlens_q must be int32 for window-mode validation"
     ):
@@ -431,7 +428,6 @@ def test_window_hint_rejects_non_int32_cu() -> None:
             BLOCK_SIZE,
             50 + window,
             -1,
-            out,
             window_seqlen_q=window,
         )
 
@@ -557,8 +553,7 @@ def test_windowed_matches_expanded_turboquant(quant: str, window: int) -> None:
     blocks = list(range(nblocks))
 
     def run_tq(tables, seq_lens, cu, wq):
-        out = mx.array(0)
-        get_ops().paged_attention_primitive(
+        out = get_ops().paged_attention_primitive(
             query,
             kc,
             vc,
@@ -571,7 +566,6 @@ def test_windowed_matches_expanded_turboquant(quant: str, window: int) -> None:
             BLOCK_SIZE,
             total_len,
             -1,
-            out,
             key_scale_cache=ks,
             value_scale_cache=vs,
             key_zero_cache=kz,

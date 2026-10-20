@@ -261,7 +261,7 @@ class GDNLinearAttentionPrimitive : public Primitive {
   int Hk_, Hv_, Dk_, Dv_;
 };
 
-std::vector<array> gdn_linear_attention_primitive_fn(
+std::tuple<array, array> gdn_linear_attention_primitive_fn(
     const array& q, const array& k, const array& v,
     const array& g, const array& beta, const array& state_pool,
     const array& cu_seqlens, const array& slot_mapping,
@@ -273,8 +273,9 @@ std::vector<array> gdn_linear_attention_primitive_fn(
   }
   auto prim = std::make_shared<GDNLinearAttentionPrimitive>(
       default_stream(Device::gpu), Hk, Hv, Dk, Dv);
-  return array::make_arrays(
+  auto outputs = array::make_arrays(
       {{q.shape(0), Hv, Dv}, state_pool.shape()},
       {q.dtype(), state_pool.dtype()}, prim,
       {q, k, v, g, beta, state_pool, cu_seqlens, slot_mapping});
+  return std::make_tuple(std::move(outputs[0]), std::move(outputs[1]));
 }

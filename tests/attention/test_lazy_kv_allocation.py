@@ -195,8 +195,7 @@ def _run_decode(ctx: int, tail_is_nan: bool) -> mx.array:
             assert bool(mx.all(mx.isnan(flat[ctx:]))), f"{name} NaN tail missing"
             assert bool(mx.all(mx.isfinite(flat[:ctx]))), f"{name} written rows changed"
 
-    out = mx.array(0)
-    get_ops().paged_attention_primitive(
+    out = get_ops().paged_attention_primitive(
         query,
         key_cache,
         value_cache,
@@ -209,7 +208,6 @@ def _run_decode(ctx: int, tail_is_nan: bool) -> mx.array:
         BLOCK_SIZE,
         ctx,
         -1,
-        out,
     )
     mx.eval(out)
     return out.reshape(num_q_heads, head_size)

@@ -9,6 +9,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "metal_device.h"
@@ -163,14 +164,14 @@ array paged_attention_primitive_fn(
     int gqa_test_partition = 0,
     const std::optional<GqaDecodeLengthPlan>& gqa_length_plan = std::nullopt,
     int nax_split_hint = -1, int nax_prefill_split_hint = -1);
-std::vector<array> tq_encode_primitive_fn(
+std::tuple<array, array, array, array, array> tq_encode_primitive_fn(
     const array& key, const array& value,
     const array& key_cache, const array& value_cache,
     const array& key_scale_cache, const array& value_scale_cache,
     const array& key_zero_cache,
     const array& slot_mapping, const array& v_centroids,
     int v_bits, int k_bits, bool k_signed);
-std::vector<array> reshape_and_cache_primitive_fn(
+std::tuple<array, array> reshape_and_cache_primitive_fn(
     const array& key, const array& value,
     const array& key_cache, const array& value_cache,
     const array& slot_mapping);
@@ -189,7 +190,7 @@ array mla_paged_attention_primitive_fn(
     int block_size,
     float scale,
     int heads_per_tg);
-std::vector<array> gdn_linear_attention_primitive_fn(
+std::tuple<array, array> gdn_linear_attention_primitive_fn(
     const array& q, const array& k, const array& v,
     const array& g, const array& beta, const array& state_pool,
     const array& cu_seqlens, const array& slot_mapping,

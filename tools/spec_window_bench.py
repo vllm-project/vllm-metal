@@ -63,8 +63,7 @@ def _time_shape(ops, query, kc, vc, nkv, tables, seq_lens, cu, max_kv, window_se
     def run_once():
         outs = []
         for _ in range(LAYERS_PER_REP):
-            out = mx.array(0)
-            ops.paged_attention_primitive(
+            out = ops.paged_attention_primitive(
                 query,
                 kc,
                 vc,
@@ -77,7 +76,6 @@ def _time_shape(ops, query, kc, vc, nkv, tables, seq_lens, cu, max_kv, window_se
                 BLOCK_SIZE,
                 max_kv,
                 -1,
-                out,
                 window_seqlen_q=window_seqlen_q,
             )
             outs.append(out)

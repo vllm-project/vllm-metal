@@ -86,8 +86,7 @@ def _run_attention(
     sinks: mx.array | None = None,
 ) -> tuple[np.ndarray, str]:
     ops = get_ops()
-    out = mx.array(0)
-    ops.paged_attention_primitive(
+    out = ops.paged_attention_primitive(
         d["query"],
         d["key_cache"],
         d["value_cache"],
@@ -100,7 +99,6 @@ def _run_attention(
         BLOCK_SIZE,
         d["max_kv_len"] if max_seq_len is None else max_seq_len,
         sliding_window,
-        out,
         sinks=sinks,
         num_decode_requests=decode_rows,
         num_decode_tokens=decode_rows,
@@ -139,8 +137,7 @@ def test_primitive_vs_reference_decode(
     num_decode_requests = len(seq_lens)
 
     ops = get_ops()
-    out = mx.array(0)
-    ops.paged_attention_primitive(
+    out = ops.paged_attention_primitive(
         d["query"],
         d["key_cache"],
         d["value_cache"],
@@ -153,7 +150,6 @@ def test_primitive_vs_reference_decode(
         BLOCK_SIZE,
         d["max_kv_len"],
         sliding_window,
-        out,
         num_decode_requests=num_decode_requests,
         num_decode_tokens=num_decode_requests,
         max_decode_context_len=max(kv_len for _, kv_len in seq_lens),
@@ -220,8 +216,7 @@ def test_primitive_vs_reference_varlen(
     )
 
     ops = get_ops()
-    out = mx.array(0)
-    ops.paged_attention_primitive(
+    out = ops.paged_attention_primitive(
         d["query"],
         d["key_cache"],
         d["value_cache"],
@@ -234,7 +229,6 @@ def test_primitive_vs_reference_varlen(
         BLOCK_SIZE,
         d["max_kv_len"],
         sliding_window,
-        out,
         num_decode_requests=num_decode_requests,
         num_decode_tokens=num_decode_requests,
         max_decode_context_len=max_decode_context_len,
@@ -463,8 +457,7 @@ def test_sliding_window_bounds_tiled_prefill_work(force_tiled_prefill) -> None:
     ops = get_ops()
 
     def run(sliding_window: int) -> None:
-        out = mx.array(0)
-        ops.paged_attention_primitive(
+        out = ops.paged_attention_primitive(
             d["query"],
             d["key_cache"],
             d["value_cache"],
@@ -477,7 +470,6 @@ def test_sliding_window_bounds_tiled_prefill_work(force_tiled_prefill) -> None:
             BLOCK_SIZE,
             d["max_kv_len"],
             sliding_window,
-            out,
         )
         mx.eval(out)
 
@@ -515,8 +507,7 @@ def test_tiled_kernel_head_size_parity(head_size: int, force_tiled_prefill) -> N
     d = _make_cache_and_inputs(256, 2, 8, seq_lens, head_size=head_size)
 
     ops = get_ops()
-    out = mx.array(0)
-    ops.paged_attention_primitive(
+    out = ops.paged_attention_primitive(
         d["query"],
         d["key_cache"],
         d["value_cache"],
@@ -529,7 +520,6 @@ def test_tiled_kernel_head_size_parity(head_size: int, force_tiled_prefill) -> N
         BLOCK_SIZE,
         d["max_kv_len"],
         -1,  # sliding_window
-        out,
     )
     mx.eval(out)
 

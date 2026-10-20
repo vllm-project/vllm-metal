@@ -202,10 +202,9 @@ class BlockDraftPagedCache:
                 )
                 window = model.context_windows[i]
                 if window is None:
-                    out = mx.array(0)
                     # Inclusive bounds: every row sees the committed prefix
                     # and every row in its own block.
-                    get_ops().paged_attention_primitive(
+                    out = get_ops().paged_attention_primitive(
                         q.reshape(-1, cfg.num_attention_heads, cfg.head_dim),
                         k,
                         v,
@@ -218,7 +217,6 @@ class BlockDraftPagedCache:
                         self.block_size,
                         self.max_model_len,
                         -1,
-                        out,
                         # A one-position block has no future block rows.
                         mm_prefix_ranges=ranges if width > 1 else None,
                     )

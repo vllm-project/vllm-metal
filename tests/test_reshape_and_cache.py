@@ -38,12 +38,24 @@ def test_reshape_and_cache_matches_scatter(dtype, num_kv_heads, head_dim):
 
     kc = mx.zeros((num_blocks, block_size, num_kv_heads, head_dim), dtype=dtype)
     vc = mx.zeros((num_blocks, block_size, num_kv_heads, head_dim), dtype=dtype)
-    new_k, new_v = get_ops().reshape_and_cache(key, value, kc, vc, slot)
+    result = get_ops().reshape_and_cache(key, value, kc, vc, slot)
+    assert isinstance(result, tuple)
+    new_k, new_v = result
     mx.eval(new_k, new_v)
 
     ref_k, ref_v = _reference_scatter(key, value, num_blocks, block_size, slot)
     assert mx.array_equal(new_k, ref_k)
     assert mx.array_equal(new_v, ref_v)
+
+
+def test_reshape_and_cache_rejects_non_array_key():
+    if not mx.metal.is_available():
+        pytest.skip("Metal is not available")
+    value = mx.ones((1, 2, 64), dtype=mx.float16)
+    cache = mx.zeros((1, 16, 2, 64), dtype=mx.float16)
+    slots = mx.array([0], dtype=mx.int64)
+    with pytest.raises(TypeError):
+        get_ops().reshape_and_cache([1], value, cache, cache, slots)
 
 
 def test_reshape_and_cache_skips_negative_slots():

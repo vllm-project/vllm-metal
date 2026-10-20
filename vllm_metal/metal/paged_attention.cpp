@@ -1522,6 +1522,13 @@ array paged_attention_primitive_fn(
           "); an understated value leaves window rows unwritten");
     }
   }
+  if (use_turboquant &&
+      (key_scale_cache == nullptr || value_scale_cache == nullptr ||
+       key_zero_cache == nullptr || v_centroids == nullptr)) {
+    throw std::invalid_argument(
+        "TurboQuant requires key_scale_cache, value_scale_cache, "
+        "key_zero_cache, and v_centroids");
+  }
   int k_bits = use_turboquant ? get_bits(quant_type) : 8;
   auto prim = std::make_shared<PagedAttentionPrimitive>(
       default_stream(Device::gpu),
@@ -1713,7 +1720,7 @@ class TQEncodePrimitive : public Primitive {
   bool k_signed_;
 };
 
-std::vector<array> tq_encode_primitive_fn(
+std::tuple<array, array, array, array, array> tq_encode_primitive_fn(
     const array& key, const array& value,
     const array& key_cache, const array& value_cache,
     const array& key_scale_cache, const array& value_scale_cache,
@@ -1743,7 +1750,7 @@ std::vector<array> tq_encode_primitive_fn(
   auto prim = std::make_shared<TQEncodePrimitive>(
       default_stream(Device::gpu), v_bits, k_bits, k_signed);
 
-  return array::make_arrays(
+  auto outputs = array::make_arrays(
       {key_cache.shape(), value_cache.shape(),
        key_scale_cache.shape(), value_scale_cache.shape(),
        key_zero_cache.shape()},
@@ -1755,6 +1762,9 @@ std::vector<array> tq_encode_primitive_fn(
        key_cache, value_cache,
        key_scale_cache, value_scale_cache, key_zero_cache,
        slot_mapping, v_centroids});
+  return std::make_tuple(
+      std::move(outputs[0]), std::move(outputs[1]), std::move(outputs[2]),
+      std::move(outputs[3]), std::move(outputs[4]));
 }
 
 // ---------------------------------------------------------------------------
@@ -1864,15 +1874,16 @@ class ReshapeAndCachePrimitive : public Primitive {
   }
 };
 
-std::vector<array> reshape_and_cache_primitive_fn(
+std::tuple<array, array> reshape_and_cache_primitive_fn(
     const array& key, const array& value,
     const array& key_cache, const array& value_cache,
     const array& slot_mapping) {
   auto prim = std::make_shared<ReshapeAndCachePrimitive>(
       default_stream(Device::gpu));
-  return array::make_arrays(
+  auto outputs = array::make_arrays(
       {key_cache.shape(), value_cache.shape()},
       {key_cache.dtype(), value_cache.dtype()},
       prim,
       {key, value, key_cache, value_cache, slot_mapping});
+  return std::make_tuple(std::move(outputs[0]), std::move(outputs[1]));
 }

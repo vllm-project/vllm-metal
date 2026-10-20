@@ -1951,9 +1951,7 @@ class TestNativeGDNStateScatter:
                 mx.ones((2, 2, 2), dtype=mx.float32),
                 mx.array([0], dtype=mx.int32),
             )
-        with pytest.raises(RuntimeError, match="must be mlx.core.array"):
-            # inst_ptr on a non-array is undefined behaviour; this used to
-            # segfault rather than raise.
+        with pytest.raises(TypeError):
             scatter(pool, mx.ones((1, 2, 2), dtype=mx.float32), [0])
         with pytest.raises(RuntimeError, match="row shape does not match"):
             scatter(

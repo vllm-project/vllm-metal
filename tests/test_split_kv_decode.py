@@ -71,8 +71,7 @@ def _run_paged_decode(
     cu_seqlens_q = mx.arange(num_seqs + 1, dtype=mx.int32)
     mx.eval(key_cache, value_cache, query, block_tables, kv_lens_arr, cu_seqlens_q)
 
-    out = mx.array(0)
-    get_ops().paged_attention_primitive(
+    out = get_ops().paged_attention_primitive(
         query,
         key_cache,
         value_cache,
@@ -85,7 +84,6 @@ def _run_paged_decode(
         BLOCK_SIZE,
         max_kv_len,
         -1,  # sliding_window (disabled here; windowed cells below)
-        out,
     )
     mx.eval(out)
 
@@ -199,8 +197,7 @@ def test_split_decode_sliding_window(kv_len: int, window: int) -> None:
     cu_seqlens_q = mx.array([0, 1], dtype=mx.int32)
     mx.eval(key_cache, value_cache, query, block_tables, seq_lens, cu_seqlens_q)
 
-    out = mx.array(0)
-    ops.paged_attention_primitive(
+    out = ops.paged_attention_primitive(
         query,
         key_cache,
         value_cache,
@@ -213,7 +210,6 @@ def test_split_decode_sliding_window(kv_len: int, window: int) -> None:
         BLOCK_SIZE,
         kv_len,
         window,
-        out,
     )
     mx.eval(out)
     o = np.array(out.astype(mx.float32))[0]
@@ -293,10 +289,9 @@ def test_split_decode_turboquant(quant: str, window: int) -> None:
     block_tables = mx.arange(nblocks, dtype=mx.int32).reshape(1, nblocks)
     seq_lens = mx.array([kv_len], dtype=mx.int32)
     cu_seqlens_q = mx.array([0, 1], dtype=mx.int32)
-    out = mx.zeros((1, NUM_QUERY_HEADS, HEAD_SIZE), dtype=mx.float16)
-    mx.eval(block_tables, seq_lens, cu_seqlens_q, out)
+    mx.eval(block_tables, seq_lens, cu_seqlens_q)
 
-    ops.paged_attention_primitive(
+    out = ops.paged_attention_primitive(
         query,
         cache.key_caches[layer],
         cache.value_caches[layer],
@@ -309,7 +304,6 @@ def test_split_decode_turboquant(quant: str, window: int) -> None:
         BLOCK_SIZE,
         kv_len,
         window,
-        out,
         key_scale_cache=cache.key_scale_caches[layer],
         value_scale_cache=cache.value_scale_caches[layer],
         key_zero_cache=cache.key_zero_caches[layer],
@@ -393,8 +387,7 @@ def test_split_decode_gemma4_full_attention(kv_lens: list[int]) -> None:
     cu_seqlens_q = mx.arange(num_seqs + 1, dtype=mx.int32)
     mx.eval(key_cache, value_cache, query, block_tables, seq_lens, cu_seqlens_q)
 
-    out = mx.array(0)
-    ops.paged_attention_primitive(
+    out = ops.paged_attention_primitive(
         query,
         key_cache,
         value_cache,
@@ -407,7 +400,6 @@ def test_split_decode_gemma4_full_attention(kv_lens: list[int]) -> None:
         GEMMA4_BLOCK_SIZE,
         max_kv_len,
         -1,
-        out,
     )
     mx.eval(out)
     o = np.array(out.astype(mx.float32))

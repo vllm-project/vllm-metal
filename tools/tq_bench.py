@@ -483,8 +483,7 @@ def bench_paged_attention(
             scale=scale,
             num_kv_heads=num_kv_heads,
         ):
-            out = mx.array(0)
-            ops.paged_attention_primitive(
+            out = ops.paged_attention_primitive(
                 q,
                 cache_tq.key_caches[0],
                 cache_tq.value_caches[0],
@@ -497,7 +496,6 @@ def bench_paged_attention(
                 BLOCK_SIZE,
                 ctx,
                 -1,
-                out,
                 key_scale_cache=cache_tq.key_scale_caches[0],
                 value_scale_cache=cache_tq.value_scale_caches[0],
                 key_zero_cache=cache_tq.key_zero_caches[0],
@@ -518,8 +516,7 @@ def bench_paged_attention(
             scale=scale,
             num_kv_heads=num_kv_heads,
         ):
-            out = mx.array(0)
-            ops.paged_attention_primitive(
+            out = ops.paged_attention_primitive(
                 q,
                 cache_fp.key_caches[0],
                 cache_fp.value_caches[0],
@@ -532,7 +529,6 @@ def bench_paged_attention(
                 BLOCK_SIZE,
                 ctx,
                 -1,
-                out,
                 use_turboquant=False,
             )
             mx.eval(out)

@@ -127,9 +127,8 @@ def _bench(ops, s: Scenario) -> tuple[int, float, float, float, float]:
     mx.eval(k_cache, v_cache, query, table, seq_lens, cu_q)
 
     def paged(q, ranges=None):
-        out = mx.array(0)
         kwargs = {} if ranges is None else {"mm_prefix_ranges": ranges}
-        ops.paged_attention_primitive(
+        out = ops.paged_attention_primitive(
             q,
             k_cache,
             v_cache,
@@ -142,7 +141,6 @@ def _bench(ops, s: Scenario) -> tuple[int, float, float, float, float]:
             BLOCK_SIZE,
             seq_len,
             WINDOW,
-            out,
             **kwargs,
         )
         return out

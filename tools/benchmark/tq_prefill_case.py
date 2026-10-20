@@ -62,8 +62,7 @@ class AttentionCase:
         def kernel_view(array):
             return array.reshape(-1, kb, c.num_kv_heads, array.shape[-1])
 
-        out = mx.array(0)
-        get_ops().paged_attention_primitive(
+        out = get_ops().paged_attention_primitive(
             q,
             kernel_view(c.key_caches[0]),
             kernel_view(c.value_caches[0]),
@@ -76,7 +75,6 @@ class AttentionCase:
             kb,
             max(self.ctx.context_lens),
             c.sliding_window_per_layer[0],
-            out,
             use_turboquant=True,
             quant_type=c.k_quant,
             v_bits=c.v_bits,

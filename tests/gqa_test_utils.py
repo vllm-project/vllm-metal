@@ -29,8 +29,7 @@ def _primitive(
     ops = get_ops()
     batch, _, head = query.shape
     routing = {"gqa_length_plan": ops.gqa_decode_length_plan(host_lengths)}
-    out = mx.array(0)
-    ops.paged_attention_primitive(
+    out = ops.paged_attention_primitive(
         query,
         keys,
         values,
@@ -43,7 +42,6 @@ def _primitive(
         block,
         maximum,
         -1,
-        out,
         num_decode_requests=batch,
         num_decode_tokens=batch,
         max_decode_context_len=(
@@ -263,9 +261,8 @@ def _run_primitive(
         )
         mx.eval(key_cache, value_cache, k_scale, k_zero, v_scale, key_ref, value_ref)
 
-    out = mx.array(0)
     if test_partition is not None:
-        get_ops()._gqa_paged_attention_for_test(
+        out = get_ops()._gqa_paged_attention_for_test(
             query,
             key_cache,
             value_cache,
@@ -275,11 +272,10 @@ def _run_primitive(
             block_size,
             max_kv_len,
             test_partition,
-            out,
             **quant_kwargs,
         )
     else:
-        get_ops().paged_attention_primitive(
+        out = get_ops().paged_attention_primitive(
             query,
             key_cache,
             value_cache,
@@ -292,7 +288,6 @@ def _run_primitive(
             block_size,
             max_kv_len,
             sliding_window,
-            out,
             window_seqlen_q=window_seqlen_q,
             num_decode_requests=num_decode_requests,
             num_decode_tokens=num_decode_tokens,

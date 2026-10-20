@@ -175,15 +175,12 @@ sliding-window attention (SWA) is not fully optimized.
 ## Diffusion Language Models
 
 Block-diffusion LMs generate a whole canvas of tokens per block through
-iterative denoising instead of left-to-right decoding. vLLM schedules the
-canvas as draft tokens (`--diffusion-config '{"canvas_length": N}'`); the
-Metal runner runs prefill and commit steps causally, and denoising steps
-bidirectionally over the canvas on the paged KV cache (see
-`vllm_metal/v1/diffusion.py`).
+iterative denoising. DiffusionGemma also supports sample logprobs and
+[structured decisions](structured_decisions.md) for yes/no, choice, and score questions.
 
 | Model | MLX | PyTorch MPS | Runner | Scope | Example checkpoint |
 | --- | --- | --- | --- | --- | --- |
-| DiffusionGemma | 🔵 | | mlx-vlm model, paged block diffusion | text input only, synchronous scheduling, no logprobs or LoRA | `mlx-community/diffusiongemma-26B-A4B-it-4bit` |
+| DiffusionGemma | 🔵 | | mlx-vlm model, paged block diffusion | text input only, synchronous scheduling, no prompt logprobs or LoRA | `mlx-community/diffusiongemma-26B-A4B-it-4bit` |
 
 ```bash
 vllm serve mlx-community/diffusiongemma-26B-A4B-it-4bit \
@@ -192,6 +189,6 @@ vllm serve mlx-community/diffusiongemma-26B-A4B-it-4bit \
 
 The canvas sampler follows the checkpoint's `generation_config.json`
 (temperature schedule, entropy-bound acceptance, convergence thresholds);
-top-k, top-p and penalties are ignored with a warning. Async scheduling is
-turned off automatically, since each step's canvas must reach the scheduler
-before the next one is scheduled.
+top-k and top-p are unsupported, and penalties are ignored with a warning.
+Async scheduling is turned off automatically, since each step's canvas must
+reach the scheduler before the next one is scheduled.

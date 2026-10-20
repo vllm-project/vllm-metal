@@ -830,7 +830,7 @@ class TestUpstreamAttentionStorage:
         )
         output = mx.array(0)
         scale = head_size**-0.5
-        get_ops().paged_attention_primitive(
+        output = get_ops().paged_attention_primitive(
             query,
             key_cache,
             value_cache,
@@ -843,7 +843,6 @@ class TestUpstreamAttentionStorage:
             kernel_block_size,
             seq_len,
             -1,
-            output,
         )
         reference = mx.fast.scaled_dot_product_attention(
             query.transpose(1, 0, 2)[None],

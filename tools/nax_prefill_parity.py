@@ -233,8 +233,7 @@ def _run(
 ) -> tuple[mx.array, str, int]:
     key_cache, value_cache, query, block_tables, seq_lens, cu_seqlens, sinks = built
     ops.set_nax_enabled(enabled)
-    out = mx.array(0)
-    ops.paged_attention_primitive(
+    out = ops.paged_attention_primitive(
         query,
         key_cache,
         value_cache,
@@ -247,7 +246,6 @@ def _run(
         case.block_size,
         max(int(x) for x in seq_lens.tolist()),
         case.sliding_window,
-        out,
         sinks=sinks,
         **({} if split_hint is None else {"nax_split_hint": split_hint}),
     )

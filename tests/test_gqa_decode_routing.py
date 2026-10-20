@@ -340,8 +340,7 @@ def _mixed_inputs(
 
 
 def _mixed_call(inputs, **overrides):
-    out = mx.array(0)
-    get_ops().paged_attention_primitive(**(inputs | overrides), out=out)
+    out = get_ops().paged_attention_primitive(**(inputs | overrides))
     mx.eval(out)
     return out
 

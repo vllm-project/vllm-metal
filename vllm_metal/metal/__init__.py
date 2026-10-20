@@ -195,8 +195,6 @@ def metal_mla_paged_attention(
     heads sharing the same latent KV; ``num_heads`` must be divisible
     by G. Currently instantiated for G ∈ {1, 2}.
     """
-    import mlx.core as mx
-
     if q_nope.shape[2] != latent_cache.shape[2] - q_pe.shape[2]:
         raise ValueError(
             f"MLA shape mismatch: q_nope.shape[2]={q_nope.shape[2]} must equal "
@@ -206,16 +204,8 @@ def metal_mla_paged_attention(
 
     block_size = latent_cache.shape[1]
 
-    total_q_tokens = int(q_nope.shape[0])
-    num_heads = int(q_nope.shape[1])
-    kv_lora_rank = int(q_nope.shape[2])
-    # ``mx.zeros`` here is lazy — the C++ side replaces ``out``'s
-    # descriptor with the Primitive output before the zeros ever
-    # evaluate, so the memset is never scheduled.
-    out = mx.zeros((total_q_tokens, num_heads, kv_lora_rank), dtype=q_nope.dtype)
-
     ops = get_ops()
-    ops.mla_paged_attention_primitive(
+    return ops.mla_paged_attention_primitive(
         q_nope,
         q_pe,
         latent_cache,
@@ -225,9 +215,7 @@ def metal_mla_paged_attention(
         block_size,
         scale,
         heads_per_tg,
-        out,
     )
-    return out
 
 
 def _load_native_module() -> ModuleType:

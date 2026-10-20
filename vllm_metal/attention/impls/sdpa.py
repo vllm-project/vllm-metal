@@ -803,7 +803,6 @@ def sdpa_forward(
     mm_kwargs = (
         {} if mm_prefix_ranges is None else {"mm_prefix_ranges": mm_prefix_ranges}
     )
-    out = mx.array(0)
     if kv_cache.turboquant:
         # Preserve the compressed primitive's layout and rejection contracts
         # for decode, short continuations, verification, sinks and image rows.
@@ -829,8 +828,7 @@ def sdpa_forward(
         def quantized_attention(
             query: mx.array, batch: _AttentionBatch | _KernelMetadata
         ) -> mx.array:
-            result = mx.array(0)
-            ops.paged_attention_primitive(
+            return ops.paged_attention_primitive(
                 query,
                 kernel_k_cache,
                 kernel_v_cache,
@@ -843,7 +841,6 @@ def sdpa_forward(
                 kernel_block_size,
                 batch.max_seq_len,
                 layer_sliding_window,
-                result,
                 sinks=sinks,
                 key_scale_cache=kernel_key_scale,
                 value_scale_cache=kernel_value_scale,
@@ -855,7 +852,6 @@ def sdpa_forward(
                 window_seqlen_q=ctx.verify_window_q,
                 **mm_kwargs,
             )
-            return result
 
         plan = None
         has_prefill = q_3d.shape[0] > len(ctx.context_lens)
@@ -925,7 +921,7 @@ def sdpa_forward(
             query = q_3d if batch.query_indices is None else q_3d[batch.query_indices]
             if ctx.paged_native_capabilities is None:
                 ctx.paged_native_capabilities = paged_attention_capabilities(ops)
-            ops.paged_attention_primitive(
+            out = ops.paged_attention_primitive(
                 query,
                 k16.reshape(-1, kernel_block_size, cache_kv_heads, q_3d.shape[2]),
                 v16.reshape(-1, kernel_block_size, cache_kv_heads, q_3d.shape[2]),
@@ -938,7 +934,6 @@ def sdpa_forward(
                 kernel_block_size,
                 batch.max_seq_len,
                 layer_sliding_window,
-                out,
                 window_seqlen_q=ctx.verify_window_q,
                 # The dequantized lane only admits full-attention layers.
                 **nax_split_kwargs(
@@ -1047,7 +1042,7 @@ def sdpa_forward(
                     capabilities, work, q_3d.shape[2], prefill_work=prefill_work
                 )
             )
-        ops.paged_attention_primitive(
+        out = ops.paged_attention_primitive(
             q_3d,
             kernel_k_cache,
             kernel_v_cache,
@@ -1060,7 +1055,6 @@ def sdpa_forward(
             kernel_block_size,
             max_seq_len,
             layer_sliding_window,
-            out,
             window_seqlen_q=ctx.verify_window_q,
             sinks=sinks,
             **paged_kwargs,

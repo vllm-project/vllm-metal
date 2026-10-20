@@ -392,6 +392,7 @@ def _build_spec() -> _BuildSpec:
         # loaded first, which metal/__init__.py guarantees by importing mlx.core
         # before this .so is dlopen'd.
         "-D_METAL_",
+        "-DNB_DOMAIN=mlx",
         "-DACCELERATE_NEW_LAPACK",
         f"-DVLLM_METAL_PARTITION_SIZE={PARTITION_SIZE}",
         f"-DVLLM_METAL_PA_WINDOW_ROWS={PA_WINDOW_ROWS}",
