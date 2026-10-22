@@ -116,22 +116,9 @@ install_vllm() {
   local download_url="https://github.com/vllm-project/vllm/releases/download/${vllm_release_tag}"
   # vLLM's prebuilt macOS arm64 wheel is tagged cp38-abi3.
   local vllm_wheel_url="${download_url}/vllm-${vllm_version}%2Bcpu-cp38-abi3-macosx_11_0_arm64.whl"
-  local status
 
   echo ""
   section "Installing vLLM core"
-
-  status=$(curl -sIL --retry 3 -o /dev/null -w '%{http_code}' "$vllm_wheel_url" || true)
-  if [[ "$status" == 404 ]]; then
-    error "vLLM ${vllm_release_tag} has no prebuilt macOS arm64 wheel."
-    exit 1
-  fi
-  if [[ "$status" != 200 ]]; then
-    error "Failed to reach ${vllm_wheel_url} (HTTP ${status})."
-    echo "Please check your internet connection and try again." >&2
-    exit 1
-  fi
-
   echo "Wheel: vLLM ${vllm_version} (prebuilt macOS arm64)"
 
   if ! uv pip install "$vllm_wheel_url"; then
