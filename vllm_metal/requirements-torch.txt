@@ -1,0 +1,6 @@
+# Override vLLM's Torch pin for upstream MPS submission improvements:
+# https://github.com/pytorch/pytorch/pull/200181
+--extra-index-url https://download.pytorch.org/whl/nightly/cpu
+torch==2.16.0.dev20261013
+torchvision==0.30.0.dev20261013
+torchaudio==2.11.0.dev20261013
