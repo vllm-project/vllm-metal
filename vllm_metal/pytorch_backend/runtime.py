@@ -126,6 +126,11 @@ def install():
     buffer_utils.UvaBackedTensor.copy_to_uva = copy_changed_state
 
     input_ops.install()
+    from vllm_metal.pytorch_backend.speculative_ops import (
+        install as install_speculation,
+    )
+
+    install_speculation()
     # validate_request limits sampling to greedy; scoring uses upstream Torch ops.
     sampler.gumbel_sample = lambda logits, *args, **kwargs: logits.argmax(dim=-1)
     sampler.compute_topk_scores = compute_topk_scores

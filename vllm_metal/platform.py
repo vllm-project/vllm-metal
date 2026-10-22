@@ -142,6 +142,15 @@ class MetalPlatform(Platform):
             import vllm_metal.pytorch_backend.normalization  # noqa: F401
 
     @classmethod
+    def register_triton_kernel_overrides(cls) -> None:
+        if envs.VLLM_METAL_BACKEND == "mps":
+            from vllm_metal.pytorch_backend.speculative_ops import (
+                register_kernel_overrides,
+            )
+
+            register_kernel_overrides()
+
+    @classmethod
     def get_default_ir_op_priority(
         cls, vllm_config: "VllmConfig"
     ) -> "IrOpPriorityConfig":
@@ -726,6 +735,7 @@ class MetalPlatform(Platform):
         # default, the same downgrade shape as the STT scheduler policy.
         if (
             speculative_config is not None
+            and backend != "mps"
             and vllm_config.scheduler_config.async_scheduling
         ):
             vllm_config.scheduler_config.async_scheduling = False

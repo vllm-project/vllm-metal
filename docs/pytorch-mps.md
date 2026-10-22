@@ -19,6 +19,20 @@ Selecting MPS defaults to MRv2. Use unquantized FP16/BF16 checkpoints and greedy
 requests (`temperature=0`). Output-token logprobs are supported; prompt logprobs
 and explicit token-ID scoring are not yet supported.
 
+## EAGLE3 speculative decoding
+
+Use a matching EAGLE3 draft with a dense FP16/BF16 text target and greedy requests:
+
+```bash
+VLLM_METAL_BACKEND=mps PYTORCH_ENABLE_MPS_FALLBACK=0 \
+  vllm serve Qwen/Qwen3-8B --dtype bfloat16 \
+  --speculative-config '{"method":"eagle3","model":"RedHatAI/Qwen3-8B-speculator.eagle3","num_speculative_tokens":3,"use_local_argmax_reduction":true}'
+```
+
+Output logprobs are supported. Parallel drafting, probabilistic sampling, and
+hybrid recurrent targets are not supported. Measure draft length on your workload;
+more draft tokens do not always improve throughput.
+
 ## Models
 
 - Use `model_impl="auto"` and vLLM's resolver. Keep model definitions and weight

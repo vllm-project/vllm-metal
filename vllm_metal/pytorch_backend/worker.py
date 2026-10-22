@@ -60,7 +60,6 @@ def configure_mps(config):
         or model.dtype not in (torch.float16, torch.bfloat16)
         or config.parallel_config.world_size != 1
         or config.parallel_config.data_parallel_size != 1
-        or config.speculative_config is not None
         or config.lora_config is not None
         or config.kv_transfer_config is not None
         or config.additional_config.get("turboquant", False)
@@ -69,8 +68,19 @@ def configure_mps(config):
             "Experimental MPS requires an unquantized dense autoregressive "
             "text decoder with a supported attention head size, optional "
             "ShortConv state, fp16/bf16, "
-            "one GPU, and no LoRA/speculative decoding/KV transfer."
+            "one GPU, and no LoRA/KV transfer."
         )
+    spec = config.speculative_config
+    if spec is not None and (
+        spec.method != "eagle3"
+        or spec.draft_sample_method != "greedy"
+        or spec.rejection_sample_method != "standard"
+        or spec.enable_adaptive_verification
+        or spec.parallel_drafting
+        or model.has_inner_state
+        or config.watermark_config is not None
+    ):
+        raise NotImplementedError("MPS speculation currently supports greedy EAGLE3")
     if config.cache_config.block_size is None:
         config.cache_config.block_size = 16
     if not MPSAttentionBackend.supports_block_size(config.cache_config.block_size):
