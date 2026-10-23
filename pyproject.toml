@@ -101,6 +101,7 @@ metal = "vllm_metal:register"
 # subprocesses; GGUF loading stays lazy for other model formats.
 [project.entry-points."vllm.general_plugins"]
 gguf_metal = "vllm_metal.gguf.vllm_integration:register"
+laya_metal = "vllm_metal.v1.pooling.backends.encoder.models.laya:register"
 
 [tool.setuptools]
 include-package-data = false

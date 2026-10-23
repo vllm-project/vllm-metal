@@ -11,6 +11,10 @@ from vllm_metal.v1.pooling.backends.encoder.models.bge_m3 import (
     load_bge_m3_backend,
     supports_bge_m3_encoder,
 )
+from vllm_metal.v1.pooling.backends.encoder.models.laya import (
+    load_laya_backend,
+    supports_laya_encoder,
+)
 from vllm_metal.v1.pooling.backends.encoder.models.xlm_roberta import (
     load_xlm_roberta_backend,
     supports_xlm_roberta_encoder,
@@ -26,6 +30,7 @@ class EncoderBackendLoader:
 
 
 _ENCODER_BACKEND_LOADERS = (
+    EncoderBackendLoader(supports=supports_laya_encoder, load=load_laya_backend),
     # Decoder pooling wraps the already-loaded generation model. Encoder pooling
     # has model-family-owned loaders because it does not use the generation
     # loader, paged attention, or KV cache.
