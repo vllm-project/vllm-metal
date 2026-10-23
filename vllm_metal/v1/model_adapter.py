@@ -391,6 +391,7 @@ class ModelAdapter(Protocol):
 
 # Models/configs that vLLM flags as multimodal but must be loaded via mlx_lm.
 # gemma4: mlx_vlm forward path produces garbled output vs mlx_lm.
+# muse_glimmer: no multimodal adapter, so image requests must stop at the frontend.
 # Qwen3.5/Qwen3.6 conditional-generation wrappers expose a multimodal config,
 # but only the FP8 and adapter-less variants are forced onto the text backbone:
 # FP8 checkpoints ship `*_weight_scale_inv` tensors that the mlx_vlm qwen3_5
@@ -411,6 +412,9 @@ _TEXT_BACKBONE_OVERRIDE_ARCHITECTURES: frozenset[str] = frozenset(
 _MISTRAL3_TEXT_BACKBONE_TEXT_TYPES: frozenset[str] = frozenset(
     {"mistral", "ministral3"}
 )
+_TEXT_BACKBONE_OVERRIDE_MODEL_TYPES: frozenset[str] = _GEMMA4_MODEL_TYPES | {
+    "muse_glimmer"
+}
 _QWEN3_VL_MODEL_TYPES: frozenset[str] = frozenset({"qwen3_5", "qwen3_vl"})
 _QWEN3_VL_ARCHITECTURES: frozenset[str] = frozenset(
     {
@@ -438,9 +442,9 @@ class DefaultModelAdapter(ModelAdapter):
         Gemma4: mlx_vlm forward currently produces garbled output; remove this
         override once mlx_vlm Gemma4 parity is fixed upstream.
 
-        Mistral 3: no multimodal adapter yet. The text backbone clears
-        ``multimodal_config``, so the frontend rejects image input instead of
-        the runner raising on it.
+        Mistral 3 and Muse Glimmer: no multimodal adapter yet. The text backbone
+        clears ``multimodal_config``, so the frontend rejects image input
+        instead of the runner raising on it.
 
         Qwen3.5/Qwen3.6 conditional-generation wrappers: these configs are
         marked multimodal even when served text-only, and the FP8 family fails
@@ -454,7 +458,7 @@ class DefaultModelAdapter(ModelAdapter):
             return False
 
         model_type_from_hf = hf_config.model_type
-        if model_type_from_hf in _GEMMA4_MODEL_TYPES:
+        if model_type_from_hf in _TEXT_BACKBONE_OVERRIDE_MODEL_TYPES:
             return True
         if model_type_from_hf == "mistral3":
             text_config = getattr(hf_config, "text_config", None)

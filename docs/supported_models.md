@@ -135,6 +135,12 @@ Ling-3.0 Tiny supports the official BF16 checkpoint and MLX-native MXFP8
 checkpoints converted from it. Direct loading of the official serialized
 block-FP8 checkpoint is not supported.
 
+Muse Glimmer checkpoints are vision-language, but vllm-metal serves only their
+text backbone: auto mode loads the mlx-lm text model and the frontend rejects
+image input. DFlash and DSpark speculative decoding need a Qwen3 target, so
+Glimmer's DFlash assistant is not supported; n-gram and draft-model speculation
+and TurboQuant are not validated.
+
 | Model | MLX | PyTorch MPS | Attention Kernel | Automatic Prefix Cache | Example checkpoint |
 | --- | --- | --- | --- | --- | --- |
 | Qwen3 | ✅ | 🔵 | GQA (paged) | ✅ | `Qwen/Qwen3-0.6B` |
@@ -171,6 +177,7 @@ block-FP8 checkpoint is not supported.
 | OLMo 2 | ✅ | 🔵 | MHA + full-projection QK norm (paged) | ✅ | `allenai/OLMo-2-0425-1B-Instruct` |
 | OLMoE | ✅ | | MHA + full-projection QK norm (paged) | ✅ | `mlx-community/OLMoE-1B-7B-0125-Instruct-4bit` |
 | OLMo 3 | 🔵 | | MHA + per-layer sliding window (paged) | ✅ | `mlx-community/Olmo-3-7B-Instruct-4bit` |
+| Muse Glimmer | 🔵 | | GQA + per-layer sliding window, gated attention with QK norm (paged) | ✅ | `mlx-community/Muse-Glimmer-30B-4bit` |
 
 **Hunyuan on MPS:** use `--generation-config vllm` to override the checkpoint’s unsupported `repetition_penalty=1.05` default.
 

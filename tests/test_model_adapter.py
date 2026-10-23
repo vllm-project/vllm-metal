@@ -108,6 +108,17 @@ class TestShouldForceTextBackbone:
         assert adapter.should_force_text_backbone(hf_config) is True
         assert adapter.build_multimodal_adapter(object(), hf_config) is None
 
+    def test_unquantized_muse_glimmer_keeps_text_backbone(self) -> None:
+        # No multimodal adapter, so a native load would let image requests
+        # reach the runner and raise there, whatever the quantization.
+        hf_config = SimpleNamespace(
+            model_type="muse_glimmer",
+            architectures=["MuseGlimmerForConditionalGeneration"],
+        )
+        adapter = DefaultModelAdapter()
+        assert adapter.should_force_text_backbone(hf_config) is True
+        assert adapter.build_multimodal_adapter(object(), hf_config) is None
+
     @pytest.mark.parametrize(
         ("text_type", "expected"),
         [
