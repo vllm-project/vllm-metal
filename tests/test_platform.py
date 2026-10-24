@@ -268,6 +268,21 @@ class TestMetalPlatform:
             MetalPlatform.validate_request({}, sampling_params)
         assert exc_info.value.parameter == control
 
+    def test_validate_request_accepts_thinking_budget_on_mlx(self) -> None:
+        MetalPlatform.validate_request({}, SamplingParams(thinking_token_budget=64))
+
+    def test_validate_request_rejects_thinking_budget_on_mps(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("vllm_metal.envs.VLLM_METAL_BACKEND", "mps")
+        with pytest.raises(
+            VLLMValidationError, match="thinking_token_budget"
+        ) as exc_info:
+            MetalPlatform.validate_request(
+                {}, SamplingParams(temperature=0.0, thinking_token_budget=64)
+            )
+        assert exc_info.value.parameter == "thinking_token_budget"
+
     @pytest.mark.parametrize(
         ("pooling_params", "parameter", "message"),
         [

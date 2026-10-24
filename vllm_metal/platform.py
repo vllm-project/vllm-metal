@@ -395,6 +395,10 @@ class MetalPlatform(Platform):
                 ),
                 ("top_k", params.top_k > 0),
                 ("top_p", params.top_p < 1.0),
+                (
+                    "thinking_token_budget",
+                    params.thinking_token_budget is not None,
+                ),
             ):
                 if enabled:
                     raise VLLMValidationError(

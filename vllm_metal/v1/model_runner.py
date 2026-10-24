@@ -137,6 +137,7 @@ from vllm_metal.v1.spec_decode import (
     SpeculativeDecodeController,
 )
 from vllm_metal.v1.structured_output import MetalStructuredOutputApplier
+from vllm_metal.v1.thinking_budget import ThinkingBudgetMarkers
 
 if TYPE_CHECKING:
     from vllm_metal.moe_offload import ExpertStore
@@ -450,6 +451,9 @@ class MetalModelRunner:
         # vLLM Sampler for token sampling with temperature, top_k, top_p support.
         # It takes the configured logprobs mode, as vLLM's GPU runner does.
         self._sampler = Sampler(logprobs_mode=self.model_config.logprobs_mode)
+        self._thinking_budget = ThinkingBudgetMarkers.from_reasoning_config(
+            getattr(vllm_config, "reasoning_config", None)
+        )
 
         self._draft_token_ids: DraftTokenIds | None = None
         # KV connector driver, built by register_kv_connector_caches.
@@ -2044,6 +2048,7 @@ class MetalModelRunner:
                     output_tokens_list,
                     vocab_size=vocab_size,
                     generators=generators,
+                    thinking_budget=self._thinking_budget,
                 )
                 plain_result = sample_from_logits(
                     plain_logits, plain_batch, self._sampler
@@ -2064,6 +2069,7 @@ class MetalModelRunner:
                 num_decode_tokens,
                 self._sampler,
                 vocab_size=vocab_size,
+                thinking_budget=self._thinking_budget,
             )
             decode_token_ids = [[token_id] for token_id in decode_result.token_ids]
             decode_logprobs = decode_result.logprobs
@@ -2074,6 +2080,7 @@ class MetalModelRunner:
             num_decode_segments,
             self._sampler,
             vocab_size=vocab_size,
+            thinking_budget=self._thinking_budget,
         )
 
         # ---- update decode state ----

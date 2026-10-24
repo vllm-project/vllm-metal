@@ -217,6 +217,7 @@ def make_stub_runner(
         "sliding_window_per_layer": None,
         "use_async_scheduling": True,
         "_sampler": None,
+        "_thinking_budget": None,
         "_native_sample_key": None,
         "_structured_output_applier": MetalStructuredOutputApplier(),
         "_prompt_logprobs_tracker": PromptLogprobsTracker(),
