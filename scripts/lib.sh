@@ -98,6 +98,22 @@ setup_dev_env() {
   install_dev_deps
 }
 
+# Reuse a compiled Arctic wheel; only cache misses need the build tools.
+install_suffix_backend() {
+  local wheel_dir="$1"
+  mkdir -p "$wheel_dir"
+  local wheels=("$wheel_dir"/arctic_inference-0.3.0-*.whl)
+  if [ ! -f "${wheels[0]}" ]; then
+    python -m pip install cmake ninja grpcio-tools wheel
+    Python_ROOT_DIR="$VIRTUAL_ENV" Python_FIND_STRATEGY=LOCATION \
+      python -m pip wheel --no-cache-dir --no-build-isolation --no-deps \
+      --no-binary arctic-inference --wheel-dir "$wheel_dir" \
+      arctic-inference==0.3.0
+  fi
+  uv pip install --no-deps --no-index --find-links "$wheel_dir" \
+    arctic-inference==0.3.0
+}
+
 # Get version from pyproject.toml
 get_version() {
   uv run python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])"

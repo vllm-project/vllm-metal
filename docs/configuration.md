@@ -83,8 +83,9 @@ Sleep levels mean something different on unified memory than on a GPU:
   comes back empty at wake. Prompts already on the disk tier still restore.
 
 Sleep mode supports dense and hybrid models on the MLX backend. Standalone MLA
-models and speculative decoding methods other than `ngram` are not supported
-yet.
+models and speculative decoding methods other than `ngram` and `suffix` are
+not supported yet. Suffix trees live in host memory and survive sleep, so
+cross-request drafting stays warm after `wake_up()`.
 
 ## KV Cache Memory Settings
 

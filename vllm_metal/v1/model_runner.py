@@ -1408,10 +1408,20 @@ class MetalModelRunner:
                 vllm_config=self.vllm_config,
                 controller=self._spec_decode_controller,
             )
+        elif spec.method == "suffix":
+            from vllm_metal.v1.suffix_proposer import SuffixProposer
+
+            # Suffix trees over prompts and past responses — like n-gram, no
+            # model and no KV cache; the tree state is plain process memory.
+            self._drafter = SuffixProposer.build(
+                vllm_config=self.vllm_config,
+                controller=self._spec_decode_controller,
+            )
         else:
             raise NotImplementedError(
                 f"Speculative method {spec.method!r} is not supported on Metal "
-                "(supported: Gemma4 MTP, draft_model, ngram, dflash, dspark)."
+                "(supported: Gemma4 MTP, draft_model, ngram, suffix, dflash, "
+                "dspark)."
             )
 
     def get_draft_model_stats(self) -> dict[str, int] | None:

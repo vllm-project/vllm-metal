@@ -184,6 +184,92 @@ cache. Its benefit depends on repeated token spans in the request history.
     --speculative-config '{"method":"ngram","num_speculative_tokens":3,"prompt_lookup_min":2,"prompt_lookup_max":3}'
 ```
 
+## Suffix
+
+Suffix decoding ([Snowflake, arXiv 2411.04975](https://arxiv.org/pdf/2411.04975))
+drafts by walking a suffix tree built over the prompts and previously
+generated responses of the serving process. Like n-gram it needs no draft
+model and no KV cache; unlike n-gram it learns *across* requests, so its
+wins concentrate in agentic and templated workloads where responses re-emit
+near-identical scaffolding (tool-call envelopes, structured lists, repeated
+phrasing). Draft lengths are dynamic per request and per step, bounded by
+`num_speculative_tokens`. Support is limited to MLX, text-only,
+full-attention paged-attention models
+(hybrid GDN targets keep the ngram-only gate for now). Verification is
+greedy-only and requires `--no-async-scheduling`, like every Metal
+speculator.
+
+Follow the upstream
+[Suffix Decoding guide](https://docs.vllm.ai/en/latest/features/speculative_decoding/suffix_decoding/)
+for the tuning knobs (`suffix_decoding_max_tree_depth`,
+`suffix_decoding_max_spec_factor`, `suffix_decoding_min_token_prob`,
+`suffix_decoding_max_cached_requests`).
+
+### Installing arctic_inference on macOS
+
+The suffix tree lives in the [`arctic_inference`](https://pypi.org/project/arctic-inference/)
+package. The tested version is **0.3.0**. Its suffix-tree core uses
+C++/nanobind and builds from source on macOS without CUDA.
+
+Activate the same native arm64 environment used to run vLLM Metal, then
+install the build tools and the pinned backend. Build without isolation
+to use the environment's existing PyTorch and nanobind versions, and pin
+the interpreter so CMake does not select a different Homebrew Python:
+
+```bash
+  python -m pip install cmake ninja grpcio-tools wheel
+  Python_ROOT_DIR="$VIRTUAL_ENV" Python_FIND_STRATEGY=LOCATION \
+    python -m pip install --no-build-isolation --no-deps \
+    --no-binary arctic-inference arctic-inference==0.3.0
+  python -c 'from arctic_inference.suffix_decoding import SuffixDecodingCache; SuffixDecodingCache(max_tree_depth=24)'
+```
+
+Serving without the package installed fails at config time with vLLM's own
+error, which may suggest `arctic-inference==0.1.1`. Use the tested 0.3.0
+version above for this backend. It is not required for other speculative
+methods. The package is Apache-2.0 licensed.
+
+`scripts/test.sh` and CI include the real Arctic tests in the main pytest
+run. CI caches the compiled wheel for the matching toolchain; cache hits
+skip the build tools and source compilation. Local runs keep the wheel in
+the test environment's `arctic-wheels` directory. To omit the optional
+backend for a shorter local check, use `VLLM_METAL_TEST_SUFFIX=0 scripts/test.sh`;
+lightweight suffix unit tests still run. For an already prepared environment,
+`pytest -m suffix tests/test_suffix_proposer.py` runs just the real-backend tests.
+
+Suffix uses the existing greedy verifier: each accepted draft must match the
+target's argmax at that position, and the first rejection emits the target's
+correction. It does not use approximate acceptance rules. As described in
+vLLM's [numerical limitations](https://docs.vllm.ai/en/latest/features/speculative_decoding/#lossless-guarantees-of-speculative-decoding),
+floating-point and batch-shape effects can still change output tokens between
+ordinary and speculative execution. This integration keeps the default Metal
+model kernels; it does not enable batch-invariant execution or guarantee
+identical complete output sequences. A separate opt-in reproducibility mode
+is outside this feature's scope.
+
+For diagnostics, compare fresh spec-off/spec-on runs with identical input
+token IDs and settings using `tools/check_parity.py --method suffix --top-k 5`.
+The tool retains its stricter check: any suffix-versus-target token divergence
+returns an unsuccessful exit status and is recorded in the summary.
+`TOP_K_MATCH` and first-divergence logprobs do not prove equivalence or identify
+the cause. Investigate divergences to distinguish numerical variation from
+incorrect verification or request state; the diagnostic tool does not change
+the engine's execution mode.
+
+With `--enable-sleep-mode`, suffix decoding supports the worker's
+`sleep(level=1)` → `wake_up()` cycle. Suffix trees remain in host memory
+while the KV cache is released, so cached responses can be reused after
+wake-up. Level 2 sleep is not supported on Metal.
+
+### Example
+
+```bash
+  vllm serve Qwen/Qwen3-8B \
+    --max-model-len 2048 \
+    --no-async-scheduling \
+    --speculative-config '{"method":"suffix","num_speculative_tokens":3}'
+```
+
 ## Benchmarking
 
 The [DFlash guide](dflash.md) covers its experimental serving restrictions and

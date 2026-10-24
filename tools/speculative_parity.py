@@ -40,13 +40,17 @@ def run_engine(args):
         if args.worker == "target"
         else {
             "method": args.method,
-            "model": args.draft,
             "num_speculative_tokens": args.num_draft_tokens,
             "num_speculative_tokens_per_batch_size": args.draft_schedule,
         }
     )
-    if spec is not None and args.dspark_draft_topk is not None:
-        spec["dspark_draft_topk"] = args.dspark_draft_topk
+    if spec is not None:
+        # Model-free methods (suffix) draft from token history alone and
+        # take no draft checkpoint.
+        if args.draft is not None:
+            spec["model"] = args.draft
+        if args.dspark_draft_topk is not None:
+            spec["dspark_draft_topk"] = args.dspark_draft_topk
     llm = LLM(
         model=args.target,
         max_model_len=1024,
@@ -183,6 +187,8 @@ def run_engine(args):
 
 
 def validate_args(args, parser):
+    if args.method == "suffix" and args.draft is not None:
+        parser.error("--draft cannot be used with --method suffix")
     if args.dspark_draft_quantization is not None and args.method != "dspark":
         parser.error("--dspark-draft-quantization requires --method dspark")
     if args.dspark_draft_topk is not None and (
@@ -196,6 +202,8 @@ def validate_args(args, parser):
             "dflash": "z-lab/Qwen3-4B-DFlash-b16",
             "dspark": "deepseek-ai/dspark_qwen3_4b_block7",
             "draft_model": "Qwen/Qwen3-0.6B",
+            # Suffix drafts from token history; there is no draft checkpoint.
+            "suffix": None,
         }[args.method]
     if args.worker not in (None, "native", "target", args.method, "replay"):
         parser.error("Draft worker must match --method")
@@ -249,9 +257,12 @@ def run(args) -> bool:
 
     # Resolve once so every worker loads the same checkpoint revision.
     for name in ("target", "draft"):
-        path = Path(getattr(args, name))
+        checkpoint = getattr(args, name)
+        if checkpoint is None:
+            continue
+        path = Path(checkpoint)
         if not path.is_dir():
-            path = Path(snapshot_download(getattr(args, name)))
+            path = Path(snapshot_download(checkpoint))
         setattr(args, name, str(path.resolve()))
     root = Path(__file__).resolve().parents[1]
     sources = sorted(
@@ -294,21 +305,19 @@ def run(args) -> bool:
         workers.append("replay")
     for worker in workers:
         with (args.output_dir / f"{worker}.log").open("w") as log:
+            command = [
+                sys.executable,
+                "-m",
+                "tools.check_parity",
+                *sys.argv[1:],
+                "--model",
+                args.target,
+            ]
+            if args.draft is not None:
+                command += ["--draft", args.draft]
+            command += ["--output-dir", str(args.output_dir), "--worker", worker]
             subprocess.run(
-                [
-                    sys.executable,
-                    "-m",
-                    "tools.check_parity",
-                    *sys.argv[1:],
-                    "--model",
-                    args.target,
-                    "--draft",
-                    args.draft,
-                    "--output-dir",
-                    str(args.output_dir),
-                    "--worker",
-                    worker,
-                ],
+                command,
                 stdout=log,
                 stderr=subprocess.STDOUT,
                 check=True,
@@ -322,6 +331,7 @@ def run(args) -> bool:
             )
     reference = json.loads((args.output_dir / "native.json").read_text())
     reports = {}
+    target_suffix_exact = True
     for batch_size in args.batch_size:
         arms = {}
         for worker in ("target", args.method):
@@ -344,8 +354,17 @@ def run(args) -> bool:
             top_k=args.top_k,
             labels=("target", args.method),
         )
+        if args.method == "suffix":
+            target_suffix_exact &= len(arms["target"]) == len(arms["suffix"]) and all(
+                target["input_ids"] == suffix["input_ids"]
+                and target["tokens"] == suffix["tokens"]
+                for target, suffix in zip(arms["target"], arms["suffix"], strict=True)
+            )
     passed = all(report["passed"] for report in reports.values())
     summary = {"top_k": args.top_k, "comparisons": reports}
+    if args.method == "suffix":
+        summary["target_suffix_exact_passed"] = target_suffix_exact
+        passed &= target_suffix_exact
     if args.audit_continuations:
         report = json.loads((args.output_dir / "continuation-audit.json").read_text())
         for name, audit in report["reports"].items():
