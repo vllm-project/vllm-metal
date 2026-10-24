@@ -3,6 +3,7 @@
 
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import mlx.core as mx
 import pytest
@@ -17,6 +18,7 @@ from vllm.config.multimodal import (
 import vllm_metal.envs as envs
 import vllm_metal.v1.model_adapter as model_adapter_module
 from vllm_metal.config import reset_config
+from vllm_metal.multimodal.lfm2_vl import Lfm2VlMultimodalAdapter
 from vllm_metal.multimodal.paddleocr_vl import PaddleOCRVLMultimodalAdapter
 from vllm_metal.multimodal.qwen3_vl import Qwen3VLMultimodalAdapter
 from vllm_metal.v1.model_adapter import (
@@ -806,6 +808,23 @@ class _Qwen35LanguageModelStub:
         return None
 
 
+class _Lfm2VlBackboneStub:
+    """Callable ``language_model.model``: the adapter rejects a non-callable one."""
+
+    def __init__(self) -> None:
+        self.embed_tokens = lambda input_ids: input_ids
+
+    def __call__(self, inputs: Any, **kwargs: Any) -> Any:
+        return inputs
+
+
+class _Lfm2VlLanguageModelStub:
+    """Minimal mlx_vlm LFM2-VL language tower for dispatch tests."""
+
+    def __init__(self) -> None:
+        self.model = _Lfm2VlBackboneStub()
+
+
 class _PaddleOCRLanguageModelStub:
     def __init__(self) -> None:
         self.model = _Qwen35BackboneStub()
@@ -897,6 +916,38 @@ class TestBuildMultimodalAdapter:
         adapter = DefaultModelAdapter().build_multimodal_adapter(model, hf_config)
 
         assert isinstance(adapter, PaddleOCRVLMultimodalAdapter)
+
+    @pytest.mark.parametrize("model_type", ["lfm2_vl", "lfm2-vl"])
+    def test_builds_lfm2_vl_adapter_from_model_type(self, model_type: str) -> None:
+        # Both spellings ship: Transformers and the 3B/1.6B checkpoints use
+        # "lfm2_vl", the 450M MLX conversions use "lfm2-vl".
+        language_model = _Lfm2VlLanguageModelStub()
+        model = SimpleNamespace(
+            config=SimpleNamespace(image_token_index=396),
+            language_model=language_model,
+            encode_images=lambda *a, **k: [],
+        )
+        hf_config = SimpleNamespace(model_type=model_type)
+
+        adapter = DefaultModelAdapter().build_multimodal_adapter(model, hf_config)
+
+        assert isinstance(adapter, Lfm2VlMultimodalAdapter)
+        assert adapter.text_model() is language_model
+
+    def test_builds_lfm2_vl_adapter_from_architecture(self) -> None:
+        model = SimpleNamespace(
+            config=SimpleNamespace(image_token_index=396),
+            language_model=_Lfm2VlLanguageModelStub(),
+            encode_images=lambda *a, **k: [],
+        )
+        hf_config = SimpleNamespace(
+            model_type="custom",
+            architectures=["Lfm2VlForConditionalGeneration"],
+        )
+
+        adapter = DefaultModelAdapter().build_multimodal_adapter(model, hf_config)
+
+        assert isinstance(adapter, Lfm2VlMultimodalAdapter)
 
     def test_generic_vlm_has_no_model_owned_adapter(self) -> None:
         model = SimpleNamespace()

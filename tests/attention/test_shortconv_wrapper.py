@@ -138,6 +138,57 @@ def _assert_close(actual: mx.array, expected: mx.array) -> None:
     )
 
 
+class TestGdnSink:
+    """mlx_vlm's LFM2 tower passes ``gdn_sink`` on every ShortConv call."""
+
+    def test_none_gdn_sink_is_accepted_on_the_paged_path(self) -> None:
+        # The VL text tower passes the keyword even when nothing is captured;
+        # rejecting it broke LFM2-VL warm-up before the forward ever ran.
+        module = _make_module()
+        wrapper, _ = _make_wrapper(module)
+        _set_packed_context([1], [0], grouped=False)
+        out = wrapper(mx.zeros((1, 1, HIDDEN)), cache=None, gdn_sink=None)
+        assert out.shape == (1, 1, HIDDEN)
+
+    def test_capture_is_rejected_on_the_paged_path(self) -> None:
+        # Paged conv state is committed in place, so there is nothing to roll
+        # back to; fail loudly rather than silently dropping the capture.
+        module = _make_module()
+        wrapper, _ = _make_wrapper(module)
+        _set_packed_context([1], [0], grouped=False)
+        with pytest.raises(RuntimeError, match=r"cannot be\s+rolled back"):
+            wrapper(mx.zeros((1, 1, HIDDEN)), cache=None, gdn_sink=[])
+
+    def test_eager_fallback_does_not_pass_the_keyword_when_unused(self) -> None:
+        # mlx_lm's ShortConv has no gdn_sink parameter, so forwarding it
+        # unconditionally would break the text path.
+        calls: list[dict] = []
+
+        class _Inner:
+            L_cache = L_CACHE
+
+            def __call__(self, x, mask=None, cache=None):
+                calls.append({"mask": mask, "cache": cache})
+                return x
+
+        wrapper = ShortConvPagedWrapper(
+            _Inner(),
+            layer_idx=0,
+            cache_idx=0,
+            state_cache=make_state_cache(
+                num_layers=1,
+                max_seqs=MAX_SEQS,
+                conv_kernel_dim=L_CACHE,
+                conv_dim=HIDDEN,
+                dtype=mx.float32,
+            ),
+        )
+        clear_context()
+        out = wrapper(mx.zeros((1, 1, HIDDEN)), cache=None, gdn_sink=None)
+        assert out.shape == (1, 1, HIDDEN)
+        assert len(calls) == 1
+
+
 class TestShortConvPagedWrapper:
     @pytest.mark.parametrize("input_dtype", [mx.float32, mx.bfloat16])
     @pytest.mark.parametrize("state_dtype", [mx.float32, mx.bfloat16, mx.float16])

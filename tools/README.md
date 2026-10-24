@@ -116,3 +116,30 @@ python tools/diffusion_bench.py --concurrency 1 4 --repeats 3 --json bench.json
 Tokens/s depends on how much of each 32-token canvas the answer uses: a short
 reply still costs a full canvas, so compare the `long` prompt across runs, not
 `short`.
+
+## LFM2-VL vision smoke
+
+`lfm2_vl_vision_smoke.py` checks LFM2-VL image serving against the real engine
+and native mlx-vlm. It compares first-token log-probs for one image (reporting
+EXACT and TOP_K_MATCH), confirms two different images do not produce the same
+distribution, and runs a short greedy completion.
+
+The second check is the important one: before image support existed the engine
+accepted an image, dropped it, and answered from the text alone. That failure
+is silent, so parity against a reference would not catch a regression back to
+it, but two images collapsing to one distribution will.
+
+```bash
+PYTORCH_ENABLE_MPS_FALLBACK=0 python tools/lfm2_vl_vision_smoke.py
+PYTORCH_ENABLE_MPS_FALLBACK=0 python tools/lfm2_vl_vision_smoke.py \
+  --checkpoint LiquidAI/LFM2.5-VL-1.6B
+```
+
+Use a checkpoint packaged for Transformers. The MLX conversions are packaged
+for mlx-vlm: the 450M declares `model_type: lfm2-vl`, which Transformers does
+not register, and the 3B names `Lfm2VlNumpyImageProcessor`, which exists in no
+Transformers release. Both fail before the engine starts.
+
+Prints `SMOKE PASS` on success. The KL tolerances assume bf16 noise between the
+Metal paged path and MLX's own SDPA; a failure well outside them points at the
+adapter rather than at precision.
