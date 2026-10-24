@@ -41,6 +41,28 @@ unset below that, on Ray executors, or when `max_num_batched_tokens` exceeds
 4096 (the #585 startup-failure shape). A value you export yourself always
 wins. Outputs are unaffected.
 
+## MFU and memory traffic metrics
+
+`--enable-mfu-metrics` enables vLLM's analytic FLOPs and memory traffic
+estimates. For MLX affine checkpoints with dense Llama/Qwen-style projections
+on a single device, weight reads use safetensors headers: packed weights
+plus each group's scales and biases, or the actual floating-point weights
+for projections left unquantized. Per-layer affine settings and tied output
+embeddings are supported. For example, 4-bit weights with group size 64 and
+BF16 scales/biases use `0.5 + 4 / 64 = 0.5625` bytes per weight; FP32
+scales/biases instead use `0.625`, even if the config declares BF16.
+FLOPs, activations, KV-cache and write bytes retain vLLM's formulas.
+
+Header metadata is read during metrics initialization and cached; model
+revisions and local checkpoint file changes are distinguished. Missing
+metadata, non-affine modes, unrecognized projection layouts, MoE FFNs and
+tensor/pipeline parallel execution retain upstream weight estimates for the
+affected components with a warning. MLA attention retains its upstream
+estimator. These counters are estimates, not hardware bandwidth measurements,
+and retain upstream limitations for architectures such as sparse attention.
+If using a `VLLM_PLUGINS` allowlist, include `metrics_metal` to enable the
+MLX weight-size accounting.
+
 ## Multimodal Serve Modes
 
 - `auto`: use the text-only compatibility path only for checkpoints on the compatibility allowlist — Qwen3.5/Qwen3.6 **FP8** conditional-generation wrappers (their `*_weight_scale_inv` tensors are not sanitized by the mlx_vlm loader), and architectures without a multimodal adapter (the Qwen3.6 and MoE wrappers). Mistral 3 checkpoints with `mistral` or `ministral3` text have no multimodal adapter, so they load their text backbone through mlx_lm. Non-FP8 Qwen3.5 dense checkpoints (official bf16 and MLX-affine quants) keep the native multimodal path. Gemma 4 checkpoints with vision weights, a loadable HF processor and no speculative decoding serve images through the vision sidecar on the mlx_lm text backbone (see [Supported Models](supported_models.md)); otherwise they stay text-only with a logged reason.
