@@ -265,7 +265,7 @@ class _PagedAttentionPlan:
     kv_budget: int
     num_blocks: int
     # KV offload host pool. Pageable, but the same physical RAM as the wired
-    # cache on unified memory, so it comes out of the same budget.
+    # cache on unified memory. Additional to an explicit cache byte budget.
     kv_offload_pool: int = 0
     kv_offload_pool_auto: bool = False
     sized_down_by_probe: bool = False
@@ -274,7 +274,8 @@ class _PagedAttentionPlan:
     def format_breakdown(self) -> str:
         if self.explicit_kv_budget is not None:
             return (
-                f"kv_cache_memory_bytes={self.explicit_kv_budget}, "
+                f"kv_cache_memory_bytes={self.explicit_kv_budget} "
+                f"({self.explicit_kv_budget / 1e9:.2f}GB), "
                 f"model_memory={self.model_memory / 1e9:.2f}GB, "
                 f"overhead={self.overhead / 1e9:.2f}GB, "
                 f"kv_offload_pool={self.kv_offload_pool / 1e9:.2f}GB, "
@@ -1256,10 +1257,11 @@ class WorkerCachePlanner:
         )
         if explicit is not None:
             logger.info(
-                "Paged attention: using --kv-cache-memory-bytes=%d, overriding "
+                "Paged attention: using --kv-cache-memory-bytes=%d (%.2fGB), overriding "
                 "--gpu-memory-utilization. Weights, activations and the offload "
                 "host pool need additional memory.",
                 explicit,
+                explicit / 1e9,
             )
         plan, room = self._probe_committed_pool(
             _PagedAttentionPlan(
@@ -1476,7 +1478,8 @@ class WorkerCachePlanner:
         if plan.explicit_kv_budget is not None:
             raise ValueError(
                 "KV commit probe: the machine paged memory out while testing "
-                f"--kv-cache-memory-bytes={plan.explicit_kv_budget}. Refusing to "
+                f"--kv-cache-memory-bytes={plan.explicit_kv_budget} "
+                f"({plan.explicit_kv_budget / 1e9:.2f}GB). Refusing to "
                 "silently shrink an explicit budget. Lower that value or free "
                 f"memory before retrying. {probe.describe()}"
             )

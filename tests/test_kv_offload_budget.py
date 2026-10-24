@@ -595,11 +595,13 @@ def test_explicit_cache_budget_does_not_subtract_offload_host_pool(automatic):
 
 
 @pytest.mark.parametrize("offload_bytes", [0, 2 * _GB])
+@pytest.mark.parametrize("override", [None, 1])
 def test_explicit_budget_keeps_commit_probe_and_refuses_unsafe_allocation(
-    monkeypatch, offload_bytes
+    monkeypatch, offload_bytes, override
 ):
     planner = _planner(_offload("MetalOffloadingConnector", offload_bytes))
     planner._worker.cache_config.kv_cache_memory_bytes = 3 * _GB
+    planner._worker.cache_config.num_gpu_blocks_override = override
     _paging_probe(monkeypatch, free=4 * _GB)
     # Once the reserve and host pool are accounted for, this request cannot
     # fit. A manual cache must either receive its byte budget or fail startup.
@@ -614,3 +616,35 @@ def test_explicit_budget_survives_probe_when_the_sample_fits(monkeypatch):
     planner._worker.cache_config.kv_cache_memory_bytes = 4 * _GB
     _paging_probe(monkeypatch, free=8 * _GB, swap_out=lambda _: 0)
     assert planner.determine_available_memory() == 4 * _GB
+
+
+@pytest.mark.parametrize("free_delta", [0, -1])
+@pytest.mark.parametrize("pool_mode", ["none", "explicit", "automatic"])
+def test_explicit_budget_probe_accounts_for_host_pool_and_workspace(
+    monkeypatch, free_delta, pool_mode
+):
+    """Paging may keep the exact byte budget, but cannot trim even one byte."""
+    config = {
+        "none": None,
+        "explicit": _offload("MetalOffloadingConnector"),
+        "automatic": _auto_pool(4 * _GB),
+    }[pool_mode]
+    planner = _planner(config)
+    planner._worker.cache_config.kv_cache_memory_bytes = 3 * _GB
+    workspace = 256 << 20
+    planner._worker.model_runner.tq_prefill_workspace_bytes = workspace
+    monkeypatch.setattr(
+        "vllm_metal.v1.cache_policy.get_config",
+        lambda: MetalConfig(mlx_device="gpu", turboquant=True),
+    )
+    pool = {"none": 0, "explicit": 2 * _GB, "automatic": 750_000_000}[pool_mode]
+    _paging_probe(monkeypatch, free=_RESERVE + 3 * _GB + pool + workspace + free_delta)
+
+    if free_delta < 0:
+        with pytest.raises(ValueError, match="Refusing to silently shrink"):
+            planner.determine_available_memory()
+    else:
+        assert planner.determine_available_memory() == 3 * _GB
+    if config is not None:
+        # Explicit cache sizing must not enter the automatic post-probe re-cap.
+        assert config.kv_connector_extra_config["cpu_bytes_to_use"] == pool

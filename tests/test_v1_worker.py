@@ -688,8 +688,9 @@ class TestPagedAttentionPlanDiagnostics:
         ("override", "expected_blocks"),
         [(None, 64), (7, 7), (64, 64), (65, None), (0, None), (-1, None)],
     )
+    @pytest.mark.parametrize("explicit", [False, True])
     def test_draft_pool_override_through_engine_initialization(
-        self, monkeypatch, override, expected_blocks
+        self, monkeypatch, override, expected_blocks, explicit
     ) -> None:
         runner = make_stub_runner(
             model=SimpleNamespace(),
@@ -700,10 +701,10 @@ class TestPagedAttentionPlanDiagnostics:
             kv_cache_dtype=mx.bfloat16,
             cache_config=make_cache_config(
                 block_size=16,
-                gpu_memory_utilization=0.5,
+                gpu_memory_utilization=0.1 if explicit else 0.5,
                 num_gpu_blocks_override=override,
             ),
-            profile_run=lambda: 0,
+            profile_run=MagicMock(return_value=0),
         )
         config = runner.vllm_config
         config.attention_config = AttentionConfig()
@@ -738,6 +739,10 @@ class TestPagedAttentionPlanDiagnostics:
         worker.vllm_config = config
         worker.cache_config = config.cache_config
         per_block_bytes = worker.get_cache_block_size_bytes()
+        if explicit:
+            # Budget both physical pools, round down the partial block, and
+            # ignore the smaller utilization-derived capacity.
+            worker.cache_config.kv_cache_memory_bytes = 65 * per_block_bytes - 1
         monkeypatch.setenv("VLLM_METAL_KV_COMMIT_PROBE", "0")
         monkeypatch.setattr(
             WorkerCachePlanner, "_metal_limit_bytes", lambda self: 128 * per_block_bytes
@@ -757,6 +762,7 @@ class TestPagedAttentionPlanDiagnostics:
             return
 
         available_memory = worker.determine_available_memory()
+        runner.profile_run.assert_called_once_with()
         groups = get_kv_cache_groups(config, worker.get_kv_cache_spec())
         kv_config = get_kv_cache_config_from_groups(config, groups, available_memory)
         worker.initialize_from_config(kv_config)
@@ -1298,13 +1304,13 @@ def test_explicit_budget_rounds_down_and_names_the_active_setting(monkeypatch):
     worker = TestWorkerRunnerBoundaryDelegation()._make_layout_budget_worker(
         monkeypatch, gpu_memory_utilization=0.1
     )
-    worker.cache_config.kv_cache_memory_bytes = 1_000_001
-    worker.get_cache_block_size_bytes = lambda: 1_000_000
+    worker.cache_config.kv_cache_memory_bytes = 1_000_000_001
+    worker.get_cache_block_size_bytes = lambda: 1_000_000_000
     planner = WorkerCachePlanner(worker)
     plan = planner._paged_attention_plan(overhead=100_000_000)
     assert plan.num_blocks == 1
     with pytest.raises(ValueError) as error:
         planner._validate_paged_attention_plan(plan, require_min_blocks=True)
-    assert "kv_cache_memory_bytes=1000001" in str(error.value)
+    assert "kv_cache_memory_bytes=1000000001 (1.00GB)" in str(error.value)
     assert "Increase --kv-cache-memory-bytes" in str(error.value)
     assert "increase --gpu-memory-utilization" not in str(error.value)

@@ -95,10 +95,25 @@ former `VLLM_METAL_MEMORY_FRACTION` override has been removed.
 Set `--kv-cache-memory-bytes` (`kv_cache_memory_bytes=` for `LLM()`) to a
 positive byte count to override that fraction for paged cache storage. Model
 weights, activations, TurboQuant workspace, and the offload host pool need
-additional memory. Startup profiling and the physical commit probe still run.
-The probe rejects a manual budget that would need shrinking; it does not
-silently replace the requested value. Whole-block allocation can round down,
-and `--num-gpu-blocks-override` still explicitly overrides the block count.
+additional memory. Zero and negative byte counts fail startup. When unset,
+automatic sizing is unchanged. An automatic offload host pool is capped at a
+quarter of the explicit cache budget, or one host chunk if larger; an explicit
+host-pool size is kept. Neither pool is subtracted from explicit cache bytes.
+
+Startup profiling still warms the allocator, profiles the vision encoder when
+enabled, and sets the MLX buffer-cache limit. The default-on physical commit
+probe also runs. It counts the future host pool and TurboQuant workspace when
+deciding whether the cache fits after paging is observed. A manual budget that
+would need shrinking fails startup instead. The probe samples at most 512 MiB;
+it does not prove that the entire cache will fit under future load. Allocation
+failures still propagate.
+
+The cache layout rounds down to whole blocks. The separate
+`--num-gpu-blocks-override` takes precedence over byte-derived block counts:
+upstream shared storage uses that count, which can exceed the byte budget.
+For ordinary target/draft pools, Metal accepts only positive overrides within
+the planned capacity and applies them before allocating either pool. A block
+override does not bypass an explicit budget's commit-probe rejection.
 
 Models with full and sliding-window attention use grouped KV cache, allowing
 sliding layers to release old blocks. This can improve long-context capacity,
