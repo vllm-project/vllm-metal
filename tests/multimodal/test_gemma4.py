@@ -66,7 +66,8 @@ class _Tower:
         self.calls.append(
             (pixel_values.dtype, pixel_values.shape, pixel_position_ids.shape)
         )
-        rows = pixel_values.shape[-2] // POOL
+        # Like mlx-vlm, a batch of frames comes back as one row run.
+        rows = pixel_values.size // pixel_values.shape[-1] // POOL
         return mx.ones((1, rows, TOWER_DIM), dtype=pixel_values.dtype)
 
 
@@ -172,6 +173,34 @@ def _image_item(num_patches: int) -> MultiModalKwargsItem:
     )
 
 
+def _video_feature(
+    *, frames: int, patches_per_frame: int = 630, offset: int = 1
+) -> MultiModalFeatureSpec:
+    """One video as vLLM's Gemma 4 processor stores it: frames stacked on dim 0."""
+    field = MultiModalFieldConfig.flat_from_sizes("video", torch.tensor([frames]))
+    pixels = field.build_elems(
+        "pixel_values_videos",
+        torch.zeros((frames, patches_per_frame, 768), dtype=torch.float32),
+    )[0]
+    positions = field.build_elems(
+        "pixel_position_ids_videos",
+        torch.zeros((frames, patches_per_frame, 2), dtype=torch.int64),
+    )[0]
+    num_embeds = frames * patches_per_frame // POOL
+    return MultiModalFeatureSpec(
+        data=MultiModalKwargsItem(
+            {"pixel_values_videos": pixels, "pixel_position_ids_videos": positions}
+        ),
+        modality="video",
+        identifier=f"video-{offset}",
+        mm_position=PlaceholderRange(
+            offset=offset,
+            length=num_embeds + 2,
+            is_embed=torch.tensor([False] + [True] * num_embeds + [False]),
+        ),
+    )
+
+
 def _feature(
     *,
     offset: int = 1,
@@ -271,10 +300,21 @@ class TestEncodeMultimodal:
         with pytest.raises(ValueError, match="produced 3 rows for 2"):
             adapter.encode_multimodal([feature])
 
-    def test_video_modality_rejected(self) -> None:
-        adapter, _ = _adapter()
-        with pytest.raises(ValueError, match="got modality='video'"):
-            adapter.encode_multimodal([_feature(modality="video")])
+    def test_video_frames_encode_in_chunks_of_half_max_patches(self) -> None:
+        tower = _Tower()  # max_patches 2520 -> two 630-patch frames per call
+        adapter, _ = _adapter(tower)
+
+        [result] = adapter.encode_multimodal([_video_feature(frames=5)])
+
+        assert [shape for _, shape, _ in tower.calls] == [
+            (2, 630, 768),
+            (2, 630, 768),
+            (1, 630, 768),
+        ]
+        assert all(dtype == mx.float32 for dtype, _, _ in tower.calls)
+        assert result.hidden_states.shape == (5 * 70, HIDDEN)
+        restored = result.hidden_states.astype(mx.float32) * adapter.embed_scale_rounded
+        assert mx.abs(restored - 3.0).max().item() <= 3.0 * 2**-7
 
     def test_audio_rows_are_divided_by_rounded_scale(self) -> None:
         audio_tower = _AudioTower()
@@ -408,10 +448,10 @@ class TestPositions:
         assert mx.array_equal(positions[1], positions[0]).item()
         assert delta == 0
 
-    def test_video_feature_rejected(self) -> None:
+    def test_audio_feature_rejected_without_audio_tower(self) -> None:
         adapter, _ = _adapter()
-        with pytest.raises(ValueError, match="got modality='video'"):
-            adapter.get_mrope_input_positions([1, 2], [_feature(modality="video")])
+        with pytest.raises(ValueError, match="got modality='audio'"):
+            adapter.get_mrope_input_positions([1, 2], [_audio_feature()])
 
 
 class TestCallLm:

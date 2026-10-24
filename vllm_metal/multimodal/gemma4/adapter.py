@@ -3,9 +3,10 @@
 
 The language model is the mlx_lm ``gemma4.Model`` that vllm-metal serves
 for text; ``vision_tower`` and ``embed_vision`` (plus ``audio_tower`` and
-``embed_audio`` on E2B/E4B) come from :class:`Gemma4VisionSidecar`.  mlx_lm
+``embed_audio`` on E2B/E4B) come from :class:`Gemma4VisionSidecar`.  Video
+frames are images to the same vision tower, as in vLLM and HF.  mlx_lm
 multiplies ``input_embeddings`` by ``embed_scale`` inside its forward, so this
-adapter hands the runner *raw* token embeddings and image/audio features
+adapter hands the runner *raw* token embeddings and image/video/audio features
 pre-divided by that scale: after the model's multiplication the text carries
 its usual scale and the encoder rows are back at the values the embedders
 produced, exactly like ``mlx_vlm.Model.get_input_embeddings``.
@@ -46,7 +47,7 @@ def _factor_near_sqrt(n: int) -> tuple[int, int]:
 
 @dataclass(frozen=True)
 class Gemma4VisionEncodeResult:
-    """Projected image/audio embeddings for one feature, pre-divided by embed_scale."""
+    """Projected image/video/audio embeddings for one feature, pre-divided by embed_scale."""
 
     hidden_states: mx.array
     deepstack_visual_embeds: Sequence[mx.array] | None = None
@@ -153,6 +154,8 @@ class Gemma4MultimodalAdapter:
             assert feature.data is not None
             if feature.modality == "audio":
                 projected = self._encode_audio(feature.data)
+            elif feature.modality == "video":
+                projected = self._encode_video(feature.data)
             else:
                 projected = self._encode_image(feature.data)
             if projected.ndim == 3:
@@ -189,6 +192,36 @@ class Gemma4MultimodalAdapter:
         return self._sidecar.embed_vision(
             self._sidecar.vision_tower(pixel_values, pixel_position_ids)
         )
+
+    def _encode_video(self, data: MultiModalKwargsItem) -> mx.array:
+        """Encode a video's frames through the image tower, a few at a time.
+
+        vLLM stores one video as ``(frames, patches, patch_dim)`` pixels with
+        ``-1`` position ids on padding patches; mlx-vlm's tower drops those
+        and returns ``(1, valid_rows, D)`` across the frames it is given, in
+        frame order.  The frames go in as the processor's float32, like
+        mlx-vlm: on 70-token frames that keeps the rows within a few bf16
+        ulps of mlx-vlm, while a cast to the tower dtype moves rows by up to
+        a third of their range.  A float32 patch costs the tower about twice
+        the activation memory of the bf16 image :meth:`profile_features`
+        profiles, so each chunk holds at most half of ``max_patches`` (two
+        70-token frames) and is evaluated before the next one; a 32-frame
+        video then peaks below the profiled image encode.
+        """
+        pixel_values = self._as_mlx(data["pixel_values_videos"].data)
+        pixel_position_ids = self._as_mlx(data["pixel_position_ids_videos"].data)
+        tower = self._sidecar.vision_tower
+        frames, patches = int(pixel_values.shape[0]), int(pixel_values.shape[1])
+        per_chunk = max(1, int(tower.max_patches) // (2 * max(patches, 1)))
+        rows: list[mx.array] = []
+        for start in range(0, frames, per_chunk):
+            end = min(start + per_chunk, frames)
+            chunk = self._sidecar.embed_vision(
+                tower(pixel_values[start:end], pixel_position_ids[start:end])
+            )
+            mx.eval(chunk)
+            rows.append(chunk[0] if chunk.ndim == 3 else chunk)
+        return mx.concatenate(rows, axis=0)
 
     def _encode_audio(self, data: MultiModalKwargsItem) -> mx.array:
         # vLLM's processor stores each clip unpadded with a True-is-valid
@@ -321,11 +354,11 @@ class Gemma4MultimodalAdapter:
         self, feature: MultiModalFeatureSpec, *, require_data: bool
     ) -> None:
         has_audio = self._sidecar.audio_tower is not None
-        supported = ("image", "audio") if has_audio else ("image",)
+        supported = ("image", "video", "audio") if has_audio else ("image", "video")
         if feature.modality not in supported:
             raise ValueError(
                 f"Feature {feature.identifier!r}: Gemma 4 adapter supports "
-                f"{' and '.join(supported)} features on this checkpoint; got "
+                f"{', '.join(supported)} features on this checkpoint; got "
                 f"modality={feature.modality!r}."
             )
         if require_data and feature.data is None:

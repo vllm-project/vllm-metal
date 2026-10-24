@@ -424,6 +424,11 @@ _PADDLEOCR_VL_ARCHITECTURES: frozenset[str] = frozenset(
 )
 
 
+def _join_words(words: list[str]) -> str:
+    """``["a", "b", "c"]`` -> ``"a, b and c"``."""
+    return words[0] if len(words) == 1 else f"{', '.join(words[:-1])} and {words[-1]}"
+
+
 class DefaultModelAdapter(ModelAdapter):
     """Default adapter implementation for known model quirks."""
 
@@ -572,9 +577,9 @@ class DefaultModelAdapter(ModelAdapter):
         that the compatibility path intentionally bypasses; clearing it makes
         ``is_multimodal_model`` ``False`` so the input processor skips that
         setup. When the mode is ``text_sidecar`` (Gemma 4), the config is
-        kept but video is turned off, and audio too unless the checkpoint has
-        an audio encoder, so the frontend rejects inputs the sidecar cannot
-        serve. ``native`` leaves the
+        kept but audio is turned off unless the checkpoint has an audio
+        encoder, and video is turned off on prefix-LM checkpoints, so the
+        frontend rejects inputs the sidecar cannot serve. ``native`` leaves the
         config untouched. :meth:`multimodal_backbone_mode` is the single
         source of truth for which mode applies.
         """
@@ -598,25 +603,38 @@ class DefaultModelAdapter(ModelAdapter):
             # Only E2B/E4B carry an audio encoder; the processor and the
             # sidecar both follow ``audio_config``.
             keep_audio = getattr(hf_config, "audio_config", None) is not None
-            self._restrict_to_images(
-                model_config.multimodal_config, keep_audio=keep_audio
+            # Video frames go through the image tower. Prefix-LM checkpoints
+            # (26B/31B) disable chunked multimodal input, so a whole video
+            # (up to 32 frames of 70 soft tokens plus boi/eoi and a timestamp)
+            # would have to fit one prefill step; they stay image-only.
+            keep_video = not getattr(model_config, "is_mm_prefix_lm", False)
+            self._restrict_modalities(
+                model_config.multimodal_config,
+                keep_audio=keep_audio,
+                keep_video=keep_video,
             )
+            served: list[str] = ["images"]
+            refused: list[str] = []
+            (served if keep_video else refused).append("video")
+            (served if keep_audio else refused).append("audio")
             logger.info(
                 "Metal: Gemma 4 serves %s through the encoder sidecar on the "
-                "mlx_lm text backbone; %s inputs are refused",
-                "images and audio" if keep_audio else "images",
-                "video" if keep_audio else "video and audio",
+                "mlx_lm text backbone%s",
+                _join_words(served),
+                f"; {_join_words(refused)} inputs are refused" if refused else "",
             )
 
     @staticmethod
-    def _restrict_to_images(
-        multimodal_config: Any, *, keep_audio: bool = False
+    def _restrict_modalities(
+        multimodal_config: Any, *, keep_audio: bool, keep_video: bool
     ) -> None:
-        """Set video (and audio, unless kept) limits to 0 so the frontend
-        rejects them (idempotent)."""
+        """Set the limits of modalities the sidecar cannot serve to 0 so the
+        frontend rejects them (idempotent)."""
         from vllm.config.multimodal import AudioDummyOptions, VideoDummyOptions
 
-        refused: list[tuple[str, type]] = [("video", VideoDummyOptions)]
+        refused: list[tuple[str, type]] = []
+        if not keep_video:
+            refused.append(("video", VideoDummyOptions))
         if not keep_audio:
             refused.append(("audio", AudioDummyOptions))
         limits = multimodal_config.limit_per_prompt

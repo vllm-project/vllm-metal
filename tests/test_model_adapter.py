@@ -1631,13 +1631,24 @@ class TestNormalizeModelConfigSidecar:
         assert config.multimodal_config is sentinel
         limits = config.multimodal_config.limit_per_prompt
         assert limits["image"].count == 4
-        assert (
-            isinstance(limits["video"], VideoDummyOptions)
-            and limits["video"].count == 0
-        )
+        assert "video" not in limits
         assert (
             isinstance(limits["audio"], AudioDummyOptions)
             and limits["audio"].count == 0
+        )
+
+    def test_prefix_lm_checkpoint_refuses_video(
+        self, tmp_path: Path, _sidecar_ready
+    ) -> None:
+        config = _gemma4_model_config(tmp_path)
+        config.is_mm_prefix_lm = True
+
+        DefaultModelAdapter().normalize_model_config(config)
+
+        limits = config.multimodal_config.limit_per_prompt
+        assert (
+            isinstance(limits["video"], VideoDummyOptions)
+            and limits["video"].count == 0
         )
 
     def test_audio_stays_enabled_with_an_audio_encoder(
@@ -1650,18 +1661,18 @@ class TestNormalizeModelConfigSidecar:
 
         limits = config.multimodal_config.limit_per_prompt
         assert "audio" not in limits
-        assert limits["video"].count == 0
+        assert "video" not in limits
 
     def test_restriction_is_idempotent_and_warns_on_override(
         self, tmp_path: Path, _sidecar_ready, caplog
     ) -> None:
         config = _gemma4_model_config(
-            tmp_path, limit_per_prompt={"video": VideoDummyOptions(count=2)}
+            tmp_path, limit_per_prompt={"audio": AudioDummyOptions(count=2)}
         )
         with caplog.at_level("WARNING"):
             DefaultModelAdapter().normalize_model_config(config)
             DefaultModelAdapter().normalize_model_config(config)
-        assert config.multimodal_config.limit_per_prompt["video"].count == 0
+        assert config.multimodal_config.limit_per_prompt["audio"].count == 0
         assert caplog.text.count("overriding") == 1
 
     def test_text_only_clears_config(self, tmp_path: Path, _sidecar_ready) -> None:

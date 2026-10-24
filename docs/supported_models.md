@@ -52,14 +52,18 @@ unsupported; leave `--video-pruning-rate` unset.
 | Qwen3-VL | 🔵 | | native multimodal paged generation | image and video input | `mlx-community/Qwen3-VL-4B-Instruct-4bit` |
 | Qwen3.5 (dense) | 🔵 | | native multimodal paged generation | image and video input; FP8 checkpoints stay text-only | `mlx-community/Qwen3.5-4B-MLX-4bit` |
 | PaddleOCR-VL | 🔵 | | native multimodal paged generation | image input, no video | `PaddlePaddle/PaddleOCR-VL-1.6` |
-| Gemma 4 | 🔵 | | mlx_lm text backbone + mlx-vlm encoder sidecar, paged generation | image input; audio input on E2B/E4B; no video; bidirectional attention inside image blocks on sliding-window layers | `mlx-community/unsloth-gemma-4-26B-A4B-it-qat-oQ4`, `mlx-community/gemma-4-e2b-it-4bit` (audio) |
+| Gemma 4 | 🔵 | | mlx_lm text backbone + mlx-vlm encoder sidecar, paged generation | image input; audio and video input on E2B/E4B; bidirectional attention inside image blocks on sliding-window layers | `mlx-community/unsloth-gemma-4-26B-A4B-it-qat-oQ4`, `mlx-community/gemma-4-e2b-it-4bit` (audio, video) |
 
 Gemma 4 keeps its text path exactly as on the text-only table (mlx_lm model,
 selective logits, intermediate forward); only `vision_tower` and `embed_vision`
 are loaded from the checkpoint through mlx-vlm, plus `audio_tower` and
 `embed_audio` on checkpoints whose config has an `audio_config` (E2B and E4B).
 Those checkpoints accept audio input; audio soft tokens attend causally, as in
-HF. The sidecar activates in
+HF. E2B and E4B also accept video: vLLM's processor samples up to 32 frames
+at 70 soft tokens each, and the sidecar encodes them through the same vision
+tower, two frames at a time. The 26B and 31B checkpoints keep video off,
+since their bidirectional image attention needs a whole video (up to 2,496
+tokens) inside one prefill step. The sidecar activates in
 `VLLM_METAL_MULTIMODAL_MODE=auto` when the checkpoint resolves to a local
 safetensors directory with `vision_tower.*` weights, the HF `Gemma4Processor`
 builds (the checkpoint's `processor_config.json` needs a `video_processor`
