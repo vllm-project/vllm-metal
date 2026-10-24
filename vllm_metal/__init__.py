@@ -137,6 +137,17 @@ __all__ = [
 ]
 
 
+def register_metrics() -> None:
+    """Register MLX metrics in the API, engine and worker processes."""
+    from vllm.platforms import current_platform
+
+    from vllm_metal import envs
+    from vllm_metal.platform import MetalPlatform
+
+    if isinstance(current_platform, MetalPlatform) and envs.VLLM_METAL_BACKEND != "mps":
+        import vllm_metal.v1.metrics  # noqa: F401
+
+
 def _register() -> str | None:
     """Register the Metal platform plugin with vLLM.
 
