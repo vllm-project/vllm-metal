@@ -97,11 +97,31 @@ class _ConstantKernel:
         self.outputs = outputs
         self.grid: tuple[int, int, int] | None = None
         self.output_shapes: list[tuple[int, ...]] | None = None
+        self.template: list[tuple[str, Any]] | None = None
+        self.threadgroup: tuple[int, int, int] | None = None
 
     def __call__(self, **kwargs: Any) -> tuple[mx.array, mx.array]:
         self.grid = kwargs.get("grid")
         self.output_shapes = kwargs.get("output_shapes")
+        self.template = kwargs.get("template")
+        self.threadgroup = kwargs.get("threadgroup")
         return self.outputs
+
+
+def _force_generic_prefill(kernels: GDNLazyKernels) -> None:
+    """Exercise the generic specialization at packed-eligible shapes in tests."""
+    kernel = kernels._recurrent_prefill_kernel
+    assert kernel is not None
+
+    def generic(**kwargs: Any) -> tuple[mx.array, mx.array]:
+        template = dict(kwargs["template"])
+        template["Packed"] = False
+        kwargs["template"] = list(template.items())
+        kwargs["grid"] = (32, template["Dv"], kwargs["grid"][2])
+        kwargs["threadgroup"] = (32, 4, 1)
+        return kernel(**kwargs)
+
+    kernels._recurrent_prefill_kernel = generic
 
 
 class _RecordingStateKernel(_ConstantKernel):
@@ -1109,6 +1129,236 @@ class TestLazyRecurrentPrefill:
             np.array(cache.recurrent_states[0]), expected_state
         )
 
+    @pytest.mark.parametrize(
+        ("d_k", "d_v", "use_packed"),
+        [
+            (128, 8, True),
+            (128, 24, True),
+            (64, 8, False),
+            (256, 8, False),
+            (128, 7, False),
+        ],
+    )
+    def test_prefill_specialization_follows_shape_independently_of_nax(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        d_k: int,
+        d_v: int,
+        use_packed: bool,
+    ) -> None:
+        monkeypatch.setenv("VLLM_METAL_DISABLE_NAX", "1")
+        # Exercise real dispatch with stub kernels and deferred state on CPU.
+        with mx.stream(mx.cpu):
+            selected_kernel = _ConstantKernel(
+                mx.ones((2, 1, d_v)), mx.full((1, 1, d_v, d_k), 9.0)
+            )
+            cache = _make_state_cache(value_head_dim=d_v, key_head_dim=d_k)
+            result = GDNLazyKernels(
+                enabled=True,
+                conv_kernel=_RaisingKernel(),
+                conv_prefill_kernel=_RaisingKernel(),
+                recurrent_decode_kernel=_RaisingKernel(),
+                recurrent_prefill_kernel=selected_kernel,
+            ).try_recurrent_prefill(
+                _recurrent_prefill_request(
+                    q=mx.zeros((1, 2, 1, d_k)),
+                    k=mx.zeros((1, 2, 1, d_k)),
+                    v=mx.zeros((1, 2, 1, d_v)),
+                    g=mx.ones((1, 2, 1)),
+                    beta=mx.ones((1, 2, 1)),
+                    cache=cache,
+                    slot_ids=[2],
+                    cu_seqlens=[0, 2],
+                    defer_state_scatter=True,
+                )
+            )
+            assert result is not None
+            assert dict(selected_kernel.template or [])["Packed"] is use_packed
+            assert selected_kernel.grid == (32, d_v // 8 if use_packed else d_v, 1)
+            assert selected_kernel.threadgroup == (32, 2 if use_packed else 4, 1)
+            np.testing.assert_array_equal(np.array(result), 1)
+            np.testing.assert_array_equal(
+                np.array(cache.pending_recurrent_state(0, [2])), 9
+            )
+
+    @pytest.mark.parametrize(
+        ("dtype", "compute_dtype", "state_dtype", "d_v", "n_hv"),
+        [
+            (mx.float32, None, mx.float32, 8, 2),
+            (mx.float16, None, mx.float32, 24, 4),
+            pytest.param(mx.float16, None, mx.float16, 24, 4, id="fp16-state"),
+            (mx.bfloat16, None, mx.bfloat16, 128, 8),
+            (mx.bfloat16, mx.float32, mx.float32, 24, 4),
+            pytest.param(
+                mx.bfloat16, mx.float32, mx.float32, 128, 6, id="gqa3-bf16-fp32"
+            ),
+        ],
+    )
+    def test_packed_prefill_matches_generic_with_ragged_strided_state(
+        self,
+        dtype: mx.Dtype,
+        compute_dtype: mx.Dtype | None,
+        state_dtype: mx.Dtype,
+        d_v: int,
+        n_hv: int,
+    ) -> None:
+        """Typed ragged prefill respects GQA, slot strides and untouched padding."""
+        _require_metal()
+        mx.random.seed(7)
+        d_k, n_hk, total_tokens = 128, 2, 37
+        slot_ids, cu_seqlens = [3, 0, 2], [0, 1, 4, total_tokens]
+        # Transpose after normalization to exercise the contiguous input wrapper.
+        q, k = [mx.random.normal((1, n_hk, total_tokens, d_k)) for _ in range(2)]
+        q = (q / mx.linalg.norm(q, axis=-1, keepdims=True) / d_k**0.5).astype(dtype)
+        k = (k / mx.linalg.norm(k, axis=-1, keepdims=True)).astype(dtype)
+        q, k = q.transpose(0, 2, 1, 3), k.transpose(0, 2, 1, 3)
+        v = (mx.random.normal((1, n_hv, total_tokens, d_v)) * 0.1).astype(dtype)
+        v = v.transpose(0, 2, 1, 3)
+        g = mx.random.uniform(0.5, 1.0, (1, n_hv, total_tokens)).astype(dtype)
+        beta = mx.random.uniform(0.0, 1.0, g.shape).astype(dtype)
+        g, beta = g.transpose(0, 2, 1), beta.transpose(0, 2, 1)
+        width = n_hv * d_v * d_k
+        initial = np.random.default_rng(7).normal(0, 0.1, (4, width + 32))
+        initial = initial.astype(np.float32)
+        initial[:, width:] = 99
+        results = []
+        for packed in (False, True):
+            kernels = GDNLazyKernels(enabled=True)
+            if not packed:
+                _force_generic_prefill(kernels)
+            cache = _make_state_cache(
+                max_seqs=4,
+                num_v_heads=n_hv,
+                value_head_dim=d_v,
+                key_head_dim=d_k,
+                recurrent_dtype=state_dtype,
+            )
+            # Native scatter mutates storage: each arm needs its own allocation.
+            backing = mx.array(initial).astype(state_dtype)
+            cache.recurrent_states[0] = _get_native_ops_or_skip().as_strided(
+                backing, (4, n_hv, d_v, d_k), (width + 32, d_v * d_k, d_k, 1)
+            )
+            untouched = np.array(backing.astype(mx.float32))
+            out = kernels.try_recurrent_prefill(
+                _recurrent_prefill_request(
+                    q=q,
+                    k=k,
+                    v=v,
+                    g=g,
+                    beta=beta,
+                    cache=cache,
+                    slot_ids=slot_ids,
+                    cu_seqlens=cu_seqlens,
+                    output_dtype=dtype,
+                    compute_dtype=compute_dtype,
+                )
+            )
+            assert out is not None
+            assert out.dtype == dtype
+            assert cache.recurrent_states[0].dtype == state_dtype
+            mx.eval(out, cache.recurrent_states[0])
+            stored = np.array(backing.astype(mx.float32))
+            np.testing.assert_array_equal(stored[1], untouched[1])
+            np.testing.assert_array_equal(stored[:, width:], untouched[:, width:])
+            results.append((np.array(out.astype(mx.float32)), stored))
+        # simd_sum lowering is not specified; allow rounding across GPU families.
+        for packed, generic, result_dtype in zip(
+            results[1], results[0], (dtype, state_dtype), strict=True
+        ):
+            rtol = {mx.float32: 2e-5, mx.float16: 1e-3, mx.bfloat16: 1e-2}[result_dtype]
+            np.testing.assert_allclose(packed, generic, rtol=rtol, atol=2e-6)
+
+    @pytest.mark.parametrize(
+        ("n_hk", "n_hv", "d_v"),
+        [(1, 2, 24), pytest.param(2, 6, 128, id="gqa3-fp32")],
+    )
+    def test_packed_prefill_continuation_and_deferred_decode_match_full_sequence(
+        self,
+        n_hk: int,
+        n_hv: int,
+        d_v: int,
+    ) -> None:
+        """Reordered prefill publishes prior updates; decode consumes compact state."""
+        _require_metal()
+        mx.random.seed(8)
+        d_k = 128
+        q, k = [mx.random.normal((1, 12, n_hk, d_k)) for _ in range(2)]
+        q = q / mx.linalg.norm(q, axis=-1, keepdims=True) / d_k**0.5
+        k = k / mx.linalg.norm(k, axis=-1, keepdims=True)
+        v = mx.random.normal((1, 12, n_hv, d_v)) * 0.1
+        g = mx.random.uniform(0.5, 1.0, (1, 12, n_hv))
+        beta = mx.random.uniform(0.0, 1.0, g.shape)
+        initial = np.random.default_rng(8).normal(0, 0.1, (4, n_hv, d_v, d_k))
+        initial = initial.astype(np.float32)
+        full_cache, chunked_cache = [
+            _make_state_cache(
+                max_seqs=4, num_v_heads=n_hv, value_head_dim=d_v, key_head_dim=d_k
+            )
+            for _ in range(2)
+        ]
+        for cache in (full_cache, chunked_cache):
+            cache.recurrent_states[0] = mx.array(initial)
+        generic_kernels = GDNLazyKernels(enabled=True)
+        _force_generic_prefill(generic_kernels)
+        expected = generic_kernels.try_recurrent_prefill(
+            _recurrent_prefill_request(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                cache=full_cache,
+                slot_ids=[3, 1],
+                cu_seqlens=[0, 7, 12],
+            )
+        )
+        assert expected is not None
+        mx.eval(expected, full_cache.recurrent_states[0])
+        kernels = GDNLazyKernels(enabled=True)
+        for indices, slots, lengths in (
+            ([0, 1, 7, 8], [3, 1], [0, 2, 4]),
+            ([9, 10, 2, 3, 4, 5], [1, 3], [0, 2, 6]),
+            ([11, 6], [1, 3], None),
+        ):
+            ids = mx.array(indices, dtype=mx.int32)
+            inputs = {
+                "q": q[:, ids],
+                "k": k[:, ids],
+                "v": v[:, ids],
+                "g": g[:, ids],
+                "beta": beta[:, ids],
+                "cache": chunked_cache,
+                "slot_ids": slots,
+            }
+            if lengths is not None:
+                actual = kernels.try_recurrent_prefill(
+                    _recurrent_prefill_request(
+                        **inputs, cu_seqlens=lengths, defer_state_scatter=True
+                    )
+                )
+            else:
+                actual = kernels.try_recurrent_decode(_recurrent_request(**inputs))
+            assert actual is not None
+            assert chunked_cache.pending_recurrent_state(0, slots) is not None
+            np.testing.assert_allclose(
+                np.array(actual), np.array(expected[ids]), rtol=2e-5, atol=2e-6
+            )
+            if slots == [3, 1]:
+                np.testing.assert_array_equal(
+                    np.array(chunked_cache.recurrent_states[0]), initial
+                )
+        chunked_cache.apply_pending_recurrent_state(0)
+        np.testing.assert_allclose(
+            np.array(chunked_cache.recurrent_states[0]),
+            np.array(full_cache.recurrent_states[0]),
+            rtol=2e-5,
+            atol=2e-6,
+        )
+        np.testing.assert_array_equal(
+            np.array(chunked_cache.recurrent_states[0][mx.array([0, 2])]),
+            initial[[0, 2]],
+        )
+
     def test_mixed_prefill_accepts_one_token_decode_segments(self) -> None:
         # Arrange
         prefill_kernel = _ConstantKernel(
@@ -1451,32 +1701,46 @@ class TestLazyRecurrentPrefill:
         assert ("T", mx.float32) in (fake_kernel.template or [])
         assert fake_kernel.output_dtypes == [mx.float32, mx.float32]
 
-    @pytest.mark.parametrize("cu_seqlens", [[0, 2, 5], [0, 1, 3]])
+    @pytest.mark.parametrize(
+        ("d_k", "d_v", "n_hk", "n_hv", "cu_seqlens"),
+        [
+            (32, 4, 1, 1, [0, 2, 5]),
+            (64, 7, 1, 1, [0, 1, 3]),
+            (256, 7, 1, 1, [0, 1, 3]),
+            (128, 24, 1, 1, [0, 1, 4]),
+            pytest.param(128, 128, 2, 6, [0, 1, 4], id="gqa3-fp32"),
+        ],
+    )
     def test_matches_cpp_recurrent_path_for_prefill(
-        self, cu_seqlens: list[int]
+        self,
+        d_k: int,
+        d_v: int,
+        n_hk: int,
+        n_hv: int,
+        cu_seqlens: list[int],
     ) -> None:
         # Arrange
         _require_metal()
         mx.random.seed(2)
         total_tokens = cu_seqlens[-1]
-        n_hk = 1
-        n_hv = 1
-        d_k = 32
-        d_v = 4
         slot_ids = [1, 0]
-        cache_lazy = _make_state_cache(value_head_dim=d_v, key_head_dim=d_k)
-        cache_cpp = _make_state_cache(value_head_dim=d_v, key_head_dim=d_k)
-        initial_state = mx.random.normal(cache_lazy.recurrent_states[0].shape).astype(
-            mx.float32
+        cache_lazy = _make_state_cache(
+            num_v_heads=n_hv, value_head_dim=d_v, key_head_dim=d_k
         )
+        cache_cpp = _make_state_cache(
+            num_v_heads=n_hv, value_head_dim=d_v, key_head_dim=d_k
+        )
+        initial_state = np.array(mx.random.normal(cache_lazy.recurrent_states[0].shape))
         cache_lazy.recurrent_states[0] = mx.array(initial_state)
         cache_cpp.recurrent_states[0] = mx.array(initial_state)
 
-        q = mx.random.normal((1, total_tokens, n_hk, d_k)).astype(mx.float32)
-        k = mx.random.normal((1, total_tokens, n_hk, d_k)).astype(mx.float32)
-        v = mx.random.normal((1, total_tokens, n_hv, d_v)).astype(mx.float32)
-        g = mx.random.normal((1, total_tokens, n_hv)).astype(mx.float32)
-        beta = mx.random.normal((1, total_tokens, n_hv)).astype(mx.float32)
+        q = mx.random.normal((1, total_tokens, n_hk, d_k))
+        k = mx.random.normal((1, total_tokens, n_hk, d_k))
+        q = q / mx.linalg.norm(q, axis=-1, keepdims=True) / d_k**0.5
+        k = k / mx.linalg.norm(k, axis=-1, keepdims=True)
+        v = mx.random.normal((1, total_tokens, n_hv, d_v))
+        g = mx.random.uniform(0.5, 1.0, (1, total_tokens, n_hv))
+        beta = mx.random.uniform(0.0, 1.0, g.shape)
         request = _recurrent_prefill_request(
             q=q,
             k=k,
@@ -1540,8 +1804,15 @@ class TestLazyRecurrentPrefill:
             atol=1e-3,
         )
 
+    @pytest.mark.parametrize(
+        ("d_k", "d_v", "compute_dtype"),
+        [(32, 4, None), (128, 128, mx.float32)],
+    )
     def test_prefill_uses_requested_output_dtype_without_losing_fallback_parity(
         self,
+        d_k: int,
+        d_v: int,
+        compute_dtype: mx.Dtype | None,
     ) -> None:
         # Arrange
         _require_metal()
@@ -1549,15 +1820,13 @@ class TestLazyRecurrentPrefill:
         total_tokens = 5
         n_hk = 1
         n_hv = 1
-        d_k = 32
-        d_v = 4
         slot_ids = [1, 0]
         cu_seqlens = [0, 2, 5]
         cache_lazy = _make_state_cache(value_head_dim=d_v, key_head_dim=d_k)
         cache_cpp = _make_state_cache(value_head_dim=d_v, key_head_dim=d_k)
-        initial_state = (
+        initial_state = np.array(
             mx.random.normal(cache_lazy.recurrent_states[0].shape) * 0.01
-        ).astype(mx.float32)
+        )
         cache_lazy.recurrent_states[0] = mx.array(initial_state)
         cache_cpp.recurrent_states[0] = mx.array(initial_state)
 
@@ -1576,6 +1845,7 @@ class TestLazyRecurrentPrefill:
             slot_ids=slot_ids,
             cu_seqlens=cu_seqlens,
             output_dtype=mx.bfloat16,
+            compute_dtype=compute_dtype,
         )
 
         # Act

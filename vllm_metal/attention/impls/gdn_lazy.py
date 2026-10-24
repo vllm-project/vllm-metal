@@ -20,6 +20,11 @@ _GDN_RECURRENT_PREFILL_V2_SOURCE = _read_v2_metal_source("gdn_recurrent_prefill.
 _RECURRENT_SIMDGROUP_WIDTH = 32
 _RECURRENT_MAX_KEY_HEAD_DIM = 256
 _RECURRENT_PREFILL_THREADGROUP_DV = 4
+_RECURRENT_PREFILL_PACKED_THREADGROUP_DV = 2
+# The packed prefill kernel gives each lane Dk/4 state elements and packs
+# 32/4 value rows per SIMD-group, so it needs Dk == 128 and Dv % 8 == 0.
+_RECURRENT_PREFILL_PACKED_KEY_HEAD_DIM = 128
+_RECURRENT_PREFILL_PACKED_ROWS_PER_SIMDGROUP = 8
 
 
 @dataclass(frozen=True)
@@ -481,6 +486,10 @@ class GDNLazyKernels:
             slot_ids_arr,
             num_requests,
         ]
+        use_packed_prefill = (
+            d_k == _RECURRENT_PREFILL_PACKED_KEY_HEAD_DIM
+            and d_v % _RECURRENT_PREFILL_PACKED_ROWS_PER_SIMDGROUP == 0
+        )
         template = [
             ("T", kernel_dtype),
             ("StT", state_dtype),
@@ -488,16 +497,31 @@ class GDNLazyKernels:
             ("Dv", d_v),
             ("Hk", n_hk),
             ("Hv", n_hv),
+            ("Packed", use_packed_prefill),
         ]
-        y_out, state_updates = self._recurrent_prefill_kernel(
-            inputs=kernel_inputs,
-            template=template,
-            grid=(_RECURRENT_SIMDGROUP_WIDTH, d_v, num_requests * n_hv),
-            threadgroup=(
+        if use_packed_prefill:
+            grid = (
+                _RECURRENT_SIMDGROUP_WIDTH,
+                d_v // _RECURRENT_PREFILL_PACKED_ROWS_PER_SIMDGROUP,
+                num_requests * n_hv,
+            )
+            threadgroup = (
+                _RECURRENT_SIMDGROUP_WIDTH,
+                _RECURRENT_PREFILL_PACKED_THREADGROUP_DV,
+                1,
+            )
+        else:
+            grid = (_RECURRENT_SIMDGROUP_WIDTH, d_v, num_requests * n_hv)
+            threadgroup = (
                 _RECURRENT_SIMDGROUP_WIDTH,
                 _RECURRENT_PREFILL_THREADGROUP_DV,
                 1,
-            ),
+            )
+        y_out, state_updates = self._recurrent_prefill_kernel(
+            inputs=kernel_inputs,
+            template=template,
+            grid=grid,
+            threadgroup=threadgroup,
             output_shapes=[(total_tokens, n_hv, d_v), (num_requests, n_hv, d_v, d_k)],
             output_dtypes=[kernel_dtype, state_dtype],
         )
