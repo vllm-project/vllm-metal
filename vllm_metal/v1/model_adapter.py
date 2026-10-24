@@ -98,8 +98,6 @@ def _gemma4_text_only_reason(model_config: Any, speculative_config: Any) -> str 
     hf_config = getattr(model_config, "hf_config", None)
     if speculative_config is not None:
         return "speculative decoding is configured; vision needs a plain decode path"
-    if getattr(model_config, "quantization", None) == "gguf":
-        return "vision needs a safetensors checkpoint (GGUF)"
     quantization_config = getattr(hf_config, "quantization_config", None)
     quant_method = (
         quantization_config.get("quant_method")
@@ -524,6 +522,9 @@ class DefaultModelAdapter(ModelAdapter):
             return "text_only"
         if mode_env == "multimodal-native":
             return "native"
+        # A .gguf carries only the text model; mmproj weights ship as their own file.
+        if model_config.quantization == "gguf":
+            return "text_only"
         if getattr(hf_config, "model_type", None) not in _GEMMA4_MODEL_TYPES:
             return (
                 "text_only" if self.should_force_text_backbone(hf_config) else "native"

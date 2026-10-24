@@ -50,7 +50,7 @@ unsupported; leave `--video-pruning-rate` unset.
 | Model | MLX | PyTorch MPS | Runner | Scope | Example checkpoint |
 | --- | --- | --- | --- | --- | --- |
 | Qwen3-VL | 🔵 | | native multimodal paged generation | image and video input | `mlx-community/Qwen3-VL-4B-Instruct-4bit` |
-| Qwen3.5 (dense) | 🔵 | | native multimodal paged generation | image and video input; FP8 checkpoints stay text-only | `mlx-community/Qwen3.5-4B-MLX-4bit` |
+| Qwen3.5 (dense) | 🔵 | | native multimodal paged generation | image and video input; FP8 and GGUF checkpoints stay text-only | `mlx-community/Qwen3.5-4B-MLX-4bit` |
 | PaddleOCR-VL | 🔵 | | native multimodal paged generation | image input, no video | `PaddlePaddle/PaddleOCR-VL-1.6` |
 | Gemma 4 | 🔵 | | mlx_lm text backbone + mlx-vlm encoder sidecar, paged generation | image input; audio input on E2B/E4B; no video; bidirectional attention inside image blocks on sliding-window layers | `mlx-community/unsloth-gemma-4-26B-A4B-it-qat-oQ4`, `mlx-community/gemma-4-e2b-it-4bit` (audio) |
 
@@ -117,11 +117,13 @@ GGUF checkpoints serve by detection like AWQ, with no env flag:
 vllm-metal's GGUF engine integration sets `quantization=gguf` from the file
 (vLLM 0.24 moved its in-tree GGUF support to the CUDA/ROCm-only
 [vllm-gguf-plugin](https://github.com/vllm-project/vllm-gguf-plugin)). Dense
-`qwen2`/`qwen3`/`llama`/`mistral` checkpoints load from a local `.gguf`
-(including llama.cpp's Q4_K_M and Q5_K_M exports) or a remote `repo_id:quant`
-reference and stay quantized in memory. See [GGUF](gguf.md) for the supported
-qtypes, exclusions, and serve examples. Verified end-to-end on Qwen3-0.6B,
-Llama-3.2-1B-Instruct, and Mistral-7B-Instruct-v0.3 in Q8_0 and Q4_K_M
+`qwen2`/`qwen3`/`llama`/`mistral` and text-only Qwen3.5 (`qwen35`) checkpoints
+load from a local `.gguf` (including llama.cpp's Q4_K_M and Q5_K_M exports) or a
+remote `repo_id:quant` reference and stay quantized in memory. See
+[GGUF](gguf.md) for the supported qtypes, exclusions, and serve examples.
+Verified end-to-end on Qwen3-0.6B, Llama-3.2-1B-Instruct, and
+Mistral-7B-Instruct-v0.3 in Q8_0 and Q4_K_M, and on Qwen3.5-0.8B Q8_0, 4B
+Q5_K_M, and 9B Q4_K_M
 ([#415](https://github.com/vllm-project/vllm-metal/issues/415),
 [#761](https://github.com/vllm-project/vllm-metal/issues/761)).
 

@@ -610,6 +610,7 @@ class TestNormalizeModelConfig:
 
     def test_clears_multimodal_config_for_qwen35_fp8_in_auto_mode(self) -> None:
         model_config = SimpleNamespace(
+            quantization=None,
             multimodal_config=SimpleNamespace(language_model_only=False),
             hf_config=SimpleNamespace(
                 model_type="qwen3_5",
@@ -625,6 +626,7 @@ class TestNormalizeModelConfig:
     def test_clears_multimodal_config_for_mistral3_in_auto_mode(self) -> None:
         # The frontend then rejects image input with a 400.
         model_config = SimpleNamespace(
+            quantization=None,
             multimodal_config=SimpleNamespace(language_model_only=False),
             hf_config=SimpleNamespace(
                 model_type="mistral3",
@@ -650,6 +652,7 @@ class TestNormalizeModelConfig:
         # pinned mlx-vlm floor, so auto mode must leave their config alone.
         sentinel = SimpleNamespace(language_model_only=False)
         model_config = SimpleNamespace(
+            quantization=None,
             multimodal_config=sentinel,
             hf_config=SimpleNamespace(
                 model_type=model_type,
@@ -665,6 +668,7 @@ class TestNormalizeModelConfig:
     def test_preserves_multimodal_config_for_other_models(self) -> None:
         sentinel = SimpleNamespace(language_model_only=False)
         model_config = SimpleNamespace(
+            quantization=None,
             multimodal_config=sentinel,
             hf_config=SimpleNamespace(model_type="qwen3_vl", architectures=[]),
         )
@@ -1334,7 +1338,6 @@ def _gemma4_model_config(
     tmp_path: Path,
     *,
     per_layer_inputs: int = 0,
-    quantization: str | None = None,
     quantization_config: dict | None = None,
     model: str | None = None,
     limit_per_prompt: dict | None = None,
@@ -1344,7 +1347,7 @@ def _gemma4_model_config(
         revision=None,
         trust_remote_code=False,
         mm_processor_kwargs=None,
-        quantization=quantization,
+        quantization=None,
         multimodal_config=SimpleNamespace(
             language_model_only=False,
             limit_per_prompt={} if limit_per_prompt is None else limit_per_prompt,
@@ -1381,6 +1384,15 @@ class TestMultimodalBackboneMode:
         config.hf_config.model_type = model_type
         mode = DefaultModelAdapter().multimodal_backbone_mode(config)
         assert mode == "text_sidecar"
+
+    def test_gguf_skips_a_ready_vision_sidecar(
+        self, tmp_path: Path, _sidecar_ready
+    ) -> None:
+        # A .gguf never holds the vision tower, so the sidecar must not load.
+        config = _gemma4_model_config(tmp_path)
+        config.quantization = "gguf"
+        mode = DefaultModelAdapter().multimodal_backbone_mode(config)
+        assert mode == "text_only"
 
     def test_language_model_only_wins_over_native_mode(
         self, tmp_path: Path, monkeypatch
@@ -1447,7 +1459,6 @@ class TestMultimodalBackboneMode:
         ("kwargs", "speculative", "reason"),
         [
             ({}, object(), "speculative decoding"),
-            ({"quantization": "gguf"}, None, "safetensors"),
             ({"quantization_config": {"quant_method": "awq"}}, None, "safetensors"),
             ({"model": "mlx-community/not-local"}, None, "local checkpoint directory"),
         ],
