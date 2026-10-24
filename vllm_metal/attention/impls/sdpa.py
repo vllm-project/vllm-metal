@@ -576,6 +576,67 @@ def llama4_query_scale(
     return scale
 
 
+def _decode_routing_kwargs(
+    ctx: PagedAttentionContext, num_query_rows: int, ops: Any
+) -> dict[str, Any]:
+    """Decode routing keywords for a call over the whole batch's query rows.
+
+    Carries the GQA kill switch, the scheduler's decode counts, and the CPU
+    length plan for ordinary decode rows (every row of a decode batch, or the
+    leading decode rows of a mixed batch). Keywords an older native build does
+    not advertise are omitted.
+    """
+    if ctx.paged_native_capabilities is None:
+        ctx.paged_native_capabilities = paged_attention_capabilities(ops)
+    capabilities = ctx.paged_native_capabilities
+    kwargs: dict[str, Any] = {}
+    if ctx.gqa_disabled:
+        if capabilities["gqa_disable"]:
+            kwargs["gqa_disabled"] = True
+        elif capabilities["gqa_decode"]:
+            # Never silently ignore a kill switch on an unrecognized GQA build.
+            raise RuntimeError(
+                "Loaded native GQA build does not advertise disable support; "
+                "rebuild the vllm-metal native extension."
+            )
+        # Pre-GQA native builds already use the established attention path.
+    if capabilities["decode_routing_metadata"]:
+        kwargs.update(
+            num_decode_requests=ctx.num_decode_requests,
+            num_decode_tokens=ctx.num_decode_tokens,
+            max_decode_context_len=ctx.max_decode_context_len,
+        )
+    num_decode = ctx.num_decode_requests
+    ordinary_decode_rows = (
+        not ctx.gqa_disabled
+        and num_decode == ctx.num_decode_tokens
+        and ctx.verify_window_q == 1
+    )
+    if (
+        capabilities["gqa_length_plan"]
+        and ordinary_decode_rows
+        and num_decode > 1
+        and num_decode == num_query_rows == len(ctx.context_lens)
+    ):
+        if ctx.gqa_length_plan is None:
+            ctx.gqa_length_plan = ops.gqa_decode_length_plan(ctx.context_lens)
+        kwargs["gqa_length_plan"] = ctx.gqa_length_plan
+    elif (
+        capabilities["gqa_mixed_decode_plan"]
+        and ordinary_decode_rows
+        and 0 < num_decode < len(ctx.context_lens)
+        and num_query_rows > num_decode
+    ):
+        # Mixed batch: describe only the leading decode rows. Native code
+        # uses it when it splits those rows from the prefill kernel.
+        if ctx.gqa_length_plan is None:
+            ctx.gqa_length_plan = ops.gqa_decode_length_plan(
+                ctx.context_lens[:num_decode]
+            )
+        kwargs["gqa_length_plan"] = ctx.gqa_length_plan
+    return kwargs
+
+
 def sdpa_forward(
     inner: nn.Module,
     x: mx.array,
@@ -868,7 +929,9 @@ def sdpa_forward(
             v_centroids = get_v_centroids(kv_cache.v_bits)
 
         def quantized_attention(
-            query: mx.array, batch: _AttentionBatch | _KernelMetadata
+            query: mx.array,
+            batch: _AttentionBatch | _KernelMetadata,
+            **routing: Any,
         ) -> mx.array:
             return ops.paged_attention_primitive(
                 query,
@@ -893,6 +956,7 @@ def sdpa_forward(
                 v_bits=kv_cache.v_bits,
                 window_seqlen_q=ctx.verify_window_q,
                 **mm_kwargs,
+                **routing,
             )
 
         plan = None
@@ -929,7 +993,13 @@ def sdpa_forward(
                 value_bits=kv_cache.v_bits,
             )
 
-        if plan is None:
+        if plan is None and not has_prefill:
+            # A whole decode batch carries the same routing metadata as the
+            # ordinary cache path, so native code can admit it to GQA decode.
+            out = quantized_attention(
+                q_3d, meta, **_decode_routing_kwargs(ctx, q_3d.shape[0], ops)
+            )
+        elif plan is None:
             out = quantized_attention(q_3d, meta)
         else:
             logger.info_once("Metal: bounded TurboQuant prefill lane active.")
@@ -997,57 +1067,10 @@ def sdpa_forward(
             mx.synchronize()
             del k16, v16
     else:
-        # Whole-batch decode routing belongs to the ordinary cache path. TQ
-        # uses its own sub-batch metadata and stays outside native decode split.
         paged_kwargs: dict[str, Any] = dict(mm_kwargs)
-        if ctx.paged_native_capabilities is None:
-            ctx.paged_native_capabilities = paged_attention_capabilities(ops)
+        paged_kwargs.update(_decode_routing_kwargs(ctx, q_3d.shape[0], ops))
         capabilities = ctx.paged_native_capabilities
-        # Omit the new keyword on the default path for older native builds.
-        if ctx.gqa_disabled:
-            if capabilities["gqa_disable"]:
-                paged_kwargs["gqa_disabled"] = True
-            elif capabilities["gqa_decode"]:
-                # Never silently ignore a kill switch on an unrecognized GQA build.
-                raise RuntimeError(
-                    "Loaded native GQA build does not advertise disable support; "
-                    "rebuild the vllm-metal native extension."
-                )
-            # Pre-GQA native builds already use the established attention path.
-        if capabilities["decode_routing_metadata"]:
-            paged_kwargs.update(
-                num_decode_requests=ctx.num_decode_requests,
-                num_decode_tokens=ctx.num_decode_tokens,
-                max_decode_context_len=ctx.max_decode_context_len,
-            )
         num_decode = ctx.num_decode_requests
-        ordinary_decode_rows = (
-            not ctx.gqa_disabled
-            and num_decode == ctx.num_decode_tokens
-            and ctx.verify_window_q == 1
-        )
-        if (
-            capabilities["gqa_length_plan"]
-            and ordinary_decode_rows
-            and num_decode > 1
-            and num_decode == q_3d.shape[0] == len(ctx.context_lens)
-        ):
-            if ctx.gqa_length_plan is None:
-                ctx.gqa_length_plan = ops.gqa_decode_length_plan(ctx.context_lens)
-            paged_kwargs["gqa_length_plan"] = ctx.gqa_length_plan
-        elif (
-            capabilities["gqa_mixed_decode_plan"]
-            and ordinary_decode_rows
-            and 0 < num_decode < len(ctx.context_lens)
-            and q_3d.shape[0] > num_decode
-        ):
-            # Mixed batch: describe only the leading decode rows. Native code
-            # uses it when it splits those rows from the prefill kernel.
-            if ctx.gqa_length_plan is None:
-                ctx.gqa_length_plan = ops.gqa_decode_length_plan(
-                    ctx.context_lens[:num_decode]
-                )
-            paged_kwargs["gqa_length_plan"] = ctx.gqa_length_plan
         if capabilities["nax_split_hint"] and q_3d.shape[0] > len(ctx.context_lens):
             # Prefill batch: pick the NAX pipeline from per-sequence lengths
             # the kernel dispatcher could only read back from the GPU.

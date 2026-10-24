@@ -744,6 +744,28 @@ class _PagedRoutingOpsSpy:
         return mx.zeros_like(_query)
 
 
+class _TurboQuantRoutingOpsSpy(_PagedRoutingOpsSpy):
+    """Routing spy for TurboQuant caches: tq_encode stands in for the write."""
+
+    def tq_encode(self, _k, _v, k_cache, v_cache, k_scale, v_scale, k_zero, *_args):
+        self.calls.append(SimpleNamespace(cache_block_size=k_cache.shape[1]))
+        return k_cache, v_cache, k_scale, v_scale, k_zero
+
+    def paged_attention_primitive(self, *args, use_turboquant=False, **kwargs):
+        for name in (
+            "key_scale_cache",
+            "value_scale_cache",
+            "key_zero_cache",
+            "v_centroids",
+            "quant_type",
+            "v_bits",
+        ):
+            kwargs.pop(name, None)
+        out = super().paged_attention_primitive(*args, **kwargs)
+        self.calls[-1].use_turboquant = use_turboquant
+        return out
+
+
 class _PreMmPrefixOps(_PagedOpsCapsOff):
     """Old native signature: reports no new capability and rejects new keywords."""
 
@@ -981,6 +1003,52 @@ class TestSDPAForward:
                     assert spy.length_plans == expected
                     assert spy.calls[-1].gqa_length_plan == next_plan
                     assert spy.calls[-1].num_decode_requests == len(next_plan)
+
+    @pytest.mark.parametrize("disabled", [False, True])
+    def test_turboquant_decode_batch_forwards_gqa_metadata(
+        self, monkeypatch, disabled
+    ) -> None:
+        """A whole TurboQuant decode batch reaches native GQA routing like FP16."""
+        monkeypatch.setenv("VLLM_METAL_DISABLE_GQA_DECODE", str(int(disabled)))
+        head_dim = 64
+        prepare_grouped([([[0]], 1), ([[1]], 3)], [], (8,))
+        ctx = get_context()
+        spy = _TurboQuantRoutingOpsSpy()
+        weight = mx.ones((_N_HEADS * head_dim, _HIDDEN))
+        inner = SimpleNamespace(
+            n_heads=_N_HEADS,
+            n_kv_heads=_N_KV_HEADS,
+            scale=head_dim**-0.5,
+            q_proj=_FakeLinear(weight),
+            k_proj=_FakeLinear(weight),
+            v_proj=_FakeLinear(weight),
+            rope=_identity_rope,
+            o_proj=lambda out: out,
+        )
+        cache = MetalPagedKVCache(
+            num_layers=1,
+            num_kv_heads=_N_KV_HEADS,
+            head_dim=head_dim,
+            num_blocks=3,
+            block_size=8,
+            dtype=mx.float16,
+            turboquant=True,
+            k_quant="q8_0",
+            v_quant="q3_0",
+        )
+        x = mx.ones((1, 2, _HIDDEN), mx.float16)
+        zeros = mx.zeros((1, 2, _N_HEADS * head_dim), mx.float16)
+        with (
+            patch.object(sdpa_mod, "get_ops", return_value=spy),
+            patch.object(sdpa_mod, "truncate_padded_output", return_value=zeros),
+        ):
+            sdpa_forward(inner, x, ctx, cache, layer_idx=0)
+        call = spy.calls[-1]
+        assert call.use_turboquant
+        assert call.gqa_disabled is disabled
+        assert (call.num_decode_requests, call.num_decode_tokens) == (2, 2)
+        assert call.max_decode_context_len == 4
+        assert call.gqa_length_plan == (None if disabled else (2, 4))
 
     @pytest.mark.parametrize(
         "supported,kind",

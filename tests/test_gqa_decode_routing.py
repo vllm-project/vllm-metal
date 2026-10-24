@@ -498,7 +498,9 @@ def test_special_attention_features_use_fallback(feature):
     _assert_close(out, ref, mx.float16)
 
 
-def test_turboquant_uses_fallback_with_dequantized_reference() -> None:
+@pytest.mark.parametrize("gqa_disabled", [False, True])
+def test_turboquant_takes_p256_with_dequantized_reference(gqa_disabled) -> None:
+    """TurboQuant decode takes the GQA producer at P256, even where P512 qualifies."""
     out, ref = _run_primitive(
         [65536],
         mx.float16,
@@ -507,9 +509,40 @@ def test_turboquant_uses_fallback_with_dequantized_reference() -> None:
         num_query_heads=16,
         num_kv_heads=2,
         turboquant=True,
+        gqa_disabled=gqa_disabled,
     )
-    _assert_fallback()
+    if gqa_disabled:
+        _assert_fallback()
+    else:
+        assert _dispatch_family() == "gqa_decode"
+        assert get_ops().last_gqa_partition_size() == 256
     _assert_close(out, ref, mx.float16)
+
+
+@pytest.mark.parametrize("kv_len,admitted", [(3839, False), (3840, True)])
+def test_turboquant_shares_the_work_budget(kv_len, admitted) -> None:
+    """Seven cores need 33 * 7 = 231: 15 full P256 partitions * 16 heads pass, 14 do not."""
+    ops = get_ops()
+    ops._override_detected_gpu_core_count_for_test(7)
+    try:
+        out, ref = _run_primitive(
+            [kv_len],
+            mx.float16,
+            interleaved=True,
+            seed=13,
+            num_query_heads=16,
+            num_kv_heads=2,
+            turboquant=True,
+            num_decode_requests=1,
+        )
+        if admitted:
+            assert _dispatch_family() == "gqa_decode"
+            assert ops.last_gqa_partition_size() == 256
+        else:
+            _assert_fallback()
+        _assert_close(out, ref, mx.float16)
+    finally:
+        _restore_test_gpu_cores()
 
 
 def test_matching_float32_uses_fallback() -> None:

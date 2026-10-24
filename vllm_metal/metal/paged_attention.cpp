@@ -146,12 +146,16 @@ static int gqa_decode_partition_for_arch(
 static int gqa_decode_partition_for_lengths(
     int num_heads, int num_kv_heads, int head_size,
     const GqaDecodeLengthPlan& plan, int gpu_cores, int block_size,
-    const std::string& gpu_arch = "", int max_seq_len = 0) {
+    const std::string& gpu_arch = "", int max_seq_len = 0,
+    bool turboquant = false) {
   if (gpu_cores <= 0 || plan.num_requests == 0 ||
       !gqa_decode_geometry_supported(
           num_heads, num_kv_heads, head_size, block_size)) return 0;
   int partition = 0;
   for (size_t i = 0; i < kGqaPartitionSizes.size(); ++i) {
+    // TurboQuant producers measured faster at P256 than P512 below 64K
+    // tokens on M5 and M1 Max, so they admit only P256, under the same budget.
+    if (turboquant && kGqaPartitionSizes[i] != 256) continue;
     if (plan.full_partitions[i] * num_heads >= kGqaSimdGroupsPerCore * gpu_cores) {
       partition = kGqaPartitionSizes[i];
       break;
@@ -170,9 +174,9 @@ static int gqa_decode_partition_for_lengths(
 int gqa_decode_plan_for_lengths(
     int num_heads, int num_kv_heads, int head_size,
     const GqaDecodeLengthPlan& plan, int gpu_cores, int block_size,
-    const std::string& gpu_arch, int max_seq_len) {
+    const std::string& gpu_arch, int max_seq_len, bool turboquant) {
   const int partition = gqa_decode_partition_for_lengths(num_heads, num_kv_heads,
-      head_size, plan, gpu_cores, block_size, gpu_arch, max_seq_len);
+      head_size, plan, gpu_cores, block_size, gpu_arch, max_seq_len, turboquant);
   if (partition == 0) return 0;
   const int64_t length = std::max(max_seq_len, plan.max_length);
   const int64_t partitions = (length + partition - 1) / partition;
@@ -737,9 +741,9 @@ static PagedAttentionPlan select_paged_attention_route(
         m.num_decode_tokens == num_seqs));
   // Enforce geometry at the actual dispatch boundary, including the private
   // forced-partition entry. That entry bypasses only occupancy selection.
-  // TurboQuant caches reach the GQA producer only through that entry for now:
-  // default routing keeps them on the per-token / split-KV kernels.
-  const bool gqa_turboquant = m.use_turboquant && m.gqa_test_partition > 0
+  // TurboQuant caches take the TurboQuant producer under the same work
+  // budget, restricted to P256 (see gqa_decode_partition_for_lengths).
+  const bool gqa_turboquant = m.use_turboquant
       && (m.key_dtype == int8 || m.key_dtype == uint8)
       && m.value_dtype == uint8;
   const bool gqa_cache_dtypes = m.use_turboquant
@@ -761,7 +765,8 @@ static PagedAttentionPlan select_paged_attention_route(
             num_seqs == 1 && m.decode_only_rows == 0
                 ? gqa_decode_length_plan(std::array<int, 1>{m.max_seq_len})
                 : m.gqa_length_plan,
-            get_detected_gpu_cores(), m.block_size, get_architecture(), m.max_seq_len);
+            get_detected_gpu_cores(), m.block_size, get_architecture(), m.max_seq_len,
+            m.use_turboquant);
 
   const int64_t partitions = gqa_partition_size > 0
       ? (static_cast<int64_t>(m.max_seq_len) + gqa_partition_size - 1) /

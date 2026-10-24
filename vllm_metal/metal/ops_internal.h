@@ -140,7 +140,7 @@ std::string gqa_decode_tq_kernel_name(
 int gqa_decode_plan_for_lengths(
     int num_heads, int num_kv_heads, int head_size,
     const GqaDecodeLengthPlan& plan, int gpu_cores, int block_size,
-    const std::string& gpu_arch = "", int max_seq_len = 0);
+    const std::string& gpu_arch = "", int max_seq_len = 0, bool turboquant = false);
 void init_library_path(const std::string& name, const std::string& path);
 void init_nax_library_path(const std::string& path);
 std::string dtype_to_metal(Dtype dt);
