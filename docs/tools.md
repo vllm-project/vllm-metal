@@ -63,4 +63,12 @@ Parity runs daily at 07:17 UTC on `main`. Users with repository write access can
 
 Both triggers invoke this same tool for Qwen3-0.6B and Qwen3.5-0.8B on a self-hosted Apple Silicon Mac: 40 shared prompts, 20 output tokens, top-K 5, and HTTP request batch sizes 1/2. CI supplies the checkpoint and environment and collects the tool's results.
 
+The Qwen3-0.6B job also compares same-checkpoint speculative outputs at batch
+sizes 1/2 using the checkpoint's normal precision and the speculative parity tool.
+A separate FP32 test checks acceptance, EAL, and each draft position through
+`LLM.get_metrics()` before and after prefix reuse. FP32 isolates cache and metric
+regressions from BF16 ties. It uses eight shared natural prompts and 65 output
+tokens, requiring at least 98% same-model acceptance. Raw counters and outputs
+are included in the artifacts; this bound does not certify BF16 acceptance.
+
 The `Parity` check links to job summaries and artifacts containing the native reference, server log, and per-batch results, retained for 14 days. Regular PR CI runs fast tests without starting model servers.

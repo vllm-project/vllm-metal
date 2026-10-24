@@ -116,6 +116,22 @@ jobs:
           python tools/check_parity.py --model "$MODEL_PATH" --top-k 5 --max-tokens 20 \
             --batch-size 1 2 --output-dir "$RUNNER_TEMP/parity" \
             --gpu-memory-utilization "$PARITY_GPU_MEMORY_UTILIZATION"
+      - name: Compare same-model speculative parity
+        if: matrix.model.name == 'qwen3-0.6b'
+        run: |
+          source .venv-vllm-metal/bin/activate
+          python -m tools.check_parity --model "$MODEL_PATH" --draft "$MODEL_PATH" \
+            --method draft_model --num-draft-tokens 3 --top-k 5 --max-tokens 20 \
+            --batch-size 1 2 --output-dir "$RUNNER_TEMP/parity/speculative" \
+            --gpu-memory-utilization "$PARITY_GPU_MEMORY_UTILIZATION"
+      - name: Check FP32 acceptance after prefix reuse
+        if: matrix.model.name == 'qwen3-0.6b'
+        run: |
+          source .venv-vllm-metal/bin/activate
+          uv pip install pytest
+          python -m pytest tests/test_draft_stats_e2e.py -k same_model_acceptance \
+            -q -s --basetemp "$RUNNER_TEMP/parity/acceptance" \
+            --junitxml "$RUNNER_TEMP/parity/acceptance.xml"
       - name: Summarize parity
         if: always()
         run: |
