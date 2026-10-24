@@ -101,11 +101,9 @@ NaxPrefillTraceResult take_nax_prefill_dispatch_trace() {
   return result;
 }
 
-// Split a mixed batch's decode rows only when they carry at least this much
-// KV work (the sum of their context lengths). Below it, the extra dispatch
-// costs more than the decode rows' wasted prefill tiles: one 256-token decode
-// row next to a 256-token NAX prefill measured 16% slower split.
-constexpr int64_t kMixedDecodeMinWork = 512;
+// Set while the mixed split encodes its decode and prefill kernels in one
+// concurrent scope, where MLX inserts no automatic hazard barriers.
+static thread_local bool g_mixed_concurrent = false;
 
 // Window mode for spec-decode verification (per-token kernel): query rows
 // per threadgroup (2 = the measured register/occupancy sweet spot on Apple
@@ -630,6 +628,8 @@ static void dispatch_paged_attention_v2_reduce(
     throw std::invalid_argument(
         "paged attention reduction exceeds the device threadgroup memory limit");
   }
+  // The producer's partials are not hazard-tracked inside a concurrent scope.
+  if (g_mixed_concurrent) enc.barrier();
   enc.set_compute_pipeline_state(rkernel);
   enc.set_threadgroup_memory_length(reduce_shmem, 0);
   enc.set_output_array(out, 0);
@@ -751,19 +751,13 @@ static PagedAttentionPlan select_paged_attention_route(
 
   // Split ordinary decode rows from NAX or tiled prefill: a one-row decode
   // sequence would otherwise occupy a whole BQ-row prefill tile with no
-  // KV-length parallelism. Gate on total decode work, not context length:
-  // many short rows gain the most from the split
-  // (tools/benchmark/mixed_decode_split_benchmark.py). The decode-prefix
-  // length plan carries the exact sum. Without one, the longest row is a
-  // lower bound on it, so uneven rows are never split on overcounted work.
-  // Spec verify windows keep their whole-batch route.
-  const int64_t decode_work =
-      m.gqa_length_plan.num_requests == m.num_decode_requests
-      ? m.gqa_length_plan.total_length : m.max_decode_context_len;
+  // KV-length parallelism. The two halves run concurrently, so the split
+  // pays no serialization cost even for short decode rows
+  // (tools/benchmark/mixed_decode_split_benchmark.py). Spec verify windows
+  // keep their whole-batch route.
   const bool split_mixed_batch = m.num_decode_requests > 0
       && m.num_decode_requests < num_seqs
       && m.num_decode_tokens == m.num_decode_requests
-      && decode_work >= kMixedDecodeMinWork
       && (use_nax || tile_config.has_value());
   PagedAttentionPlan plan;
   plan.total_q_tokens = total_q_tokens;
@@ -1340,48 +1334,63 @@ static void dispatch_paged_attention_mixed(
   // into GQA and tightens the bound to the plan's longest decode row.
   const bool prefix_plan =
       metadata.gqa_length_plan.num_requests == metadata.num_decode_requests;
-  dispatch_paged_attention_v2_online(
-      arrays.out, arrays.query, arrays.key_cache, arrays.value_cache,
-      metadata.num_kv_heads, metadata.scale, metadata.softcap,
-      arrays.block_tables, arrays.seq_lens, arrays.cu_seqlens_q,
-      metadata.block_size,
-      prefix_plan ? metadata.gqa_length_plan.max_length : decode_max_seq_len,
-      metadata.sliding_window, metadata.window_seqlen_q, arrays.s,
-      arrays.key_scale_cache, arrays.value_scale_cache,
-      arrays.key_zero_cache, arrays.v_centroids,
-      metadata.use_turboquant, metadata.k_bits, metadata.v_bits, arrays.sinks, nullptr,
-      metadata.num_decode_requests, metadata.num_decode_tokens,
-      metadata.max_decode_context_len,
-      metadata.num_decode_tokens, metadata.gqa_disabled, 0,
-      prefix_plan ? metadata.gqa_length_plan : GqaDecodeLengthPlan{});
-  // Keep the decode prefix's GQA selection visible in the diagnostics.
-  const int decode_partition = g_last_gqa_partition.load(std::memory_order_relaxed);
-  const int decode_requests = g_last_gqa_requests.load(std::memory_order_relaxed);
-  // Decode rows lead the batch, so the first prefill sequence starts at
-  // q-block cu_seqlens_q[D] / BQ + D with D = num_decode_requests.
-  if (plan.route == PagedAttentionRoute::MixedNaxSplit ||
-      plan.route == PagedAttentionRoute::MixedNaxUnsplit) {
-    dispatch_paged_attention_nax(
+  const bool nax = plan.route == PagedAttentionRoute::MixedNaxSplit ||
+      plan.route == PagedAttentionRoute::MixedNaxUnsplit;
+  // Both halves write disjoint rows of `out`. MLX's hazard tracking only sees
+  // the shared buffer and would serialize them, so encode them in one
+  // concurrent scope; a split-KV reduce inside it adds its own barrier.
+  auto& enc = metal::get_command_encoder(arrays.s);
+  {
+    auto concurrent = enc.start_concurrent();
+    g_mixed_concurrent = true;
+    // Decode rows lead the batch, so the first prefill sequence starts at
+    // q-block cu_seqlens_q[D] / BQ + D with D = num_decode_requests.
+    if (nax) {
+      dispatch_paged_attention_nax(
+          arrays.out, arrays.query, arrays.key_cache, arrays.value_cache,
+          metadata.num_kv_heads, metadata.scale, metadata.softcap,
+          arrays.block_tables, arrays.seq_lens, arrays.cu_seqlens_q,
+          metadata.block_size, metadata.max_seq_len, metadata.sliding_window,
+          metadata.num_decode_tokens / kernels::kNaxBQ + metadata.num_decode_requests,
+          arrays.s, arrays.sinks,
+          plan.route == PagedAttentionRoute::MixedNaxSplit);
+    } else {
+      const int q_block_offset =
+          metadata.num_decode_tokens / plan.tile_config->BQ + metadata.num_decode_requests;
+      dispatch_paged_attention_tiled(
+          arrays.out, arrays.query, arrays.key_cache, arrays.value_cache,
+          metadata.num_kv_heads, metadata.scale, metadata.softcap,
+          arrays.block_tables, arrays.seq_lens, arrays.cu_seqlens_q,
+          metadata.block_size, metadata.max_seq_len, metadata.sliding_window,
+          q_block_offset, *plan.tile_config, arrays.s, arrays.sinks,
+          arrays.mm_prefix_ranges);
+    }
+    // The decode dispatch's own diagnostics clear the NAX pipeline record.
+    const int nax_split = g_last_nax_split.load(std::memory_order_relaxed);
+    const int nax_heads_per_tg = g_last_nax_heads_per_tg.load(std::memory_order_relaxed);
+    dispatch_paged_attention_v2_online(
         arrays.out, arrays.query, arrays.key_cache, arrays.value_cache,
         metadata.num_kv_heads, metadata.scale, metadata.softcap,
         arrays.block_tables, arrays.seq_lens, arrays.cu_seqlens_q,
-        metadata.block_size, metadata.max_seq_len, metadata.sliding_window,
-        metadata.num_decode_tokens / kernels::kNaxBQ + metadata.num_decode_requests,
-        arrays.s, arrays.sinks,
-        plan.route == PagedAttentionRoute::MixedNaxSplit);
-    record_paged_dispatch(PagedDispatch::MixedNaxPrefillDecode,
-                          decode_partition, decode_requests);
-    return;
+        metadata.block_size,
+        prefix_plan ? metadata.gqa_length_plan.max_length : decode_max_seq_len,
+        metadata.sliding_window, metadata.window_seqlen_q, arrays.s,
+        arrays.key_scale_cache, arrays.value_scale_cache,
+        arrays.key_zero_cache, arrays.v_centroids,
+        metadata.use_turboquant, metadata.k_bits, metadata.v_bits, arrays.sinks, nullptr,
+        metadata.num_decode_requests, metadata.num_decode_tokens,
+        metadata.max_decode_context_len,
+        metadata.num_decode_tokens, metadata.gqa_disabled, 0,
+        prefix_plan ? metadata.gqa_length_plan : GqaDecodeLengthPlan{});
+    g_last_nax_split.store(nax_split, std::memory_order_relaxed);
+    g_last_nax_heads_per_tg.store(nax_heads_per_tg, std::memory_order_relaxed);
+    g_mixed_concurrent = false;
   }
-  const int q_block_offset =
-      metadata.num_decode_tokens / plan.tile_config->BQ + metadata.num_decode_requests;
-  dispatch_paged_attention_tiled(
-      arrays.out, arrays.query, arrays.key_cache, arrays.value_cache,
-      metadata.num_kv_heads, metadata.scale, metadata.softcap,
-      arrays.block_tables, arrays.seq_lens, arrays.cu_seqlens_q,
-      metadata.block_size, metadata.max_seq_len, metadata.sliding_window, q_block_offset,
-      *plan.tile_config, arrays.s, arrays.sinks, arrays.mm_prefix_ranges);
-  record_paged_dispatch(PagedDispatch::MixedPrefillDecode,
+  // Keep the decode prefix's GQA selection visible in the diagnostics.
+  const int decode_partition = g_last_gqa_partition.load(std::memory_order_relaxed);
+  const int decode_requests = g_last_gqa_requests.load(std::memory_order_relaxed);
+  record_paged_dispatch(nax ? PagedDispatch::MixedNaxPrefillDecode
+                            : PagedDispatch::MixedPrefillDecode,
                         decode_partition, decode_requests);
   return;
 }
