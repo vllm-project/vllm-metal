@@ -92,6 +92,14 @@ The paged KV cache budget follows vLLM's standard `--gpu-memory-utilization`
 flag (`gpu_memory_utilization=` for `LLM()`), a fraction in `(0, 1]`. The
 former `VLLM_METAL_MEMORY_FRACTION` override has been removed.
 
+Set `--kv-cache-memory-bytes` (`kv_cache_memory_bytes=` for `LLM()`) to a
+positive byte count to override that fraction for paged cache storage. Model
+weights, activations, TurboQuant workspace, and the offload host pool need
+additional memory. Startup profiling and the physical commit probe still run.
+The probe rejects a manual budget that would need shrinking; it does not
+silently replace the requested value. Whole-block allocation can round down,
+and `--num-gpu-blocks-override` still explicitly overrides the block count.
+
 Models with full and sliding-window attention use grouped KV cache, allowing
 sliding layers to release old blocks. This can improve long-context capacity,
 but not necessarily generation speed. Use `--disable-hybrid-kv-cache-manager`

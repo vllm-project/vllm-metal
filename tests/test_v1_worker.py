@@ -1269,3 +1269,42 @@ class TestSwapTolerance:
             kv_swap_tolerance_bytes(512 << 20)
             == (512 << 20) // KV_COMMIT_SWAP_TOLERANCE_DIVISOR
         )
+
+
+@pytest.mark.parametrize("explicit", [100_000_000, 4_000_000_000])
+@pytest.mark.parametrize("utilization", [0.1, 0.5])
+def test_explicit_cache_bytes_override_automatic_budget_and_keep_profiling(
+    monkeypatch, explicit, utilization
+):
+    worker = TestWorkerRunnerBoundaryDelegation()._make_layout_budget_worker(
+        monkeypatch, gpu_memory_utilization=utilization
+    )
+    worker.cache_config.kv_cache_memory_bytes = explicit
+    assert MetalWorker.determine_available_memory(worker) == explicit
+    worker.model_runner.profile_run.assert_called_once_with()
+
+
+@pytest.mark.parametrize("explicit", [0, -1])
+def test_explicit_cache_bytes_must_be_positive(monkeypatch, explicit):
+    worker = TestWorkerRunnerBoundaryDelegation()._make_layout_budget_worker(
+        monkeypatch, gpu_memory_utilization=0.5
+    )
+    worker.cache_config.kv_cache_memory_bytes = explicit
+    with pytest.raises(ValueError, match="kv-cache-memory-bytes must be positive"):
+        MetalWorker.determine_available_memory(worker)
+
+
+def test_explicit_budget_rounds_down_and_names_the_active_setting(monkeypatch):
+    worker = TestWorkerRunnerBoundaryDelegation()._make_layout_budget_worker(
+        monkeypatch, gpu_memory_utilization=0.1
+    )
+    worker.cache_config.kv_cache_memory_bytes = 1_000_001
+    worker.get_cache_block_size_bytes = lambda: 1_000_000
+    planner = WorkerCachePlanner(worker)
+    plan = planner._paged_attention_plan(overhead=100_000_000)
+    assert plan.num_blocks == 1
+    with pytest.raises(ValueError) as error:
+        planner._validate_paged_attention_plan(plan, require_min_blocks=True)
+    assert "kv_cache_memory_bytes=1000001" in str(error.value)
+    assert "Increase --kv-cache-memory-bytes" in str(error.value)
+    assert "increase --gpu-memory-utilization" not in str(error.value)
