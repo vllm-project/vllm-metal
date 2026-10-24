@@ -772,6 +772,35 @@ class _PreMmPrefixOps(_PagedOpsCapsOff):
 class TestSDPAForward:
     """Tests for ``sdpa_forward`` runtime argument propagation."""
 
+    @pytest.mark.parametrize("cache_dtype", [mx.bfloat16, mx.float16])
+    def test_output_projection_receives_the_layer_input_dtype(
+        self, cache_dtype: mx.Dtype
+    ) -> None:
+        """A float16 checkpoint with a bfloat16 cache must not hand o_proj a
+        bfloat16 tensor: MLX promotes the mix to a float32 residual stream."""
+        inner = _make_inner()
+        projected: list[mx.Dtype] = []
+
+        def o_proj(out: mx.array) -> mx.array:
+            projected.append(out.dtype)
+            return out
+
+        inner.o_proj = o_proj
+        cache = MetalPagedKVCache(
+            num_layers=1,
+            num_kv_heads=_N_KV_HEADS,
+            head_dim=_HEAD_DIM,
+            num_blocks=1,
+            block_size=8,
+            dtype=cache_dtype,
+        )
+        x = mx.ones((_BATCH, _SEQ_LEN, _HIDDEN), dtype=mx.float16)
+        with patch.object(sdpa_mod, "get_ops", return_value=_PagedRoutingOpsSpy()):
+            output, _ = sdpa_forward(inner, x, _make_ctx(_SEQ_LEN), cache, layer_idx=0)
+
+        assert projected == [mx.float16]
+        assert output.dtype == mx.float16
+
     def test_deepseek_num_kv_heads_naming_reaches_kernel(self) -> None:
         """DeepSeek exposes ``num_kv_heads``, not ``num_key_value_heads``."""
         from mlx_lm.models.deepseek import DeepseekAttention, ModelArgs

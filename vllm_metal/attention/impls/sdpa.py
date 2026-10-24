@@ -1125,6 +1125,11 @@ def sdpa_forward(
 
     # Reshape + strip padding back to actual head_dim before o_proj.
     out = truncate_padded_output(out, B, L, n_heads, cache_head_dim, actual_head_dim)
+    # The kernel returns the cache dtype. Hand o_proj the layer's input dtype:
+    # MLX promotes bfloat16 with float16 to float32, so a float16 checkpoint
+    # with a bfloat16 cache would otherwise carry a float32 residual stream.
+    if out.dtype != x.dtype:
+        out = out.astype(x.dtype)
     if gate is not None:
         out = out * mx.sigmoid(gate)
     out = apply_g_proj_gate(inner, out, x, n_heads, actual_head_dim)
