@@ -155,6 +155,8 @@ class PagedAttentionContext:
     # NAX tile counts keyed by (sliding window, first sequence), so whole
     # batches and prefill subsets are shared only by matching layers.
     nax_tile_work: Any = None
+    # Hardware facts shared by this forward's NAX admission decisions.
+    nax_gpu_core_count: int | None = None
     # Per-row Llama 4 query scale memo keyed by (beta, original_max); every
     # scaled layer of this forward shares it (``impls.sdpa.llama4_query_scale``).
     llama4_query_scales: dict[tuple[float, int], Any] = field(default_factory=dict)
