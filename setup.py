@@ -16,6 +16,7 @@ setup(
     distclass=BinaryDistribution,
     package_data={
         "vllm_metal.pytorch_backend": [
+            "deploy/*.yaml",
             "*.mm",
             f"_mps_ops{sysconfig.get_config_var('EXT_SUFFIX')}",
             "_mps_ops.torch-version",
