@@ -7,6 +7,7 @@ import os
 import platform
 import re
 import sys
+from importlib.resources import files
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -75,6 +76,27 @@ def _isolate_mb_buffer_default(monkeypatch):
         os.environ.pop("MLX_MAX_MB_PER_BUFFER", None)
     else:
         os.environ["MLX_MAX_MB_PER_BUFFER"] = saved
+
+
+def test_qwen3_tts_mps_profile_preserves_cli_overrides(monkeypatch):
+    factory = pytest.importorskip("vllm_omni.config.config_factory")
+    from vllm_omni.config.pipeline_registry import resolve_pipeline_config
+    from vllm_omni.platforms import current_omni_platform
+
+    monkeypatch.setattr(current_omni_platform, "device_name", "mps")
+    path = files("vllm_metal.pytorch_backend") / "deploy/qwen3_tts_mps.yaml"
+    stages, _ = factory.StageConfigFactory._create_legacy_from_registry(
+        resolve_pipeline_config("qwen3_tts"),
+        {"max_num_seqs": 3},
+        deploy_config_path=str(path),
+    )
+    talker = stages[0]
+    sampling = talker.yaml_extras["default_sampling_params"]
+    assert sampling["temperature"] == 0 and sampling["min_tokens"] == 0
+    assert sampling["repetition_penalty"] == 1.5
+    assert talker.yaml_engine_args["subtalker_sampling_params"]["do_sample"] is False
+    assert talker.yaml_engine_args["kv_cache_memory_bytes"] == 536870912
+    assert talker.runtime_overrides["max_num_seqs"] == 3
 
 
 class TestMetalPlatform:
@@ -362,6 +384,28 @@ class TestMetalPlatform:
 
     def test_validate_request_accepts_min_p(self) -> None:
         MetalPlatform.validate_request({}, SamplingParams(min_p=0.2))
+
+    @pytest.mark.parametrize(
+        "omni,controls,unsupported",
+        [
+            (True, {}, None),
+            (True, {"temperature": 0.9}, "temperature"),
+            (True, {"repetition_penalty": 1.05}, None),
+            (False, {"repetition_penalty": 1.05}, "repetition_penalty"),
+            (True, {"frequency_penalty": 0.2}, "frequency_penalty"),
+            (True, {"presence_penalty": 0.2}, "presence_penalty"),
+            (True, {"allowed_token_ids": [0]}, "allowed_token_ids"),
+        ],
+    )
+    def test_mps_omni_sampling_controls(self, monkeypatch, omni, controls, unsupported):
+        monkeypatch.setattr("vllm_metal.envs.VLLM_METAL_BACKEND", "mps")
+        monkeypatch.setattr(MetalPlatform, "_serves_omni", omni)
+        params = SamplingParams(**({"temperature": 0} | controls))
+        if unsupported is None:
+            MetalPlatform.validate_request({}, params)
+        else:
+            with pytest.raises(VLLMValidationError, match=unsupported):
+                MetalPlatform.validate_request({}, params)
 
     def test_check_and_update_config_rejects_pipeline_with_tensor_parallel(
         self,

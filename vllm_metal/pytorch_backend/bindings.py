@@ -21,10 +21,13 @@ def register_kernel_overrides():
 
 def _install_input_ops():
     from vllm.v1.worker.gpu import block_table, input_batch, model_runner
+    from vllm.v1.worker.gpu.mm.rope import RopeState
     from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
     from vllm.v1.worker.gpu.sample import sampler
 
     from vllm_metal.pytorch_backend import input_ops
+
+    RopeState.prepare_positions = input_ops.prepare_rope_positions
 
     for name in (
         "prepare_prefill_inputs",

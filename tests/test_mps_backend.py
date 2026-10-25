@@ -454,3 +454,85 @@ def _check_chunked_verification(logprobs):
             chunked_scores.selected_token_ranks, scores.selected_token_ranks
         )
         assert chunked_scores.cu_num_generated_tokens == scores.cu_num_generated_tokens
+
+
+def test_mrope_positions_preserve_ragged_prefill_and_decode():
+    from vllm_metal.pytorch_backend.input_ops import prepare_rope_positions
+
+    state = SimpleNamespace(
+        num_dims=3,
+        max_model_len=8,
+        positions=torch.full((3, 7), -1, device="mps", dtype=torch.int64),
+        prefill_positions=SimpleNamespace(
+            gpu=torch.arange(4 * 3 * 8, device="mps").reshape(12, 8)
+        ),
+        prefill_delta=SimpleNamespace(gpu=torch.tensor([0, 7, 0, 0], device="mps")),
+    )
+    prepare_rope_positions(
+        state,
+        torch.tensor([3, 1], device="mps"),
+        torch.tensor([0, 2, 5], device="mps"),
+        torch.tensor([0, 4, 0, 3], device="mps"),
+        torch.tensor([0, 4, 0, 1], device="mps"),
+    )
+    assert state.positions.cpu().tolist() == [
+        [73, 74, 11, 12, 13, 0, -1],
+        [81, 82, 11, 12, 13, 0, -1],
+        [89, 90, 11, 12, 13, 0, -1],
+    ]
+
+
+def test_omni_repetition_penalty_matches_upstream_torch():
+    """Sampler row order may differ from request-slot order."""
+    from vllm.model_executor.layers.utils import apply_penalties as reference
+
+    from vllm_metal.pytorch_backend.omni_logits import apply_penalties, bincount
+
+    logits = torch.tensor([[2.0, -3.0, 4.0, -5.0], [-1.0, 2.0, -3.0, 4.0]])
+    prompts = torch.tensor([[0, 1], [2, 3]])
+    outputs = torch.tensor([[1, 1], [0, 3]])
+    rep, freq, pres = (
+        torch.tensor([1.2, 1.5]),
+        torch.zeros(2),
+        torch.zeros(2),
+    )
+    with torch.compiler.set_stance("force_eager"):
+        expected = reference(
+            logits.clone(), prompts.flip(0), outputs.flip(0), pres, freq, rep.flip(0)
+        )
+    ids = torch.cat([prompts, outputs], dim=1).to("mps")
+    mask = torch.zeros(2, 1, dtype=torch.int32, device="mps")
+    counts = torch.zeros(2, 4, dtype=torch.int32, device="mps")
+    mapping = torch.tensor([1, 0], device="mps")
+    bincount(mapping, ids, torch.tensor([2, 2]), torch.tensor([4, 4]), mask, counts, 4)
+    actual = logits.to("mps")
+    apply_penalties(
+        actual,
+        mapping,
+        None,
+        None,
+        rep.to("mps"),
+        freq.to("mps"),
+        pres.to("mps"),
+        mask,
+        counts,
+    )
+    torch.testing.assert_close(actual.cpu(), expected)
+
+
+@pytest.mark.parametrize("with_metadata", [False, True])
+def test_omni_macos_transport_handles_long_names_and_page_padding(with_metadata):
+    pytest.importorskip("vllm_omni")
+    from vllm_metal.pytorch_backend.omni_connector import MetalSharedMemoryConnector
+
+    connector = MetalSharedMemoryConnector({})
+    key = "speech-" + "long-request-id-" * 8
+    try:
+        ok, size, metadata = connector.put("0", "1", key, {"frame": 7})
+        assert ok
+        connector.reap_consumed()
+        result = connector.get("0", "1", key, metadata if with_metadata else None)
+        assert result == ({"frame": 7}, size)
+        assert connector.get("0", "1", key) is None
+    finally:
+        connector.close()
