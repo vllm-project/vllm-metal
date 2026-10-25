@@ -1,12 +1,14 @@
 # GQA decode routing
 
-The default paged attention path selects between 256- and 512-token GQA
-partitions for ordinary single- and multi-request decode in the geometries below.
+The default paged attention path uses direct-output GQA in the measured
+short-context domain below, then selects between 256- and 512-token GQA
+partitions for other eligible single- and multi-request decode.
 Each partition has FP16/BF16 specializations for head dimensions 128/256
 with kernel block16, plus head256 with kernel block32. These form 12 active
-shader specializations.
+split-KV shader specializations; direct output adds two head128/block16
+FP16/BF16 specializations.
 
-This is a Metal-backend split-KV occupancy heuristic over precompiled
+The partition selector is a Metal-backend split-KV occupancy heuristic over precompiled
 partitions. It uses a fixed work budget, counts only complete partitions,
 and tries 512, then 256. A measured M3 preference below chooses P256 for
 some long-context batches that also qualify for P512. This is the same class
@@ -17,7 +19,30 @@ and [ROCm partition choices](https://github.com/vllm-project/vllm/blob/main/csrc
 not an equivalent cost model. FA3 also favors fewer splits near its estimated
 best efficiency; this implementation does not adopt its wave-efficiency model.
 
-## Automatic eligibility and partition selection
+## Direct-output decode
+
+On the measured 20-core M5 Pro (`applegpu_g17s`), ordinary decode uses one
+threadgroup per KV head and request, sharing the existing grouped producer's
+page walk and online softmax. It writes the final output directly, without
+partial-output buffers, statistics buffers or a reducer.
+
+Automatic selection is limited to FP16/BF16 `32/8/128` geometry with kernel
+block16, **every request's post-append KV length between 128 and 256**, and
+`B * Q >= 33 * C` with `B <= 64`, where B counts requests, Q query heads and
+C GPU cores. For the measured device this is 21–64
+requests. The per-forward CPU length plan records the minimum as well as the
+maximum length; a long row does not admit a batch of short rows. The ordinary
+decode, cache dtype and feature guards below, including the disable switch,
+still apply. Other architectures, core counts and workloads keep their
+existing split-KV or per-token selection.
+
+These are measured admission bounds, not the shader's numerical limits or
+a claim of a speedup on other devices. Single requests and severely ragged
+batches can lose to existing kernels. The private test entry accepts
+`partition_size=0` for this geometry on other devices and lengths, bypassing
+the performance policy while retaining the kernel's input contract.
+
+## Split-KV eligibility and partition selection
 
 The supported `(query heads, KV heads, head dimension)` geometries are
 `(32,8,128)`, `(24,4,256)`, `(16,2,128)`, and `(16,2,256)`.
@@ -135,7 +160,7 @@ Every eligible call additionally requires:
   decode prefix requires a plan describing exactly its rows.
 - A verification window of at most 1.
 - Matching FP16/BF16 query, key-cache and value-cache types.
-- At most **512 MiB total GQA scratch per attention call**. With multi-request
+- For split-KV routes, at most **512 MiB total GQA scratch per attention call**. With multi-request
   length metadata, padded rows use compact scratch:
   `Q * sum(ceil(length_i / P)) * (2 * head_dim + 8) + 8 * (B + 1)` bytes for
   the FP16/BF16 partial output, two FP32 statistics and INT64 partition offsets.
@@ -143,7 +168,7 @@ Every eligible call additionally requires:
   `B * Q * ceil(max_seq_len / P) * (2 * head_dim + 8)` bytes.
   Larger calls fall back before allocation. This ceiling covers the measured
   serving windows; it is not a reservation or a bound on total process memory.
-- A kernel page size allowed above and sufficient reducer shared memory:
+- A kernel page size allowed above and, for split-KV routes, sufficient reducer shared memory:
   aligned dynamic statistics plus the compiled pipeline's static allocation.
   This is checked before allocating GQA scratch or encoding the producer;
   an oversized `max_seq_len` allocation bound falls back even when the actual
@@ -184,8 +209,10 @@ ordinary decode, the listed geometries, the two-tier work budget and the
 scoped M3 partition preference.
 The C++ boundary enforces both, including for direct primitive callers.
 
-The native planner consumes post-append KV lengths, query/KV head geometry
-and detected core count; its result is fallback or P256/P512. For a whole
+The split-KV planner consumes post-append KV lengths, query/KV head geometry
+and detected core count; its result is fallback or P256/P512. Its partition
+query functions still report that split-KV candidate. Native dispatch first
+selects direct output when its narrower policy applies. For a whole
 ordinary decode batch, SDPA forwards the scheduler's existing CPU lengths.
 The primitive captures its own copy and includes it in lazy-node equivalence.
 Direct callers must supply lengths consistent with `seq_lens`; shape and
@@ -222,7 +249,8 @@ rows or whose maximum exceeds `max_decode_context_len`.
 `last_paged_dispatch()` alongside the numerical reference. Positive cases
 must actually report `gqa_decode`; partition tests additionally check
 the executed 256/512 specialization through
-`last_gqa_partition_size()`. Boundary, multi-request, verification, feature,
+`last_gqa_partition_size()`. Direct-output cases report `gqa_decode_nosplit`
+and partition zero. Boundary, multi-request, verification, feature,
 and disabled cases must report the appropriate established family, including
 upstream mixed prefill/decode.
 References include independent grouped CPU FP32 attention and native MLX SDPA.
@@ -266,7 +294,9 @@ partition grid. Hosts whose IORegistry does not report cores inject a
 test-only count through `_override_detected_gpu_core_count_for_test` so
 the default selector still runs; the unknown-core fallback test forces
 that count to zero. Production serving never calls the override.
-`tests/test_gqa_paged_decode.py` tests kernel correctness separately through the private
+`tests/test_gqa_paged_decode.py` also checks direct-output tails, ragged rows,
+shared storage and a large allocation bound without split scratch. It tests
+kernel correctness separately through the private
 `_gqa_paged_attention_for_test` entry, which accepts one query row per request
 and selects an explicit partition
 without changing global state or the public primitive's routing API.
@@ -275,8 +305,9 @@ These tests execute both partitions, both dtypes, every shipped shader
 specialization, tails and upstream shared-page writes/copies even when CI
 cannot report GPU cores. Numerical parity does not establish performance
 eligibility. Feature/dtype/page-size fallback tests remain independent.
-The library-availability check loads all 12 active GQA specializations and
-their matching reducers even when the reported core count is unavailable.
+The library-availability check loads all 12 split-KV GQA specializations and
+their matching reducers, plus the two direct-output specializations, even
+when the reported core count is unavailable.
 Validate the positive path on a capable GPU before reporting GQA coverage.
 
 Dispatch diagnostics are disabled by default. The ordinary dispatch path
@@ -322,11 +353,12 @@ interchangeable with serving results.
 ## Follow-up work (separate PRs)
 
 These are directions for evaluation after this scoped change, not additional
-enablement or performance claims of this two-tier routing policy:
+enablement or performance claims of these routing policies:
 
-1. **GQA without split-KV:** evaluate a grouped kernel that writes its final
-   output directly, independently of context partitioning. Measure its
-   tradeoff against P256/P512 at larger batch sizes.
+1. **Broader direct-output GQA:** measure additional devices, geometries and
+   length ranges before expanding the narrow admission policy above. Compare
+   against per-token, P256 and P512 paths, including ragged batches; the
+   `tools/benchmark/gqa_nosplit_benchmark.py` tool records those four routes.
 2. **Mixed prefill/decode:** the decode prefix split by
    [#851](https://github.com/vllm-project/vllm-metal/pull/851) (and its NAX
    counterpart) now uses GQA through a decode-prefix length plan (see the

@@ -29,7 +29,7 @@ using namespace mlx::core;
 constexpr int kPartitionSize = VLLM_METAL_PARTITION_SIZE;
 // Process-wide diagnostic for tests; not a per-request trace or routing input.
 enum class PagedDispatch {
-  None, GqaDecode, PerToken, SplitKv, Window, WindowSplitKv, NaxPrefill,
+  None, GqaDecode, GqaDecodeNoSplit, PerToken, SplitKv, Window, WindowSplitKv, NaxPrefill,
   TiledPrefill, MixedPrefillDecode, MixedNaxPrefillDecode, Count
 };
 using hardware::detected_gpu_core_count;
@@ -57,7 +57,17 @@ constexpr std::array<GqaDecodeGeometry, 6> kGqaDecodeGeometries = {{
 static_assert(kPartitionSize == 512,
               "GQA partition list assumes the established 512-token split");
 constexpr std::array<int, 2> kGqaPartitionSizes = {512, 256};
+constexpr GqaDecodeGeometry kGqaNoSplitGeometry = {32, 8, 128, 16};
+// Zero retains automatic routing; the private entry maps partition_size=0
+// to this distinct value, which is also captured in lazy-node equivalence.
+constexpr int kGqaNoSplitTestPartition = -1;
 constexpr int64_t kGqaSimdGroupsPerCore = 33;
+// Measured on the 20-core M5 Pro; other devices retain split-KV selection.
+constexpr const char* kGqaNoSplitArchitecture = "applegpu_g17s";
+constexpr int kGqaNoSplitGpuCores = 20;
+constexpr int kGqaNoSplitMinContext = 128;
+constexpr int kGqaNoSplitMaxContext = 256;
+constexpr int kGqaNoSplitMaxRequests = 64;
 // The ordinary GQA reducer specializes out the TurboQuant workspace, but
 // retains red_smem[2 * NUM_WARPS] (256 threads / 32 SIMD lanes). Reserve its
 // 64 bytes as well as the dynamic statistics; dispatch also checks the
@@ -82,12 +92,14 @@ constexpr size_t kGqaMaxScratchBytes = 512 * 1024 * 1024;
 using GqaPartitionOffsets = std::array<std::vector<int64_t>, 2>;
 struct GqaDecodeLengthPlan {
   int num_requests = 0;
+  int min_length = 0;
   int max_length = 0;
   std::array<int64_t, 2> full_partitions = {};
   std::shared_ptr<const GqaPartitionOffsets> partition_offsets;
 
   bool operator==(const GqaDecodeLengthPlan& other) const {
-    return num_requests == other.num_requests && max_length == other.max_length &&
+    return num_requests == other.num_requests && min_length == other.min_length &&
+        max_length == other.max_length &&
         full_partitions == other.full_partitions &&
         (partition_offsets == other.partition_offsets ||
          (partition_offsets && other.partition_offsets &&
@@ -115,6 +127,8 @@ static GqaDecodeLengthPlan gqa_decode_length_plan(const Lengths& context_lens) {
   }
   for (int length : context_lens) {
     if (length <= 0) return {};
+    plan.min_length = plan.num_requests == 0
+        ? length : std::min(plan.min_length, length);
     ++plan.num_requests;
     plan.max_length = std::max(plan.max_length, length);
     for (size_t i = 0; i < kGqaPartitionSizes.size(); ++i) {
@@ -132,6 +146,12 @@ static GqaDecodeLengthPlan gqa_decode_length_plan(const Lengths& context_lens) {
 
 bool gqa_decode_geometry_supported(int num_heads, int num_kv_heads,
                                    int head_size, int block_size);
+bool gqa_decode_no_split_geometry_supported(int num_heads, int num_kv_heads,
+                                            int head_size, int block_size);
+bool gqa_decode_no_split_eligible(
+    int num_heads, int num_kv_heads, int head_size,
+    const GqaDecodeLengthPlan& plan, int gpu_cores, int block_size,
+    const std::string& gpu_arch = "");
 std::string gqa_decode_kernel_name(
     const std::string& dtype, int head_size, int block_size, int partition_size);
 std::string gqa_decode_tq_kernel_name(
