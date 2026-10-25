@@ -34,8 +34,12 @@ and explicit token-ID scoring are not yet supported.
 
 ## Kernels: choose the existing integration point
 
-Choose the implementation and its upstream hook separately. Our RMSNorm provider
-reuses a PyTorch fused operation through a vLLM IR registration.
+Choose the implementation and its upstream hook separately. Plain RMSNorm reuses
+PyTorch's fused operation through a vLLM IR registration. Residual-add RMSNorm
+uses a bundled Metal kernel for contiguous two-dimensional FP16/BF16 inputs and
+one-dimensional weights; other supported layouts retain the PyTorch path. The
+kernel computes variance from the FP32 residual sum, then rounds the normalized
+value before applying the learned weight, preserving vLLM's numerical contract.
 
 | What needs changing? | Use |
 | --- | --- |

@@ -1,14 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Use PyTorch's fused MPS RMSNorm through vLLM's operator registry.
+"""MPS RMSNorm implementations for vLLM's operator registry."""
 
-vLLM's eager fallback decomposes RMSNorm into casts, a reduction and
-multiplies, so it never selects PyTorch's fused RMSNorm kernel. Calling
-the public PyTorch operator avoids those intermediate tensors and
-dispatches without adding another kernel implementation.
-"""
+from functools import cache
 
 import torch
 from vllm import ir
+
+
+@cache
+def _add_rms_norm_kernel(dtype):
+    from vllm_metal import envs
+    from vllm_metal.metal.build import prepare_metallib
+
+    path = prepare_metallib(
+        "normalization_kern", build_from_source=envs.VLLM_METAL_BUILD_FROM_SOURCE
+    )
+    library = torch.mps.load_metallib(path)
+    name = "add_rms_norm_fp16" if dtype == torch.float16 else "add_rms_norm_bf16"
+    return library, getattr(library, name)
 
 
 def _supports_rms_norm(x, weight, epsilon, variance_size=None):
@@ -53,6 +62,30 @@ def fused_add_rms_norm(
     variance_size: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert weight is not None
+    if (
+        x.ndim == 2
+        and x.is_contiguous()
+        and x_residual.is_contiguous()
+        and weight.ndim == 1
+        and weight.shape[0] == x.shape[1]
+        and weight.is_contiguous()
+    ):
+        output = torch.empty_like(x)
+        residual = torch.empty_like(x)
+        _, kernel = _add_rms_norm_kernel(x.dtype)
+        kernel(
+            x,
+            x_residual,
+            weight,
+            output,
+            residual,
+            x.shape[1],
+            epsilon,
+            threads=(256, x.shape[0], 1),
+            group_size=(256, 1, 1),
+        )
+        return output, residual
+
     # vLLM computes variance from the unrounded FP32 residual sum.
     summed = x.float() + x_residual.float()
     # An explicit weight selects PyTorch's fused MPS kernel. Use FP32 ones

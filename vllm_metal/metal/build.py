@@ -53,7 +53,13 @@ _HASH = _stamp_path(_OUT)
 _MLX_VERSION = _THIS_DIR / "_paged_ops.mlx-version"
 
 # Required precompiled shader libraries bundled in every wheel.
-METALLIB_NAMES = ("paged_attention_v2_kern", "gdn_kern", "paged_mla_kern", "rope_kern")
+METALLIB_NAMES = (
+    "paged_attention_v2_kern",
+    "gdn_kern",
+    "paged_mla_kern",
+    "rope_kern",
+    "normalization_kern",
+)
 
 # Kept outside METALLIB_NAMES because wheels built with older SDKs omit it.
 NAX_METALLIB_NAME = "paged_attention_nax_kern"
@@ -134,6 +140,7 @@ def _metallib_source(name: str) -> str:
         _build_gdn_source,
         _build_mla_paged_attention_source,
         _build_nax_source,
+        _build_normalization_source,
         _build_rope_source,
         _build_v2_paged_attention_source,
     )
@@ -144,6 +151,7 @@ def _metallib_source(name: str) -> str:
         "paged_mla_kern": _build_mla_paged_attention_source,
         NAX_METALLIB_NAME: _build_nax_source,
         "rope_kern": _build_rope_source,
+        "normalization_kern": _build_normalization_source,
     }
     return builders[name]()
 
