@@ -50,8 +50,9 @@ missing, ambiguous, or shard-only matches also fail before model load.
   (`qwen35`).
 - Qwen3.5 serves text only and images are refused. Point `--tokenizer` at the
   `Qwen3_5ForConditionalGeneration` repository, such as `Qwen/Qwen3.5-9B`.
-  vllm-metal does not load `mmproj` files, and files that embed a
-  multi-token-prediction block are not supported yet.
+  vllm-metal does not load `mmproj` files. Files that embed a
+  multi-token-prediction block, such as unsloth's `-MTP-GGUF` repos, load
+  with that block skipped. MTP speculative decoding is not supported.
 - Supported qtypes: Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q2_K, Q3_K, Q4_K, Q5_K, and
   Q6_K, plus plain F32/F16/BF16 tensors, mixed freely within one file, so
   llama.cpp's Q4_K_M and Q5_K_M exports and bartowski's Q4_K_L load. Remote

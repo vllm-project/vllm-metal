@@ -120,9 +120,12 @@ def _write_gguf(
     quant_overrides: dict[str, QT] | None = None,
     inject: dict | None = None,
     values: dict[str, np.ndarray] | None = None,
+    metadata: dict[str, int] | None = None,
 ) -> None:
     rng = np.random.default_rng(0)
     writer = gguf.GGUFWriter(str(path), arch)
+    for key, value in (metadata or {}).items():
+        writer.add_uint32(key, value)
     for name, (kind, shape) in {**specs, **(inject or {})}.items():
         data = rng.standard_normal(shape).astype(np.float32)
         data = (values or {}).get(name, data)
@@ -1388,6 +1391,7 @@ def _build_qwen35_fixture(
     quant_type=QT.Q8_0,
     quant_overrides: dict[str, QT] | None = None,
     inject: dict | None = None,
+    metadata: dict[str, int] | None = None,
 ) -> tuple[str, str, dict[str, np.ndarray]]:
     """Write a tiny Qwen3.5 config and the GGUF llama.cpp converts it to.
 
@@ -1420,8 +1424,36 @@ def _build_qwen35_fixture(
         quant_overrides=quant_overrides,
         inject=inject,
         values=values,
+        metadata=metadata,
     )
     return str(gguf_path), str(tmp_path), hf
+
+
+def _qwen35_mtp_block(bid: int) -> dict:
+    """The MTP layer llama.cpp appends: a full-attention layer plus nextn tensors."""
+    hidden = _QWEN35_TEXT_CONFIG["hidden_size"]
+    ffn = _QWEN35_TEXT_CONFIG["intermediate_size"]
+    head_dim = _QWEN35_TEXT_CONFIG["head_dim"]
+    q_dim = _QWEN35_TEXT_CONFIG["num_attention_heads"] * head_dim
+    kv_dim = _QWEN35_TEXT_CONFIG["num_key_value_heads"] * head_dim
+    block = {
+        "attn_norm.weight": ("f", (hidden,)),
+        "attn_q.weight": ("q", (2 * q_dim, hidden)),
+        "attn_k.weight": ("q", (kv_dim, hidden)),
+        "attn_v.weight": ("q", (kv_dim, hidden)),
+        "attn_q_norm.weight": ("f", (head_dim,)),
+        "attn_k_norm.weight": ("f", (head_dim,)),
+        "attn_output.weight": ("q", (hidden, q_dim)),
+        "post_attention_norm.weight": ("f", (hidden,)),
+        "ffn_gate.weight": ("q", (ffn, hidden)),
+        "ffn_up.weight": ("q", (ffn, hidden)),
+        "ffn_down.weight": ("q", (hidden, ffn)),
+        "nextn.eh_proj.weight": ("q", (hidden, 2 * hidden)),
+        "nextn.enorm.weight": ("f", (hidden,)),
+        "nextn.hnorm.weight": ("f", (hidden,)),
+        "nextn.shared_head_norm.weight": ("f", (hidden,)),
+    }
+    return {f"blk.{bid}.{kind}": spec for kind, spec in block.items()}
 
 
 def _qwen35_source_model(cfg_dir: str, hf: dict[str, np.ndarray]) -> nn.Module:
@@ -1610,6 +1642,29 @@ def test_qwen35_rejects_out_of_scope_moe_tensor(tmp_path, moe_tensor):
 
     with pytest.raises(GGUFLoadError, match=f"Out-of-scope GGUF tensor '{moe_tensor}'"):
         GGUFModelLoader(gguf_path, config_dir=cfg_dir, target_dtype=mx.float32).load()
+
+
+def test_qwen35_skips_the_mtp_block(tmp_path):
+    num_layers = _QWEN35_TEXT_CONFIG["num_hidden_layers"]
+    gguf_path, cfg_dir, hf = _build_qwen35_fixture(
+        tmp_path,
+        _GDN_R1,
+        tie=False,
+        quant_type=QT.F32,
+        inject=_qwen35_mtp_block(num_layers),
+        metadata={"qwen35.nextn_predict_layers": 1},
+    )
+    tokens = mx.array([[1, 2, 3, 4, 5, 6, 7, 8]])
+    expected = np.array(_qwen35_source_model(cfg_dir, hf)(tokens))
+
+    model, _ = GGUFModelLoader(
+        gguf_path, config_dir=cfg_dir, target_dtype=mx.float32
+    ).load()
+    logits = np.array(model(tokens))
+
+    np.testing.assert_allclose(
+        logits, expected, rtol=0, atol=float(np.abs(expected).max()) * 1e-6
+    )
 
 
 def test_qwen35_a_log_keeps_float32_under_bfloat16(tmp_path):

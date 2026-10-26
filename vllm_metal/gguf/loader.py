@@ -135,6 +135,7 @@ class GGUFModelLoader:
             gguf=gguf,
             arch=arch,
             num_hidden_layers=self._num_hidden_layers(config),
+            nextn_predict_layers=self._nextn_predict_layers(reader, arch),
         )
 
         # Split tensors into wrapper installs, plain weights, and side biases.
@@ -469,6 +470,12 @@ class GGUFModelLoader:
         if field is None:
             raise GGUFLoadError("GGUF file has no general.architecture metadata.")
         return str(field.contents())
+
+    @staticmethod
+    def _nextn_predict_layers(reader: Any, arch: str) -> int:
+        """Count the MTP blocks llama.cpp appends after the decoder layers."""
+        field = reader.get_field(gguf.Keys.LLM.NEXTN_PREDICT_LAYERS.format(arch=arch))
+        return 0 if field is None else int(field.contents())
 
     @staticmethod
     def _num_hidden_layers(config: dict[str, Any]) -> int:
