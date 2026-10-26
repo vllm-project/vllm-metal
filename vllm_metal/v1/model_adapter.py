@@ -98,8 +98,6 @@ def _gemma4_text_only_reason(model_config: Any, speculative_config: Any) -> str 
     hf_config = getattr(model_config, "hf_config", None)
     if speculative_config is not None:
         return "speculative decoding is configured; vision needs a plain decode path"
-    if getattr(model_config, "quantization", None) == "gguf":
-        return "vision needs a safetensors checkpoint (GGUF)"
     quantization_config = getattr(hf_config, "quantization_config", None)
     quant_method = (
         quantization_config.get("quant_method")
@@ -391,6 +389,7 @@ class ModelAdapter(Protocol):
 
 # Models/configs that vLLM flags as multimodal but must be loaded via mlx_lm.
 # gemma4: mlx_vlm forward path produces garbled output vs mlx_lm.
+# muse_glimmer: no multimodal adapter, so image requests must stop at the frontend.
 # Qwen3.5/Qwen3.6 conditional-generation wrappers expose a multimodal config,
 # but only the FP8 and adapter-less variants are forced onto the text backbone:
 # FP8 checkpoints ship `*_weight_scale_inv` tensors that the mlx_vlm qwen3_5
@@ -411,6 +410,9 @@ _TEXT_BACKBONE_OVERRIDE_ARCHITECTURES: frozenset[str] = frozenset(
 _MISTRAL3_TEXT_BACKBONE_TEXT_TYPES: frozenset[str] = frozenset(
     {"mistral", "ministral3"}
 )
+_TEXT_BACKBONE_OVERRIDE_MODEL_TYPES: frozenset[str] = _GEMMA4_MODEL_TYPES | {
+    "muse_glimmer"
+}
 _QWEN3_VL_MODEL_TYPES: frozenset[str] = frozenset({"qwen3_5", "qwen3_vl"})
 _QWEN3_VL_ARCHITECTURES: frozenset[str] = frozenset(
     {
@@ -438,9 +440,9 @@ class DefaultModelAdapter(ModelAdapter):
         Gemma4: mlx_vlm forward currently produces garbled output; remove this
         override once mlx_vlm Gemma4 parity is fixed upstream.
 
-        Mistral 3: no multimodal adapter yet. The text backbone clears
-        ``multimodal_config``, so the frontend rejects image input instead of
-        the runner raising on it.
+        Mistral 3 and Muse Glimmer: no multimodal adapter yet. The text backbone
+        clears ``multimodal_config``, so the frontend rejects image input
+        instead of the runner raising on it.
 
         Qwen3.5/Qwen3.6 conditional-generation wrappers: these configs are
         marked multimodal even when served text-only, and the FP8 family fails
@@ -454,7 +456,7 @@ class DefaultModelAdapter(ModelAdapter):
             return False
 
         model_type_from_hf = hf_config.model_type
-        if model_type_from_hf in _GEMMA4_MODEL_TYPES:
+        if model_type_from_hf in _TEXT_BACKBONE_OVERRIDE_MODEL_TYPES:
             return True
         if model_type_from_hf == "mistral3":
             text_config = getattr(hf_config, "text_config", None)
@@ -524,6 +526,9 @@ class DefaultModelAdapter(ModelAdapter):
             return "text_only"
         if mode_env == "multimodal-native":
             return "native"
+        # A .gguf carries only the text model; mmproj weights ship as their own file.
+        if model_config.quantization == "gguf":
+            return "text_only"
         if getattr(hf_config, "model_type", None) not in _GEMMA4_MODEL_TYPES:
             return (
                 "text_only" if self.should_force_text_backbone(hf_config) else "native"
@@ -572,9 +577,9 @@ class DefaultModelAdapter(ModelAdapter):
         that the compatibility path intentionally bypasses; clearing it makes
         ``is_multimodal_model`` ``False`` so the input processor skips that
         setup. When the mode is ``text_sidecar`` (Gemma 4), the config is
-        kept but video is turned off, and audio too unless the checkpoint has
-        an audio encoder, so the frontend rejects inputs the sidecar cannot
-        serve. ``native`` leaves the
+        kept but audio is turned off unless the checkpoint has an audio
+        encoder, and video is turned off on prefix-LM checkpoints, so the
+        frontend rejects inputs the sidecar cannot serve. ``native`` leaves the
         config untouched. :meth:`multimodal_backbone_mode` is the single
         source of truth for which mode applies.
         """
@@ -598,25 +603,34 @@ class DefaultModelAdapter(ModelAdapter):
             # Only E2B/E4B carry an audio encoder; the processor and the
             # sidecar both follow ``audio_config``.
             keep_audio = getattr(hf_config, "audio_config", None) is not None
-            self._restrict_to_images(
-                model_config.multimodal_config, keep_audio=keep_audio
+            # Video frames go through the image tower. Prefix-LM checkpoints
+            # (26B/31B) disable chunked multimodal input, so a whole video
+            # (up to 32 frames of 70 soft tokens plus boi/eoi and a timestamp)
+            # would have to fit one prefill step; they stay image-only.
+            keep_video = not getattr(model_config, "is_mm_prefix_lm", False)
+            self._restrict_modalities(
+                model_config.multimodal_config,
+                keep_audio=keep_audio,
+                keep_video=keep_video,
             )
             logger.info(
-                "Metal: Gemma 4 serves %s through the encoder sidecar on the "
-                "mlx_lm text backbone; %s inputs are refused",
-                "images and audio" if keep_audio else "images",
-                "video" if keep_audio else "video and audio",
+                "Metal: Gemma 4 encoder sidecar support: "
+                "image=True, audio=%s, video=%s",
+                keep_audio,
+                keep_video,
             )
 
     @staticmethod
-    def _restrict_to_images(
-        multimodal_config: Any, *, keep_audio: bool = False
+    def _restrict_modalities(
+        multimodal_config: Any, *, keep_audio: bool, keep_video: bool
     ) -> None:
-        """Set video (and audio, unless kept) limits to 0 so the frontend
-        rejects them (idempotent)."""
+        """Set the limits of modalities the sidecar cannot serve to 0 so the
+        frontend rejects them (idempotent)."""
         from vllm.config.multimodal import AudioDummyOptions, VideoDummyOptions
 
-        refused: list[tuple[str, type]] = [("video", VideoDummyOptions)]
+        refused: list[tuple[str, type]] = []
+        if not keep_video:
+            refused.append(("video", VideoDummyOptions))
         if not keep_audio:
             refused.append(("audio", AudioDummyOptions))
         limits = multimodal_config.limit_per_prompt

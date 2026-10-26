@@ -47,7 +47,7 @@ dependencies = [
     "transformers>=5.16.1,<5.20.0",
     "accelerate>=0.26.0",
     "safetensors>=0.4.0",
-    "gguf>=0.17.0",
+    "gguf>=0.18.0",
     # Speech-to-text audio processing.
     "librosa>=0.10.2",
     "numba>=0.59.0",

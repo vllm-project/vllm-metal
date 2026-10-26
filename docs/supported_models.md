@@ -50,16 +50,20 @@ unsupported; leave `--video-pruning-rate` unset.
 | Model | MLX | PyTorch MPS | Runner | Scope | Example checkpoint |
 | --- | --- | --- | --- | --- | --- |
 | Qwen3-VL | 🔵 | | native multimodal paged generation | image and video input | `mlx-community/Qwen3-VL-4B-Instruct-4bit` |
-| Qwen3.5 (dense) | 🔵 | | native multimodal paged generation | image and video input; FP8 checkpoints stay text-only | `mlx-community/Qwen3.5-4B-MLX-4bit` |
+| Qwen3.5 (dense) | 🔵 | | native multimodal paged generation | image and video input; FP8 and GGUF checkpoints stay text-only | `mlx-community/Qwen3.5-4B-MLX-4bit` |
 | PaddleOCR-VL | 🔵 | | native multimodal paged generation | image input, no video | `PaddlePaddle/PaddleOCR-VL-1.6` |
-| Gemma 4 | 🔵 | | mlx_lm text backbone + mlx-vlm encoder sidecar, paged generation | image input; audio input on E2B/E4B; no video; bidirectional attention inside image blocks on sliding-window layers | `mlx-community/unsloth-gemma-4-26B-A4B-it-qat-oQ4`, `mlx-community/gemma-4-e2b-it-4bit` (audio) |
+| Gemma 4 | 🔵 | | mlx_lm text backbone + mlx-vlm encoder sidecar, paged generation | image input; audio and video input on E2B/E4B; bidirectional attention inside image blocks on sliding-window layers | `mlx-community/unsloth-gemma-4-26B-A4B-it-qat-oQ4`, `mlx-community/gemma-4-e2b-it-4bit` (audio, video) |
 
 Gemma 4 keeps its text path exactly as on the text-only table (mlx_lm model,
 selective logits, intermediate forward); only `vision_tower` and `embed_vision`
 are loaded from the checkpoint through mlx-vlm, plus `audio_tower` and
 `embed_audio` on checkpoints whose config has an `audio_config` (E2B and E4B).
 Those checkpoints accept audio input; audio soft tokens attend causally, as in
-HF. The sidecar activates in
+HF. E2B and E4B also accept video: vLLM's processor samples up to 32 frames
+at 70 soft tokens each, and the sidecar encodes them through the same vision
+tower, two frames at a time. The 26B and 31B checkpoints keep video off,
+since their bidirectional image attention needs a whole video (up to 2,496
+tokens) inside one prefill step. The sidecar activates in
 `VLLM_METAL_MULTIMODAL_MODE=auto` when the checkpoint resolves to a local
 safetensors directory with `vision_tower.*` weights, the HF `Gemma4Processor`
 builds (the checkpoint's `processor_config.json` needs a `video_processor`
@@ -117,11 +121,13 @@ GGUF checkpoints serve by detection like AWQ, with no env flag:
 vllm-metal's GGUF engine integration sets `quantization=gguf` from the file
 (vLLM 0.24 moved its in-tree GGUF support to the CUDA/ROCm-only
 [vllm-gguf-plugin](https://github.com/vllm-project/vllm-gguf-plugin)). Dense
-`qwen2`/`qwen3`/`llama`/`mistral` checkpoints load from a local `.gguf`
-(including llama.cpp's Q4_K_M and Q5_K_M exports) or a remote `repo_id:quant`
-reference and stay quantized in memory. See [GGUF](gguf.md) for the supported
-qtypes, exclusions, and serve examples. Verified end-to-end on Qwen3-0.6B,
-Llama-3.2-1B-Instruct, and Mistral-7B-Instruct-v0.3 in Q8_0 and Q4_K_M
+`qwen2`/`qwen3`/`llama`/`mistral` and text-only Qwen3.5 (`qwen35`) checkpoints
+load from a local `.gguf` (including llama.cpp's Q4_K_M and Q5_K_M exports) or a
+remote `repo_id:quant` reference and stay quantized in memory. See
+[GGUF](gguf.md) for the supported qtypes, exclusions, and serve examples.
+Verified end-to-end on Qwen3-0.6B, Llama-3.2-1B-Instruct, and
+Mistral-7B-Instruct-v0.3 in Q8_0 and Q4_K_M, and on Qwen3.5-0.8B Q8_0, 4B
+Q5_K_M, and 9B Q4_K_M
 ([#415](https://github.com/vllm-project/vllm-metal/issues/415),
 [#761](https://github.com/vllm-project/vllm-metal/issues/761)).
 
@@ -134,6 +140,12 @@ path but fail at load on `attn_scale`
 Ling-3.0 Tiny supports the official BF16 checkpoint and MLX-native MXFP8
 checkpoints converted from it. Direct loading of the official serialized
 block-FP8 checkpoint is not supported.
+
+Muse Glimmer checkpoints are vision-language, but vllm-metal serves only their
+text backbone: auto mode loads the mlx-lm text model and the frontend rejects
+image input. DFlash and DSpark speculative decoding need a Qwen3 target, so
+Glimmer's DFlash assistant is not supported; n-gram and draft-model speculation
+and TurboQuant are not validated.
 
 | Model | MLX | PyTorch MPS | Attention Kernel | Automatic Prefix Cache | Example checkpoint |
 | --- | --- | --- | --- | --- | --- |
@@ -171,6 +183,7 @@ block-FP8 checkpoint is not supported.
 | OLMo 2 | ✅ | 🔵 | MHA + full-projection QK norm (paged) | ✅ | `allenai/OLMo-2-0425-1B-Instruct` |
 | OLMoE | ✅ | | MHA + full-projection QK norm (paged) | ✅ | `mlx-community/OLMoE-1B-7B-0125-Instruct-4bit` |
 | OLMo 3 | 🔵 | | MHA + per-layer sliding window (paged) | ✅ | `mlx-community/Olmo-3-7B-Instruct-4bit` |
+| Muse Glimmer | 🔵 | | GQA + per-layer sliding window, gated attention with QK norm (paged) | ✅ | `mlx-community/Muse-Glimmer-30B-4bit` |
 
 **Hunyuan on MPS:** use `--generation-config vllm` to override the checkpoint’s unsupported `repetition_penalty=1.05` default.
 

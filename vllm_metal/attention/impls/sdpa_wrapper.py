@@ -116,6 +116,16 @@ class SDPAPagedAttentionWrapper(nn.Module):
         """
         return getattr(self._inner, "is_local", False)
 
+    @property
+    def layer_type(self) -> Any:
+        """Expose the wrapped attention's layer type.
+
+        Muse Glimmer's host model forward (mlx_lm) reads
+        ``self_attn.layer_type`` to select the sliding-window vs full mask
+        per layer.
+        """
+        return self._inner.layer_type
+
     def rebind_cache(
         self,
         kv_cache: MetalPagedKVCache,

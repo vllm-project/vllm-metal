@@ -457,7 +457,7 @@ class GGUFMLXQuantizedTensor:
         on axis 0 and quantize along the (untouched) input axis, so gathering
         the three together stays bit-exact to a dequantize-permute-requantize
         and keeps the tensor MLX-native quantized. Used to undo llama.cpp's
-        RoPE weight layout on q/k projections at load time.
+        stored row order at load time.
         """
         out_features = self.out_features
         if index.ndim != 1 or index.shape[0] != out_features:

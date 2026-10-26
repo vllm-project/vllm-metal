@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Local GGUF loader for dense checkpoints."""
+"""Local GGUF loader for mlx-lm models."""
 
 from __future__ import annotations
 
@@ -17,16 +17,23 @@ from huggingface_hub import snapshot_download
 from mlx.utils import tree_flatten
 from mlx_lm.utils import load_config, load_model, load_tokenizer
 
-from vllm_metal.gguf.adapter import GGUFLoadError, GGUFModelAdapter
+from vllm_metal.gguf.adapter import (
+    GGUFLoadError,
+    GGUFModelAdapter,
+    GGUFPlainTransform,
+)
+from vllm_metal.gguf.layout import GGUFColumnPermutedTensor
 from vllm_metal.gguf.mlx_native import AFFINE_GGUF_TYPES, GGUFMLXQuantizedTensor
 from vllm_metal.gguf.raw_block import RAW_KERNEL_GGUF_TYPES, GGUFRawBlockTensor
 from vllm_metal.gguf.source import GGUFLoadSource
+from vllm_metal.gguf.tensor import GGUFTensor
 from vllm_metal.gguf.wrappers import GGUFEmbedding, GGUFLinear
 
 __all__ = ["GGUFLoadError", "GGUFModelLoader"]
 
 _WEIGHT_SUFFIX = ".weight"
 _BIAS_SUFFIX = ".bias"
+_BIAS_PARAM = "bias"
 _NUM_LAYERS_KEYS = ("num_hidden_layers", "n_layers", "num_layers", "n_layer")
 _QUANTIZATION_KEYS = ("quantization", "quantization_config")
 _PLAIN_GGUF_TYPES = frozenset(
@@ -54,7 +61,7 @@ GGUFQuantTensor = GGUFMLXQuantizedTensor | GGUFRawBlockTensor
 class _PartitionedTensors:
     """GGUF tensors split by how the loader installs them."""
 
-    quant: dict[str, GGUFQuantTensor]
+    quant: dict[str, GGUFTensor]
     plain: dict[str, mx.array]
     biases: dict[str, mx.array]
 
@@ -68,10 +75,10 @@ class _InstalledWrapper:
 
 
 class GGUFModelLoader:
-    """Load a dense GGUF checkpoint into its mlx-lm model.
+    """Load a GGUF checkpoint into its mlx-lm model.
 
     Args:
-        gguf_path: Path to a local dense ``.gguf`` file.
+        gguf_path: Path to a local ``.gguf`` file.
         config_dir: Companion HF config source that defines the mlx-lm skeleton.
         tokenizer_dir: Companion tokenizer source. Defaults to ``config_dir``.
         target_dtype: Compute dtype for dequantized embedding rows / activations.
@@ -107,34 +114,35 @@ class GGUFModelLoader:
             GGUFLoadError: On any unsupported file, arch, qtype, shape mismatch, or
                 an incompletely populated model (fail fast, never silent).
         """
-        # Open the local GGUF + companion config and validate they describe one dense arch.
+        # Open the local GGUF + companion config and validate they describe one arch.
         reader, config = self._open_inputs()
         arch = GGUFModelAdapter.resolve_arch(
             gguf_arch=self._gguf_arch(reader),
             config_model_type=str(config.get("model_type", "")),
         )
-        self._preflight(reader)
+        self._preflight(reader, arch)
 
-        # Build the mlx-lm skeleton lazily; the GGUF replaces every parameter, so
-        # its own weights are never materialized.
+        # Build the mlx-lm skeleton lazily; the GGUF replaces every parameter of
+        # its text model, so the skeleton's own weights are never materialized.
         model = self._build_skeleton(config)
-        tied = bool(getattr(model.args, "tie_word_embeddings", False))
+        text_model = GGUFModelAdapter.text_model(model)
+        tied = bool(getattr(text_model.args, "tie_word_embeddings", False))
         self._preflight_deferred_output(reader, tied=tied)
 
         # Derive the GGUF->MLX name translation from the live model structure.
         adapter = GGUFModelAdapter.from_model(
-            model,
+            text_model,
             gguf=gguf,
             arch=arch,
             num_hidden_layers=self._num_hidden_layers(config),
         )
 
         # Split tensors into wrapper installs, plain weights, and side biases.
-        partition = self._partition(reader, model, tied, adapter)
+        partition = self._partition(reader, text_model, tied, adapter)
         installed = self._install_quant_modules(
-            model, partition.quant, partition.biases
+            text_model, partition.quant, partition.biases
         )
-        self._load_plain_weights(model, partition.plain, installed)
+        self._load_plain_weights(text_model, partition.plain, installed)
 
         # Build the tokenizer from the companion config directory and return both.
         tokenizer = load_tokenizer(
@@ -168,16 +176,14 @@ class GGUFModelLoader:
             ) from exc
         return reader, load_config(self._config_dir)
 
-    def _preflight(self, reader: Any) -> None:
+    def _preflight(self, reader: Any, arch: str) -> None:
         """Reject out-of-scope tensors / qtypes from the reader, before any load."""
         for tensor in reader.tensors:
             name = tensor.name
-            if any(
-                sub in name for sub in GGUFModelAdapter.OUT_OF_SCOPE_TENSOR_SUBSTRINGS
-            ):
+            if GGUFModelAdapter.is_out_of_scope_tensor(name, arch):
                 raise GGUFLoadError(
                     f"Out-of-scope GGUF tensor {name!r} (fused-QKV/SSM/MoE/vision) "
-                    "is not supported by the dense GGUF loader."
+                    f"is not supported for GGUF arch {arch!r}."
                 )
             if name == "output.weight":
                 continue
@@ -190,12 +196,13 @@ class GGUFModelLoader:
                     f"{name!r}; {_SUPPORTED_QTYPES_NOTE}"
                 )
             if (
-                name.endswith(_BIAS_SUFFIX)
+                not name.endswith(_WEIGHT_SUFFIX)
                 and tensor.tensor_type not in _PLAIN_GGUF_TYPES
             ):
                 raise GGUFLoadError(
-                    f"Unsupported qtype {tensor.tensor_type.name} on bias {name!r}; "
-                    f"additive biases must be plain {_PLAIN_QTYPE_NAMES}."
+                    f"Unsupported qtype {tensor.tensor_type.name} on {name!r}; "
+                    f"biases and other non-weight tensors must be plain "
+                    f"{_PLAIN_QTYPE_NAMES}."
                 )
 
     @staticmethod
@@ -250,9 +257,12 @@ class GGUFModelLoader:
         Tensors are read from the reader's memory map, so the file only needs
         read access.
         """
-        quant: dict[str, GGUFQuantTensor] = {}
+        quant: dict[str, GGUFTensor] = {}
         plain: dict[str, mx.array] = {}
         biases: dict[str, mx.array] = {}
+        # mlx-lm's per-parameter dtype policy (qwen3_5 keeps A_log float32), as
+        # mlx_lm.convert applies it.
+        cast_predicate = getattr(model, "cast_predicate", lambda _: True)
         for tensor in reader.tensors:
             name = tensor.name
             translated = adapter.translate(name)
@@ -261,8 +271,7 @@ class GGUFModelLoader:
             if tied and translated == "lm_head.weight":
                 continue  # tie-redundant output table; the tied head uses as_linear
 
-            suffix = _BIAS_SUFFIX if name.endswith(_BIAS_SUFFIX) else _WEIGHT_SUFFIX
-            module_path = translated[: -len(suffix)]
+            module_path, _, param_name = translated.rpartition(".")
 
             try:
                 current = self._resolve_path(model, module_path)
@@ -272,27 +281,33 @@ class GGUFModelLoader:
                     f"{module_path!r} is absent from the model."
                 ) from exc
 
-            # llama.cpp permutes q/k rows for its RoPE layout regardless of qtype;
-            # the adapter returns the row index to undo it (None for every other
-            # tensor / arch). GGUF is a file boundary: validate the source tensor
-            # shape BEFORE permuting, so a malformed row count fails fast instead
-            # of being masked into an expected shape by the gather.
-            permute = adapter.rope_permute_index(name)
+            # The adapter returns the indexes that undo llama.cpp's stored row and
+            # column order. GGUF is a file boundary, so each branch checks the
+            # source shape before a gather could mask a bad count.
+            permute = adapter.row_permute_index(name)
+            columns = adapter.column_permute_index(name)
 
-            if suffix == _BIAS_SUFFIX:
+            if param_name == _BIAS_PARAM:
                 bias = self._to_target_dtype(self._plain_tensor(tensor))
                 self._validate_plain_shape(model, translated, bias, name)
                 biases[module_path] = bias[permute] if permute is not None else bias
             elif tensor.tensor_type in _QUANT_GGUF_TYPES:
                 qt = self._quant_tensor(tensor)
                 self._validate_quant_shape(module_path, current, qt, name)
+                qt = qt.permute_rows(permute) if permute is not None else qt
                 quant[module_path] = (
-                    qt.permute_rows(permute) if permute is not None else qt
+                    GGUFColumnPermutedTensor(qt, columns) if columns is not None else qt
                 )
-            else:  # plain F32/F16/BF16
-                weight = self._to_target_dtype(self._plain_tensor(tensor))
-                self._validate_plain_shape(model, translated, weight, name)
-                plain[translated] = weight[permute] if permute is not None else weight
+            else:  # plain F32/F16/BF16, transformed in its file dtype
+                transform = adapter.plain_transform(name)
+                weight = self._plain_tensor(tensor)
+                self._validate_plain_shape(model, translated, weight, name, transform)
+                weight = transform.apply(weight) if transform is not None else weight
+                weight = weight[permute] if permute is not None else weight
+                weight = weight[:, columns] if columns is not None else weight
+                if cast_predicate(translated):
+                    weight = self._to_target_dtype(weight)
+                plain[translated] = weight
 
         # A bias whose weight is plain (not quantized) loads through the normal
         # path; only biases paired with a quant weight go to GGUFLinear.
@@ -330,7 +345,7 @@ class GGUFModelLoader:
     def _install_quant_modules(
         self,
         model: nn.Module,
-        quant: dict[str, GGUFQuantTensor],
+        quant: dict[str, GGUFTensor],
         biases: dict[str, mx.array],
     ) -> list[_InstalledWrapper]:
         """Replace each quantized module with a GGUF wrapper on the live tree."""
@@ -427,18 +442,25 @@ class GGUFModelLoader:
             )
 
     def _validate_plain_shape(
-        self, model: nn.Module, param_path: str, array: mx.array, name: str
+        self,
+        model: nn.Module,
+        param_path: str,
+        array: mx.array,
+        name: str,
+        transform: GGUFPlainTransform | None = None,
     ) -> None:
         module_path, _, param_name = param_path.rpartition(".")
         expected = tuple(
             int(d)
             for d in getattr(self._resolve_path(model, module_path), param_name).shape
         )
+        if transform is not None:
+            expected = transform.source_shape(expected)
         actual = tuple(int(d) for d in array.shape)
         if actual != expected:
             raise GGUFLoadError(
-                f"GGUF tensor {name!r} shape {actual} != model {param_path!r} "
-                f"{expected}."
+                f"GGUF tensor {name!r} shape {actual} != expected {expected} for "
+                f"model {param_path!r}."
             )
 
     @staticmethod

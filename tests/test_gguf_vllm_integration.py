@@ -787,7 +787,12 @@ def test_remote_load_source_rejects_unsupported_tag_before_download(
 
 @pytest.mark.parametrize(
     ("model_type", "architecture"),
-    [("qwen3_moe", "Qwen3MoeForCausalLM"), ("phi3", "Phi3ForCausalLM")],
+    [
+        ("qwen3_moe", "Qwen3MoeForCausalLM"),
+        ("phi3", "Phi3ForCausalLM"),
+        ("qwen3_5_moe", "Qwen3_5MoeForConditionalGeneration"),
+        ("qwen3_5_text", "Qwen3_5ForCausalLM"),
+    ],
 )
 def test_remote_load_source_rejects_unsupported_family_before_download(
     tmp_path, monkeypatch, model_type: str, architecture: str
@@ -802,14 +807,14 @@ def test_remote_load_source_rejects_unsupported_family_before_download(
     model_config = _engine_args(
         model="org/model-GGUF:Q4_K_M", tokenizer=str(tmp_path)
     ).create_model_config()
-    supported = sorted(GGUFModelAdapter.SUPPORTED_DENSE_ARCHS)
+    supported = sorted(GGUFModelAdapter.SUPPORTED_ARCHS)
 
     with pytest.raises(GGUFLoadError) as excinfo:
         gguf_source.GGUFLoadSource.from_model_config(model_config)
 
     assert str(excinfo.value) == (
-        f"Config model_type {model_type!r} is not a supported dense decoder; "
-        f"the GGUF loader supports {supported}."
+        f"Config model_type {model_type!r} is not supported; the GGUF loader "
+        f"supports {supported}."
     )
 
 

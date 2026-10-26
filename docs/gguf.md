@@ -1,9 +1,10 @@
 # GGUF
 
-vllm-metal supports dense decoder GGUF checkpoints through the MLX runtime. A
-GGUF file carries weights only, so it needs a Hugging Face config and tokenizer
-source. That source can be a quantized checkpoint, such as an mlx-community
-4-bit, FP8, or AWQ repository; vllm-metal reads only its config and tokenizer.
+vllm-metal supports dense decoder and Qwen3.5 GGUF checkpoints through the MLX
+runtime. A GGUF file carries weights only, so it needs a Hugging Face config and
+tokenizer source. That source can be a quantized checkpoint, such as an
+mlx-community 4-bit, FP8, or AWQ repository; vllm-metal reads only its config
+and tokenizer.
 
 ## Local weights
 
@@ -45,7 +46,12 @@ missing, ambiguous, or shard-only matches also fail before model load.
 
 ## Current scope
 
-- Supported model families: Qwen2, Qwen3, Llama, and Mistral.
+- Supported model families: Qwen2, Qwen3, Llama, Mistral, and Qwen3.5
+  (`qwen35`).
+- Qwen3.5 serves text only and images are refused. Point `--tokenizer` at the
+  `Qwen3_5ForConditionalGeneration` repository, such as `Qwen/Qwen3.5-9B`.
+  vllm-metal does not load `mmproj` files, and files that embed a
+  multi-token-prediction block are not supported yet.
 - Supported qtypes: Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q2_K, Q3_K, Q4_K, Q5_K, and
   Q6_K, plus plain F32/F16/BF16 tensors, mixed freely within one file, so
   llama.cpp's Q4_K_M and Q5_K_M exports and bartowski's Q4_K_L load. Remote
@@ -63,5 +69,5 @@ missing, ambiguous, or shard-only matches also fail before model load.
   ones, such as a prefill, dequantize a transient dense copy of the weight
   for one GEMM and free it afterwards.
 - A tied model's unused `output.weight` is skipped whatever its qtype.
-- Unsupported: IQ and T-quants, MoE, SSM or hybrid models, vision
-  models, fused-QKV GGUFs, sharded GGUF files, and LoRA (`--enable-lora`).
+- Unsupported: IQ and T-quants, MoE, SSM or hybrid models other than
+  Qwen3.5, vision input, sharded GGUF files, and LoRA (`--enable-lora`).

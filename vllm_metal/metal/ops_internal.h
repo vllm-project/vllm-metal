@@ -94,12 +94,14 @@ struct GqaDecodeLengthPlan {
   int num_requests = 0;
   int min_length = 0;
   int max_length = 0;
+  int64_t total_length = 0;
   std::array<int64_t, 2> full_partitions = {};
   std::shared_ptr<const GqaPartitionOffsets> partition_offsets;
 
   bool operator==(const GqaDecodeLengthPlan& other) const {
     return num_requests == other.num_requests && min_length == other.min_length &&
         max_length == other.max_length &&
+        total_length == other.total_length &&
         full_partitions == other.full_partitions &&
         (partition_offsets == other.partition_offsets ||
          (partition_offsets && other.partition_offsets &&
@@ -131,6 +133,7 @@ static GqaDecodeLengthPlan gqa_decode_length_plan(const Lengths& context_lens) {
         ? length : std::min(plan.min_length, length);
     ++plan.num_requests;
     plan.max_length = std::max(plan.max_length, length);
+    plan.total_length += length;
     for (size_t i = 0; i < kGqaPartitionSizes.size(); ++i) {
       plan.full_partitions[i] += length / kGqaPartitionSizes[i];
       if (offsets) {

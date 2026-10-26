@@ -30,7 +30,9 @@ All operations use MLX arrays end-to-end — no PyTorch MPS bridge.
 
 from __future__ import annotations
 
+import functools
 import math
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -254,6 +256,17 @@ def _apply_qk_norms(
     return queries, keys
 
 
+def _norm_then_scale_queries(
+    q_norm: Callable[[mx.array], mx.array], scale: float, queries: mx.array
+) -> mx.array:
+    """Normalize, then scale in fp32 and cast back (Muse Glimmer, before RoPE).
+
+    vLLM and mlx-vlm apply Glimmer's query scale in this order.
+    """
+    queries = q_norm(queries)
+    return (queries.astype(mx.float32) * scale).astype(queries.dtype)
+
+
 # === Q/K/V preparation (YOCO, K-eq-V, v_norm variants) ===
 
 
@@ -299,7 +312,7 @@ def prepare_sdpa_qkv(
         - ``queries``, ``keys``, ``values``: ``(B, H, L, head_dim)`` tensors
           ready for the Metal kernel.
         - ``gate``: optional gate tensor for gated attention (Qwen3.5
-          Qwen3Next style), else ``None``.
+          Qwen3Next style, or Muse Glimmer's ``gate_proj``), else ``None``.
         - ``kv_for_sharing``: the post-norm+RoPE ``(keys, values)`` pair so
           the caller can forward them to the next YOCO layer.
 
@@ -312,6 +325,17 @@ def prepare_sdpa_qkv(
     norm_placement = attention_contract.qk_norm_placement
     q_norm = _named_norm(inner, "q_norm", "query_layernorm", "q_layernorm")
     k_norm = _named_norm(inner, "k_norm", "key_layernorm", "k_layernorm")
+    if attention_contract.scaleless_qk_norm:
+        q_norm = k_norm = functools.partial(
+            mx.fast.rms_norm, weight=None, eps=inner.eps
+        )
+    if attention_contract.shared_qk_norm:
+        q_norm = k_norm = inner.qk_norm
+    if attention_contract.post_norm_query_scale:
+        # From here on, q_norm also applies the query scale.
+        q_norm = functools.partial(
+            _norm_then_scale_queries, q_norm, inner.qk_scale_factor
+        )
     if shared_kv is not None and read_existing_kv:
         raise ValueError("shared_kv and read_existing_kv are mutually exclusive")
 
@@ -430,6 +454,9 @@ def prepare_sdpa_qkv(
         )
         if norm_placement is QKNormPlacement.AFTER_ROPE:
             queries, keys = _apply_qk_norms(queries, keys, q_norm, k_norm)
+
+    if attention_contract.sigmoid_output_gate:
+        gate = inner.gate_proj(x)
 
     kv_for_sharing = (keys, values)
     return queries, keys, values, gate, kv_for_sharing
@@ -687,6 +714,9 @@ def sdpa_forward(
         queries, keys, values, head_dim, cache_head_dim
     )
     head_dim = cache_head_dim
+
+    # The attention output keeps the query dtype, not the cache dtype.
+    attention_output_dtype = queries.dtype
 
     # Reshape to 3D: (1, heads, L, hd) → (L, heads, hd)
     q_3d = mx.contiguous(queries[0].transpose(1, 0, 2).astype(kv_cache.dtype))
@@ -1125,6 +1155,11 @@ def sdpa_forward(
 
     # Reshape + strip padding back to actual head_dim before o_proj.
     out = truncate_padded_output(out, B, L, n_heads, cache_head_dim, actual_head_dim)
+    # The kernel returns the cache dtype. MLX promotes bfloat16 with float16
+    # to float32, so a float16 checkpoint with a bfloat16 cache would
+    # otherwise carry a float32 residual stream.
+    if out.dtype != attention_output_dtype:
+        out = out.astype(attention_output_dtype)
     if gate is not None:
         out = out * mx.sigmoid(gate)
     out = apply_g_proj_gate(inner, out, x, n_heads, actual_head_dim)

@@ -445,8 +445,8 @@ class GGUFRawBlockTensor:
         """Return a copy with output rows reordered by ``index`` (load-time).
 
         Every superblock is self-contained within its row, so gathering the
-        packed byte rows is bit-exact. Used to undo llama.cpp's RoPE weight
-        layout on q/k projections at load time.
+        packed byte rows is bit-exact. Used to undo llama.cpp's stored row
+        order at load time.
         """
         out_features = self.out_features
         if index.ndim != 1 or index.shape[0] != out_features:

@@ -3,14 +3,17 @@
 
 from functools import wraps
 
-import psutil
 import torch
 from vllm.config.utils import getattr_iter
 from vllm.utils.torch_utils import set_random_seed
 
 from vllm_metal.pytorch_backend.attention import MPSAttentionBackend
+from vllm_metal.pytorch_backend.mps_ops import _load_mps_module
 from vllm_metal.pytorch_backend.runner import MPSModelRunner
 from vllm_metal.v1.worker import MetalWorker, init_worker_distributed_environment
+
+# PyTorch's MPS allocator rounds large heaps up to this size (kRoundLarge).
+_MPS_HEAP_ALIGNMENT = 2 << 20
 
 
 def _patch_mps_mrv2_validation():
@@ -112,8 +115,20 @@ class MPSWorker(MetalWorker):
     def determine_available_memory(self):
         torch.mps.synchronize()
         torch.mps.empty_cache()
-        if self.cache_config.kv_cache_memory_bytes is not None:
-            return self.cache_config.kv_cache_memory_bytes
+        # Upstream backs all KV layers with one MPS buffer. PyTorch requires
+        # size < maxBufferLength, after rounding up to the heap alignment.
+        # TODO: total KV capacity should not be capped by one buffer; this is a
+        # current limitation of the Apple Silicon MPS path.
+        limit = _load_mps_module().max_buffer_length()
+        max_buffer = (limit - 1) // _MPS_HEAP_ALIGNMENT * _MPS_HEAP_ALIGNMENT
+        requested = self.cache_config.kv_cache_memory_bytes
+        if requested is not None:
+            if requested > max_buffer:
+                raise ValueError(
+                    f"--kv-cache-memory-bytes={requested} does not fit in one "
+                    f"MPS buffer; use at most {max_buffer} bytes on this device."
+                )
+            return requested
         hf = self.model_config.hf_text_config
         hidden_size = self.model_config.get_hidden_size()
         intermediate_size = getattr_iter(
@@ -128,21 +143,22 @@ class MPSWorker(MetalWorker):
                 "set --kv-cache-memory-bytes explicitly."
             )
         # PoC estimate only; --kv-cache-memory-bytes bypasses this heuristic.
-        # TODO: budget against torch.mps.recommended_max_memory() and measure
-        # execution overhead at the configured prefill/concurrency limits
-        # instead of estimating it from model dimensions.
+        # TODO: measure execution overhead at the configured prefill/concurrency
+        # limits instead of estimating it from model dimensions.
         reserve = self.scheduler_config.max_num_batched_tokens * (
             intermediate_size * 2 + hidden_size * 8
         ) * 4 + (512 << 20)
+        # Like the MLX backend, budget against the GPU working set, not RAM.
         budget = int(
-            psutil.virtual_memory().total * self.cache_config.gpu_memory_utilization
+            torch.mps.recommended_max_memory()
+            * self.cache_config.gpu_memory_utilization
         )
         available = budget - torch.mps.driver_allocated_memory() - reserve
         if available <= 0:
             raise ValueError(
                 "MPS model and activation allowance exceed the memory budget"
             )
-        return available
+        return min(available, max_buffer)
 
     def synchronize_device(self):
         torch.mps.synchronize()

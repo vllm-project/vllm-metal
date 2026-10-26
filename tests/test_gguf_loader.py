@@ -9,6 +9,7 @@ completeness, and fail-fast rejection of unsupported files.
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -534,17 +535,28 @@ def test_resolve_arch_accepts_llama_gguf_with_mistral_config():
     assert arch == "llama"
 
 
-@pytest.mark.parametrize("gguf_arch", ["mistral", "mistral3", "mistral4"])
-def test_resolve_arch_rejects_unsupported_mistral_gguf_archs(gguf_arch):
+@pytest.mark.parametrize(
+    ("gguf_arch", "config_model_type"),
+    [
+        ("mistral", "mistral"),
+        ("mistral3", "mistral"),
+        ("mistral4", "mistral"),
+        ("qwen35moe", "qwen3_5_moe"),
+    ],
+)
+def test_resolve_arch_rejects_unsupported_gguf_archs(gguf_arch, config_model_type):
     # The config-side mapping never widens the .gguf side: a file declaring a
     # raw "mistral" arch is not a llama.cpp product, and the multimodal
-    # mistral3/mistral4 archs are out of scope; all stay allowlist-rejected.
-    with pytest.raises(GGUFLoadError) as not_dense:
-        GGUFModelAdapter.resolve_arch(gguf_arch=gguf_arch, config_model_type="mistral")
+    # mistral3/mistral4 and MoE qwen35moe archs are out of scope; all stay
+    # allowlist-rejected.
+    with pytest.raises(GGUFLoadError) as unsupported:
+        GGUFModelAdapter.resolve_arch(
+            gguf_arch=gguf_arch, config_model_type=config_model_type
+        )
 
-    assert str(not_dense.value) == (
-        f"Architecture {gguf_arch!r} is not a supported dense decoder; the GGUF "
-        "loader supports ['llama', 'qwen2', 'qwen3']."
+    assert str(unsupported.value) == (
+        f"Architecture {gguf_arch!r} is not supported; the GGUF loader supports "
+        "['llama', 'qwen2', 'qwen3', 'qwen35']."
     )
 
 
@@ -771,14 +783,12 @@ def test_rejects_missing_required_bias(tmp_path):
         ).load()
 
 
-def test_rejects_non_dense_arch(tmp_path):
-    # A linear-attention/fused-QKV hybrid arch is rejected by the dense allowlist.
+def test_rejects_unsupported_arch(tmp_path):
+    # llama.cpp converts Qwen3.5 as "qwen35", so a raw "qwen3_5" arch stays rejected.
     gguf_path, cfg_dir = _build_dense_fixture(
         tmp_path, "qwen3", config_overrides={"model_type": "qwen3_5"}, has_qk_norm=True
     )
-    with pytest.raises(
-        GGUFLoadError, match="'qwen3_5' is not a supported dense decoder"
-    ):
+    with pytest.raises(GGUFLoadError, match="'qwen3_5' is not supported"):
         GGUFModelLoader(
             gguf_path,
             config_dir=cfg_dir,
@@ -801,17 +811,17 @@ def test_rejects_gguf_config_arch_mismatch(tmp_path):
         ).load()
 
 
-def test_rejects_out_of_scope_tensor(tmp_path):
-    d = _dims(_tiny_config("qwen3"))
+@pytest.mark.parametrize(
+    ("name", "spec"),
+    [("blk.0.attn_qkv.weight", ("q", (64, 64))), ("blk.0.ssm_a", ("f", (4,)))],
+    ids=["attn_qkv", "ssm"],
+)
+def test_rejects_out_of_scope_tensor(tmp_path, name, spec):
+    # qwen35 admits these markers; every other arch still rejects them.
     gguf_path, cfg_dir = _build_dense_fixture(
-        tmp_path,
-        "qwen3",
-        has_qk_norm=True,
-        inject={"blk.0.attn_qkv.weight": ("q", (d["qd"], d["h"]))},
+        tmp_path, "qwen3", has_qk_norm=True, inject={name: spec}
     )
-    with pytest.raises(
-        GGUFLoadError, match="Out-of-scope GGUF tensor 'blk.0.attn_qkv.weight'"
-    ):
+    with pytest.raises(GGUFLoadError, match=f"Out-of-scope GGUF tensor '{name}'"):
         GGUFModelLoader(
             gguf_path,
             config_dir=cfg_dir,
@@ -993,7 +1003,7 @@ def test_rejects_quantized_bias(tmp_path):
         quant_overrides={"blk.0.attn_q.bias": QT.Q8_0},
     )
     with pytest.raises(
-        GGUFLoadError, match="Unsupported qtype Q8_0 on bias 'blk.0.attn_q.bias'"
+        GGUFLoadError, match="Unsupported qtype Q8_0 on 'blk.0.attn_q.bias'"
     ):
         GGUFModelLoader(
             gguf_path,
@@ -1186,3 +1196,433 @@ def test_loads_read_only_gguf_file(tmp_path):
     ).load()
 
     _assert_dense_wrapper_histogram(model)
+
+
+# Every projection row is 256 wide so Q6_K superblocks fit, and the gated-delta
+# kernel splits the key head dim across 32 lanes.
+_QWEN35_TEXT_CONFIG = {
+    "model_type": "qwen3_5_text",
+    "hidden_size": 256,
+    "intermediate_size": 256,
+    "num_hidden_layers": 4,
+    "full_attention_interval": 2,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "head_dim": 64,
+    "vocab_size": 256,
+    "rms_norm_eps": 1e-6,
+    "max_position_embeddings": 512,
+    "linear_conv_kernel_dim": 4,
+    "linear_key_head_dim": 32,
+}
+# full_attention_interval 2 makes layers 1 and 3 full attention.
+_QWEN35_GDN_LAYERS = (0, 2)
+
+# GGUF tensor (after ``blk.N.``) -> mlx-lm parameter (after ``layers.N.``).
+_QWEN35_LAYER_TENSORS = {
+    "attn_norm.weight": "input_layernorm.weight",
+    "post_attention_norm.weight": "post_attention_layernorm.weight",
+    "ffn_gate.weight": "mlp.gate_proj.weight",
+    "ffn_up.weight": "mlp.up_proj.weight",
+    "ffn_down.weight": "mlp.down_proj.weight",
+    "attn_q.weight": "self_attn.q_proj.weight",
+    "attn_k.weight": "self_attn.k_proj.weight",
+    "attn_v.weight": "self_attn.v_proj.weight",
+    "attn_output.weight": "self_attn.o_proj.weight",
+    "attn_q_norm.weight": "self_attn.q_norm.weight",
+    "attn_k_norm.weight": "self_attn.k_norm.weight",
+    "attn_qkv.weight": "linear_attn.in_proj_qkv.weight",
+    "attn_gate.weight": "linear_attn.in_proj_z.weight",
+    "ssm_alpha.weight": "linear_attn.in_proj_a.weight",
+    "ssm_beta.weight": "linear_attn.in_proj_b.weight",
+    "ssm_a": "linear_attn.A_log",
+    "ssm_dt.bias": "linear_attn.dt_bias",
+    "ssm_conv1d.weight": "linear_attn.conv1d.weight",
+    "ssm_norm.weight": "linear_attn.norm.weight",
+    "ssm_out.weight": "linear_attn.out_proj.weight",
+}
+_QWEN35_GLOBAL_TENSORS = {
+    "token_embd.weight": "model.embed_tokens.weight",
+    "output_norm.weight": "model.norm.weight",
+    "output.weight": "lm_head.weight",
+}
+_QWEN35_LIVE_TO_GGUF_LAYER = {
+    live: kind for kind, live in _QWEN35_LAYER_TENSORS.items()
+}
+_QWEN35_LIVE_TO_GGUF_GLOBAL = {
+    live: name for name, live in _QWEN35_GLOBAL_TENSORS.items()
+}
+# llama.cpp keeps 1-D tensors and the depthwise conv kernel in F32.
+_QWEN35_PLAIN_TENSORS = frozenset(
+    {"ssm_a", "ssm_dt.bias", "ssm_conv1d.weight"}
+    | {kind for kind in _QWEN35_LAYER_TENSORS if kind.endswith("norm.weight")}
+    | {"output_norm.weight"}
+)
+
+
+@dataclass(frozen=True)
+class _GDNGeometry:
+    num_k_heads: int
+    num_v_heads: int
+    v_head_dim: int
+
+
+# nk != nv // nk in r2/r3, so the tiled V-head order is not its own inverse.
+_GDN_R1 = _GDNGeometry(num_k_heads=4, num_v_heads=4, v_head_dim=64)
+_GDN_R2 = _GDNGeometry(num_k_heads=4, num_v_heads=8, v_head_dim=32)
+_GDN_R3 = _GDNGeometry(num_k_heads=2, num_v_heads=6, v_head_dim=128)
+
+
+def _qwen35_config(geometry: _GDNGeometry, *, tie: bool | None) -> dict:
+    """A Qwen3_5ForConditionalGeneration config; ``tie=None`` omits the text
+    tie flag the way the real 9B/27B configs do. The top-level flag always
+    disagrees with the text one, so only the built text model resolves it."""
+    text = {
+        **_QWEN35_TEXT_CONFIG,
+        "linear_num_key_heads": geometry.num_k_heads,
+        "linear_num_value_heads": geometry.num_v_heads,
+        "linear_value_head_dim": geometry.v_head_dim,
+    }
+    if tie is not None:
+        text["tie_word_embeddings"] = tie
+    return {
+        "model_type": "qwen3_5",
+        "architectures": ["Qwen3_5ForConditionalGeneration"],
+        "tie_word_embeddings": not tie,
+        "text_config": text,
+    }
+
+
+def _qwen35_gguf_name(param_path: str) -> str:
+    """Live mlx-lm parameter path -> the GGUF tensor llama.cpp writes for it."""
+    path = param_path.removeprefix("language_model.")
+    if not path.startswith("model.layers."):
+        return _QWEN35_LIVE_TO_GGUF_GLOBAL[path]
+    _, _, layer, leaf = path.split(".", 3)
+    return f"blk.{layer}.{_QWEN35_LIVE_TO_GGUF_LAYER[leaf]}"
+
+
+def _qwen35_kind(gguf_name: str) -> str:
+    return gguf_name.split(".", 2)[2] if gguf_name.startswith("blk.") else gguf_name
+
+
+def _reorder_v_heads(
+    tensor: np.ndarray, dim: int, num_k_heads: int, num_v_per_k: int, head_dim: int
+) -> np.ndarray:
+    """numpy port of llama.cpp's ``_LinearAttentionVReorderBase._reorder_v_heads``."""
+    shape = list(tensor.shape)
+    new_shape = shape[:dim] + [num_k_heads, num_v_per_k, head_dim] + shape[dim + 1 :]
+    perm = list(range(len(new_shape)))
+    perm[dim], perm[dim + 1] = perm[dim + 1], perm[dim]
+    return tensor.reshape(new_shape).transpose(perm).reshape(shape)
+
+
+def _v_head_width(kind: str, geometry: _GDNGeometry) -> int:
+    wide = (
+        "attn_qkv.weight",
+        "ssm_conv1d.weight",
+        "attn_gate.weight",
+        "ssm_out.weight",
+    )
+    return geometry.v_head_dim if kind in wide else 1
+
+
+def _qwen35_llama_cpp_tensor(
+    kind: str, hf: np.ndarray, geometry: _GDNGeometry
+) -> np.ndarray:
+    """What llama.cpp's Qwen3.5 converter writes for one HF-layout tensor."""
+    nk, width = geometry.num_k_heads, _v_head_width(kind, geometry)
+    ratio = geometry.num_v_heads // nk
+    qk_rows = 2 * nk * _QWEN35_TEXT_CONFIG["linear_key_head_dim"]
+    if kind == "ssm_conv1d.weight":
+        hf = hf[..., 0]
+    if kind in ("attn_qkv.weight", "ssm_conv1d.weight"):
+        v_rows = _reorder_v_heads(hf[qk_rows:], 0, nk, ratio, width)
+        return np.concatenate([hf[:qk_rows], v_rows])
+    if kind in ("attn_gate.weight", "ssm_alpha.weight", "ssm_beta.weight"):
+        return _reorder_v_heads(hf, 0, nk, ratio, width)
+    if kind == "ssm_dt.bias":
+        return _reorder_v_heads(hf, 0, nk, ratio, 1)
+    if kind == "ssm_a":
+        return -np.exp(_reorder_v_heads(hf, 0, nk, ratio, 1))
+    if kind == "ssm_out.weight":
+        return _reorder_v_heads(hf, 1, nk, ratio, width)
+    return hf
+
+
+def _hf_order_index(kind: str, geometry: _GDNGeometry) -> np.ndarray:
+    """Position in the llama.cpp layout of each HF row (ssm_out: column)."""
+    nk, width = geometry.num_k_heads, _v_head_width(kind, geometry)
+    tiled = _reorder_v_heads(
+        np.arange(geometry.num_v_heads * width),
+        0,
+        nk,
+        geometry.num_v_heads // nk,
+        width,
+    )
+    index = np.argsort(tiled)
+    if kind not in ("attn_qkv.weight", "ssm_conv1d.weight"):
+        return index
+    qk_rows = 2 * nk * _QWEN35_TEXT_CONFIG["linear_key_head_dim"]
+    return np.concatenate([np.arange(qk_rows), qk_rows + index])
+
+
+def _qwen35_hf_value(rng: np.random.Generator, kind: str, shape: tuple) -> np.ndarray:
+    # Scaled so every head's gate stays sensitive to its own A_log/dt_bias/a.
+    if kind == "ssm_a":
+        value = np.log(rng.uniform(1.0, 16.0, shape))
+    elif kind.endswith("norm.weight"):
+        value = 1.0 + 0.1 * rng.standard_normal(shape)
+    elif len(shape) > 1 and kind != "token_embd.weight":
+        value = rng.standard_normal(shape) / np.sqrt(shape[1])
+    else:
+        value = rng.standard_normal(shape)
+    return value.astype(np.float32)
+
+
+def _build_qwen35_fixture(
+    tmp_path: Path,
+    geometry: _GDNGeometry,
+    *,
+    tie: bool | None = True,
+    quant_type=QT.Q8_0,
+    quant_overrides: dict[str, QT] | None = None,
+    inject: dict | None = None,
+) -> tuple[str, str, dict[str, np.ndarray]]:
+    """Write a tiny Qwen3.5 config and the GGUF llama.cpp converts it to.
+
+    Returns ``(gguf_path, config_dir, hf)``; ``hf`` maps each GGUF name to the
+    HF-layout source value it was converted from.
+    """
+    config = _qwen35_config(geometry, tie=tie)
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    skeleton, _ = mlx_lm_utils.load_model(tmp_path, lazy=True, strict=False)
+    rng = np.random.default_rng(0)
+    hf = {}
+    for path, param in tree_flatten(skeleton.parameters()):
+        name = _qwen35_gguf_name(path)
+        hf[name] = _qwen35_hf_value(rng, _qwen35_kind(name), tuple(param.shape))
+    values = {
+        name: _qwen35_llama_cpp_tensor(_qwen35_kind(name), value, geometry)
+        for name, value in hf.items()
+        if name not in (inject or {})
+    }
+    specs = {
+        name: ("f" if _qwen35_kind(name) in _QWEN35_PLAIN_TENSORS else "q", v.shape)
+        for name, v in values.items()
+    }
+    gguf_path = tmp_path / "qwen35.gguf"
+    _write_gguf(
+        gguf_path,
+        "qwen35",
+        specs,
+        quant_type=quant_type,
+        quant_overrides=quant_overrides,
+        inject=inject,
+        values=values,
+    )
+    return str(gguf_path), str(tmp_path), hf
+
+
+def _qwen35_source_model(cfg_dir: str, hf: dict[str, np.ndarray]) -> nn.Module:
+    """The dense mlx-lm model the fixture's GGUF was converted from."""
+    model, _ = mlx_lm_utils.load_model(Path(cfg_dir), lazy=True, strict=False)
+    params = [path for path, _ in tree_flatten(model.parameters())]
+    model.load_weights(
+        [(path, mx.array(hf[_qwen35_gguf_name(path)])) for path in params]
+    )
+    model.eval()
+    return model
+
+
+def _gguf_dense(gguf_path: str, name: str) -> np.ndarray:
+    """A file tensor's values, dequantized by the gguf-py oracle."""
+    tensor = next(t for t in gguf.GGUFReader(gguf_path).tensors if t.name == name)
+    return gguf.quants.dequantize(tensor.data, tensor.tensor_type).astype(np.float32)
+
+
+def _packed_arrays(qt: GGUFMLXQuantizedTensor | GGUFRawBlockTensor) -> list:
+    if isinstance(qt, GGUFRawBlockTensor):
+        return [qt.qweight]
+    return [qt.qweight, qt.scales, qt.biases]
+
+
+def _gdn(model: nn.Module, layer: int) -> nn.Module:
+    return model.language_model.model.layers[layer].linear_attn
+
+
+@pytest.mark.parametrize(
+    "geometry",
+    [
+        pytest.param(_GDN_R1, id="r1"),
+        pytest.param(_GDN_R2, id="r2"),
+        pytest.param(_GDN_R3, id="r3"),
+    ],
+)
+def test_qwen35_loads_the_model_it_was_converted_from(tmp_path, geometry):
+    # A plain file loads back to the exact source model, whatever the V-head ratio.
+    gguf_path, cfg_dir, hf = _build_qwen35_fixture(
+        tmp_path, geometry, tie=False, quant_type=QT.F32
+    )
+    tokens = mx.array([[1, 2, 3, 4, 5, 6, 7, 8]])
+    expected = np.array(_qwen35_source_model(cfg_dir, hf)(tokens))
+
+    model, _ = GGUFModelLoader(
+        gguf_path, config_dir=cfg_dir, target_dtype=mx.float32
+    ).load()
+    logits = np.array(model(tokens))
+
+    np.testing.assert_allclose(
+        logits, expected, rtol=0, atol=float(np.abs(expected).max()) * 1e-6
+    )
+
+
+@pytest.mark.parametrize(
+    "geometry", [pytest.param(_GDN_R2, id="r2"), pytest.param(_GDN_R3, id="r3")]
+)
+@pytest.mark.parametrize("quant_type", [QT.Q8_0, QT.Q6_K], ids=["affine", "raw_block"])
+def test_qwen35_quantized_v_head_rows_are_untiled(tmp_path, quant_type, geometry):
+    gguf_path, cfg_dir, _ = _build_qwen35_fixture(
+        tmp_path, geometry, quant_type=quant_type
+    )
+    projections = {
+        "attn_qkv.weight": "in_proj_qkv",
+        "attn_gate.weight": "in_proj_z",
+        "ssm_alpha.weight": "in_proj_a",
+        "ssm_beta.weight": "in_proj_b",
+    }
+    raw = {
+        (i, kind): _file_quant_tensor(gguf_path, f"blk.{i}.{kind}")
+        for i in _QWEN35_GDN_LAYERS
+        for kind in projections
+    }
+    expected = {
+        key: qt.permute_rows(mx.array(_hf_order_index(key[1], geometry)))
+        for key, qt in raw.items()
+    }
+
+    model, _ = GGUFModelLoader(
+        gguf_path, config_dir=cfg_dir, target_dtype=mx.float32
+    ).load()
+
+    for (i, kind), raw_qt in raw.items():
+        got = getattr(_gdn(model, i), projections[kind]).tensor
+        pairs = zip(
+            _packed_arrays(got), _packed_arrays(expected[(i, kind)]), strict=True
+        )
+        assert all(bool(mx.array_equal(a, b).item()) for a, b in pairs), (i, kind)
+        assert not bool(mx.array_equal(got.qweight, raw_qt.qweight).item()), (i, kind)
+
+
+@pytest.mark.parametrize(
+    "geometry", [pytest.param(_GDN_R2, id="r2"), pytest.param(_GDN_R3, id="r3")]
+)
+@pytest.mark.parametrize(
+    "ssm_out_type", [QT.Q8_0, QT.Q6_K], ids=["affine", "raw_block"]
+)
+def test_qwen35_ssm_out_reads_hf_order_columns(tmp_path, ssm_out_type, geometry):
+    gguf_path, cfg_dir, _ = _build_qwen35_fixture(
+        tmp_path,
+        geometry,
+        quant_overrides={
+            f"blk.{i}.ssm_out.weight": ssm_out_type for i in _QWEN35_GDN_LAYERS
+        },
+    )
+    columns = _hf_order_index("ssm_out.weight", geometry)
+    width = geometry.num_v_heads * geometry.v_head_dim
+    # The GDN runtime calls out_proj on (1, tokens, value_dim).
+    x = np.random.default_rng(1).standard_normal((1, 3, width)).astype(np.float32)
+    stored = {
+        i: _gguf_dense(gguf_path, f"blk.{i}.ssm_out.weight") for i in _QWEN35_GDN_LAYERS
+    }
+    expected = {i: x @ w[:, columns].T for i, w in stored.items()}
+    untransformed = {i: x @ w.T for i, w in stored.items()}
+
+    model, _ = GGUFModelLoader(
+        gguf_path, config_dir=cfg_dir, target_dtype=mx.float32
+    ).load()
+    out = {i: np.array(_gdn(model, i).out_proj(mx.array(x))) for i in stored}
+
+    for i in stored:
+        atol = float(np.abs(expected[i]).max()) * 4e-5
+        np.testing.assert_allclose(out[i], expected[i], rtol=0, atol=atol)
+        assert not np.allclose(out[i], untransformed[i], rtol=0, atol=atol)
+
+
+@pytest.mark.parametrize(
+    ("tie", "has_lm_head"),
+    [
+        pytest.param(True, False, id="text-tie-true"),
+        pytest.param(False, True, id="text-tie-false"),
+        pytest.param(None, True, id="text-tie-omitted"),
+    ],
+)
+def test_qwen35_tie_flag_resolves_on_text_model(tmp_path, tie, has_lm_head):
+    # This fixture always carries output.weight; a tied model must skip it.
+    text = _QWEN35_TEXT_CONFIG
+    output = {"output.weight": ("q", (text["vocab_size"], text["hidden_size"]))}
+    gguf_path, cfg_dir, _ = _build_qwen35_fixture(
+        tmp_path, _GDN_R1, tie=tie, inject=output
+    )
+
+    model, _ = GGUFModelLoader(
+        gguf_path, config_dir=cfg_dir, target_dtype=mx.float32
+    ).load()
+
+    assert isinstance(model.language_model.get("lm_head"), GGUFLinear) is has_lm_head
+
+
+@pytest.mark.parametrize(
+    ("kind", "source_shape"),
+    [("ssm_dt.bias", (16,)), ("ssm_conv1d.weight", (1024, 4))],
+    ids=["ssm_dt", "ssm_conv1d"],
+)
+def test_qwen35_rejects_oversized_source_before_transform(tmp_path, kind, source_shape):
+    # Twice the r2 rows: a reorder gather would mask the extra rows.
+    gguf_path, cfg_dir, _ = _build_qwen35_fixture(
+        tmp_path, _GDN_R2, inject={f"blk.0.{kind}": ("f", source_shape)}
+    )
+
+    with pytest.raises(
+        GGUFLoadError, match=rf"'blk\.0\.{kind}' shape \({source_shape[0]},"
+    ):
+        GGUFModelLoader(gguf_path, config_dir=cfg_dir, target_dtype=mx.float32).load()
+
+
+def test_qwen35_rejects_quantized_ssm_a(tmp_path):
+    # ssm_a has no .weight suffix, so it must be plain like a bias.
+    gguf_path, cfg_dir, _ = _build_qwen35_fixture(
+        tmp_path, _GDN_R1, inject={"blk.0.ssm_a": ("q", (32,))}
+    )
+
+    with pytest.raises(GGUFLoadError, match="Unsupported qtype Q8_0 on 'blk.0.ssm_a'"):
+        GGUFModelLoader(gguf_path, config_dir=cfg_dir, target_dtype=mx.float32).load()
+
+
+@pytest.mark.parametrize(
+    "moe_tensor", ["blk.0.ffn_gate_inp.weight", "blk.0.ffn_gate_exps.weight"]
+)
+def test_qwen35_rejects_out_of_scope_moe_tensor(tmp_path, moe_tensor):
+    # qwen35 admits only its own fused-QKV and SSM substrings, not qwen35moe's.
+    gguf_path, cfg_dir, _ = _build_qwen35_fixture(
+        tmp_path, _GDN_R1, inject={moe_tensor: ("f", (2, 256))}
+    )
+
+    with pytest.raises(GGUFLoadError, match=f"Out-of-scope GGUF tensor '{moe_tensor}'"):
+        GGUFModelLoader(gguf_path, config_dir=cfg_dir, target_dtype=mx.float32).load()
+
+
+def test_qwen35_a_log_keeps_float32_under_bfloat16(tmp_path):
+    gguf_path, cfg_dir, hf = _build_qwen35_fixture(tmp_path, _GDN_R1)
+
+    model, _ = GGUFModelLoader(
+        gguf_path, config_dir=cfg_dir, target_dtype=mx.bfloat16
+    ).load()
+
+    for i in _QWEN35_GDN_LAYERS:
+        a_log = _gdn(model, i).A_log
+        assert a_log.dtype == mx.float32
+        np.testing.assert_allclose(
+            np.array(a_log), hf[f"blk.{i}.ssm_a"], rtol=1e-6, atol=0
+        )
+        assert _gdn(model, i).dt_bias.dtype == mx.bfloat16

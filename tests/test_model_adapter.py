@@ -108,6 +108,17 @@ class TestShouldForceTextBackbone:
         assert adapter.should_force_text_backbone(hf_config) is True
         assert adapter.build_multimodal_adapter(object(), hf_config) is None
 
+    def test_unquantized_muse_glimmer_keeps_text_backbone(self) -> None:
+        # No multimodal adapter, so a native load would let image requests
+        # reach the runner and raise there, whatever the quantization.
+        hf_config = SimpleNamespace(
+            model_type="muse_glimmer",
+            architectures=["MuseGlimmerForConditionalGeneration"],
+        )
+        adapter = DefaultModelAdapter()
+        assert adapter.should_force_text_backbone(hf_config) is True
+        assert adapter.build_multimodal_adapter(object(), hf_config) is None
+
     @pytest.mark.parametrize(
         ("text_type", "expected"),
         [
@@ -610,6 +621,7 @@ class TestNormalizeModelConfig:
 
     def test_clears_multimodal_config_for_qwen35_fp8_in_auto_mode(self) -> None:
         model_config = SimpleNamespace(
+            quantization=None,
             multimodal_config=SimpleNamespace(language_model_only=False),
             hf_config=SimpleNamespace(
                 model_type="qwen3_5",
@@ -625,6 +637,7 @@ class TestNormalizeModelConfig:
     def test_clears_multimodal_config_for_mistral3_in_auto_mode(self) -> None:
         # The frontend then rejects image input with a 400.
         model_config = SimpleNamespace(
+            quantization=None,
             multimodal_config=SimpleNamespace(language_model_only=False),
             hf_config=SimpleNamespace(
                 model_type="mistral3",
@@ -650,6 +663,7 @@ class TestNormalizeModelConfig:
         # pinned mlx-vlm floor, so auto mode must leave their config alone.
         sentinel = SimpleNamespace(language_model_only=False)
         model_config = SimpleNamespace(
+            quantization=None,
             multimodal_config=sentinel,
             hf_config=SimpleNamespace(
                 model_type=model_type,
@@ -665,6 +679,7 @@ class TestNormalizeModelConfig:
     def test_preserves_multimodal_config_for_other_models(self) -> None:
         sentinel = SimpleNamespace(language_model_only=False)
         model_config = SimpleNamespace(
+            quantization=None,
             multimodal_config=sentinel,
             hf_config=SimpleNamespace(model_type="qwen3_vl", architectures=[]),
         )
@@ -1334,7 +1349,6 @@ def _gemma4_model_config(
     tmp_path: Path,
     *,
     per_layer_inputs: int = 0,
-    quantization: str | None = None,
     quantization_config: dict | None = None,
     model: str | None = None,
     limit_per_prompt: dict | None = None,
@@ -1344,7 +1358,7 @@ def _gemma4_model_config(
         revision=None,
         trust_remote_code=False,
         mm_processor_kwargs=None,
-        quantization=quantization,
+        quantization=None,
         multimodal_config=SimpleNamespace(
             language_model_only=False,
             limit_per_prompt={} if limit_per_prompt is None else limit_per_prompt,
@@ -1381,6 +1395,15 @@ class TestMultimodalBackboneMode:
         config.hf_config.model_type = model_type
         mode = DefaultModelAdapter().multimodal_backbone_mode(config)
         assert mode == "text_sidecar"
+
+    def test_gguf_skips_a_ready_vision_sidecar(
+        self, tmp_path: Path, _sidecar_ready
+    ) -> None:
+        # A .gguf never holds the vision tower, so the sidecar must not load.
+        config = _gemma4_model_config(tmp_path)
+        config.quantization = "gguf"
+        mode = DefaultModelAdapter().multimodal_backbone_mode(config)
+        assert mode == "text_only"
 
     def test_language_model_only_wins_over_native_mode(
         self, tmp_path: Path, monkeypatch
@@ -1447,7 +1470,6 @@ class TestMultimodalBackboneMode:
         ("kwargs", "speculative", "reason"),
         [
             ({}, object(), "speculative decoding"),
-            ({"quantization": "gguf"}, None, "safetensors"),
             ({"quantization_config": {"quant_method": "awq"}}, None, "safetensors"),
             ({"model": "mlx-community/not-local"}, None, "local checkpoint directory"),
         ],
@@ -1631,13 +1653,24 @@ class TestNormalizeModelConfigSidecar:
         assert config.multimodal_config is sentinel
         limits = config.multimodal_config.limit_per_prompt
         assert limits["image"].count == 4
-        assert (
-            isinstance(limits["video"], VideoDummyOptions)
-            and limits["video"].count == 0
-        )
+        assert "video" not in limits
         assert (
             isinstance(limits["audio"], AudioDummyOptions)
             and limits["audio"].count == 0
+        )
+
+    def test_prefix_lm_checkpoint_refuses_video(
+        self, tmp_path: Path, _sidecar_ready
+    ) -> None:
+        config = _gemma4_model_config(tmp_path)
+        config.is_mm_prefix_lm = True
+
+        DefaultModelAdapter().normalize_model_config(config)
+
+        limits = config.multimodal_config.limit_per_prompt
+        assert (
+            isinstance(limits["video"], VideoDummyOptions)
+            and limits["video"].count == 0
         )
 
     def test_audio_stays_enabled_with_an_audio_encoder(
@@ -1650,18 +1683,18 @@ class TestNormalizeModelConfigSidecar:
 
         limits = config.multimodal_config.limit_per_prompt
         assert "audio" not in limits
-        assert limits["video"].count == 0
+        assert "video" not in limits
 
     def test_restriction_is_idempotent_and_warns_on_override(
         self, tmp_path: Path, _sidecar_ready, caplog
     ) -> None:
         config = _gemma4_model_config(
-            tmp_path, limit_per_prompt={"video": VideoDummyOptions(count=2)}
+            tmp_path, limit_per_prompt={"audio": AudioDummyOptions(count=2)}
         )
         with caplog.at_level("WARNING"):
             DefaultModelAdapter().normalize_model_config(config)
             DefaultModelAdapter().normalize_model_config(config)
-        assert config.multimodal_config.limit_per_prompt["video"].count == 0
+        assert config.multimodal_config.limit_per_prompt["audio"].count == 0
         assert caplog.text.count("overriding") == 1
 
     def test_text_only_clears_config(self, tmp_path: Path, _sidecar_ready) -> None:

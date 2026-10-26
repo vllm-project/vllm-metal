@@ -143,11 +143,12 @@ def _make_inner(
     *,
     with_v_proj: bool = True,
     with_v_norm: bool = False,
+    dtype: mx.Dtype = mx.float32,
 ) -> SimpleNamespace:
     """Build a fake Attention module matching sdpa_forward's contract."""
-    q_weight = mx.ones((_N_HEADS * _HEAD_DIM, _HIDDEN))
-    k_weight = mx.ones((_N_KV_HEADS * _HEAD_DIM, _HIDDEN))
-    v_weight = mx.ones((_N_KV_HEADS * _HEAD_DIM, _HIDDEN))
+    q_weight = mx.ones((_N_HEADS * _HEAD_DIM, _HIDDEN), dtype=dtype)
+    k_weight = mx.ones((_N_KV_HEADS * _HEAD_DIM, _HIDDEN), dtype=dtype)
+    v_weight = mx.ones((_N_KV_HEADS * _HEAD_DIM, _HIDDEN), dtype=dtype)
 
     inner = SimpleNamespace(
         n_heads=_N_HEADS,
@@ -771,6 +772,36 @@ class _PreMmPrefixOps(_PagedOpsCapsOff):
 
 class TestSDPAForward:
     """Tests for ``sdpa_forward`` runtime argument propagation."""
+
+    @pytest.mark.parametrize("cache_dtype", [mx.bfloat16, mx.float16])
+    def test_output_projection_receives_the_query_dtype(
+        self, cache_dtype: mx.Dtype
+    ) -> None:
+        """A float16 checkpoint with a bfloat16 cache must hand o_proj the
+        float16 query dtype: MLX promotes a bfloat16/float16 mix to a float32
+        residual stream."""
+        inner = _make_inner(dtype=mx.float16)
+        projected: list[mx.Dtype] = []
+
+        def o_proj(out: mx.array) -> mx.array:
+            projected.append(out.dtype)
+            return out
+
+        inner.o_proj = o_proj
+        cache = MetalPagedKVCache(
+            num_layers=1,
+            num_kv_heads=_N_KV_HEADS,
+            head_dim=_HEAD_DIM,
+            num_blocks=1,
+            block_size=8,
+            dtype=cache_dtype,
+        )
+        x = mx.ones((_BATCH, _SEQ_LEN, _HIDDEN), dtype=mx.float16)
+        with patch.object(sdpa_mod, "get_ops", return_value=_PagedRoutingOpsSpy()):
+            output, _ = sdpa_forward(inner, x, _make_ctx(_SEQ_LEN), cache, layer_idx=0)
+
+        assert projected == [mx.float16]
+        assert output.dtype == mx.float16
 
     def test_deepseek_num_kv_heads_naming_reaches_kernel(self) -> None:
         """DeepSeek exposes ``num_kv_heads``, not ``num_key_value_heads``."""

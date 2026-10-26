@@ -1775,10 +1775,11 @@ class TestMetalPlatform:
         assert vllm_config.cache_config.enable_prefix_caching is prefix_caching
 
     @pytest.mark.parametrize(
-        ("mode", "hf_fields", "should_clear"),
+        ("mode", "quantization", "hf_fields", "should_clear"),
         [
-            (None, {"model_type": "gemma4"}, True),
+            (None, None, {"model_type": "gemma4"}, True),
             (
+                None,
                 None,
                 {
                     "model_type": "qwen3_5",
@@ -1789,6 +1790,7 @@ class TestMetalPlatform:
             ),
             (
                 None,
+                None,
                 {
                     "model_type": "qwen3_vl",
                     "architectures": ["Qwen3VLForConditionalGeneration"],
@@ -1797,10 +1799,29 @@ class TestMetalPlatform:
             ),
             (
                 "multimodal-native",
+                None,
                 {
                     "model_type": "qwen3_5",
                     "architectures": ["Qwen3_5ForConditionalGeneration"],
                     "quantization_config": {"quant_method": "fp8"},
+                },
+                False,
+            ),
+            (
+                None,
+                "gguf",
+                {
+                    "model_type": "qwen3_5",
+                    "architectures": ["Qwen3_5ForConditionalGeneration"],
+                },
+                True,
+            ),
+            (
+                "multimodal-native",
+                "gguf",
+                {
+                    "model_type": "qwen3_5",
+                    "architectures": ["Qwen3_5ForConditionalGeneration"],
                 },
                 False,
             ),
@@ -1810,6 +1831,7 @@ class TestMetalPlatform:
         self,
         monkeypatch: pytest.MonkeyPatch,
         mode: str | None,
+        quantization: str | None,
         hf_fields: dict[str, object],
         should_clear: bool,
     ) -> None:
@@ -1820,6 +1842,7 @@ class TestMetalPlatform:
         try:
             multimodal_config = MultiModalConfig()
             model_config = SimpleNamespace(
+                quantization=quantization,
                 enable_sleep_mode=False,
                 model="test-model",
                 disable_cascade_attn=False,
@@ -1848,6 +1871,7 @@ class TestMetalPlatform:
         self._patch_stt_resolution(monkeypatch, is_stt=False)
         multimodal_config = MultiModalConfig(mm_device_do_normalize=True)
         model_config = SimpleNamespace(
+            quantization=None,
             enable_sleep_mode=False,
             model="test-model",
             tokenizer=None,
