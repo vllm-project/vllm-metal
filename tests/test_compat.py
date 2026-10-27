@@ -334,6 +334,11 @@ class TestGemma4MTPConfigCompatPatch:
             "_patch_mlx_lm_minicpm4_model_type",
             lambda: calls.append("minicpm4_model_type"),
         )
+        monkeypatch.setattr(
+            compat,
+            "_patch_mlx_vlm_nemotron_nano_vl_v2",
+            lambda: calls.append("nano_vl_v2"),
+        )
 
         compat.apply_compat_patches()
 
@@ -342,6 +347,7 @@ class TestGemma4MTPConfigCompatPatch:
             "qwen35_fp8",
             "qwen3_flat_prefix",
             "minicpm4_model_type",
+            "nano_vl_v2",
         ]
 
 
@@ -1150,3 +1156,35 @@ class TestQwen3FlatPrefixRealStrictLoad:
             assert not hasattr(pooling, "lm_head")
         finally:
             _unwrap_qwen3_sanitize(model_cls)
+
+
+def test_nano_v2_loader_alias_and_processor_preserve_checkpoint(tmp_path, monkeypatch):
+    """MLX exports need neither rewritten config nor missing NVIDIA Python files."""
+    from pathlib import Path
+
+    from mlx_vlm import utils
+    from mlx_vlm.models.nemotron_h_nano_omni import NemotronHNanoOmniProcessor
+    from transformers import AutoProcessor
+
+    config = {
+        "model_type": "NemotronH_Nano_VL_V2",
+        "architectures": ["NemotronH_Nano_VL_V2"],
+    }
+    config_path = tmp_path / "config.json"
+    payload = json.dumps(config)
+    config_path.write_text(payload)
+    seen = []
+    processor = object()
+
+    def make_processor(path, **kwargs):
+        seen.append(Path(path))
+        return processor
+
+    monkeypatch.setattr(NemotronHNanoOmniProcessor, "from_pretrained", make_processor)
+    compat._patch_mlx_vlm_nemotron_nano_vl_v2()
+    module, model_type = utils.get_model_and_args(config)
+    assert model_type == "nemotron_h_nano_omni"
+    assert module.Model.__module__.startswith("mlx_vlm.models.nemotron_h_nano_omni.")
+    assert AutoProcessor.from_pretrained(tmp_path, local_files_only=True) is processor
+    assert seen == [tmp_path]
+    assert config_path.read_text() == payload

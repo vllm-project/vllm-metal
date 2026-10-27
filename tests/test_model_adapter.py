@@ -1751,3 +1751,22 @@ class TestBuildMultimodalAdapterPassesBidirectionalFlag:
             object(), hf_config, sidecar=object()
         )
         assert captured["flag"] is None
+
+
+def test_nano_frontend_rejects_audio_video_and_preserves_image_limit():
+    from vllm.config.multimodal import MultiModalConfig
+
+    config = SimpleNamespace(
+        quantization=None,
+        hf_config=SimpleNamespace(
+            model_type="NemotronH_Nano_VL_V2",
+            architectures=["NemotronH_Nano_VL_V2"],
+        ),
+        multimodal_config=MultiModalConfig(
+            limit_per_prompt={"image": 2, "audio": 1, "video": 1}
+        ),
+    )
+    DefaultModelAdapter().normalize_model_config(config)
+    assert config.multimodal_config.get_limit_per_prompt("image") == 2
+    assert config.multimodal_config.get_limit_per_prompt("video") == 0
+    assert config.multimodal_config.get_limit_per_prompt("audio") == 0

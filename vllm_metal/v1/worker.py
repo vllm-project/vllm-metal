@@ -50,6 +50,11 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# WorkerWrapperBase resolves this module before creating its multimodal
+# receiver cache, which can load configuration before MetalWorker.__init__.
+# Platform discovery is already complete here, so model registration is safe.
+MetalPlatform.pre_register_and_update()
+
 
 def init_worker_distributed_environment(
     vllm_config: VllmConfig,
@@ -96,6 +101,9 @@ class MetalWorker(WorkerBase):
         is_driver_worker: bool = False,
         **kwargs: Any,
     ):
+        # Spawned workers need registries before WorkerBase constructs its
+        # renderer, which can read the model configuration immediately.
+        MetalPlatform.pre_register_and_update()
         super().__init__(
             vllm_config=vllm_config,
             local_rank=local_rank,

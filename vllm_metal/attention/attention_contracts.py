@@ -20,6 +20,9 @@ class AttentionContract:
     qk_norm_placement: QKNormPlacement = QKNormPlacement.BEFORE_ROPE
     derive_scale_from_query: bool = False
     use_rope: bool = True
+    # Nano's quantized BF16 K/V can vary with packed GEMM geometry. Keep each
+    # request's projections stable before its recurrent layers amplify the drift.
+    project_kv_per_request: bool = False
     # Ministral 3: attention is called as ``(x, attn_scale, mask, cache)`` and
     # scales queries by a position-dependent Llama 4 factor.
     llama4_query_scaling: bool = False
@@ -67,6 +70,9 @@ _ATTENTION_CONTRACTS: dict[str, AttentionContract] = {
         shared_qk_norm=True,
         post_norm_query_scale=True,
         sigmoid_output_gate=True,
+    ),
+    "mlx_vlm.models.nemotron_h.language": AttentionContract(
+        use_rope=False, project_kv_per_request=True
     ),
 }
 

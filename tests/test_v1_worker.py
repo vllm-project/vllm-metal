@@ -155,6 +155,24 @@ class TestWorkerRunnerBoundaryDelegation:
         assert "Linear(input_dims=4, output_dims=8, bias=True)" in inspection
         assert "RMSNorm(8, eps=1e-05)" in inspection
 
+    def test_registries_exist_before_base_worker_renderer(self, monkeypatch) -> None:
+        from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+        from vllm.transformers_utils.config import _CONFIG_REGISTRY
+
+        from vllm_metal.multimodal.nemotron_nano_vl.config import NemotronNanoVLConfig
+
+        model_type = NemotronNanoVLConfig.model_type
+        monkeypatch.delitem(CONFIG_MAPPING._extra_content, model_type, raising=False)
+        monkeypatch.delitem(_CONFIG_REGISTRY, model_type, raising=False)
+
+        def initialize_base(worker, **kwargs):
+            assert CONFIG_MAPPING[model_type] is NemotronNanoVLConfig
+            assert _CONFIG_REGISTRY[model_type] is NemotronNanoVLConfig
+            worker.parallel_config = SimpleNamespace()
+
+        monkeypatch.setattr(worker_base.WorkerBase, "__init__", initialize_base)
+        MetalWorker(SimpleNamespace(additional_config={}), 0, 0, "unused")
+
     @pytest.mark.parametrize("revision", [None, "release-tag", "a" * 40])
     def test_init_device_preserves_stt_revision(self, monkeypatch, revision) -> None:
         from vllm_metal.v1 import worker as worker_module

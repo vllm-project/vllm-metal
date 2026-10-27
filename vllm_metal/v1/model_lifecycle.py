@@ -511,7 +511,10 @@ class ModelLifecycle:
         # Adapter state follows the effective VLM mode, not the raw config flag.
         multimodal_adapter = (
             self._model_adapter.build_multimodal_adapter(
-                loaded_model.model, request.hf_config, sidecar=loaded_model.sidecar
+                loaded_model.model,
+                request.hf_config,
+                sidecar=loaded_model.sidecar,
+                model_config=request.model_config,
             )
             if request.is_vlm
             else None

@@ -1,0 +1,214 @@
+{
+  "cases": [
+    {
+      "name": "text_only",
+      "images": [],
+      "messages": [
+        {
+          "role": "user",
+          "content": "Return exactly these three uppercase words separated by one space: METAL REFERENCE READY"
+        }
+      ]
+    },
+    {
+      "name": "square",
+      "images": [
+        "red_square"
+      ],
+      "messages": [
+        {
+          "role": "user",
+          "content": "<image>\nWhat is the main color in this image? Answer with one color word."
+        }
+      ]
+    },
+    {
+      "name": "resized",
+      "images": [
+        "blue_resized"
+      ],
+      "messages": [
+        {
+          "role": "user",
+          "content": "<image>\nWhat is the main color in this image? Answer with one color word."
+        }
+      ]
+    },
+    {
+      "name": "wide_tiled",
+      "images": [
+        "wide"
+      ],
+      "messages": [
+        {
+          "role": "user",
+          "content": "<image>\nWhat color is the left half of this image? Answer with one color word."
+        }
+      ]
+    },
+    {
+      "name": "portrait_tiled",
+      "images": [
+        "portrait"
+      ],
+      "messages": [
+        {
+          "role": "user",
+          "content": "<image>\nWhat color is the bottom half of this image? Answer with one color word."
+        }
+      ]
+    },
+    {
+      "name": "two_images",
+      "images": [
+        "red_square",
+        "blue_resized"
+      ],
+      "messages": [
+        {
+          "role": "user",
+          "content": "First image: <image>\nSecond image: <image>\nName the main color of each image, in that order. Answer with two color words separated by a comma."
+        }
+      ]
+    },
+    {
+      "name": "reversed_images",
+      "images": [
+        "blue_resized",
+        "red_square"
+      ],
+      "messages": [
+        {
+          "role": "user",
+          "content": "First image: <image>\nSecond image: <image>\nName the main color of each image, in that order. Answer with two color words separated by a comma."
+        }
+      ]
+    },
+    {
+      "name": "multi_turn",
+      "images": [
+        "red_square",
+        "blue_resized"
+      ],
+      "messages": [
+        {
+          "role": "user",
+          "content": "Remember these two images. First: <image>\nSecond: <image>"
+        },
+        {
+          "role": "assistant",
+          "content": "I will refer to the images in that order."
+        },
+        {
+          "role": "user",
+          "content": "What is the main color in the second image? Answer with one color word."
+        }
+      ]
+    }
+  ],
+  "fixture_id": "nano-vl-v2-images-v1",
+  "images": {
+    "blue_resized": {
+      "color": [
+        0,
+        0,
+        255
+      ],
+      "size": [
+        379,
+        291
+      ]
+    },
+    "portrait": {
+      "color": [
+        0,
+        255,
+        0
+      ],
+      "rectangles": [
+        {
+          "box": [
+            0,
+            512,
+            511,
+            1023
+          ],
+          "color": [
+            0,
+            0,
+            255
+          ]
+        }
+      ],
+      "size": [
+        512,
+        1024
+      ]
+    },
+    "red_square": {
+      "color": [
+        255,
+        0,
+        0
+      ],
+      "size": [
+        512,
+        512
+      ]
+    },
+    "wide": {
+      "color": [
+        255,
+        0,
+        0
+      ],
+      "rectangles": [
+        {
+          "box": [
+            512,
+            0,
+            1023,
+            511
+          ],
+          "color": [
+            0,
+            0,
+            255
+          ]
+        }
+      ],
+      "size": [
+        1024,
+        512
+      ]
+    }
+  },
+  "max_num_tiles": 2,
+  "max_tokens": 32,
+  "model": {
+    "files_sha256": {
+      "chat_template.jinja": "f98c2d2d577b64d7881d0e84a271d354ea773209a6288da3b817fcc2fb3bb684",
+      "config.json": "1132a4834deddb37056087914318b7b34ef8b69d8c922f7abc17832a6fb861da",
+      "generation_config.json": "dc3497ad1a44de1dd3956dc21b5fa527888f4e99d36f8dcebcdeb8b83f5969d9",
+      "model.safetensors": "259c896ccd039e4ae62d02bc97e89c2ed6ab9e6155a31d05216a62974d7ca790",
+      "preprocessor_config.json": "aa4323e2d68793ed8fdf0a87bdcc26344e5308819265aff98db0ceef7e2db115",
+      "special_tokens_map.json": "2a4d2e7403546286e5d75f5b6b3c197490be67fb1e2118e5c60ad5c26e6668b1",
+      "tokenizer.json": "db8e35444fca3a2b98e2c8e927a8f1d8b1ba9d4b349e13ce5aafdb11b6404205",
+      "tokenizer_config.json": "d4a2fc1995e22d777b3fc9a1a383b69366cf22c24a816bc8f4bbea7d2017cd37"
+    },
+    "repository": "ekryski/Nemotron-Nano-12B-v2-VL-4bit",
+    "revision": "e47ef857c31650d807610d810be199a20d9bf114"
+  },
+  "reference": {
+    "environment": {
+      "MLX_ENABLE_TF32": "1"
+    },
+    "implementation": "mlx-vlm-direct-with-pinned-nvidia-vl-v2-preprocessing",
+    "mlx": "0.32.4",
+    "mlx_vlm": "0.7.6",
+    "nvidia_processor_revision": "ca9543b126e8bf3176916d3d305ccc415f89fd4d",
+    "nvidia_processor_sha256": "c9a186c2c272de9e9e56e192663fbaa2e7b4543bb871051f53a686be400b9f6d"
+  },
+  "seed": 0,
+  "max_model_len": 2048
+}

@@ -54,6 +54,8 @@ unsupported; leave `--video-pruning-rate` unset.
 | PaddleOCR-VL | 🔵 | | native multimodal paged generation | image input, no video | `PaddlePaddle/PaddleOCR-VL-1.6` |
 | Gemma 4 | 🔵 | | mlx_lm text backbone + mlx-vlm encoder sidecar, paged generation | image input; audio and video input on E2B/E4B; bidirectional attention inside image blocks on sliding-window layers | `mlx-community/unsloth-gemma-4-26B-A4B-it-qat-oQ4`, `mlx-community/gemma-4-e2b-it-4bit` (audio, video) |
 
+| [Nemotron Nano VL V2](nemotron_nano_vl.md) | 🔵 | | native multimodal paged generation | image input, text output; see validation limits | `ekryski/Nemotron-Nano-12B-v2-VL-4bit` |
+
 Gemma 4 keeps its text path exactly as on the text-only table (mlx_lm model,
 selective logits, intermediate forward); only `vision_tower` and `embed_vision`
 are loaded from the checkpoint through mlx-vlm, plus `audio_tower` and

@@ -157,6 +157,19 @@ class MetalPlatform(Platform):
         )
 
     @classmethod
+    def pre_register_and_update(cls, parser=None) -> None:
+        # vLLM calls this after platform discovery and before model config
+        # construction. Importing model registries during discovery itself
+        # creates a cycle through vllm.config and can hide the Metal platform.
+        from vllm_metal.multimodal.nemotron_nano_vl.config import (
+            register_config,
+            register_processing,
+        )
+
+        register_config()
+        register_processing()
+
+    @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
         """Get the name of the Metal device.
 

@@ -597,6 +597,44 @@ class TestPrepareSDPAQKV:
         assert mx.array_equal(queries, expected_q)
         assert mx.array_equal(keys, expected_k)
 
+    @pytest.mark.parametrize("lengths", [(461, 51), (51, 461), (1, 1)])
+    def test_nano_quantized_kv_is_independent_of_other_requests(self, lengths) -> None:
+        """Packed BF16 K/V must preserve each request's standalone projection."""
+        from mlx_vlm.models.nemotron_h.language import NemotronHAttention
+
+        mx.random.seed(7)
+        inner = NemotronHAttention(
+            SimpleNamespace(
+                hidden_size=1024,
+                num_attention_heads=4,
+                num_key_value_heads=4,
+                head_dim=64,
+                attention_bias=False,
+            )
+        )
+        inner.set_dtype(mx.bfloat16)
+        nn.quantize(inner, group_size=64, bits=4)
+        x = mx.random.normal((1, sum(lengths), 1024)).astype(mx.bfloat16)
+        contract = attention_contract_for(inner)
+        ctx = _make_ctx(sum(lengths))
+        ctx.cu_seqlens = [0, lengths[0], sum(lengths)]
+        ctx.context_lens = list(lengths)
+        _, keys, values, _, _ = prepare_sdpa_qkv(
+            inner, x, ctx, 4, 4, attention_contract=contract
+        )
+
+        for start, end in zip(ctx.cu_seqlens[:-1], ctx.cu_seqlens[1:], strict=True):
+            _, expected_k, expected_v, _, _ = prepare_sdpa_qkv(
+                inner,
+                x[:, start:end],
+                _make_ctx(end - start),
+                4,
+                4,
+                attention_contract=contract,
+            )
+            assert mx.array_equal(keys[:, :, start:end], expected_k)
+            assert mx.array_equal(values[:, :, start:end], expected_v)
+
     def test_contract_without_rope_covers_the_shared_kv_path(self) -> None:
         inner = _make_inner(with_v_proj=True)
         del inner.rope

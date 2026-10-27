@@ -40,6 +40,7 @@ def apply_compat_patches() -> None:
     _patch_mlx_lm_qwen35_fp8_sanitize()
     _patch_mlx_lm_qwen3_flat_weight_prefix()
     _patch_mlx_lm_minicpm4_model_type()
+    _patch_mlx_vlm_nemotron_nano_vl_v2()
     _patch_transformers_exaone4_config()
 
 
@@ -1073,3 +1074,54 @@ def _patch_mlx_lm_qwen3_flat_weight_prefix() -> bool:
     if patched:
         logger.debug("Patched mlx_lm Qwen3 flat weight prefix compatibility")
     return patched
+
+
+_NANO_VL_V2_MODEL_TYPE = "nemotronh_nano_vl_v2"
+_NANO_VIDEO_EMBEDDER_PREFIX = (
+    "vision_model.radio_model.model.patch_generator.video_embedder."
+)
+_NANO_VL_PROCESSOR_PATCHED = False
+
+
+def _drop_nano_v2_unshipped_video_embedder(
+    model: Any, weights: Mapping[str, Any]
+) -> Mapping[str, Any]:
+    """Only V2 omits Omni's video projection; missing Omni weights remain errors."""
+    if str(model.config.model_type).lower() != _NANO_VL_V2_MODEL_TYPE:
+        return weights
+    if not any(key.startswith(_NANO_VIDEO_EMBEDDER_PREFIX) for key in weights):
+        patch_generator = model.vision_model.radio_model.model.patch_generator
+        if "video_embedder" in patch_generator:
+            delattr(patch_generator, "video_embedder")
+    return weights
+
+
+def _patch_mlx_vlm_nemotron_nano_vl_v2() -> bool:
+    """Map V2 onto mlx-vlm's Omni image path without rewriting checkpoints.
+
+    Adapted from syang-genai's PR #1160, commit
+    96ba69519bd7c3d8ce83591fa31c33b3a29223d7. The sanitizer is restricted to
+    V2 so incomplete, unrelated Omni checkpoints still fail strict loading.
+    The returned Omni processor is unused: serving uses our static V2 processor.
+    TODO: remove when the pinned mlx-vlm supports this model type directly.
+    """
+    from importlib import import_module
+
+    global _NANO_VL_PROCESSOR_PATCHED
+    try:
+        utils = import_module("mlx_vlm.utils")
+        omni = import_module("mlx_vlm.models.nemotron_h_nano_omni")
+    except ImportError as exc:
+        logger.warning("Could not install Nano VL V2 mlx-vlm compatibility: %s", exc)
+        return False
+    utils.MODEL_REMAPPING.setdefault(_NANO_VL_V2_MODEL_TYPE, "nemotron_h_nano_omni")
+    if not _NANO_VL_PROCESSOR_PATCHED:
+        import_module("mlx_vlm.models.base").install_auto_processor_patch(
+            [_NANO_VL_V2_MODEL_TYPE], omni.NemotronHNanoOmniProcessor
+        )
+        _NANO_VL_PROCESSOR_PATCHED = True
+    return _wrap_model_sanitize(
+        omni.Model,
+        "_vllm_metal_nano_vl_v2_patch",
+        _drop_nano_v2_unshipped_video_embedder,
+    )

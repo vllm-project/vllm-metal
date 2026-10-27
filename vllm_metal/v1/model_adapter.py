@@ -358,12 +358,18 @@ class ModelAdapter(Protocol):
         """
 
     def build_multimodal_adapter(
-        self, model: Any, hf_config: Any, *, sidecar: Any | None = None
+        self,
+        model: Any,
+        hf_config: Any,
+        *,
+        sidecar: Any | None = None,
+        model_config: ModelConfig | None = None,
     ) -> MultimodalRuntimeAdapter | None:
         """Return a model-owned multimodal adapter for native VLM execution.
 
         ``sidecar`` is the loaded :class:`Gemma4VisionSidecar` on the
         ``text_sidecar`` path and ``None`` otherwise.
+        ``model_config`` supplies the configured encoder input limits.
         """
 
     def build_yoco_cache_mapping(
@@ -599,6 +605,13 @@ class DefaultModelAdapter(ModelAdapter):
                 multimodal_mode,
             )
             return
+        if "NemotronH_Nano_VL_V2" in (getattr(hf_config, "architectures", ()) or ()):
+            self._restrict_modalities(
+                model_config.multimodal_config,
+                keep_audio=False,
+                keep_video=False,
+                model_name="Nemotron Nano VL V2",
+            )
         if mode == "text_sidecar":
             # Only E2B/E4B carry an audio encoder; the processor and the
             # sidecar both follow ``audio_config``.
@@ -622,7 +635,11 @@ class DefaultModelAdapter(ModelAdapter):
 
     @staticmethod
     def _restrict_modalities(
-        multimodal_config: Any, *, keep_audio: bool, keep_video: bool
+        multimodal_config: Any,
+        *,
+        keep_audio: bool,
+        keep_video: bool,
+        model_name: str = "Gemma 4 sidecar",
     ) -> None:
         """Set the limits of modalities the sidecar cannot serve to 0 so the
         frontend rejects them (idempotent)."""
@@ -638,9 +655,10 @@ class DefaultModelAdapter(ModelAdapter):
             current = limits.get(modality)
             if current is not None and int(getattr(current, "count", 0)) > 0:
                 logger.warning(
-                    "Metal: %s inputs are unsupported on the Gemma 4 sidecar path; "
+                    "Metal: %s inputs are unsupported on the %s path; "
                     "overriding --limit-mm-per-prompt %s=%s with 0",
                     modality,
+                    model_name,
                     modality,
                     current.count,
                 )
@@ -953,7 +971,12 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
         return apply_pipeline_split(self.text_model(model), pp)
 
     def build_multimodal_adapter(
-        self, model: Any, hf_config: Any, *, sidecar: Any | None = None
+        self,
+        model: Any,
+        hf_config: Any,
+        *,
+        sidecar: Any | None = None,
+        model_config: ModelConfig | None = None,
     ) -> MultimodalRuntimeAdapter | None:
         """Build the native multimodal adapter for supported model families."""
         if sidecar is not None:
@@ -993,6 +1016,22 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
             return cast(
                 MultimodalRuntimeAdapter,
                 PaddleOCRVLMultimodalAdapter.from_loaded_model(model),
+            )
+
+        if "NemotronH_Nano_VL_V2" in architectures:
+            from vllm_metal.multimodal.nemotron_nano_vl import (
+                NemotronNanoVLImageAdapter,
+            )
+
+            return cast(
+                MultimodalRuntimeAdapter,
+                NemotronNanoVLImageAdapter.from_loaded_model(
+                    model,
+                    hf_config=hf_config,
+                    mm_config=(
+                        model_config.multimodal_config if model_config else None
+                    ),
+                ),
             )
 
         return None

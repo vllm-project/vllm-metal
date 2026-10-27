@@ -439,6 +439,67 @@ class TestIsEmbedSplice:
         ).item()
 
 
+@pytest.mark.parametrize("start,end", [(0, 7), (1, 2), (2, 3), (3, 6), (5, 7)])
+@pytest.mark.parametrize("with_deepstack", [False, True])
+def test_masked_feature_splice_across_chunk_boundaries(
+    start: int, end: int, with_deepstack: bool
+) -> None:
+    """Marker tokens consume prompt positions but never encoder rows."""
+    adapter = _MmAdapter()
+    runner = _runner(adapter)
+    # Include an internal text marker as well as opening/closing markers.
+    # This exercises vLLM's general mask contract, which Nano also uses.
+    tokens = [10, 40, 99, 77, 99, 41, 11]
+    feature = MultiModalFeatureSpec(
+        data=None,
+        modality="image",
+        identifier="masked-image",
+        mm_position=PlaceholderRange(
+            offset=1,
+            length=5,
+            is_embed=torch.tensor([False, True, False, True, False]),
+        ),
+    )
+    runner.encoder_cache.add_request("req-0", [feature])
+    expected_values = [0, 0, 10, 0, 20, 0, 0][start:end]
+    selected_values = [value for value in expected_values if value]
+    # A marker-only chunk must not need an image encoder result at all.
+    if selected_values:
+        _put_encode(
+            runner,
+            feature.identifier,
+            hidden_states=mx.array([[10.0] * 4, [20.0] * 4]),
+            deepstack=[mx.array([[110.0] * 4, [120.0] * 4])]
+            if with_deepstack
+            else None,
+        )
+    runner._spec_decode_controller.build_decode_segments = MagicMock(return_value=())
+    prefill = _mm_prefill(
+        "req-0",
+        token_ids=tokens[start:end],
+        prompt_len=len(tokens),
+        start_pos=start,
+        full_prompt=tokens,
+    )
+
+    runner._start_paged_forward(
+        batch=MagicMock(),
+        prefill_reqs=[prefill],
+        decode_reqs=[],
+        scheduler_output=_scheduler_output(),
+    )
+
+    call = adapter.call_lm_calls[0]
+    assert call["visual_pos_masks"].tolist() == [[bool(v) for v in expected_values]]
+    assert call["inputs_embeds"].tolist() == [[[v] * 4 for v in expected_values]]
+    if with_deepstack and selected_values:
+        assert call["deepstack_visual_embeds"][0].tolist() == [
+            [v + 100] * 4 for v in selected_values
+        ]
+    else:
+        assert call["deepstack_visual_embeds"] is None
+
+
 class TestTextOnlyRoutingForExplicitPositionsAdapter:
     """``requires_explicit_positions`` adapters (PaddleOCR-VL) route
     text-only batches through the mm forward so the LM always receives

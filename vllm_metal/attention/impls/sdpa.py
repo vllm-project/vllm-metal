@@ -270,6 +270,24 @@ def _norm_then_scale_queries(
 # === Q/K/V preparation (YOCO, K-eq-V, v_norm variants) ===
 
 
+def _project_kv(
+    projection: nn.Module,
+    x: mx.array,
+    ctx: PagedAttentionContext,
+    contract: AttentionContract,
+) -> mx.array:
+    bounds = ctx.cu_seqlens
+    if not contract.project_kv_per_request or bounds is None or len(bounds) <= 2:
+        return projection(x)
+    return mx.concatenate(
+        [
+            projection(x[:, start:end])
+            for start, end in zip(bounds[:-1], bounds[1:], strict=True)
+        ],
+        axis=1,
+    )
+
+
 def prepare_sdpa_qkv(
     inner: nn.Module,
     x: mx.array,
@@ -416,7 +434,7 @@ def prepare_sdpa_qkv(
             queries, keys = _apply_qk_norms(queries, keys, q_norm)
     else:
         if not packed_qkv:
-            k_proj_out = inner.k_proj(x)
+            k_proj_out = _project_kv(inner.k_proj, x, ctx, attention_contract)
             if (
                 norm_placement is QKNormPlacement.BEFORE_HEAD_SPLIT
                 and k_norm is not None
@@ -427,7 +445,9 @@ def prepare_sdpa_qkv(
             # DiffusionGemma keeps the attribute but sets it to None on
             # full-attention layers.
             if getattr(inner, "v_proj", None) is not None:
-                values = inner.v_proj(x).reshape(B, L, n_kv_heads, -1)
+                values = _project_kv(inner.v_proj, x, ctx, attention_contract).reshape(
+                    B, L, n_kv_heads, -1
+                )
             else:
                 values = keys
 
