@@ -70,8 +70,10 @@ from vllm_metal.attention.context import (
 )
 from vllm_metal.attention.runtime.sdpa import SDPAPagedAttentionRuntime
 from vllm_metal.metal.constants import PA_WINDOW_MAX_HEAD_SIZE
+from vllm_metal.tensor_bridge import TORCH_TO_MLX_DTYPE
 from vllm_metal.utils import get_model_download_path
 from vllm_metal.v1.mlx_lm_paths import mlx_lm_compatible_model_path
+from vllm_metal.v1.model_weights import cast_model_weights
 from vllm_metal.v1.proposer import (
     _DECODE_INGEST_MAX_TOKENS,
     NoOwnKVProposer,
@@ -968,7 +970,9 @@ def _load_draft_model(
     )
     with mlx_lm_compatible_model_path(model_path) as compatible_path:
         model, _ = mlx_lm_load(
-            str(compatible_path), revision=draft_model_config.revision
+            str(compatible_path), revision=draft_model_config.revision, lazy=True
         )
+    cast_model_weights(model, TORCH_TO_MLX_DTYPE[draft_model_config.dtype])
+    mx.eval(model.parameters())
 
     return model, dims

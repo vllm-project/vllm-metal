@@ -81,9 +81,11 @@ class ExpertStore:
         index: dict[str, TensorLocation],
         cache_bytes: int,
         stack_bytes: int,
+        dtypes: dict[tuple[str, str, str], mx.Dtype],
     ) -> None:
         self._index = index
         self._cache_bytes = cache_bytes
+        self._dtypes = dtypes
         # A forward stacks the experts it touches on top of the cache, and a
         # long prefill touches nearly every expert of a layer.
         self.reserved_bytes = cache_bytes + stack_bytes
@@ -117,11 +119,25 @@ class ExpertStore:
         targets = cls._switch_layers(model)
         for path, module in targets:
             cls._validate_layer(index, path, module)
+        # Reserve and reload the resident model's dtypes, which may differ
+        # from those on disk after applying the serving dtype.
         stack_bytes = max(
-            cls._layer_bytes(index, path, module.gate_proj.num_experts)
-            for path, module in targets
+            sum(
+                array.nbytes
+                for projection in cls.PROJECTIONS
+                for component in cls.COMPONENTS
+                if (array := module[projection].get(component)) is not None
+            )
+            for _, module in targets
         )
-        store = cls(index, cache_bytes, stack_bytes)
+        dtypes = {
+            (path, projection, component): array.dtype
+            for path, module in targets
+            for projection in cls.PROJECTIONS
+            for component in cls.COMPONENTS
+            if (array := module[projection].get(component)) is not None
+        }
+        store = cls(index, cache_bytes, stack_bytes, dtypes)
         model.update_modules(
             tree_unflatten(
                 [
@@ -164,8 +180,11 @@ class ExpertStore:
             entry = self._entries.setdefault(
                 (module_path, expert), {p: {} for p in self.PROJECTIONS}
             )
-            entry[projection][component] = self._to_array(piece, raw)
-            self.bytes += len(raw)
+            array = self._to_array(piece, raw).astype(
+                self._dtypes[(module_path, projection, component)]
+            )
+            entry[projection][component] = array
+            self.bytes += array.nbytes
         self.misses += len(missing)
         self.hits += len(experts) - len(missing)
         for expert in experts:
@@ -258,23 +277,6 @@ class ExpertStore:
                             "'<block>.switch_mlp.<proj>.<component>' and "
                             "per-expert '<block>.experts.<j>.<proj>.<component>'."
                         )
-
-    @classmethod
-    def _layer_bytes(
-        cls, index: dict[str, TensorLocation], module_path: str, num_experts: int
-    ) -> int:
-        return sum(
-            piece.nbytes
-            for expert in range(num_experts)
-            for projection in cls.PROJECTIONS
-            for component in cls.COMPONENTS
-            if (
-                piece := cls._expert_slice(
-                    index, module_path, projection, component, expert
-                )
-            )
-            is not None
-        )
 
     @classmethod
     def _expert_slice(

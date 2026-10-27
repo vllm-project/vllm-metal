@@ -15,6 +15,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import pytest
 import torch
+from mlx.utils import tree_flatten
 from mlx_lm.models.nemotron_h import Model as NemotronHModel
 from mlx_lm.models.nemotron_h import ModelArgs as NemotronHModelArgs
 from vllm.model_executor.models import ModelRegistry
@@ -231,12 +232,75 @@ def _make_lifecycle(
 
 
 class TestModelLifecycle:
+    @pytest.mark.parametrize(
+        "dtype",
+        [torch.float16, torch.bfloat16, torch.float32],
+        ids=["fp16", "bf16", "fp32"],
+    )
+    @pytest.mark.parametrize("quantized", [False, True], ids=["dense", "quantized"])
+    def test_native_load_honours_dtype_without_casting_packed_weights(
+        self, monkeypatch: pytest.MonkeyPatch, dtype: torch.dtype, quantized: bool
+    ) -> None:
+        model = nn.Sequential(nn.Linear(32, 32), nn.RMSNorm(32))
+        if quantized:
+            nn.quantize(model, group_size=32, bits=4)
+        model.set_dtype(mx.bfloat16)
+        packed = {
+            name: array
+            for name, array in tree_flatten(model.parameters())
+            if not mx.issubdtype(array.dtype, mx.floating)
+        }
+        monkeypatch.setattr(
+            model_lifecycle.AWQQuantLoader, "for_model", lambda *a, **kw: None
+        )
+        monkeypatch.setattr(
+            model_lifecycle, "mlx_lm_load", lambda *a, **kw: (model, None)
+        )
+        lifecycle, _ = _make_lifecycle(model_config=_runner_model_config(dtype=dtype))
+
+        loaded, _ = lifecycle._load_generation_model("org/model", False)
+
+        expected_dtype = model_lifecycle.TORCH_TO_MLX_DTYPE[dtype]
+        for name, array in tree_flatten(loaded.parameters()):
+            if name in packed:
+                assert array.dtype == packed[name].dtype
+                assert mx.array_equal(array, packed[name])
+            else:
+                assert array.dtype == expected_dtype
+
+    def test_native_load_preserves_model_precision_exceptions(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        model = NemotronHModel(NemotronHModelArgs.from_dict(NEMOTRON_H_TINY_ARGS))
+        protected = {
+            name: array
+            for name, array in tree_flatten(model.parameters())
+            if not model.cast_predicate(name)
+        }
+        assert protected
+        monkeypatch.setattr(
+            model_lifecycle.AWQQuantLoader, "for_model", lambda *a, **kw: None
+        )
+        monkeypatch.setattr(
+            model_lifecycle, "mlx_lm_load", lambda *a, **kw: (model, None)
+        )
+        lifecycle, _ = _make_lifecycle()
+
+        loaded, _ = lifecycle._load_generation_model("org/model", False)
+
+        for name, array in tree_flatten(loaded.parameters()):
+            if name in protected:
+                assert array.dtype == protected[name].dtype == mx.float32
+                assert mx.array_equal(array, protected[name])
+            elif mx.issubdtype(array.dtype, mx.floating):
+                assert array.dtype == mx.float16
+
     @pytest.mark.parametrize("revision", [None, "release-tag", "a" * 40])
     @pytest.mark.parametrize("backend", ["text", "vlm", "awq"])
     def test_generation_load_preserves_revision(
         self, monkeypatch: pytest.MonkeyPatch, revision: str | None, backend: str
     ) -> None:
-        model, tokenizer = object(), object()
+        model, tokenizer = nn.Module(), object()
         loader = Mock(return_value=(model, tokenizer))
         awq_loader = SimpleNamespace(load=loader) if backend == "awq" else None
         detect_awq = Mock(return_value=awq_loader)
@@ -427,6 +491,31 @@ class TestModelLifecycle:
         lifecycle._load_mlx_lm_text_model("stub", {}, lazy=False)
         assert captured["lazy"] is False
 
+    @pytest.mark.parametrize("lazy", [False, True])
+    def test_native_load_casts_before_evaluation_and_keeps_lazy_weights_lazy(
+        self, monkeypatch: pytest.MonkeyPatch, lazy: bool
+    ) -> None:
+        model = nn.Linear(8, 8)
+        model.set_dtype(mx.bfloat16)
+        load = Mock(return_value=(model, None))
+        monkeypatch.setattr(model_lifecycle, "mlx_lm_load", load)
+        monkeypatch.setattr(
+            model_lifecycle.AWQQuantLoader, "for_model", lambda *a, **kw: None
+        )
+        evaluated = []
+
+        def evaluate(parameters):
+            evaluated.append([p.dtype for _, p in tree_flatten(parameters)])
+
+        monkeypatch.setattr(model_lifecycle.mx, "eval", evaluate)
+        lifecycle, _ = _make_lifecycle()
+
+        lifecycle._load_generation_model("org/model", False, lazy_weights=lazy)
+
+        assert load.call_args.kwargs["lazy"] is True
+        assert evaluated == ([] if lazy else [[mx.float16, mx.float16]])
+        assert model.weight.dtype == model.bias.dtype == mx.float16
+
     def test_load_uses_adapter_override_for_qwen35_fp8_conditional_generation(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -598,7 +687,8 @@ class TestModelLifecycle:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        text_model = SimpleNamespace(config=_text_config())
+        text_model = nn.Module()
+        text_model.config = _text_config()
         text_tokenizer = object()
 
         class _StubAWQLoader:
@@ -1015,7 +1105,8 @@ class TestModelLifecycle:
         model-name string or any other heuristic — is what gates the
         dispatch.
         """
-        fake_model = SimpleNamespace(config=_text_config())
+        fake_model = nn.Module()
+        fake_model.config = _text_config()
         fake_tokenizer = object()
         awq_load_calls: list[dict[str, object]] = []
         mlx_lm_load_calls: list[dict[str, object]] = []
@@ -1182,7 +1273,8 @@ class TestModelLifecycle:
         Tripwire: block the ``gguf`` package itself (``sys.modules[...] = None``
         raises on import). A generic load must leave the GGUF owner unimported.
         """
-        fake_model = SimpleNamespace(config=_text_config())
+        fake_model = nn.Module()
+        fake_model.config = _text_config()
         fake_tokenizer = object()
 
         class _StubAWQLoader:

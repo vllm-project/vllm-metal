@@ -17,12 +17,15 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import mlx.core as mx
+import mlx.nn as nn
 import pytest
+import torch
 from vllm.sampling_params import SamplingParams
 from vllm.utils.math_utils import cdiv
 
 from tests.stub_draft_model import VOCAB_SIZE, StubDraftModel
 from vllm_metal.attention.context import OffsetCache, get_context
+from vllm_metal.tensor_bridge import TORCH_TO_MLX_DTYPE
 from vllm_metal.v1 import draft_model_proposer
 from vllm_metal.v1.draft_model_proposer import DraftDims, DraftModelProposer
 from vllm_metal.v1.model_runner import PrefillRequest, RequestState
@@ -123,10 +126,18 @@ def test_profile_warmup_selects_max_sequence_rows():
 
 
 @pytest.mark.parametrize("revision", [None, "release-tag", "a" * 40])
-def test_draft_load_preserves_revision(monkeypatch, revision):
-    dims, model = object(), object()
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.float16, torch.bfloat16, torch.float32],
+    ids=["fp16", "bf16", "fp32"],
+)
+def test_draft_load_honours_dtype_and_revision(monkeypatch, revision, dtype):
+    dims, model = object(), nn.Linear(8, 8)
+    model.set_dtype(mx.bfloat16)
     config = SimpleNamespace(
-        draft_model_config=SimpleNamespace(model="org/draft", revision=revision)
+        draft_model_config=SimpleNamespace(
+            model="org/draft", revision=revision, dtype=dtype
+        )
     )
     monkeypatch.setattr(draft_model_proposer, "resolve_draft_dims", lambda *_: dims)
     resolve_path = Mock(return_value="org/draft")
@@ -135,8 +146,9 @@ def test_draft_load_preserves_revision(monkeypatch, revision):
     monkeypatch.setattr(draft_model_proposer, "mlx_lm_load", load)
 
     assert draft_model_proposer._load_draft_model(config, None) == (model, dims)
+    assert model.weight.dtype == model.bias.dtype == TORCH_TO_MLX_DTYPE[dtype]
     resolve_path.assert_called_once_with("org/draft", revision=revision)
-    load.assert_called_once_with("org/draft", revision=revision)
+    load.assert_called_once_with("org/draft", revision=revision, lazy=True)
 
 
 class _PositionEncodingDraftModel(StubDraftModel):

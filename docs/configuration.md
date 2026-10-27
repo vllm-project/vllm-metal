@@ -1,5 +1,13 @@
 # Configuration
 
+## Model Precision
+
+For native MLX-LM text models, `--dtype` sets the floating weight precision for
+the target and ordinary draft models. Packed quantized weights retain their
+storage format, and model-defined precision exceptions stay intact.
+[Offloaded experts](moe_offload.md) use the same precision as resident experts;
+their memory reservation and cache budget account for the converted weights.
+
 ## Environment Variables
 
 vllm-metal validates these variables when the engine configuration is created and reports every invalid value together, so a typo fails the startup. Boolean switches treat `1` as on and any other value as off.

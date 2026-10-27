@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import mlx.core as mx
 import torch
 from mlx_lm import load as mlx_lm_load
 from mlx_vlm import load as mlx_vlm_load
@@ -31,6 +32,7 @@ from vllm_metal.v1.mlx_lm_paths import (
 )
 from vllm_metal.v1.mm import EncoderCache
 from vllm_metal.v1.model_adapter import ModelAdapter
+from vllm_metal.v1.model_weights import cast_model_weights
 from vllm_metal.v1.pooling.backends.decoder.factory import (
     build_decoder_pooling_backend,
 )
@@ -425,13 +427,16 @@ class ModelLifecycle:
             model, tokenizer = self._load_mlx_lm_text_model(
                 model_name,
                 tokenizer_config,
-                lazy=lazy_weights or bool(expert_cache_bytes),
+                lazy=True,
                 revision=revision,
             )
+            cast_model_weights(model, target_dtype)
             if expert_cache_bytes:
                 self._runner._expert_store = ExpertStore.install(
                     model, model_name, revision, expert_cache_bytes
                 )
+            elif not lazy_weights:
+                mx.eval(model.parameters())
 
         loaded_from = (
             gguf_source.weights_path if gguf_source is not None else model_name
