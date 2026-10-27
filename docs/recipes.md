@@ -5,11 +5,8 @@ Mac's memory below and the rest of the page follows that choice. To see it,
 open the Apple menu, choose **About This Mac**, and look for **Memory**.
 
 !!! note "Estimated starting points"
-    The 32 GB and 64 GB settings were first measured on 128 GB Macs with vLLM
-    limited to the memory a smaller Mac gives its graphics chip. The 16 GB
-    recipe was then checked on a real 16 GB MacBook Pro (M2 Pro). A Mac with
-    other apps open may still need a smaller `--max-model-len`. Start here and
-    adjust.
+    Start with the recipe for your Mac's memory. If other apps are open and the
+    server does not start, quit them or use a smaller `--max-model-len`.
 
 ## Before you start
 
@@ -100,9 +97,8 @@ Read the error just above the last line in Terminal.
   [Before you start](#before-you-start) in this window.
 - **"To serve at least one request with the model's max seq len"**: the
   conversation length does not fit. Replace the number after
-  `--max-model-len` with the smaller one the message suggests. On a real 16 GB
-  Mac this is common if browsers or other large apps are open; try `8192` or
-  `4096`.
+  `--max-model-len` with the smaller one the message suggests, or quit other
+  large apps and try again.
 - **"not enough Metal memory"**: the model does not fit in the memory free
   right now. Quit other large apps and try again. Halving the number after
   `--max-num-batched-tokens` also helps, or use a smaller model.
@@ -112,8 +108,6 @@ Read the error just above the last line in Terminal.
   vLLM is checking the model on Hugging Face and the connection is slow.
   Once the model is downloaded, start with `HF_HUB_OFFLINE=1` in front of the
   command, for example `HF_HUB_OFFLINE=1 vllm serve ...`.
-- **"Found ulimit of 2048"**: raise the open-file limit in that Terminal window
-  with `ulimit -n 10240`, then run the serve command again.
 
 ## Or with llmman
 
@@ -147,27 +141,16 @@ build. See [KV Cache Offloading](kv_offloading.md).
 
 You can skip this section.
 
-The 32 GB and 64 GB commands were first run as written with vLLM 0.31 and
-vLLM Metal main (October 2026), on a 128 GB M3 Max and a 128 GB M4 Max.
-`--gpu-memory-utilization` was added to limit vLLM to the memory a smaller Mac
-gives its graphics chip, taken as 2/3 of the Mac's memory. Measured Macs gave
-between 67% and 84%. Both Macs gave the same results for those two recipes:
+The 32 GB and 64 GB recipes were checked on large Macs with memory limited to
+match smaller machines:
 
 | Recipe | KV cache | Full-length conversations at once | 14,000-token prompt (M4 Max) |
 |---|---|---|---|
 | 32 GB | 47,786 tokens | 1.5 | 65 s |
 | 64 GB | 716,584 tokens | 22 | 12 s |
 
-The 16 GB recipe was then checked on a real 16 GB MacBook Pro (Apple M2 Pro,
-macOS 27.2) with vLLM 0.32.0 and vLLM Metal 0.32.0.dev, using the install
-script and normal desktop apps open. The earlier simulated 16 GB setting of
-`--max-model-len 65536` failed to start: after the 6 GB weights loaded, only a
-fraction of a gigabyte remained for KV cache. `--max-model-len 8192` started
-and answered a short chat request; larger values such as 16384 worked only when
-memory pressure was low. The table above no longer lists a simulated 16 GB KV
-figure for that reason.
-
-The llmman command was run on the M4 Max with llmman 0.1.535. Tool calls were
-checked with a request that defines one function.
+The 16 GB recipe was checked on a real 16 GB MacBook Pro. A very long
+conversation setting did not start there, so the recipe uses a shorter one
+that does.
 
 If a recipe does not work on your Mac, please open an issue.

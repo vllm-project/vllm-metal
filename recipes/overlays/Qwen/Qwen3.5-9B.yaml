@@ -40,7 +40,5 @@ variants:
       - The first run downloads 6.0 GB.
       - `--max-num-batched-tokens 2048` reads long text in smaller steps, so the
         model needs less memory. Without it this model does not fit on 16 GB.
-      - `--max-model-len 8192` fits a real 16 GB MacBook Pro with other apps
-        open. Larger values such as 65536 need more KV cache than a 16 GB Mac
-        usually has left after the weights load. If startup still asks for a
-        smaller max seq len, quit browsers and chat apps, or try `4096`.
+      - `--max-model-len 8192` is sized for a real 16 GB Mac. If startup still
+        asks for a smaller max seq len, quit other apps or try `4096`.
