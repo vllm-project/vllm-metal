@@ -93,7 +93,7 @@ flag (`gpu_memory_utilization=` for `LLM()`), a fraction in `(0, 1]`. The
 former `VLLM_METAL_MEMORY_FRACTION` override has been removed.
 
 Set `--kv-cache-memory-bytes` (`kv_cache_memory_bytes=` for `LLM()`) to a
-positive byte count to override automatic sizing, for example
+positive byte count to **override** automatic sizing, for example
 `--kv-cache-memory-bytes 2147483648` for 2 GiB. This budgets paged cache storage;
 weights, activations, runtime workspace, and the
 [offload host pool](kv_offloading.md) need additional memory.
