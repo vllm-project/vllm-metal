@@ -136,21 +136,3 @@ on that text instead of redoing it. It works with Qwen3 models such as
 `mlx-community/Qwen3-8B-4bit`, not with the Qwen3.5 models above. It needs a
 vLLM Metal release newer than v0.30.0 or the install script's development
 build. See [KV Cache Offloading](kv_offloading.md).
-
-## How these were tested
-
-You can skip this section.
-
-The 32 GB and 64 GB recipes were checked on large Macs with memory limited to
-match smaller machines:
-
-| Recipe | KV cache | Full-length conversations at once | 14,000-token prompt (M4 Max) |
-|---|---|---|---|
-| 32 GB | 47,786 tokens | 1.5 | 65 s |
-| 64 GB | 716,584 tokens | 22 | 12 s |
-
-The 16 GB recipe was checked on a real 16 GB MacBook Pro. A very long
-conversation setting did not start there, so the recipe uses a shorter one
-that does.
-
-If a recipe does not work on your Mac, please open an issue.
