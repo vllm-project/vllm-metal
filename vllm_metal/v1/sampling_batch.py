@@ -30,6 +30,8 @@ from vllm_metal.v1.logits_processors import BatchMinPLogitsProcessor
 
 GREEDY_TEMPERATURE_EPS = 1e-5
 _EMPTY_LOGITSPROCS = LogitsProcessors()
+# Logits per chunk when native top-k picks candidates by chunk maxima.
+TOP_K_CHUNK_SIZE = 64
 
 
 @dataclass(frozen=True)
@@ -355,7 +357,8 @@ class SamplingBatch:
         The whole vocabulary is sorted, not just the ``max(top_k)`` largest
         logits: top-k masks by value, so a row whose k-th largest logit is
         tied keeps every token sharing that value, and a candidate set cut to
-        ``max(top_k)`` would drop the ones past it.
+        ``max(top_k)`` would drop the ones past it. Batches where every row
+        has a small top-k use :meth:`_top_k_candidates` instead.
         """
         vocab_size = int(scaled_logits.shape[-1])
         effective_k = [k if 0 < k < vocab_size else vocab_size for k in top_k]
@@ -379,6 +382,124 @@ class SamplingBatch:
             leading_mass = mx.cumsum(sorted_probs, axis=-1) - sorted_probs
             sorted_desc = mx.where(leading_mass < top_p_col, sorted_desc, -mx.inf)
         return sorted_desc, sorted_idx
+
+    @staticmethod
+    def _uses_top_k_candidates(top_k: Sequence[int], vocab_size: int) -> bool:
+        """Whether every row has a top-k small enough for chunked candidates."""
+        if any(k <= 0 or k >= vocab_size for k in top_k):
+            return False
+        return max(top_k) * TOP_K_CHUNK_SIZE * 4 <= vocab_size
+
+    @staticmethod
+    def _top_k_candidates(
+        scaled_logits: mx.array,
+        top_k: Sequence[int],
+        top_p: Sequence[float],
+        min_p: Sequence[float],
+    ) -> tuple[mx.array, mx.array, mx.array, mx.array]:
+        """Same candidates as :meth:`_sorted_candidate_logits`, without
+        sorting the vocabulary. Every row needs ``0 < top_k``.
+
+        The k largest logits of a row lie in the k chunks with the largest
+        maxima: those maxima are k logits at or above the k-th chunk maximum,
+        and every logit outside those chunks is at most that. Sorting the k
+        chunks gives the exact k-th largest value and every logit above it.
+        Logits equal to the k-th value can also sit in other chunks, so they
+        are counted over the whole row and drawn as one group.
+
+        Returns ``(logits, token_ids, tie_value, tie_count)``. ``logits`` has
+        one column per sorted candidate above the row's k-th largest value
+        (``-inf`` where masked), labelled by ``token_ids``, plus a last
+        column for the group: the first ``tie_count`` tokens in vocab order
+        whose logit equals ``tie_value``. Top-p keeps sorted positions, and
+        the group comes last among the surviving positions, so it keeps a
+        count of tied tokens just as the full sort does.
+        """
+        num_rows, vocab_size = scaled_logits.shape
+        num_chunks = -(-vocab_size // TOP_K_CHUNK_SIZE)
+        padding = num_chunks * TOP_K_CHUNK_SIZE - vocab_size
+        padded = scaled_logits
+        if padding:
+            padded = mx.pad(
+                scaled_logits, [(0, 0), (0, padding)], constant_values=-mx.inf
+            )
+        chunks = padded.reshape(num_rows, num_chunks, TOP_K_CHUNK_SIZE)
+        top_chunks = mx.argsort(-chunks.max(axis=-1), axis=-1)[:, : max(top_k)]
+        candidates = mx.take_along_axis(chunks, top_chunks[..., None], axis=1)
+        candidate_ids = top_chunks[..., None] * TOP_K_CHUNK_SIZE + mx.arange(
+            TOP_K_CHUNK_SIZE, dtype=mx.uint32
+        )
+        candidates = candidates.reshape(num_rows, -1)
+        order = mx.argsort(-candidates, axis=-1)
+        sorted_desc = mx.take_along_axis(candidates, order, axis=-1)
+        token_ids = mx.take_along_axis(
+            candidate_ids.reshape(num_rows, -1), order, axis=-1
+        )
+
+        kth_pos = mx.array([k - 1 for k in top_k], dtype=mx.int32)[:, None]
+        tie_value = mx.take_along_axis(sorted_desc, kth_pos, axis=-1)
+        # Weights relative to the row maximum; each tied token weighs tie_weight.
+        weights = mx.exp(sorted_desc - sorted_desc[:, :1])
+        tie_weight = mx.exp(tie_value - sorted_desc[:, :1])
+        if any(p > 0.0 for p in min_p):
+            min_p_col = mx.array(min_p, dtype=mx.float32)[:, None]
+            weights = mx.where(weights >= min_p_col, weights, 0.0)
+            tie_weight = mx.where(tie_weight >= min_p_col, tie_weight, 0.0)
+        keep = (sorted_desc > tie_value) & (weights > 0.0)
+        tie_count = (scaled_logits == tie_value).sum(axis=-1, keepdims=True)
+        tie_count = mx.where(tie_weight > 0.0, tie_count, 0).astype(mx.float32)
+        if any(p < 1.0 for p in top_p):
+            top_p_col = mx.array(top_p, dtype=mx.float32)[:, None]
+            kept_weights = mx.where(keep, weights, 0.0)
+            above_mass = kept_weights.sum(axis=-1, keepdims=True)
+            budget = top_p_col * (above_mass + tie_count * tie_weight)
+            leading = mx.cumsum(kept_weights, axis=-1) - kept_weights
+            keep = keep & ((leading < budget) | (top_p_col >= 1.0))
+            # Tied position j (0-based) survives while above_mass + j * w < budget.
+            tie_room = mx.ceil(
+                (budget - above_mass) / mx.where(tie_weight > 0.0, tie_weight, 1.0)
+            )
+            tie_count = mx.where(
+                top_p_col >= 1.0, tie_count, mx.clip(tie_room, 0.0, tie_count)
+            )
+
+        group_logit = mx.where(
+            tie_count > 0.0, tie_value + mx.log(mx.maximum(tie_count, 1.0)), -mx.inf
+        )
+        logits = mx.concatenate(
+            [mx.where(keep, sorted_desc, -mx.inf), group_logit], axis=-1
+        )
+        return logits, token_ids, tie_value, tie_count
+
+    @classmethod
+    def _top_k_candidate_tokens(
+        cls,
+        scaled_logits: mx.array,
+        top_k: Sequence[int],
+        top_p: Sequence[float],
+        min_p: Sequence[float],
+        key: mx.array,
+    ) -> mx.array:
+        """Draw from :meth:`_top_k_candidates`; a group draw picks one of its
+        tied tokens uniformly."""
+        logits, token_ids, tie_value, tie_count = cls._top_k_candidates(
+            scaled_logits, top_k, top_p, min_p
+        )
+        candidate_key, tie_key = mx.random.split(key)
+        position = mx.random.categorical(logits, axis=-1, key=candidate_key)
+        num_candidates = token_ids.shape[-1]
+        candidate = mx.take_along_axis(
+            token_ids, mx.minimum(position, num_candidates - 1)[:, None], axis=-1
+        )[:, 0]
+
+        is_tied = scaled_logits == tie_value
+        tie_rank = mx.cumsum(is_tied.astype(mx.int32), axis=-1)
+        pick = mx.floor(
+            mx.random.uniform(shape=tie_count.shape, key=tie_key) * tie_count
+        )
+        pick = mx.minimum(pick, tie_count - 1.0).astype(mx.int32)
+        tied = mx.argmax(is_tied & (tie_rank == pick + 1), axis=-1)
+        return mx.where(position == num_candidates, tied, candidate)
 
     @classmethod
     def _native_random_tokens(
@@ -432,22 +553,32 @@ class SamplingBatch:
             logits_2d.astype(mx.float32)
             / mx.array(temperatures, dtype=mx.float32)[:, None]
         )
-        sorted_desc, sorted_idx = cls._sorted_candidate_logits(
-            scaled, top_k, top_p, min_p
-        )
-        if key is None:
-            position = mx.zeros((sorted_desc.shape[0],), dtype=mx.uint32)
+        # Seeded rows keep the full sort: their draw must not depend on what the
+        # rest of the batch asks for, and the candidate width below does.
+        has_row_keys = row_keys is not None and any(k is not None for k in row_keys)
+        if (
+            key is not None
+            and not has_row_keys
+            and cls._uses_top_k_candidates(top_k, int(scaled.shape[-1]))
+        ):
+            tokens = cls._top_k_candidate_tokens(scaled, top_k, top_p, min_p, key)
         else:
-            position = mx.random.categorical(sorted_desc, axis=-1, key=key)
-        if row_keys is not None and any(k is not None for k in row_keys):
-            rows = [
-                position[i]
-                if row_key is None
-                else mx.random.categorical(sorted_desc[i], axis=-1, key=row_key)
-                for i, row_key in enumerate(row_keys)
-            ]
-            position = mx.stack(rows).astype(position.dtype)
-        tokens = mx.take_along_axis(sorted_idx, position[:, None], axis=-1)[:, 0]
+            sorted_desc, sorted_idx = cls._sorted_candidate_logits(
+                scaled, top_k, top_p, min_p
+            )
+            if key is None:
+                position = mx.zeros((sorted_desc.shape[0],), dtype=mx.uint32)
+            else:
+                position = mx.random.categorical(sorted_desc, axis=-1, key=key)
+            if row_keys is not None and has_row_keys:
+                rows = [
+                    position[i]
+                    if row_key is None
+                    else mx.random.categorical(sorted_desc[i], axis=-1, key=row_key)
+                    for i, row_key in enumerate(row_keys)
+                ]
+                position = mx.stack(rows).astype(position.dtype)
+            tokens = mx.take_along_axis(sorted_idx, position[:, None], axis=-1)[:, 0]
         if any(greedy_rows):
             tokens = mx.where(
                 mx.array(greedy_rows), mlx_greedy_tokens(logits_2d), tokens
