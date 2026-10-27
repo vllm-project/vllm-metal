@@ -1,5 +1,5 @@
 meta:
-  date_updated: "2026-10-17"
+  date_updated: "2026-10-27"
   hardware:
     apple_16gb: supported
     apple_32gb: supported
@@ -9,7 +9,7 @@ variants:
   mlx_int4:
     label: MLX 4-bit
     model_id: mlx-community/Qwen3.5-9B-MLX-4bit
-    description: Qwen3.5-9B, with room for a conversation of about 49,000 words.
+    description: Qwen3.5-9B, with room for a conversation of about 6,000 words.
     precision: int4
     # ceil(5,950,062,560 checkpoint bytes / 1e9 * 1.2), not a serving budget.
     vram_minimum_gb: 8
@@ -28,7 +28,7 @@ variants:
       - --host
       - "127.0.0.1"
       - --max-model-len
-      - "65536"
+      - "8192"
       - --max-num-batched-tokens
       - "2048"
       - --enable-auto-tool-choice
@@ -40,3 +40,7 @@ variants:
       - The first run downloads 6.0 GB.
       - `--max-num-batched-tokens 2048` reads long text in smaller steps, so the
         model needs less memory. Without it this model does not fit on 16 GB.
+      - `--max-model-len 8192` fits a real 16 GB MacBook Pro with other apps
+        open. Larger values such as 65536 need more KV cache than a 16 GB Mac
+        usually has left after the weights load. If startup still asks for a
+        smaller max seq len, quit browsers and chat apps, or try `4096`.
