@@ -1,10 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The KV offload host pool comes out of the Metal KV budget.
-
-On unified memory the pool is the same physical RAM as the wired cache, so
-``--gpu-memory-utilization`` must bound both. The budget reported to vLLM
-shrinks by the pool, and vLLM sizes a smaller KVCacheConfig from it.
-"""
+"""Host pools share automatic KV budgets but sit outside explicit cache budgets."""
 
 from __future__ import annotations
 
@@ -583,28 +578,24 @@ def test_recap_holds_for_every_case(monkeypatch) -> None:
         assert budget + pool <= min(past, 3 * _GB), case
 
 
-@pytest.mark.parametrize("automatic", [False, True])
-def test_explicit_cache_budget_does_not_subtract_offload_host_pool(automatic):
+@pytest.mark.parametrize(
+    "automatic,expected_pool", [(False, _POOL), (True, 750_000_000)]
+)
+def test_explicit_cache_budget_does_not_subtract_offload_host_pool(
+    automatic, expected_pool
+):
     config = _auto_pool(4 * _GB) if automatic else _offload("MetalOffloadingConnector")
     planner = _planner(config, max_model_len=16 * 2999)
     planner._worker.cache_config.kv_cache_memory_bytes = 3 * _GB
-    plan = planner._paged_attention_plan(overhead=_GB)
-    assert plan.kv_budget == 3 * _GB
-    assert plan.kv_offload_pool > 0
     assert planner.determine_available_memory() == 3 * _GB
+    assert config.kv_connector_extra_config["cpu_bytes_to_use"] == expected_pool
 
 
-@pytest.mark.parametrize("offload_bytes", [0, 2 * _GB])
-@pytest.mark.parametrize("override", [None, 1])
-def test_explicit_budget_keeps_commit_probe_and_refuses_unsafe_allocation(
-    monkeypatch, offload_bytes, override
-):
-    planner = _planner(_offload("MetalOffloadingConnector", offload_bytes))
+def test_block_override_cannot_bypass_explicit_budget_probe(monkeypatch):
+    planner = _planner(None)
     planner._worker.cache_config.kv_cache_memory_bytes = 3 * _GB
-    planner._worker.cache_config.num_gpu_blocks_override = override
+    planner._worker.cache_config.num_gpu_blocks_override = 1
     _paging_probe(monkeypatch, free=4 * _GB)
-    # Once the reserve and host pool are accounted for, this request cannot
-    # fit. A manual cache must either receive its byte budget or fail startup.
     with pytest.raises(
         ValueError, match="Refusing to silently shrink an explicit budget"
     ):

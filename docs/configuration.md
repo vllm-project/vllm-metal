@@ -93,27 +93,14 @@ flag (`gpu_memory_utilization=` for `LLM()`), a fraction in `(0, 1]`. The
 former `VLLM_METAL_MEMORY_FRACTION` override has been removed.
 
 Set `--kv-cache-memory-bytes` (`kv_cache_memory_bytes=` for `LLM()`) to a
-positive byte count to override that fraction for paged cache storage. Model
-weights, activations, TurboQuant workspace, and the offload host pool need
-additional memory. Zero and negative byte counts fail startup. When unset,
-automatic sizing is unchanged. An automatic offload host pool is capped at a
-quarter of the explicit cache budget, or one host chunk if larger; an explicit
-host-pool size is kept. Neither pool is subtracted from explicit cache bytes.
+positive byte count to override automatic sizing, for example
+`--kv-cache-memory-bytes 2147483648` for 2 GiB. This budgets paged cache storage;
+weights, activations, runtime workspace, and the
+[offload host pool](kv_offloading.md) need additional memory.
 
-Startup profiling still warms the allocator, profiles the vision encoder when
-enabled, and sets the MLX buffer-cache limit. The default-on physical commit
-probe also runs. It counts the future host pool and TurboQuant workspace when
-deciding whether the cache fits after paging is observed. A manual budget that
-would need shrinking fails startup instead. The probe samples at most 512 MiB;
-it does not prove that the entire cache will fit under future load. Allocation
-failures still propagate.
-
-The cache layout rounds down to whole blocks. The separate
-`--num-gpu-blocks-override` takes precedence over byte-derived block counts:
-upstream shared storage uses that count, which can exceed the byte budget.
-For ordinary target/draft pools, Metal accepts only positive overrides within
-the planned capacity and applies them before allocating either pool. A block
-override does not bypass an explicit budget's commit-probe rejection.
+Sizes round down to whole blocks. Startup profiling and the memory probe still
+run; an explicit budget that would need shrinking is rejected. The separate
+`--num-gpu-blocks-override` takes precedence over byte-derived block counts.
 
 Models with full and sliding-window attention use grouped KV cache, allowing
 sliding layers to release old blocks. This can improve long-context capacity,
@@ -177,4 +164,4 @@ The budget keeps the full byte count: vLLM chooses its own grouped layout from
 the bytes it is handed. If free memory is merely below the plan, the pool keeps
 its capacity and the shortfall is logged: a plan is a cap, and only the blocks
 requests actually write are ever backed. Set `VLLM_METAL_KV_COMMIT_PROBE=0` to
-skip the touch and trust `--gpu-memory-utilization` alone.
+skip the touch and use the configured cache budget.

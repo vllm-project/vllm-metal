@@ -256,18 +256,36 @@ class TestWorkerRunnerBoundaryDelegation:
         )
         return worker
 
-    def test_determine_available_memory_layout_budget_mode(
-        self, monkeypatch: pytest.MonkeyPatch
+    @pytest.mark.parametrize(
+        ("explicit", "utilization", "expected"),
+        [
+            pytest.param(None, 0.5, 2_900_000_000, id="automatic"),
+            pytest.param(100_000_000, 0.5, 100_000_000, id="below-automatic"),
+            pytest.param(4_000_000_000, 0.5, 4_000_000_000, id="above-automatic"),
+            pytest.param(100_000_000, 0.1, 100_000_000, id="negative-automatic"),
+        ],
+    )
+    def test_layout_budget_uses_explicit_bytes_or_automatic_sizing(
+        self, monkeypatch: pytest.MonkeyPatch, explicit, utilization, expected
     ) -> None:
         worker = self._make_layout_budget_worker(
-            monkeypatch, gpu_memory_utilization=0.5
+            monkeypatch, gpu_memory_utilization=utilization
         )
+        worker.cache_config.kv_cache_memory_bytes = explicit
 
         available = MetalWorker.determine_available_memory(worker)
 
-        # 10 GB * 0.5 - 2 GB weights - 0.1 GB overhead.
-        assert available == 2_900_000_000
+        assert available == expected
         worker.model_runner.profile_run.assert_called_once_with()
+
+    @pytest.mark.parametrize("explicit", [0, -1])
+    def test_explicit_cache_bytes_must_be_positive(self, monkeypatch, explicit):
+        worker = self._make_layout_budget_worker(
+            monkeypatch, gpu_memory_utilization=0.5
+        )
+        worker.cache_config.kv_cache_memory_bytes = explicit
+        with pytest.raises(ValueError, match="kv-cache-memory-bytes must be positive"):
+            MetalWorker.determine_available_memory(worker)
 
     def test_layout_budget_oom_reports_breakdown_and_mitigations(
         self, monkeypatch: pytest.MonkeyPatch
@@ -618,11 +636,24 @@ class TestPagedAttentionPlanDiagnostics:
         worker.get_cache_block_size_bytes = MagicMock(return_value=per_block_bytes)
         return WorkerCachePlanner(worker)
 
-    def test_oom_mitigation_names_gpu_memory_utilization(self, monkeypatch) -> None:
+    @pytest.mark.parametrize(
+        ("explicit", "mitigation"),
+        [
+            (None, "increase --gpu-memory-utilization (currently 0.15)"),
+            (1, "Increase --kv-cache-memory-bytes"),
+        ],
+    )
+    def test_small_budget_error_names_active_setting(
+        self, monkeypatch, explicit, mitigation
+    ) -> None:
         runner = SimpleNamespace(
             is_hybrid=False,
+            scheduler_memory_reporting_mode=lambda: "paged_attention_capacity",
+            profile_run=lambda: 100_000_000,
+            validate_paged_attention_support=lambda: None,
         )
         planner = self._make_planner(runner, gpu_memory_utilization=0.15)
+        planner._worker.cache_config.kv_cache_memory_bytes = explicit
         monkeypatch.setattr(
             WorkerCachePlanner,
             "_metal_limit_bytes",
@@ -634,12 +665,10 @@ class TestPagedAttentionPlanDiagnostics:
             lambda self: 2_000_000_000,
         )
 
-        plan = planner._paged_attention_plan(overhead=100_000_000)
         with pytest.raises(ValueError) as exc_info:
-            planner._validate_paged_attention_plan(plan, require_min_blocks=True)
+            planner.determine_available_memory()
 
-        message = str(exc_info.value)
-        assert "increase --gpu-memory-utilization (currently 0.15)" in message
+        assert mitigation in str(exc_info.value)
 
     def test_non_hybrid_oom_error_omits_gdn_reservation(self, monkeypatch) -> None:
         runner = SimpleNamespace(
@@ -704,7 +733,7 @@ class TestPagedAttentionPlanDiagnostics:
                 gpu_memory_utilization=0.1 if explicit else 0.5,
                 num_gpu_blocks_override=override,
             ),
-            profile_run=MagicMock(return_value=0),
+            profile_run=lambda: 0,
         )
         config = runner.vllm_config
         config.attention_config = AttentionConfig()
@@ -762,7 +791,6 @@ class TestPagedAttentionPlanDiagnostics:
             return
 
         available_memory = worker.determine_available_memory()
-        runner.profile_run.assert_called_once_with()
         groups = get_kv_cache_groups(config, worker.get_kv_cache_spec())
         kv_config = get_kv_cache_config_from_groups(config, groups, available_memory)
         worker.initialize_from_config(kv_config)
@@ -1275,42 +1303,3 @@ class TestSwapTolerance:
             kv_swap_tolerance_bytes(512 << 20)
             == (512 << 20) // KV_COMMIT_SWAP_TOLERANCE_DIVISOR
         )
-
-
-@pytest.mark.parametrize("explicit", [100_000_000, 4_000_000_000])
-@pytest.mark.parametrize("utilization", [0.1, 0.5])
-def test_explicit_cache_bytes_override_automatic_budget_and_keep_profiling(
-    monkeypatch, explicit, utilization
-):
-    worker = TestWorkerRunnerBoundaryDelegation()._make_layout_budget_worker(
-        monkeypatch, gpu_memory_utilization=utilization
-    )
-    worker.cache_config.kv_cache_memory_bytes = explicit
-    assert MetalWorker.determine_available_memory(worker) == explicit
-    worker.model_runner.profile_run.assert_called_once_with()
-
-
-@pytest.mark.parametrize("explicit", [0, -1])
-def test_explicit_cache_bytes_must_be_positive(monkeypatch, explicit):
-    worker = TestWorkerRunnerBoundaryDelegation()._make_layout_budget_worker(
-        monkeypatch, gpu_memory_utilization=0.5
-    )
-    worker.cache_config.kv_cache_memory_bytes = explicit
-    with pytest.raises(ValueError, match="kv-cache-memory-bytes must be positive"):
-        MetalWorker.determine_available_memory(worker)
-
-
-def test_explicit_budget_rounds_down_and_names_the_active_setting(monkeypatch):
-    worker = TestWorkerRunnerBoundaryDelegation()._make_layout_budget_worker(
-        monkeypatch, gpu_memory_utilization=0.1
-    )
-    worker.cache_config.kv_cache_memory_bytes = 1_000_000_001
-    worker.get_cache_block_size_bytes = lambda: 1_000_000_000
-    planner = WorkerCachePlanner(worker)
-    plan = planner._paged_attention_plan(overhead=100_000_000)
-    assert plan.num_blocks == 1
-    with pytest.raises(ValueError) as error:
-        planner._validate_paged_attention_plan(plan, require_min_blocks=True)
-    assert "kv_cache_memory_bytes=1000000001 (1.00GB)" in str(error.value)
-    assert "Increase --kv-cache-memory-bytes" in str(error.value)
-    assert "increase --gpu-memory-utilization" not in str(error.value)

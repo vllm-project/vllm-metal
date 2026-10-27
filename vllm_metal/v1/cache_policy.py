@@ -1239,7 +1239,7 @@ class WorkerCachePlanner:
                     workspace / 2**20,
                 )
         usable_metal = int(metal_limit * fraction)
-        base_kv_budget = (
+        kv_budget = (
             explicit
             if explicit is not None
             else self.base_kv_budget_bytes(
@@ -1249,12 +1249,11 @@ class WorkerCachePlanner:
                 overhead,
             )
         )
-        kv_offload_pool = self._resolve_kv_offload_pool(base_kv_budget, per_block_bytes)
+        kv_offload_pool = self._resolve_kv_offload_pool(kv_budget, per_block_bytes)
         # Explicit bytes budget the paged storage alone. The offload host pool
         # and other future allocations still count in the physical commit probe.
-        kv_budget = (
-            explicit if explicit is not None else base_kv_budget - kv_offload_pool
-        )
+        if explicit is None:
+            kv_budget -= kv_offload_pool
         if explicit is not None:
             logger.info(
                 "Paged attention: using --kv-cache-memory-bytes=%d (%.2fGB), overriding "
