@@ -41,6 +41,10 @@ from vllm_metal.v1.pooling.backends.decoder.runtime import (  # noqa: E402
 )
 from vllm_metal.v1.pooling.backends.encoder.factory import (  # noqa: E402
     load_encoder_pooling_backend,
+    supports_encoder_pooling_backend,
+)
+from vllm_metal.v1.pooling.backends.encoder.models.embedding_gemma2 import (  # noqa: E402
+    load_embedding_gemma2_backend,
 )
 from vllm_metal.v1.pooling.backends.encoder.models.loading import (  # noqa: E402
     load_encoder_weight_file,
@@ -741,6 +745,104 @@ class TestMetalPoolingCapabilities:
                 (_SupportedEmbedPooler(), _SupportedEmbedPooler()),
             )
 
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    @pytest.mark.parametrize("length", [7, 515])
+    def test_embedding_gemma2_checkpoint_preserves_projected_mean_embeddings(
+        self, tmp_path, dtype, length
+    ) -> None:
+        """Match HF across padding and the inclusive 512-token sliding window."""
+        hf = pytest.importorskip("transformers.models.embedding_gemma2")
+        torch.manual_seed(0)
+        text_config = hf.EmbeddingGemma2TextConfig(
+            vocab_size=32,
+            hidden_size=8,
+            intermediate_size=16,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=4,
+            global_head_dim=8,
+            num_global_key_value_heads=1,
+            hidden_size_per_layer_input=8,
+            embedding_dim=12,
+        )
+        config = hf.EmbeddingGemma2Config(text_config=text_config)
+        reference = hf.EmbeddingGemma2Model(config).to(dtype).eval()
+        reference.save_pretrained(tmp_path)
+        # A text-only load must discard media weights from a full checkpoint.
+        mx.save_safetensors(
+            str(tmp_path / "model-media.safetensors"),
+            {"vision_tower.unused.weight": mx.ones((1,))},
+        )
+        model_config = _encoder_model_config(
+            model=str(tmp_path),
+            hf_config=config,
+            dtype=dtype,
+            pooler_config=_pooler_config(seq_pooling_type="MEAN"),
+            is_matryoshka=True,
+            matryoshka_dimensions=None,
+            embedding_size=text_config.embedding_dim,
+        )
+        backend = load_encoder_pooling_backend(model_config)
+        assert supports_encoder_pooling_backend(model_config)
+        assert backend.model.model.vision_tower is None
+        assert backend.model.model.audio_tower is None
+        assert backend.model_args["vocab_size"] == text_config.vocab_size
+
+        ids = torch.randint(3, text_config.vocab_size, (2, length))
+        ids[1, -3:] = 0
+        mask = (ids != 0).long()
+        with torch.no_grad():
+            expected = reference(input_ids=ids, attention_mask=mask).last_hidden_state
+        actual = backend.pooling_backend.forward_padded(
+            mx.array(ids.numpy()), mx.array(mask.numpy())
+        )
+        # BF16 CPU and Metal kernels can differ by a few rounding steps.
+        tolerance = 1e-5 if dtype == torch.float32 else 5e-3
+        torch.testing.assert_close(
+            mlx_to_torch(actual.astype(mx.float32), device="cpu"),
+            expected.float(),
+            atol=tolerance,
+            rtol=tolerance,
+        )
+        for dimensions in (None, 6):
+            params = _pooling_params(task="embed", dimensions=dimensions)
+            params.verify(model_config)
+            requests = [
+                _new_req(str(i), row[valid.bool()].tolist(), pooling_params=params)
+                for i, (row, valid) in enumerate(zip(ids, mask, strict=True))
+            ]
+            outputs = backend.pooling_backend.pool_scheduler_output(
+                _scheduler_output(new_reqs=requests), model_config
+            )
+            assert [output.req_id for output in outputs] == ["0", "1"]
+            for i, output in enumerate(outputs):
+                vector = expected[i, mask[i].bool(), :dimensions].float().mean(0)
+                torch.testing.assert_close(
+                    output.pooler_output,
+                    normalize(vector, dim=0),
+                    atol=1e-5 if dtype == torch.float32 else 1e-2,
+                    rtol=1e-5 if dtype == torch.float32 else 1e-2,
+                )
+                assert (
+                    torch.nn.functional.cosine_similarity(
+                        output.pooler_output, vector, dim=0
+                    )
+                    > 0.9998
+                )
+
+    @pytest.mark.parametrize("quantization", ["mlx", None])
+    def test_embedding_gemma2_rejects_quantization_before_loading(self, quantization):
+        config = _encoder_model_config(
+            hf_config=_hf_config(
+                model_type="embedding_gemma2",
+                quantization_config={} if quantization else {"bits": 4},
+            ),
+            quantization=quantization,
+        )
+        with pytest.raises(NotImplementedError, match="does not support quantization"):
+            load_embedding_gemma2_backend(config)
+
     @pytest.mark.parametrize("model_type", ["xlm-roberta", "roberta"])
     @pytest.mark.parametrize("pooling_type", ["CLS", "LAST", "MEAN"])
     @pytest.mark.parametrize("dimensions", [None, 4])
@@ -1280,6 +1382,17 @@ class TestMetalPoolingRunnerOutput:
 
 
 class TestMetalPoolingFailFast:
+    def test_embedding_gemma2_requires_text_only_mode(self) -> None:
+        runner = _make_runner(
+            paged=False,
+            model_config=_encoder_model_config(
+                hf_config=_hf_config(model_type="embedding_gemma2"),
+                multimodal_config=SimpleNamespace(language_model_only=False),
+            ),
+        )
+        with pytest.raises(NotImplementedError, match="--language-model-only"):
+            ModelLifecycle(runner, MagicMock()).load()
+
     def test_non_decoder_pooling_models_fail_fast_on_execute(
         self,
     ) -> None:
