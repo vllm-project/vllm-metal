@@ -736,7 +736,7 @@ class MetalModelRunner:
                 self._multimodal_adapter, "lora_weights_mapper", None
             ),
         )
-        # Probed here because it runs a cacheless one-token forward, which is
+        # Probed here because it runs an isolated one-token forward, which is
         # only safe before a paged context is installed. PP takes another
         # forward branch that never requests selection.
         self._selective_logits_supported = (

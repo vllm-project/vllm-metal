@@ -55,6 +55,14 @@ unsupported; leave `--video-pruning-rate` unset.
 | LFM2-VL / LFM2.5-VL | 🔵 | | native multimodal paged generation on the ShortConv text tower | image input, no video; one tile grid plus thumbnail per image; needs a checkpoint packaged for Transformers, which the MLX conversions are not | `LiquidAI/LFM2.5-VL-1.6B` |
 | Gemma 4 | 🔵 | | mlx_lm text backbone + mlx-vlm encoder sidecar, paged generation | image input; audio and video input on E2B/E4B; bidirectional attention inside image blocks on sliding-window layers | `mlx-community/unsloth-gemma-4-26B-A4B-it-qat-oQ4`, `mlx-community/gemma-4-e2b-it-4bit` (audio, video) |
 
+Eligible requests project only the logits rows needed for sampling.
+A load-time probe checks exact agreement with the model's own output head,
+using independent native caches when the model provides a cache factory. This
+also covers Qwen3.5/3.6 backbones that require cache metadata on their first
+token. Profiling uses the same native-cache contract for the split forward.
+An unsuccessful probe keeps full logits; prompt-logprobs requests still project
+all required prompt rows.
+
 Gemma 4 keeps its text path exactly as on the text-only table (mlx_lm model,
 selective logits, intermediate forward); only `vision_tower` and `embed_vision`
 are loaded from the checkpoint through mlx-vlm, plus `audio_tower` and

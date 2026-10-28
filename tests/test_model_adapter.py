@@ -513,6 +513,114 @@ class TestSupportsSelectiveLogits:
     not reproduce, so the probe compares a one-row forward both ways and only
     accepts an exact match."""
 
+    @pytest.mark.parametrize("head_scale", [1.0, 0.5])
+    def test_cache_required_wrappers_use_independent_probe_state(
+        self, head_scale: float
+    ) -> None:
+        class Backbone:
+            def __call__(self, input_ids, *, cache):
+                # Reusing the reference cache changes the split output.
+                offset = cache[0].offset
+                values = mx.ones((1, 1, input_ids.size, 2))
+                cache[0].update_and_fetch(values, values)
+                return mx.full((*input_ids.shape, 2), offset + 1.0)
+
+        class TextModel:
+            def __init__(self):
+                self.model = Backbone()
+
+            def make_cache(self):
+                return [KVCache()]
+
+            def compute_logits(self, hidden_states):
+                return hidden_states * 3.0
+
+            def __call__(self, input_ids, cache=None):
+                return (
+                    self.compute_logits(self.model(input_ids, cache=cache)) * head_scale
+                )
+
+        class Wrapper:
+            def __init__(self):
+                self.language_model = TextModel()
+
+            def __call__(self, input_ids, cache=None):
+                return self.language_model(input_ids, cache=cache)
+
+        adapter = DefaultModelAdapter()
+        model = Wrapper()
+        assert adapter.supports_selective_logits(model) is (head_scale == 1.0)
+        assert adapter.supports_selective_logits(model) is (head_scale == 1.0)
+
+    @pytest.mark.parametrize("tied", [False, True], ids=["linear", "tied-embedding"])
+    def test_qwen35_quantized_head_supports_selective_logits(self, tied: bool) -> None:
+        """The real hybrid backbone needs a cache even for the load-time probe."""
+        import mlx.nn as nn
+        from mlx_vlm.models.qwen3_5.config import ModelConfig, TextConfig, VisionConfig
+        from mlx_vlm.models.qwen3_5.language import LanguageModel
+
+        mx.random.seed(7)
+        config = TextConfig(
+            model_type="qwen3_5",
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            linear_num_value_heads=2,
+            linear_num_key_heads=2,
+            linear_key_head_dim=32,
+            linear_value_head_dim=32,
+            linear_conv_kernel_dim=4,
+            rms_norm_eps=1e-6,
+            vocab_size=128,
+            max_position_embeddings=128,
+            tie_word_embeddings=tied,
+            rope_parameters={
+                "type": "default",
+                "mrope_section": [2, 2, 4],
+                "rope_theta": 100000,
+                "partial_rotary_factor": 1.0,
+            },
+        )
+        model = LanguageModel(
+            config,
+            ModelConfig(config, VisionConfig(), model_type="qwen3_5"),
+        )
+        model.eval()
+        nn.quantize(
+            model,
+            group_size=64,
+            bits=4,
+            class_predicate=lambda path, _: path in {"model.embed_tokens", "lm_head"},
+        )
+        adapter = DefaultModelAdapter()
+        assert adapter.supports_selective_logits(model)
+
+        # Startup profiling selects rows without a serving cache installed.
+        tokens = mx.array([[3, 4, 5]], dtype=mx.int32)
+        full = model(tokens).logits
+        selected = adapter.target_forward(
+            model, tokens, logits_indices=mx.array([1, 2], dtype=mx.int32)
+        ).logits
+        mx.eval(full, selected)
+        assert mx.allclose(selected, full[:, [1, 2]], atol=1e-6, rtol=1e-6).item()
+
+        full_cache, split_cache = model.make_cache(), model.make_cache()
+        prefix = mx.array([[1, 2]], dtype=mx.int32)
+        mx.eval(model(prefix, cache=full_cache).logits)
+        mx.eval(model(prefix, cache=split_cache).logits)
+        full = model(tokens, cache=full_cache).logits
+        selected = adapter.target_forward(
+            model,
+            tokens,
+            cache=split_cache,
+            logits_indices=mx.array([1, 2], dtype=mx.int32),
+        ).logits
+        mx.eval(full, selected)
+        assert mx.allclose(selected, full[:, [1, 2]], atol=1e-6, rtol=1e-6).item()
+
     def test_accepts_a_head_reproduced_by_the_split_path(self) -> None:
         class Model:
             def __init__(self) -> None:

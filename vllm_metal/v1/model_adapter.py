@@ -817,12 +817,17 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
         keep a model allowlist in sync with ``mlx_lm``, probe the loaded object
         for bit-exact agreement on one row.
 
-        Resolved once after load: the probe runs a cacheless forward, which is
-        only safe while no ``PagedAttentionContext`` is installed.
+        Resolved once after load, before any ``PagedAttentionContext`` is
+        installed. Models with a cache factory get independent empty caches
+        for the two forwards; their bare backbone may require cache metadata
+        even for the first token.
         """
         probe_ids = mx.zeros((1, 1), dtype=mx.int32)
         try:
-            reference = self.extract_logits(model(probe_ids, cache=None))
+            make_cache = getattr(self.text_model(model), "make_cache", None)
+            reference = self.extract_logits(
+                model(probe_ids, cache=make_cache() if make_cache is not None else None)
+            )
             hidden_states = self._forward_target_hidden_states(
                 model, probe_ids, cache=None
             )
@@ -878,6 +883,12 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
                 "Target hidden states require a text model with a `model` "
                 "backbone; this model output does not expose hidden states."
             )
+        if cache is None:
+            # Profiling and the head probe call the bare backbone without the
+            # full-model wrapper that normally supplies its native cache.
+            make_cache = getattr(self.text_model(model), "make_cache", None)
+            if make_cache is not None:
+                cache = make_cache()
         return backbone(input_ids, cache=cache)
 
     def _compute_target_logits(self, model: Any, hidden_states: mx.array) -> mx.array:

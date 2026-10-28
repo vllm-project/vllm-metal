@@ -220,7 +220,7 @@ class DraftModelProposer(NoOwnKVProposer):
     ) -> DraftModelProposer:
         """Load draft weights without binding the paged cache."""
         model, dims = _load_draft_model(speculative_config, parallel_config)
-        # The capability probe uses a cacheless forward and must run before
+        # The capability probe uses isolated native caches and must run before
         # patch_model() installs attention wrappers that require a paged
         # context. Unsupported model heads retain the full-logits fallback.
         selective_logits_supported = model_adapter.supports_selective_logits(model)
