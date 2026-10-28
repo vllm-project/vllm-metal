@@ -35,11 +35,9 @@ The source priority is:
 
 vllm-metal downloads exactly one matching `.gguf` file from the remote
 repository. A quant published both as one file and as that file's shards
-resolves to the single file. Projector files such as `mmproj-BF16.gguf` are
-never selected, so a BF16 tag picks the model file next to them. Missing or
-ambiguous matches, and quants published only as shards, fail before model load.
-A config from an unsupported model family fails earlier, before the `.gguf`
-file is selected or downloaded.
+resolves to the single file. Missing or ambiguous matches, and quants published
+only as shards, fail before model load. A config from an unsupported model
+family fails earlier, before the `.gguf` file is selected or downloaded.
 
 With `HF_HUB_OFFLINE=1`, remote references select from the cached repo listing
 of the requested revision, or from its cached files when the cache has no
