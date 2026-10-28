@@ -714,13 +714,18 @@ def test_remote_load_source_repins_the_config_repo_revision_offline(
         # Dropping a shard set still leaves its single file as a candidate.
         (
             [
-                "mmproj-model-Q8_0.gguf",
                 "model-Q8_0-00001-of-00002.gguf",
                 "model-Q8_0-00002-of-00002.gguf",
                 "model-Q8_0.gguf",
+                "other-Q8_0.gguf",
             ],
             "Remote GGUF reference 'Qwen/Qwen3-0.6B-GGUF:Q8_0' matched "
-            "multiple files: mmproj-model-Q8_0.gguf, model-Q8_0.gguf.",
+            "multiple files: model-Q8_0.gguf, other-Q8_0.gguf.",
+        ),
+        # A projector is never the backbone, even when it is the only match.
+        (
+            ["mmproj-model-Q8_0.gguf"],
+            "No 'Q8_0' GGUF file found in remote repository 'Qwen/Qwen3-0.6B-GGUF'.",
         ),
     ],
 )
@@ -871,18 +876,22 @@ def test_remote_load_source_admits_mistral_repo_config(tmp_path, monkeypatch) ->
 
 @pytest.mark.parametrize("offline", [False, True])
 @pytest.mark.parametrize("tag", ["F16", "F32", "BF16"])
-def test_remote_plain_type_tags_resolve(tmp_path, monkeypatch, tag, offline) -> None:
+def test_remote_plain_type_tags_resolve_past_projector_siblings(
+    tmp_path, monkeypatch, tag, offline
+) -> None:
     monkeypatch.setattr(hf_constants, "HF_HUB_OFFLINE", offline)
     snapshot = tmp_path / "weights"
     snapshot.mkdir()
     gguf_name = f"model-{tag}.gguf"
-    (snapshot / gguf_name).write_text("dummy")
+    repo_files = [gguf_name, f"mmproj-{tag}.gguf", f"mmproj-model-{tag.lower()}.gguf"]
+    for filename in repo_files:
+        (snapshot / filename).write_text("dummy")
     monkeypatch.setattr(
         gguf_source,
         "HfApi",
         lambda: SimpleNamespace(
             resolve_revision=_echo_revision,
-            list_repo_files=lambda **_: ["README.md", gguf_name],
+            list_repo_files=lambda **_: ["README.md", *repo_files],
         ),
     )
     monkeypatch.setattr(gguf_source, "snapshot_download", lambda **_: str(snapshot))
@@ -987,10 +996,10 @@ def test_remote_offline_rejects_ambiguous_cached_listing(tmp_path, monkeypatch) 
     monkeypatch.setattr(hf_constants, "HF_HUB_OFFLINE", True)
     snapshot = tmp_path / "weights"
     snapshot.mkdir()
-    (snapshot / "mmproj-model-Q8_0.gguf").write_text("dummy")
+    (snapshot / "other-Q8_0.gguf").write_text("dummy")
     listing = [
         RepoFile(path=path, size=0, oid="0")
-        for path in ("mmproj-model-Q8_0.gguf", "model-Q8_0.gguf")
+        for path in ("model-Q8_0.gguf", "other-Q8_0.gguf")
     ]
 
     def partial_snapshot_download(**_: object) -> str:
@@ -1012,5 +1021,5 @@ def test_remote_offline_rejects_ambiguous_cached_listing(tmp_path, monkeypatch) 
 
     assert str(excinfo.value) == (
         "Remote GGUF reference 'org/model:Q8_0' matched multiple files: "
-        "mmproj-model-Q8_0.gguf, model-Q8_0.gguf."
+        "model-Q8_0.gguf, other-Q8_0.gguf."
     )

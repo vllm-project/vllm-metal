@@ -28,6 +28,8 @@ _QUANT_TAG_RE = re.compile(
 _REMOTE_PREFIXES = ("*.", "*-")
 _REMOTE_SUFFIXES = ("-*", "")
 _SHARD_NAME_RE = re.compile(r"-\d+-of-(\d+)\.gguf$")
+# Multimodal projector files carry quant tags too, e.g. mmproj-BF16.gguf.
+_PROJECTOR_MARKER = "mmproj"
 _SUPPORTED_REMOTE_TAGS = frozenset(
     {
         "Q8_0",
@@ -179,6 +181,11 @@ class RemoteGGUFReference:
         return str(snapshot_dir / filename)
 
     def _select_single_filename(self, filenames: list[str]) -> str:
+        filenames = [
+            filename
+            for filename in filenames
+            if _PROJECTOR_MARKER not in Path(filename).name.lower()
+        ]
         if not filenames:
             raise ValueError(
                 f"No {self.quant_type!r} GGUF file found in remote repository "
