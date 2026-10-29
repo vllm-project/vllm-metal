@@ -1,12 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Host-side NAX split/unsplit pipeline choice (vllm_metal.attention.nax_split)."""
 
-import mlx.core as mx
 import pytest
 
-from tests.gqa_test_utils import _primitive
-from tests.test_gqa_decode_routing import _mixed_call, _mixed_inputs
 from vllm_metal.attention.nax_split import (
+    nax_gpu_core_count,
     nax_split_hint,
     nax_split_kwargs,
     nax_tile_work,
@@ -108,7 +106,9 @@ def test_sliding_window_counts_only_tiles_inside_the_window():
     assert nax_split_hint(causal, 128) == 1
     assert nax_split_hint(windowed, 128) == 0
     # A window wider than the context changes nothing.
-    assert nax_tile_work(cu, kv, sliding_window=1 << 20) == causal
+    wide = nax_tile_work(cu, kv, sliding_window=1 << 20)
+    assert wide.full_tiles == causal.full_tiles
+    assert wide.partial_tiles == causal.partial_tiles
 
 
 def test_length_mismatch_is_rejected():
@@ -116,8 +116,167 @@ def test_length_mismatch_is_rejected():
         nax_tile_work([0, 4], [4, 5])
 
 
+def test_sequence_boundaries_retain_kv_loop_depth():
+    # Equal aggregate work must not turn four independent one-block streams
+    # into the better-amortized stream of one four-block prefill.
+    single = _work([(256, 0)])
+    multiple = _work([(64, 96)] * 4)
+    for work in (single, multiple):
+        assert (work.full_blocks, work.full_tiles, work.partial_tiles) == (4, 20, 0)
+    assert single.full_stream_tiles == 5
+    assert multiple.full_stream_tiles == 20
+    kwargs = {"num_heads": 32, "num_kv_heads": 32, "gpu_core_count": 20}
+    assert nax_split_hint(single, 96, **kwargs) == 1
+    assert nax_split_hint(multiple, 96, **kwargs) == 0
+
+
+def test_shared_cached_pages_do_not_count_as_independent_streams():
+    cu, kv = [64 * i for i in range(6)], [576] * 5
+    independent = nax_tile_work(cu, kv)
+    shared = nax_tile_work(
+        cu,
+        kv,
+        block_tables=[[*range(8), 8 + i] for i in range(5)],
+        block_size=64,
+    )
+    assert shared.full_stream_tiles == independent.full_stream_tiles == 90
+    assert shared.repeated_prefix_tiles == 64
+    kwargs = {"num_heads": 4, "num_kv_heads": 4, "gpu_core_count": 4}
+    assert nax_split_hint(independent, 128, **kwargs) == 0
+    assert nax_split_hint(shared, 128, **kwargs) == 1
+
+
+def test_prefix_reuse_counts_complete_scheduler_pages_only():
+    kwargs = {"block_tables": [[5, 6], [5, 7]], "block_size": 784}
+    work = nax_tile_work([0, 64, 128], [896, 896], **kwargs)
+    # 832 cached tokens: only the complete 784-token page is shared.
+    assert work.full_stream_tiles == 56
+    assert work.repeated_prefix_tiles == 784 / 32
+    windowed = nax_tile_work([0, 64, 128], [896, 896], 128, **kwargs)
+    assert windowed.repeated_prefix_tiles == 0
+
+
+@pytest.mark.parametrize(
+    "seqs,dimension,heads,kv_heads,cores,expected",
+    [
+        ([(128, 8192)], 256, 24, 4, 40, 1),
+        ([(129, 8192)], 256, 24, 4, 40, 0),
+        ([(257, 0)], 256, 36, 9, 40, 1),
+        ([(63, 8192)] * 4, 512, 8, 2, 10, 1),
+        ([(64, 8192)] * 4, 64, 14, 2, 40, 1),
+        ([(1, 255)] * 4 + [(128, 8192)], 96, 32, 32, 40, 0),
+        ([(128, 32768)], 128, 18, 3, 40, 0),
+        ([(128, 32768)], 128, 27, 1, 40, 1),
+        ([(64, 8192)] * 2, 96, 32, 32, 20, 0),
+        (
+            [(1, 127), (1, 255), (1, 383), (128, 6144), (255, 128), (31, 768)],
+            256,
+            13,
+            13,
+            40,
+            1,
+        ),
+    ],
+    ids=[
+        "single-full-blocks",
+        "expensive-tail",
+        "established-complete-blocks",
+        "multiple-output-slices",
+        "multiple-full-blocks",
+        "decode-passengers",
+        "underfilled-grid",
+        "shared-kv-stream",
+        "no-margin-independent-streams",
+        "wide-groups-with-decode-passengers",
+    ],
+)
+def test_batch_score_accounts_for_work_and_capacity(
+    seqs, dimension, heads, kv_heads, cores, expected
+):
+    assert (
+        nax_split_hint(
+            _work(seqs),
+            dimension,
+            num_heads=heads,
+            num_kv_heads=kv_heads,
+            gpu_core_count=cores,
+        )
+        == expected
+    )
+
+
+def test_short_queries_do_not_form_complete_blocks_across_requests():
+    work = _work([(63, 128)] * 5)
+    assert work.query_tokens > 256 and work.full_blocks == 0
+    assert work.full_stream_tiles == 0
+    kwargs = {"num_heads": 8, "num_kv_heads": 2, "gpu_core_count": 20}
+    assert nax_split_hint(work, 128, **kwargs) == 0
+    assert nax_split_hint(work, 512, **kwargs) == 1
+    # One-row YOCO/decode views retain their native decode route.
+    assert nax_split_hint(_work([(1, 8192)] * 4), 512, **kwargs) == 0
+
+
+def test_parallel_blocks_do_not_erase_guarded_kv_traffic():
+    # The full grid is large, but each MHA stream has only two complete
+    # blocks before a one-row tail. Admitting this batch regressed on M5.
+    assert (
+        nax_split_hint(
+            _work([(129, 8192)] * 4),
+            96,
+            num_heads=32,
+            num_kv_heads=32,
+            gpu_core_count=10,
+        )
+        == 0
+    )
+
+
+@pytest.mark.parametrize("missing", ["num_heads", "num_kv_heads", "gpu_core_count"])
+def test_missing_layout_metadata_keeps_legacy_admission(missing):
+    kwargs = {"num_heads": 8, "num_kv_heads": 2, "gpu_core_count": 20}
+    work = _work([(16, 0)])
+    assert nax_split_hint(work, 512, **kwargs) == 1
+    kwargs.pop(missing)
+    assert nax_split_hint(work, 512, **kwargs) == 0
+    assert nax_gpu_core_count(object()) == 0
+
+
+@pytest.mark.parametrize("dimension", [64, 96, 128, 256, 512])
+@pytest.mark.parametrize("query", [2047, 2048])
+def test_long_prefill_keeps_the_optimized_pipeline(dimension, query):
+    assert (
+        nax_split_hint(
+            _work([(query, 0)]),
+            dimension,
+            num_heads=16,
+            num_kv_heads=4,
+            gpu_core_count=40,
+        )
+        == 1
+    )
+
+
+def test_cached_append_hint_describes_the_potential_prefill_batch():
+    # Native may execute this whole batch or split its decode prefix under
+    # either native decode-work gate. Python must provide both correct scores.
+    whole = _work([(1, 131071), (64, 8192), (64, 8192)])
+    prefill = _work([(64, 8192), (64, 8192)])
+    caps = {"nax_split_hint": True, "nax_prefill_split_hint": True}
+    kwargs = {"gpu_core_count": 20, "num_heads": 24, "num_kv_heads": 4}
+    assert nax_split_kwargs(caps, whole, 256, prefill_work=prefill, **kwargs) == {
+        "nax_split_hint": 0,
+        "nax_prefill_split_hint": 1,
+    }
+    assert nax_split_kwargs(
+        {"nax_split_hint": True}, whole, 256, prefill_work=prefill, **kwargs
+    ) == {"nax_split_hint": 0}
+
+
 @pytest.mark.parametrize("head_size", [128, 512])
 def test_native_hint_does_not_change_outputs(head_size):
+    import mlx.core as mx
+
+    from tests.test_gqa_decode_routing import _mixed_call, _mixed_inputs
     from vllm_metal.metal import get_ops
 
     ops = get_ops()
@@ -146,6 +305,8 @@ def test_native_hint_does_not_change_outputs(head_size):
 @pytest.mark.parametrize("name", ["nax_split_hint", "nax_prefill_split_hint"])
 def test_native_rejects_invalid_hints_before_evaluation(name):
     """Public argument validation also runs on machines without NAX."""
+    from tests.test_gqa_decode_routing import _mixed_call, _mixed_inputs
+
     inputs = _mixed_inputs([2], prefill_kv=2, geometry=(8, 2, 128, 16))
     for invalid in (-2, 2):
         with pytest.raises(ValueError, match=name):
@@ -173,20 +334,30 @@ def test_native_prefill_hint_only_applies_after_decode_separation(
     nax_prefill, decode_kv, decode_rows, metadata, separated, head_size
 ):
     """Conflicting hints expose the native subset choice and preserve row ownership."""
+    import mlx.core as mx
+
+    from tests.gqa_test_utils import _primitive
+    from tests.test_gqa_decode_routing import _mixed_call, _mixed_inputs
+
     ops = nax_prefill
+    # D512's cached-append extension must preserve both output slices on a
+    # partial Q block after the native dispatcher removes the decode prefix.
+    prefill_rows = 63 if head_size == 512 else 256
     inputs = _mixed_inputs(
         [decode_kv], prefill_kv=256, geometry=(8, 2, head_size, 16), dtype=mx.float16
     )
     inputs.update(
-        query=mx.random.normal((decode_rows + 256, 8, head_size)).astype(mx.float16),
-        cu_seqlens_q=mx.array([0, decode_rows, decode_rows + 256], mx.int32),
+        query=mx.random.normal((decode_rows + prefill_rows, 8, head_size)).astype(
+            mx.float16
+        ),
+        cu_seqlens_q=mx.array([0, decode_rows, decode_rows + prefill_rows], mx.int32),
         num_decode_tokens=decode_rows,
         nax_split_hint=0,
     )
     if decode_rows > 1:
         inputs.update(
             cu_seqlens_q=mx.array(
-                [*range(decode_rows + 1), decode_rows + 256], mx.int32
+                [*range(decode_rows + 1), decode_rows + prefill_rows], mx.int32
             ),
             block_tables=inputs["block_tables"][mx.array([0] * decode_rows + [1])],
             seq_lens=mx.array(

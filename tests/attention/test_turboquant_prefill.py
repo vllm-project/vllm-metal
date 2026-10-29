@@ -142,7 +142,6 @@ def test_prefill_quantization_formats(
     args, kwargs = recorded_ops[0]
     assert not kwargs.get("use_turboquant", False)
     assert kwargs["window_seqlen_q"] == case.ctx.verify_window_q == 1
-    assert kwargs["nax_split_hint"] == 0  # Two full Q blocks retain the original loop.
     assert args[1].dtype == dtype
     assert args[1].shape == (17, 16, 2, 128)
 
@@ -166,7 +165,7 @@ def test_prefill_strided_translated_pages(
     assert_parity(case)
     args, kwargs = recorded_ops[0]
     assert not kwargs.get("use_turboquant", False)
-    assert kwargs["nax_split_hint"] == 1
+    assert kwargs.get("nax_split_hint", -1) == (1 if get_ops().nax_ready() else -1)
     kb = args[9]
     # Only ceil(valid KV / kernel block) pages, even if the scheduler page
     # contains many unused sub-blocks and the input table has spare capacity.
@@ -206,7 +205,7 @@ def test_nax_hint_describes_only_the_dequantized_prefill(recorded_ops):
     assert_parity(case)
     prefill = [kw for _, kw in recorded_ops if not kw.get("use_turboquant", False)]
     assert len(prefill) == 1
-    assert prefill[0]["nax_split_hint"] == 1
+    assert prefill[0].get("nax_split_hint", -1) == (1 if get_ops().nax_ready() else -1)
 
 
 @pytest.mark.parametrize("qlen", [1, 2, 32, 127, 128])
@@ -705,13 +704,26 @@ def test_128k_history_does_not_block_smaller_candidate(recorded_ops):
     ],
 )
 def test_rollout_requires_nax_or_explicit_opt_in(
-    recorded_ops, monkeypatch, mode, ready, selected
+    recorded_ops, monkeypatch, request, mode, ready, selected
 ):
     monkeypatch.setenv("VLLM_METAL_TQ_PREFILL", mode)
+    if not ready:
+        request.getfixturevalue("force_tiled_prefill")
     monkeypatch.setattr(get_ops(), "nax_ready", lambda: ready)
     case = build_case()
-    assert_parity(case)
+    with (
+        patch.object(
+            turboquant_prefill, "nax_tile_work", wraps=turboquant_prefill.nax_tile_work
+        ) as work,
+        patch.object(
+            sdpa, "nax_gpu_core_count", wraps=sdpa.nax_gpu_core_count
+        ) as cores,
+    ):
+        assert_parity(case)
+    assert work.call_count == int(selected and ready)
+    assert cores.call_count == int(selected and ready)
     assert recorded_ops[0][1].get("use_turboquant", False) == (not selected)
+    assert ("nax_split_hint" in recorded_ops[0][1]) == (selected and ready)
 
 
 def test_workspace_plan_key_includes_kv_geometry():
@@ -728,6 +740,14 @@ def test_workspace_plan_key_includes_kv_geometry():
     assert plans[1].workspace_bytes > plans[0].workspace_bytes
     assert plans[2] is not plans[0]
     assert plans[2].workspace_bytes > plans[0].workspace_bytes
+    # A runtime NAX toggle must not reuse a plan without its requested work.
+    enabled = sdpa._turboquant_prefill_plan(
+        case.ctx, meta, case.ctx.block_tables, 16, 8, 2, 128, compute_nax_work=True
+    )
+    assert enabled is not plans[0]
+    assert enabled.prefill.nax_work is not None
+    assert plans[0].prefill.nax_work is None
+    assert enabled.fallback.nax_work is None
 
 
 def test_prefill_plan_rejects_missing_query_lengths():

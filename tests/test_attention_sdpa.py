@@ -677,6 +677,9 @@ class _PagedRoutingOpsSpy:
     def supports_mm_prefix(self) -> bool:
         return self._supports_mm_prefix
 
+    def nax_ready(self) -> bool:
+        return True
+
     def paged_attention_capabilities(self) -> dict[str, bool]:
         return {
             "gqa_decode": True,
@@ -1014,18 +1017,20 @@ class TestSDPAForward:
                     assert spy.calls[-1].num_decode_requests == len(next_plan)
 
     @pytest.mark.parametrize(
-        "supported,kind",
+        "supported,kind,ready",
         [
-            ("subset", "decode"),
-            ("subset", "prefill"),
-            ("subset", "mixed"),
-            ("subset", "expanded_verify"),
-            ("whole", "mixed"),
-            ("none", "mixed"),
+            ("subset", "decode", True),
+            ("subset", "prefill", True),
+            ("subset", "mixed", True),
+            ("subset", "expanded_verify", True),
+            ("whole", "mixed", True),
+            ("none", "mixed", True),
+            ("subset", "prefill", False),
+            ("subset", "mixed", False),
         ],
     )
     def test_nax_hints_follow_batch_shape_and_native_capabilities(
-        self, monkeypatch, supported, kind
+        self, monkeypatch, supported, kind, ready
     ) -> None:
         decode = [([[0] * 65], 511), ([[1] * 65], 511)] if kind != "prefill" else []
         if kind == "expanded_verify":
@@ -1042,8 +1047,11 @@ class TestSDPAForward:
             "nax_prefill_split_hint": supported == "subset",
         }
         monkeypatch.setattr(spy, "paged_attention_capabilities", lambda: caps)
+        monkeypatch.setattr(spy, "nax_ready", lambda: ready)
         work = MagicMock(wraps=sdpa_mod.nax_tile_work)
         monkeypatch.setattr(sdpa_mod, "nax_tile_work", work)
+        cores = MagicMock(return_value=0)
+        monkeypatch.setattr(sdpa_mod, "nax_gpu_core_count", cores)
         inner = _make_inner()
         inner.o_proj = lambda out: out
         cache = MetalPagedKVCache(
@@ -1057,8 +1065,9 @@ class TestSDPAForward:
         total = len(ctx.slot_mapping)
         x = mx.ones((1, total, _HIDDEN), mx.float16)
         zeros = mx.zeros((1, total, _N_HEADS * _HEAD_DIM), mx.float16)
-        subset = supported == "subset" and kind == "mixed"
-        windows = (-1, 128, -1, 128) if subset else (-1,)
+        mixed_subset = supported == "subset" and kind == "mixed"
+        subset = mixed_subset and ready
+        windows = (-1, 128, -1, 128) if mixed_subset else (-1,)
         with (
             patch.object(sdpa_mod, "get_ops", return_value=spy),
             patch.object(sdpa_mod, "truncate_padded_output", return_value=zeros),
@@ -1066,7 +1075,7 @@ class TestSDPAForward:
             for window in windows:
                 cache.sliding_window_per_layer[0] = window
                 sdpa_forward(inner, x, ctx, cache, layer_idx=0)
-        forwarded = supported != "none" and kind != "decode"
+        forwarded = supported != "none" and kind != "decode" and ready
         # The full prefill blocks split on their own; decode partial tiles
         # keep the whole mixed batch unsplit, including at window 128.
         whole_hint = int(kind == "prefill")
@@ -1074,6 +1083,7 @@ class TestSDPAForward:
         assert spy.calls[-1].nax_prefill_split_hint == (1 if subset else -1)
         # Matching layers reuse each whole/subset plan for their window.
         assert work.call_count == len(set(windows)) * (int(forwarded) + int(subset))
+        assert cores.call_count == int(forwarded)
 
     def test_mixed_batch_routes_slots_and_page_tables_by_layer_group(self) -> None:
         """Full and sliding layers consume their scheduler-group metadata."""
