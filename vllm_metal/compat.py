@@ -90,10 +90,12 @@ def register_model_compat() -> None:
         )
         logger.debug("Registered Flint architecture compatibility")
 
-    if "Lfm3ForCausalLM" not in ModelRegistry.get_supported_archs():
-        ModelRegistry.register_model(
-            "Lfm3ForCausalLM", "vllm_metal.patches.lfm3_registry:Lfm3ForCausalLM"
-        )
+    supported = ModelRegistry.get_supported_archs()
+    for arch in ("Lfm3ForCausalLM", "Lfm3VlForConditionalGeneration"):
+        if arch not in supported:
+            ModelRegistry.register_model(
+                arch, f"vllm_metal.patches.lfm3_registry:{arch}"
+            )
 
 
 def apply_compat_patches() -> None:

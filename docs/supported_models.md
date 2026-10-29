@@ -54,6 +54,7 @@ unsupported; leave `--video-pruning-rate` unset.
 | Qwen3.5 / 3.6 (dense and MoE) | 🔵 | | native multimodal paged generation | image and video input; FP8 and GGUF checkpoints stay text-only | `mlx-community/Qwen3.5-4B-MLX-4bit` |
 | PaddleOCR-VL | 🔵 | | native multimodal paged generation | image input, no video | `PaddlePaddle/PaddleOCR-VL-1.6` |
 | LFM2-VL / LFM2.5-VL | 🔵 | | native multimodal paged generation on the ShortConv text tower | image input, no video; one tile grid plus thumbnail per image; needs a checkpoint packaged for Transformers, which the MLX conversions are not | `LiquidAI/LFM2.5-VL-1.6B` |
+| LFM3-VL | 🔵 | | native multimodal paged generation on the LFM3 text tower | image input, no video; needs `--trust-remote-code`; the image processor comes from mlx-vlm | `LiquidAI/LFM3-VL-2B-MLX-4bit` |
 | Gemma 4 | 🔵 | | mlx_lm text backbone + mlx-vlm encoder sidecar, paged generation | image input; audio and video input on E2B/E4B; bidirectional attention inside image blocks on sliding-window layers | `mlx-community/unsloth-gemma-4-26B-A4B-it-qat-oQ4`, `mlx-community/gemma-4-e2b-it-4bit` (audio, video) |
 
 Gemma 4 keeps its text path exactly as on the text-only table (mlx_lm model,
@@ -192,7 +193,8 @@ and TurboQuant are not validated.
 **Hunyuan on MPS:** use `--generation-config vllm` to override the checkpoint’s unsupported `repetition_penalty=1.05` default.
 
 LFM3 support covers text generation with BF16 and MLX-quantized checkpoints.
-Vision, audio, and omni variants require separate integrations.
+LFM3-VL image input is listed under multimodal models. Audio, omni, and d1
+variants require separate integrations.
 
 sliding-window attention (SWA) is not fully optimized.
 
