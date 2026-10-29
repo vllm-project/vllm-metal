@@ -68,6 +68,151 @@ def test_batch_planner_requires_known_cores(cores):
     )
 
 
+@pytest.mark.parametrize(
+    "lengths,cores,architecture,eligible",
+    [
+        ([128] * 20, 20, "applegpu_g17s", False),
+        ([128] * 21, 20, "applegpu_g17s", True),
+        ([256] * 64, 20, "applegpu_g17s", True),
+        ([256] * 65, 20, "applegpu_g17s", False),
+        ([127] + [256] * 20, 20, "applegpu_g17s", False),
+        ([128] + [256] * 20, 20, "applegpu_g17s", True),
+        ([128] * 20 + [257], 20, "applegpu_g17s", False),
+        ([], 20, "applegpu_g17s", False),
+        ([0] + [128] * 20, 20, "applegpu_g17s", False),
+        ([128] * 21, 0, "applegpu_g17s", False),
+        ([128] * 21, 19, "applegpu_g17s", False),
+        ([128] * 21, 21, "applegpu_g17s", False),
+        ([128] * 21, 20, "applegpu_g16g", False),
+        ([128] * 21, 20, "applegpu_g17g", False),
+        ([128] * 21, 20, "unknown", False),
+    ],
+)
+def test_nosplit_policy_boundaries(lengths, cores, architecture, eligible):
+    assert (
+        get_ops()._gqa_decode_no_split_eligible_for_test(
+            32, 8, 128, lengths, cores, gpu_arch=architecture
+        )
+        is eligible
+    )
+
+
+@pytest.mark.parametrize(
+    "q,kv,head,block", [(24, 4, 256, 16), (16, 2, 128, 16), (32, 8, 128, 32)]
+)
+def test_nosplit_policy_keeps_unmeasured_geometries_off(q, kv, head, block):
+    assert not get_ops()._gqa_decode_no_split_eligible_for_test(
+        q, kv, head, [128] * 32, 20, block, gpu_arch="applegpu_g17s"
+    )
+
+
+@pytest.mark.parametrize(
+    "dtype,partition",
+    [
+        (mx.float16, None),
+        (mx.bfloat16, None),
+        (mx.float16, 0),
+        (mx.float16, 256),
+        (mx.float16, 512),
+    ],
+)
+def test_nosplit_default_and_forced_routes_remain_distinct(dtype, partition):
+    ops = get_ops()
+    ops._override_detected_gpu_core_count_for_test(20)
+    lengths = [128] * 20 + [256]
+    out, ref = _run_primitive(
+        lengths,
+        dtype,
+        interleaved=True,
+        seed=1042,
+        num_decode_requests=len(lengths),
+        num_decode_tokens=len(lengths),
+        gqa_lengths=lengths,
+        test_partition=partition,
+    )
+    if partition is None and mx.device_info()["architecture"] != "applegpu_g17s":
+        _assert_fallback()
+        assert ops.last_gqa_num_requests() == 0
+    else:
+        assert _dispatch_family() == (
+            "gqa_decode" if partition else "gqa_decode_nosplit"
+        )
+        assert ops.last_gqa_num_requests() == len(lengths)
+    assert ops.last_gqa_partition_size() == (partition or 0)
+    _assert_close(out, ref, dtype)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"gqa_disabled": True},
+        {"gqa_lengths": None},
+        {"num_decode_tokens": 0},
+        {"softcap": 2.0},
+        {"sliding_window": 64},
+        {"dtype": mx.float32},
+    ],
+)
+def test_nosplit_default_keeps_feature_and_metadata_guards(overrides):
+    get_ops()._override_detected_gpu_core_count_for_test(20)
+    lengths = [128] * 21
+    kwargs = {
+        "dtype": mx.float16,
+        "num_decode_requests": len(lengths),
+        "num_decode_tokens": len(lengths),
+        "gqa_lengths": lengths,
+    }
+    kwargs.update(overrides)
+    out, ref = _run_primitive(lengths, interleaved=True, seed=1043, **kwargs)
+    _assert_fallback()
+    _assert_close(out, ref, kwargs["dtype"])
+
+
+def test_nosplit_minimum_length_is_captured_by_each_deferred_forward():
+    ops = get_ops()
+    ops._override_detected_gpu_core_count_for_test(20)
+    batch, q, kv, head, block = 21, 32, 8, 128, 16
+    query = mx.zeros((batch, q, head), mx.float16)
+    keys = mx.zeros((batch, block, kv, head), mx.float16)
+    values = mx.stack(
+        [mx.full((block, kv, head), i + 1, mx.float16) for i in range(batch)]
+    )
+    tables = mx.array([[i] * 16 for i in range(batch)], mx.int32)
+    host_lengths = [128] + [256] * (batch - 1)
+    admitted = _primitive(
+        query,
+        keys,
+        values,
+        tables,
+        mx.array(host_lengths, mx.int32),
+        block,
+        256,
+        host_lengths,
+    )
+    # The minimum changes while maximum and P256/P512 counts/offsets do not.
+    host_lengths[0] = 127
+    excluded = _primitive(
+        query,
+        keys,
+        values,
+        tables,
+        mx.array(host_lengths, mx.int32),
+        block,
+        256,
+        host_lengths,
+    )
+    mx.eval(excluded)
+    _assert_fallback()
+    mx.eval(admitted)
+    if mx.device_info()["architecture"] == "applegpu_g17s":
+        assert _dispatch_family() == "gqa_decode_nosplit"
+    else:
+        _assert_fallback()
+    expected = np.broadcast_to(np.arange(1, batch + 1)[:, None, None], admitted.shape)
+    for out in (admitted, excluded):
+        np.testing.assert_allclose(np.array(out), expected, atol=2e-3, rtol=0)
+
+
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
 @pytest.mark.parametrize(
     "partition,length,maximum,expected",
@@ -505,10 +650,14 @@ def test_host_lengths_are_captured_by_each_lazy_primitive():
 
 
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
-@pytest.mark.parametrize("partition", GQA_PARTITIONS)
 @pytest.mark.parametrize(
-    "q,kv,head,cache_block",
-    [(24, 4, 256, 784), (24, 4, 256, 800), (16, 2, 256, 1056)],
+    "partition,q,kv,head,cache_block",
+    [
+        (partition, *geometry)
+        for partition in GQA_PARTITIONS
+        for geometry in [(24, 4, 256, 784), (24, 4, 256, 800), (16, 2, 256, 1056)]
+    ]
+    + [(0, 32, 8, 128, 16), (0, 32, 8, 128, 784)],
 )
 def test_batched_shared_prefix_and_strided_scheduler_pages(
     dtype, partition, q, kv, head, cache_block
@@ -573,6 +722,10 @@ def test_batched_shared_prefix_and_strided_scheduler_pages(
         scale=head**-0.5,
     )
     _assert_close(out, ref, dtype)
+    assert _dispatch_family() == (
+        "gqa_decode_nosplit" if partition == 0 else "gqa_decode"
+    )
+    assert ops.last_gqa_partition_size() == partition
     assert ops.last_gqa_num_requests() == 2
 
 
@@ -647,10 +800,13 @@ def test_compact_scratch_admits_ragged_batch_within_budget(dtype):
 
 def test_precomputed_length_plan_is_immutable_and_validated():
     ops = get_ops()
-    plan = ops.gqa_decode_length_plan([10752, 10752])
-    assert plan.num_requests == 2 and plan.max_length == 10752
-    with pytest.raises(AttributeError):
-        plan.max_length = 1
+    plan = ops.gqa_decode_length_plan([10751, 10752])
+    assert (
+        plan.num_requests == 2 and plan.min_length == 10751 and plan.max_length == 10752
+    )
+    for field in ("min_length", "max_length"):
+        with pytest.raises(AttributeError):
+            setattr(plan, field, 1)
     query = mx.zeros((1, 32, 128), mx.float16)
     keys = mx.zeros((1, 16, 8, 128), mx.float16)
     with pytest.raises(ValueError, match="one positive length per decode row"):

@@ -82,6 +82,7 @@ NB_MODULE(_paged_ops, m) {
         "This does not change attention routing or numerical computation.");
   nb::class_<GqaDecodeLengthPlan>(m, "GqaDecodeLengthPlan")
       .def_ro("num_requests", &GqaDecodeLengthPlan::num_requests)
+      .def_ro("min_length", &GqaDecodeLengthPlan::min_length)
       .def_ro("max_length", &GqaDecodeLengthPlan::max_length);
   m.def("gqa_decode_length_plan", &gqa_decode_length_plan<std::vector<int>>,
         nb::arg("context_lens"),
@@ -90,14 +91,15 @@ NB_MODULE(_paged_ops, m) {
   m.def("gqa_decode_partition_size", &gqa_decode_plan_for_shape,
         nb::arg("num_heads"), nb::arg("num_kv_heads"), nb::arg("head_size"),
         nb::arg("max_seq_len"), nb::arg("gpu_cores"), nb::arg("block_size") = 16,
-        "Default GQA partition for a supported decode geometry, or zero. "
+        "Split-KV GQA partition candidate for a supported decode geometry, or zero. "
         "Geometry, work and scratch-budget planning; dtype, feature and reducer "
         "eligibility are enforced separately by gqa_decode dispatch.");
   m.def("gqa_decode_batch_partition_size", &gqa_decode_batch_plan_for_shape,
         nb::arg("num_heads"), nb::arg("num_kv_heads"), nb::arg("head_size"),
         nb::arg("context_lens"), nb::arg("gpu_cores"), nb::arg("block_size") = 16,
         nb::arg("gpu_arch") = "", nb::arg("max_seq_len") = 0,
-        "GQA partition from per-request KV lengths, or zero. Empty gpu_arch "
+        "Split-KV GQA candidate from per-request KV lengths, or zero; an eligible "
+        "no-split route takes precedence in dispatch. Empty gpu_arch "
         "uses the executing GPU; an explicit architecture is a read-only planning "
         "input and does not override dispatch. max_seq_len optionally supplies "
         "the dispatch bound; compact scratch uses actual lengths. Dispatch separately "
@@ -105,7 +107,7 @@ NB_MODULE(_paged_ops, m) {
   m.def("last_gqa_partition_size", []() {
     return g_last_gqa_partition.load(std::memory_order_relaxed);
   }, "Partition selected by the most recent recorded paged eval, or zero "
-     "when disabled, cleared or on a fallback. "
+     "for no-split GQA, a fallback, or disabled/cleared diagnostics. "
      "Process-wide diagnostic; not a request trace or routing input.");
   m.def("last_gqa_num_requests", []() {
     return g_last_gqa_requests.load(std::memory_order_relaxed);
@@ -120,6 +122,19 @@ NB_MODULE(_paged_ops, m) {
   m.def("min_decode_grid", &min_decode_grid,
         "Decode-grid threshold (threadgroups) below which split-KV decode "
         "engages on this machine.");
+  m.def("_gqa_decode_no_split_eligible_for_test",
+        [](int num_heads, int num_kv_heads, int head_size,
+           const std::vector<int>& context_lens, int gpu_cores, int block_size,
+           const std::string& gpu_arch) {
+          return gqa_decode_no_split_eligible(
+              num_heads, num_kv_heads, head_size,
+              gqa_decode_length_plan(context_lens), gpu_cores, block_size, gpu_arch);
+        }, nb::arg("num_heads"), nb::arg("num_kv_heads"), nb::arg("head_size"),
+        nb::arg("context_lens"), nb::arg("gpu_cores"), nb::arg("block_size") = 16,
+        nb::arg("gpu_arch") = "",
+        "Private read-only no-split policy query. Empty gpu_arch uses the executing "
+        "GPU; explicit hardware inputs simulate planning without changing dispatch. "
+        "Dtype, feature and decode-row eligibility are checked separately.");
   m.def("_gqa_decode_config_for_test", []() {
     nb::dict config;
     nb::list geometries;
@@ -131,6 +146,18 @@ NB_MODULE(_paged_ops, m) {
     for (int partition : kGqaPartitionSizes) partitions.append(nb::int_(partition));
     config["geometries"] = geometries;
     config["partitions"] = partitions;
+    nb::list no_split_geometries;
+    no_split_geometries.append(nb::make_tuple(
+        kGqaNoSplitGeometry.num_heads, kGqaNoSplitGeometry.num_kv_heads,
+        kGqaNoSplitGeometry.head_size, kGqaNoSplitGeometry.block_size));
+    config["no_split_geometries"] = no_split_geometries;
+    nb::dict no_split_policy;
+    no_split_policy["architecture"] = kGqaNoSplitArchitecture;
+    no_split_policy["gpu_cores"] = kGqaNoSplitGpuCores;
+    no_split_policy["min_context"] = kGqaNoSplitMinContext;
+    no_split_policy["max_context"] = kGqaNoSplitMaxContext;
+    no_split_policy["max_requests"] = kGqaNoSplitMaxRequests;
+    config["no_split_policy"] = no_split_policy;
     config["simd_groups_per_core"] = kGqaSimdGroupsPerCore;
     config["max_scratch_bytes"] = kGqaMaxScratchBytes;
     nb::dict m3;
@@ -157,6 +184,13 @@ NB_MODULE(_paged_ops, m) {
           // Check every layout admitted by the dispatch table. Duplicate
           // layouts reuse the same cached pipelines.
           for (const char* dtype : {"half", "bfloat16_t"}) {
+            bool no = false;
+            const auto direct = gqa_decode_kernel_name(
+                dtype, kGqaNoSplitGeometry.head_size,
+                kGqaNoSplitGeometry.block_size, 0);
+            if (d.get_kernel(direct, lib, direct + "_compact0",
+                {{&no, MTL::DataType::DataTypeBool, NS::UInteger(130)}})
+                == nullptr) return false;
             for (int part : kGqaPartitionSizes) {
               for (const auto& layout : kGqaDecodeGeometries) {
                 const auto reducer = kernels::paged_reduce_kernel_name(
@@ -282,9 +316,10 @@ NB_MODULE(_paged_ops, m) {
            float scale, const array& tables, const array& lengths,
            int block_size, int max_seq_len, int partition_size,
            const std::optional<GqaDecodeLengthPlan>& gqa_length_plan) {
-          if (std::find(kGqaPartitionSizes.begin(), kGqaPartitionSizes.end(),
+          if (partition_size != 0 &&
+              std::find(kGqaPartitionSizes.begin(), kGqaPartitionSizes.end(),
                         partition_size) == kGqaPartitionSizes.end()) {
-            throw std::invalid_argument("GQA test partition must be 256/512");
+            throw std::invalid_argument("GQA test partition must be 0/256/512");
           }
           if (q.ndim() != 3 || q.shape(0) < 1 || k.ndim() != 4 ||
               k.shape() != v.shape() || k.strides() != v.strides() ||
@@ -293,6 +328,9 @@ NB_MODULE(_paged_ops, m) {
               k.shape(3) != q.shape(2) ||
               !gqa_decode_geometry_supported(q.shape(1), k.shape(2),
                                              q.shape(2), block_size) ||
+              (partition_size == 0 &&
+               !gqa_decode_no_split_geometry_supported(q.shape(1), k.shape(2),
+                                                        q.shape(2), block_size)) ||
               k.shape(1) % block_size != 0 ||
               tables.ndim() != 2 || tables.shape(0) != q.shape(0) ||
               tables.dtype() != int32 || lengths.ndim() != 1 ||
@@ -301,13 +339,15 @@ NB_MODULE(_paged_ops, m) {
               max_seq_len > static_cast<int64_t>(tables.shape(1)) * block_size) {
             throw std::invalid_argument("GQA test entry requires supported one-token decode rows");
           }
-          const int64_t num_partitions =
-              (static_cast<int64_t>(max_seq_len) + partition_size - 1) /
-              partition_size;
-          if (kernels::paged_reduce_threadgroup_bytes(num_partitions) >
-              metal::device(Device::gpu).mtl_device()->maxThreadgroupMemoryLength()) {
-            throw std::invalid_argument(
-                "GQA test partition exceeds the device threadgroup memory limit");
+          if (partition_size > 0) {
+            const int64_t num_partitions =
+                (static_cast<int64_t>(max_seq_len) + partition_size - 1) /
+                partition_size;
+            if (kernels::paged_reduce_threadgroup_bytes(num_partitions) >
+                metal::device(Device::gpu).mtl_device()->maxThreadgroupMemoryLength()) {
+              throw std::invalid_argument(
+                  "GQA test partition exceeds the device threadgroup memory limit");
+            }
           }
           auto cu = arange(q.shape(0) + 1, int32);
           return paged_attention_primitive_fn(
@@ -315,12 +355,14 @@ NB_MODULE(_paged_ops, m) {
               block_size, max_seq_len, -1, false, "", nullptr, nullptr,
               nullptr, nullptr, 3, 1, nullptr, nullptr, q.shape(0), q.shape(0),
               max_seq_len, false,
-              partition_size, gqa_length_plan);
+              partition_size == 0 ? kGqaNoSplitTestPartition : partition_size,
+              gqa_length_plan);
         }, nb::arg("query"), nb::arg("key_cache"), nb::arg("value_cache"),
         nb::arg("scale"), nb::arg("block_tables"), nb::arg("seq_lens"),
         nb::arg("block_size"), nb::arg("max_seq_len"), nb::arg("partition_size"),
         nb::arg("gqa_length_plan") = nb::none(),
-        "Private test-only one-token-per-request GQA dispatch with an explicit partition. "
+        "Private test-only one-token-per-request GQA dispatch. partition_size=0 "
+        "selects direct output without split-KV; 256/512 select a partition. "
         "Page IDs and sequence lengths must describe valid cache contents. "
         "Does not change the default selector or require GPU core detection.");
 
@@ -490,7 +532,7 @@ NB_MODULE(_paged_ops, m) {
       "last_paged_dispatch",
       []() {
         static constexpr const char* names[] = {
-            "", "gqa_decode", "per_token_ps0", "per_token_ps512", "window_ps0",
+            "", "gqa_decode", "gqa_decode_nosplit", "per_token_ps0", "per_token_ps512", "window_ps0",
             "window_ps512", "nax_prefill", "tiled_prefill", "mixed_prefill_decode",
             "mixed_nax_prefill_decode"};
         static_assert(std::size(names) == static_cast<size_t>(PagedDispatch::Count),
@@ -499,7 +541,7 @@ NB_MODULE(_paged_ops, m) {
             g_last_dispatch.load(std::memory_order_relaxed))];
       },
       "Dispatch family chosen by the most recent recorded paged_attention_primitive "
-      "eval (\"gqa_decode\", \"per_token_ps0\", \"per_token_ps512\", "
+      "eval (\"gqa_decode\", \"gqa_decode_nosplit\", \"per_token_ps0\", \"per_token_ps512\", "
       "\"window_ps0\", \"window_ps512\", \"nax_prefill\", "
       "\"tiled_prefill\", \"mixed_prefill_decode\", \"mixed_nax_prefill_decode\"). "
       "Diagnostic surface for routing tests; empty "
