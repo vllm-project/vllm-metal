@@ -101,9 +101,11 @@ NaxPrefillTraceResult take_nax_prefill_dispatch_trace() {
   return result;
 }
 
-// Set while the mixed split encodes its decode and prefill kernels in one
-// concurrent scope, where MLX inserts no automatic hazard barriers.
-static thread_local bool g_mixed_concurrent = false;
+// Split a mixed batch's decode rows on pre-M5 GPUs only when they carry at
+// least this much KV work (the sum of their context lengths). #1159 measured
+// it on M1 Max and M5 while the split's halves still serialized; the
+// concurrent encoding removed that overhead on M5, so M5 splits every batch.
+constexpr int64_t kMixedDecodeMinWork = 512;
 
 // Window mode for spec-decode verification (per-token kernel): query rows
 // per threadgroup (2 = the measured register/occupancy sweet spot on Apple
@@ -281,6 +283,26 @@ static const bool nax_gqa_prefill_enabled_ = []() {
   const char* value = std::getenv("VLLM_METAL_NAX_GQA_PREFILL");
   return value == nullptr || std::string(value) == "1";
 }();
+
+// -1 follows the hardware; 0 or 1 forces the pre-M5 mixed-split floor off or
+// on. Set only by `_override_mixed_decode_floor_for_test`.
+static std::atomic<int> g_test_mixed_decode_floor{-1};
+
+static bool mixed_decode_floor() {
+  const int override = g_test_mixed_decode_floor.load(std::memory_order_relaxed);
+  if (override >= 0) return override != 0;
+  static const bool pre_m5 = !metal::device(Device::gpu).mtl_device()->supportsFamily(
+      static_cast<MTL::GPUFamily>(hardware::kApple10));
+  return pre_m5;
+}
+
+int override_mixed_decode_floor_for_test(int floor) {
+  if (floor < -1 || floor > 1)
+    throw std::invalid_argument(
+        "mixed decode floor override must be -1, 0 or 1 (got " +
+        std::to_string(floor) + ")");
+  return g_test_mixed_decode_floor.exchange(floor, std::memory_order_relaxed);
+}
 
 void init_nax_library_path(const std::string& path) {
   init_library_path("paged_attention_nax_kern", path);
@@ -615,7 +637,7 @@ static void dispatch_paged_attention_v2_reduce(
     const std::string& dt, bool use_sinks, const array* sinks,
     bool use_tq_fc, int partition_size = kPartitionSize,
     MTL::ComputePipelineState* rkernel = nullptr,
-    const array* partition_offsets = nullptr) {
+    const array* partition_offsets = nullptr, bool concurrent = false) {
   if (rkernel == nullptr) {
     rkernel = paged_attention_v2_reduce_kernel(
         d, dt, head_size, partition_size, use_sinks, use_tq_fc,
@@ -629,7 +651,7 @@ static void dispatch_paged_attention_v2_reduce(
         "paged attention reduction exceeds the device threadgroup memory limit");
   }
   // The producer's partials are not hazard-tracked inside a concurrent scope.
-  if (g_mixed_concurrent) enc.barrier();
+  if (concurrent) enc.barrier();
   enc.set_compute_pipeline_state(rkernel);
   enc.set_threadgroup_memory_length(reduce_shmem, 0);
   enc.set_output_array(out, 0);
@@ -675,6 +697,7 @@ struct PagedAttentionMetadata {
   bool use_sinks;
   bool nax_ready;
   bool nax_enabled;
+  bool mixed_decode_floor;
   int num_decode_requests;
   int num_decode_tokens;
   int max_decode_context_len;
@@ -751,13 +774,20 @@ static PagedAttentionPlan select_paged_attention_route(
 
   // Split ordinary decode rows from NAX or tiled prefill: a one-row decode
   // sequence would otherwise occupy a whole BQ-row prefill tile with no
-  // KV-length parallelism. The two halves run concurrently, so the split
-  // pays no serialization cost even for short decode rows
-  // (tools/benchmark/mixed_decode_split_benchmark.py). Spec verify windows
-  // keep their whole-batch route.
+  // KV-length parallelism. The two halves run concurrently, so on M5 the
+  // split pays no serialization cost even for short decode rows
+  // (tools/benchmark/mixed_decode_split_benchmark.py). Pre-M5 GPUs keep the
+  // decode-work floor until they are measured with concurrent halves. The
+  // decode-prefix length plan carries the exact work; without one, the
+  // longest row is a lower bound on it, so uneven rows are never split on
+  // overcounted work. Spec verify windows keep their whole-batch route.
+  const int64_t decode_work =
+      m.gqa_length_plan.num_requests == m.num_decode_requests
+      ? m.gqa_length_plan.total_length : m.max_decode_context_len;
   const bool split_mixed_batch = m.num_decode_requests > 0
       && m.num_decode_requests < num_seqs
       && m.num_decode_tokens == m.num_decode_requests
+      && (!m.mixed_decode_floor || decode_work >= kMixedDecodeMinWork)
       && (use_nax || tile_config.has_value());
   PagedAttentionPlan plan;
   plan.total_q_tokens = total_q_tokens;
@@ -968,6 +998,9 @@ struct PagedAttentionEncoding {
   std::string dt;
   std::string k_cache_dt;
   std::string v_cache_dt;
+  // Encoded inside the mixed split's concurrent scope, where MLX inserts no
+  // hazard barriers: a split-KV reduce must add its own.
+  bool concurrent = false;
 };
 
 // Split-KV scratch factory shared by the split paths below: partial output
@@ -1083,7 +1116,7 @@ static void dispatch_paged_attention_gqa_decode(
       metadata.num_heads, metadata.head_size,
       gqa_num_partitions, encoding.dt, /*use_sinks=*/false, nullptr,
       /*use_tq_fc=*/tq, plan.gqa_partition_size, gqa_rkernel,
-      plan.compact ? &*g_offsets : nullptr);
+      plan.compact ? &*g_offsets : nullptr, encoding.concurrent);
   return;
 }
 
@@ -1179,7 +1212,8 @@ static void dispatch_paged_attention_per_token(
       *encoding.device, enc, arrays.out, exp_sums, max_logits, tmp_out,
       arrays.seq_lens, arrays.cu_seqlens_q, plan.num_seqs, plan.total_q_tokens,
       metadata.num_heads, metadata.head_size, plan.max_num_partitions, encoding.dt,
-      kernel_plan.use_sinks, arrays.sinks, kernel_plan.use_tq);
+      kernel_plan.use_sinks, arrays.sinks, kernel_plan.use_tq, kPartitionSize,
+      nullptr, nullptr, encoding.concurrent);
 }
 
 static void dispatch_paged_attention_mixed(
@@ -1215,7 +1249,8 @@ static void dispatch_paged_attention_v2_online(
     int decode_only_rows = 0, bool gqa_disabled = false,
     int gqa_test_partition = 0,
     const GqaDecodeLengthPlan& gqa_length_plan = {},
-    int nax_split_hint = -1, int nax_prefill_split_hint = -1) {
+    int nax_split_hint = -1, int nax_prefill_split_hint = -1,
+    bool concurrent = false) {
   int head_size = static_cast<int>(query.shape(2));
   PagedAttentionMetadata metadata{
       gqa_length_plan, query.dtype(), key_cache.dtype(), value_cache.dtype()};
@@ -1238,6 +1273,7 @@ static void dispatch_paged_attention_v2_online(
   metadata.use_sinks = sinks != nullptr;
   metadata.nax_ready = nax_lib_ready_;
   metadata.nax_enabled = nax_enabled_;
+  metadata.mixed_decode_floor = mixed_decode_floor();
   metadata.num_decode_requests = num_decode_requests;
   metadata.num_decode_tokens = num_decode_tokens;
   metadata.max_decode_context_len = max_decode_context_len;
@@ -1251,6 +1287,7 @@ static void dispatch_paged_attention_v2_online(
       key_scale_cache, value_scale_cache, key_zero_cache, v_centroids,
       sinks, mm_prefix_ranges, s};
   PagedAttentionEncoding encoding;
+  encoding.concurrent = concurrent;
   auto plan = select_paged_attention_route(
       metadata,
       [&]() {
@@ -1342,7 +1379,6 @@ static void dispatch_paged_attention_mixed(
   auto& enc = metal::get_command_encoder(arrays.s);
   {
     auto concurrent = enc.start_concurrent();
-    g_mixed_concurrent = true;
     // Decode rows lead the batch, so the first prefill sequence starts at
     // q-block cu_seqlens_q[D] / BQ + D with D = num_decode_requests.
     if (nax) {
@@ -1381,10 +1417,10 @@ static void dispatch_paged_attention_mixed(
         metadata.num_decode_requests, metadata.num_decode_tokens,
         metadata.max_decode_context_len,
         metadata.num_decode_tokens, metadata.gqa_disabled, 0,
-        prefix_plan ? metadata.gqa_length_plan : GqaDecodeLengthPlan{});
+        prefix_plan ? metadata.gqa_length_plan : GqaDecodeLengthPlan{},
+        -1, -1, /*concurrent=*/true);
     g_last_nax_split.store(nax_split, std::memory_order_relaxed);
     g_last_nax_heads_per_tg.store(nax_heads_per_tg, std::memory_order_relaxed);
-    g_mixed_concurrent = false;
   }
   // Keep the decode prefix's GQA selection visible in the diagnostics.
   const int decode_partition = g_last_gqa_partition.load(std::memory_order_relaxed);

@@ -264,11 +264,19 @@ def test_primitive_vs_reference_varlen(
 
 
 @pytest.mark.parametrize(
+    "mixed_decode_floor", [False, True], ids=["m5", "pre-m5"], indirect=True
+)
+@pytest.mark.parametrize(
     "decode_lengths,head_size",
     [
         pytest.param([64], 128, id="single-short"),
         pytest.param([256], 128, id="single-medium"),
+        pytest.param([511], 128, id="below-floor"),
+        pytest.param([512], 128, id="at-floor"),
+        # Uneven rows count their exact sum, not rows x longest context.
         pytest.param([256, 64], 128, id="uneven-pair"),
+        pytest.param([447, 64], 128, id="uneven-below-floor"),
+        pytest.param([448, 64], 128, id="uneven-at-floor"),
         pytest.param([64] * 33, 128, id="many-short-rows"),
         pytest.param([4096] + [64] * 32, 128, id="split-kv-reduce-d128"),
         pytest.param([4096] + [64] * 32, 256, id="split-kv-reduce-d256"),
@@ -278,9 +286,11 @@ def test_primitive_vs_reference_varlen(
 def test_mixed_batch_splits_decode_rows(
     decode_lengths: list[int],
     head_size: int,
+    mixed_decode_floor: bool,
     force_tiled_prefill,
 ) -> None:
-    """Decode rows take the decode kernel; prefill rows keep tiled bit-for-bit."""
+    """Split decode rows take the decode kernel; prefill rows keep tiled bit-for-bit."""
+    split_decode = not mixed_decode_floor or sum(decode_lengths) >= 512
     decode_rows = len(decode_lengths)
     decode_context = max(decode_lengths)
     seq_lens = [(1, length) for length in decode_lengths] + [(32, 64)]
@@ -300,23 +310,54 @@ def test_mixed_batch_splits_decode_rows(
     finally:
         mx.synchronize()
         ops._set_paged_dispatch_diagnostics(previous)
-    decode = {
-        **d,
-        "query": d["query"][:decode_rows],
-        "block_tables": d["block_tables"][:decode_rows],
-        "kv_lens_arr": d["kv_lens_arr"][:decode_rows],
-        "cu_seqlens_q": mx.arange(decode_rows + 1, dtype=mx.int32),
-    }
-    expected_decode, _ = _run_attention(
-        decode,
-        decode_rows=decode_rows,
-        decode_context=decode_context,
-        decode_lengths=decode_lengths,
-    )
+    expected_decode = whole_tiled[:decode_rows]
+    if split_decode:
+        decode = {
+            **d,
+            "query": d["query"][:decode_rows],
+            "block_tables": d["block_tables"][:decode_rows],
+            "kv_lens_arr": d["kv_lens_arr"][:decode_rows],
+            "cu_seqlens_q": mx.arange(decode_rows + 1, dtype=mx.int32),
+        }
+        expected_decode, _ = _run_attention(
+            decode,
+            decode_rows=decode_rows,
+            decode_context=decode_context,
+            decode_lengths=decode_lengths,
+        )
+
     assert whole_family == "tiled_prefill"
-    assert mixed_family == "mixed_prefill_decode"
+    assert mixed_family == ("mixed_prefill_decode" if split_decode else "tiled_prefill")
     np.testing.assert_array_equal(mixed[:decode_rows], expected_decode)
     np.testing.assert_array_equal(mixed[decode_rows:], whole_tiled[decode_rows:])
+
+
+@pytest.mark.parametrize("mixed_decode_floor", [True], ids=["pre-m5"], indirect=True)
+@pytest.mark.parametrize(
+    "decode_lengths,split_decode",
+    [([256, 256], False), ([512, 64], True)],
+)
+def test_mixed_batch_without_length_plan_bounds_work_by_longest_row(
+    decode_lengths: list[int],
+    split_decode: bool,
+    mixed_decode_floor: bool,
+    force_tiled_prefill,
+) -> None:
+    """Without a length plan the longest row is a lower bound on the decode work."""
+    seq_lens = [(1, length) for length in decode_lengths] + [(32, 64)]
+    mx.random.seed(0)
+    d = _make_cache_and_inputs(512, 2, 8, seq_lens)
+    ops = get_ops()
+    previous = ops._set_paged_dispatch_diagnostics(True)
+    try:
+        _, family = _run_attention(
+            d, decode_rows=len(decode_lengths), decode_context=max(decode_lengths)
+        )
+    finally:
+        mx.synchronize()
+        ops._set_paged_dispatch_diagnostics(previous)
+
+    assert family == ("mixed_prefill_decode" if split_decode else "tiled_prefill")
 
 
 @pytest.mark.parametrize(

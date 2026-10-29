@@ -160,6 +160,23 @@ def force_tiled_prefill():
 
 
 @pytest.fixture
+def mixed_decode_floor(request):
+    """Force the pre-M5 mixed-split decode-work floor on or off.
+
+    Parametrize indirectly with a bool. Lets an M5 cover the pre-M5 floor and
+    a pre-M5 runner cover the M5 route, whatever hardware runs the test.
+    """
+    from vllm_metal.metal import get_ops
+
+    ops = get_ops()
+    previous = ops._override_mixed_decode_floor_for_test(int(request.param))
+    try:
+        yield request.param
+    finally:
+        ops._override_mixed_decode_floor_for_test(previous)
+
+
+@pytest.fixture
 def nax_prefill():
     """Route eligible prefill to NAX and record the dispatch family.
 
