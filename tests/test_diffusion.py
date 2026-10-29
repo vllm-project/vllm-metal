@@ -1003,7 +1003,11 @@ class TestPlatformDiffusionConfig:
 
     @pytest.mark.parametrize(
         ("params", "parameter"),
-        [({"top_k": 5}, "top_k"), ({"top_p": 0.9}, "top_p")],
+        [
+            ({"top_k": 5}, "top_k"),
+            ({"top_p": 0.9}, "top_p"),
+            ({"thinking_token_budget": 8}, "thinking_token_budget"),
+        ],
     )
     def test_rejects_top_k_and_top_p_while_serving_diffusion(
         self, monkeypatch, params, parameter

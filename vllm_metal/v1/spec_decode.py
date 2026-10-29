@@ -454,12 +454,13 @@ class SpeculativeDecodeController:
                 or sampling_params.num_logprobs is not None
                 or bool(sampling_params.allowed_token_ids)
                 or bool(sampling_params.bad_words_token_ids)
+                or sampling_params.thinking_token_budget is not None
             )
             if unsupported:
                 raise NotImplementedError(
                     "Speculative decode verification on Metal currently "
                     "supports greedy sampling only (temperature=0, no "
-                    "penalties, constraints, or logprobs)."
+                    "penalties, constraints, thinking budget, or logprobs)."
                 )
 
 
