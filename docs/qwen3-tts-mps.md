@@ -5,7 +5,7 @@ Generate speech with the optional vLLM-Omni integration.
 After the [development setup](CONTRIBUTING.md#development-setup), install:
 
 ```bash
-VLLM_OMNI_TARGET_DEVICE=cpu uv pip install -e '.[omni]' 'torch==2.13.0'
+VLLM_OMNI_TARGET_DEVICE=cpu uv pip install -e '.[omni]'
 ```
 
 Start the server from the repository root:
