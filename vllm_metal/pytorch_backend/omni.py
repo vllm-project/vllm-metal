@@ -29,6 +29,10 @@ class MPSOmniGenerationModelRunner(MPSModelRunner, OmniGenerationModelRunner):
 class MPSOmniWorker(OmniWorkerMixin, MPSWorker):
     is_omni = True
 
+    def get_stage_post_warmup_memory_stats(self) -> None:
+        """MPS does not provide the optional CUDA warmup snapshot."""
+        return None
+
     def shutdown(self):
         try:
             if getattr(self, "model_runner", None) is not None:
