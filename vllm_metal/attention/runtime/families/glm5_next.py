@@ -23,7 +23,9 @@ from vllm_metal.attention.runtime.hybrid_plan import (
 
 _LAYER_ROLES: dict[str, LayerRole] = {
     "linear_attention": STATE_LAYER,
+    # Transformers 5.18 renamed deepseek_sparse_attention to indexed_attention.
     "deepseek_sparse_attention": ATTENTION_LAYER,
+    "indexed_attention": ATTENTION_LAYER,
 }
 
 
