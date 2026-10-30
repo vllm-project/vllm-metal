@@ -2,6 +2,7 @@
 """MPS request mapping, cache sizing and normalization parity."""
 
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -167,10 +168,10 @@ def test_rms_norm_parity(dtype, fused, num_tokens, hidden_size):
 
 
 @pytest.mark.parametrize("strided_arg", [0, 1, 2], ids=["input", "residual", "weight"])
-def test_residual_rms_norm_preserves_noncontiguous_inputs(strided_arg):
+def test_residual_rms_norm_falls_back_for_noncontiguous_inputs(strided_arg):
     from vllm import ir
 
-    import vllm_metal.pytorch_backend.normalization  # noqa: F401
+    from vllm_metal.pytorch_backend import normalization
 
     op = ir.ops.fused_add_rms_norm
     args = list(
@@ -188,11 +189,23 @@ def test_residual_rms_norm_preserves_noncontiguous_inputs(strided_arg):
     )
     args[strided_arg] = storage[..., ::2]
     args[strided_arg].copy_(source)
+    assert not args[strided_arg].is_contiguous()
     before = [arg.cpu() if isinstance(arg, torch.Tensor) else arg for arg in args]
     with op.set_priority(["native"]):
         expected = op(*before)
-    with op.set_priority(["torch_mps", "native"]):
+    with (
+        op.set_priority(["torch_mps", "native"]),
+        patch.object(
+            normalization,
+            "_add_rms_norm_kernel",
+            side_effect=AssertionError(
+                "Noncontiguous inputs must bypass the fused kernel"
+            ),
+        ) as kernel_loader,
+    ):
+        assert op.dispatch(*args).provider == "torch_mps"
         actual = op(*args)
+        kernel_loader.assert_not_called()
     for result, reference in zip(actual, expected, strict=True):
         torch.testing.assert_close(
             result.cpu(), reference, **op.get_tolerance(source.dtype)
