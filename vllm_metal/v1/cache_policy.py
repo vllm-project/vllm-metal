@@ -932,14 +932,6 @@ class ModelCachePolicy:
                 + self._draft_cache_block_size_bytes()
             )
 
-        if self._is_sparse_mla() and self._runner.is_hybrid:
-            # vLLM's GLM-5-Next layout: the latent and pooled-key pages, which
-            # the KDA pages alias.
-            return sum(
-                spec.page_size_bytes
-                for spec in self.get_kv_cache_spec().values()
-                if type(spec) is MLAAttentionSpec
-            )
         return (
             self._kv_factor() * block_size * dtype_size * self._kv_layer_size_sum()
             + self._draft_cache_block_size_bytes()

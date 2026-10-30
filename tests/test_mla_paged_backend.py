@@ -1178,12 +1178,16 @@ def _glm5_next_paged(inner, *, num_blocks: int = 12, block_size: int = 32):
 
 
 class _GlmRequest:
-    """One request's blocks and mlx-vlm's own caches for it."""
+    """One request's latent and pooled-key blocks and mlx-vlm's own caches for
+    it."""
 
-    def __init__(self, blocks: list[int], kpool: int = 4) -> None:
+    def __init__(
+        self, blocks: list[int], pooled_blocks: list[int], kpool: int = 4
+    ) -> None:
         from mlx_vlm.models.cache import CacheList, KVCache, PoolingCache
 
         self.blocks = blocks
+        self.pooled_blocks = pooled_blocks
         self.kpool = kpool
         self.offset = 0
         # Every step so far ran this request alone, so its rows are mlx-vlm's.
@@ -1200,7 +1204,7 @@ def _glm_step(inner, runtime, wrapper, step):
     dtype = inner.qkv_a_proj.weight.dtype
     decode, prefill, xs = [], [], []
     for request, num_tokens in step:
-        ids = [list(request.blocks)]
+        ids = [list(request.blocks), list(request.pooled_blocks)]
         if num_tokens == 1 and request.offset:
             assert not prefill, "decode rows come first"
             decode.append((ids, request.offset))
@@ -1244,7 +1248,7 @@ def _assert_pages_match(runtime, request: _GlmRequest) -> None:
     tail_keys, tail_gates, pooled = request.reference[2].state
     num_pools, remainder = divmod(request.offset, request.kpool)
     if num_pools:
-        pages = caches.pooled.latent_caches[0][mx.array(request.blocks)]
+        pages = caches.pooled.latent_caches[0][mx.array(request.pooled_blocks)]
         rows = pages.reshape(-1, pages.shape[-1])[:num_pools]
         assert bool(mx.array_equal(rows, pooled[0]))
     if remainder:
@@ -1277,7 +1281,7 @@ class TestGlm5NextSparseAttention:
         and the paged pools and tail against its PoolingCache, every step."""
         inner = _glm5_next_layer(kpool=kpool)
         runtime, wrapper = _glm5_next_paged(inner, block_size=block_size)
-        request = _GlmRequest([5, 2, 7], kpool=kpool)
+        request = _GlmRequest([5, 2, 7], [10], kpool=kpool)
 
         for num_tokens in chunks:
             ((actual, expected, _, _),) = _glm_step(
@@ -1293,7 +1297,11 @@ class TestGlm5NextSparseAttention:
         request's own; outputs within bf16 tolerance."""
         inner = _glm5_next_layer()
         runtime, wrapper = _glm5_next_paged(inner)
-        a, b, c = _GlmRequest([3, 9]), _GlmRequest([6, 4, 11]), _GlmRequest([8])
+        a, b, c = (
+            _GlmRequest([3, 9], [10]),
+            _GlmRequest([6, 4, 11], [7]),
+            _GlmRequest([8], [5]),
+        )
         steps = [
             [(a, 13)],
             [(a, 1), (b, 7)],
@@ -1313,17 +1321,18 @@ class TestGlm5NextSparseAttention:
 
     def test_prefix_hit_starts_on_the_shared_blocks(self) -> None:
         """A prefix-cache hit: the second request starts on the first
-        request's whole first block. It reads that
-        block's latent rows and pools, and matches mlx-vlm fed the same
-        prefix rows."""
+        request's whole first latent block and, as vLLM's partial hits do, on
+        a copy of its partly filled pooled-key block. It reads that block's
+        latent rows and pools, and matches mlx-vlm fed the same prefix rows."""
         inner = _glm5_next_layer()
         runtime, wrapper = _glm5_next_paged(inner)
-        first = _GlmRequest([4, 1])
+        first = _GlmRequest([4, 1], [10])
         ((_, _, _, prefix),) = _glm_step(inner, runtime, wrapper, [(first, 32)])
         # The first request goes on, into its own second block.
         _glm_step(inner, runtime, wrapper, [(first, 5)])
 
-        second = _GlmRequest([4, 6])
+        second = _GlmRequest([4, 6], [7])
+        runtime.copy_blocks([(10, 7)])
         inner(prefix, cache=second.reference)
         second.offset = 32
         for num_tokens in (7, 1, 1):
@@ -1360,7 +1369,9 @@ class TestGlm5NextSparseAttention:
         inner = _glm5_next_layer(ties=ties)
         runtime, wrapper = _glm5_next_paged(inner, num_blocks=40, block_size=block_size)
         blocks = list(range(math.ceil((history + chunk) / block_size), 0, -1))
-        request = _GlmRequest(blocks)
+        num_pooled = math.ceil((history + chunk) / runtime.kv_group_block_sizes()[1])
+        pooled = list(range(len(blocks) + 1, len(blocks) + 1 + num_pooled))
+        request = _GlmRequest(blocks, pooled)
         _glm_step(inner, runtime, wrapper, [(request, history)])
 
         ((actual, projected, selected, x),) = _glm_step(

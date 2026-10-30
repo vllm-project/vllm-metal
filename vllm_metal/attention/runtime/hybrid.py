@@ -102,9 +102,19 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
         if isinstance(self._cache, MLAPagedLatentCache) and (
             attention_names[0] + INDEXER_CACHE_SUFFIX in self.storage.specs
         ):
-            # GLM-5-Next: the pooled keys share the latent's group.
+            # GLM-5-Next: the pooled keys are a KV group of their own, after the
+            # latent's in the step context.
             self._indexer_caches = SparseIndexerCaches.from_upstream(
-                self.storage, attention_names, latent=self._cache
+                self.storage,
+                attention_names,
+                latent=self._cache,
+                kv_group=len(self._scheduler_group_indices),
+            )
+            pooled_names = [name + INDEXER_CACHE_SUFFIX for name in attention_names]
+            self._scheduler_group_indices += tuple(
+                i
+                for i, group in enumerate(config.kv_cache_groups)
+                if any(name in pooled_names for name in group.layer_names)
             )
         self._group_block_sizes = tuple(
             config.kv_cache_groups[i].kv_cache_spec.block_size
