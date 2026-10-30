@@ -1266,8 +1266,8 @@ class TestGlm5NextSparseAttention:
             # A chunk ending exactly on a block, then decode into the next.
             (4, 32, (32, 1, 1, 3, 1)),
             # Chunks start and end mid-pool, reading and overwriting the tail.
-            # A 5-token chunk takes mlx-vlm's decode path, a 9-token one its
-            # prefill path.
+            # One-token steps take mlx-vlm's decode path, the 5- and 9-token
+            # chunks the indexed kernel.
             (4, 64, (1, 1, 11, 5, 9, 1, 1)),
             (16, 512, (35, 13, 1, 1)),
         ],

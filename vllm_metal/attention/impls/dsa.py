@@ -13,7 +13,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import torch
 from mlx_vlm.models.cache import KVCache, PoolingCache
-from mlx_vlm.models.linear import DECODE_BLOCK_SIZE, linear
+from mlx_vlm.models.linear import linear
 from mlx_vlm.models.sparse_attention import indexed_sparse_attention
 from vllm.v1.kv_cache_interface import MLAAttentionSpec, SparseCacheRole
 
@@ -369,10 +369,9 @@ class DSAPagedAttentionWrapper(nn.Module):
         latent = latent.reshape(1, 1, -1, latent.shape[-1])
 
         rows, slots, selected = self._select(ctx, x, q_resid)
-        # mlx-vlm's own split between its decode and prefill attention.
-        decode = [
-            i for i, request in enumerate(rows) if len(request) <= DECODE_BLOCK_SIZE
-        ]
+        # One-token requests take mlx-vlm's decode attention, which gathers
+        # their selected rows: one row per request, as the reserve counts.
+        decode = [i for i, request in enumerate(rows) if len(request) == 1]
         prefill = [i for i in range(len(rows)) if i not in decode]
         outputs: list[mx.array] = []
         order: list[int] = []
