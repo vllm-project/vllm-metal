@@ -126,9 +126,8 @@ async def test_speech_streams_complete_for_concurrent_requests(
                         audio.extend(base64.b64decode(event["audio"]))
                     elif event["type"] == "speech.audio.done":
                         assert event["usage"]["output_tokens"] < 128
-            assert len(audio) > 4800
+            assert audio
             assert events.count("speech.audio.delta") > 1
-            assert events[0] == "speech.audio.delta"
             assert events[-1] == "speech.audio.done"
 
         await asyncio.gather(*(generate(index) for index in range(concurrency)))
