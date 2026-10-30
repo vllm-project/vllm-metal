@@ -1,6 +1,7 @@
 # Agent instructions for vllm-metal
 
 Follow [the contributor guide](docs/CONTRIBUTING.md) for setup and general checks.
+For Omni additions, follow the [model ownership and layout](docs/pytorch-mps.md#adding-omni-models).
 
 ## Motivation
 

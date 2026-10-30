@@ -1,0 +1,35 @@
+# Qwen3-TTS on Apple Silicon
+
+Generate speech with the optional vLLM-Omni integration.
+
+After the [development setup](CONTRIBUTING.md#development-setup), install:
+
+```bash
+VLLM_OMNI_TARGET_DEVICE=cpu uv pip install -e '.[omni]'
+```
+
+Start the server from the repository root:
+
+```bash
+VLLM_METAL_BACKEND=mps vllm-omni serve \
+  Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice --omni \
+  --deploy-config vllm_metal/pytorch_backend/deploy/qwen3_tts_mps.yaml \
+  --host 127.0.0.1 --port 8091
+```
+
+Save generated speech to a WAV file:
+
+```bash
+curl http://127.0.0.1:8091/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{"input":"Hello, have a wonderful day.","voice":"Ryan","language":"English","response_format":"wav"}' \
+  --output speech.wav
+```
+
+For streaming audio, add `"stream": true`, `"stream_format": "audio"`, and
+`"response_format": "pcm"` to the request. See the
+[Omni Speech API](https://docs.vllm.ai/projects/vllm-omni/en/latest/serving/speech_api/)
+for request formats and examples.
+
+This preview uses greedy decoding for both the talker and code predictor.
+Random sampling, quantized models, and distributed serving are not supported.

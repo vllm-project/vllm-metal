@@ -114,6 +114,7 @@ class MetalPlatform(Platform):
     _serves_diffusion: ClassVar[bool] = False
     # Its served canvas_length, recorded by _check_diffusion_config.
     _diffusion_canvas_length: ClassVar[int | None] = None
+    _serves_omni: ClassVar[bool] = False
 
     # --- Ray distributed executor support (Phase 1) ---
     # Advertise the Apple GPU as a custom Ray resource named "mlx".  Because this
@@ -366,7 +367,10 @@ class MetalPlatform(Platform):
                     ("temperature", params.temperature != 0),
                     ("presence_penalty", params.presence_penalty != 0),
                     ("frequency_penalty", params.frequency_penalty != 0),
-                    ("repetition_penalty", params.repetition_penalty != 1),
+                    (
+                        "repetition_penalty",
+                        params.repetition_penalty != 1 and not cls._serves_omni,
+                    ),
                     ("allowed_token_ids", bool(params.allowed_token_ids)),
                     ("bad_words", bool(params.bad_words)),
                 )
@@ -604,7 +608,8 @@ class MetalPlatform(Platform):
         if backend == "mps":
             from vllm_metal.pytorch_backend.worker import configure_mps
 
-            configure_mps(vllm_config)
+            cls._serves_omni = getattr(model_config, "model_stage", None) is not None
+            configure_mps(vllm_config, omni=cls._serves_omni)
         if parallel_config.worker_cls == "auto":
             parallel_config.worker_cls = (
                 "vllm_metal.pytorch_backend.worker.MPSWorker"

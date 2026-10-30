@@ -363,6 +363,17 @@ class TestMetalPlatform:
     def test_validate_request_accepts_min_p(self) -> None:
         MetalPlatform.validate_request({}, SamplingParams(min_p=0.2))
 
+    @pytest.mark.parametrize("omni", [False, True])
+    def test_mps_repetition_penalty_requires_omni(self, monkeypatch, omni):
+        monkeypatch.setattr("vllm_metal.envs.VLLM_METAL_BACKEND", "mps")
+        monkeypatch.setattr(MetalPlatform, "_serves_omni", omni)
+        params = SamplingParams(temperature=0, repetition_penalty=1.05)
+        if omni:
+            MetalPlatform.validate_request({}, params)
+        else:
+            with pytest.raises(VLLMValidationError, match="repetition_penalty"):
+                MetalPlatform.validate_request({}, params)
+
     def test_check_and_update_config_rejects_pipeline_with_tensor_parallel(
         self,
     ) -> None:

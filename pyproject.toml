@@ -69,6 +69,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+omni = [
+    "vllm-omni @ git+https://github.com/vllm-project/vllm-omni@c4ac0642bd3254b3aac9050a6aadeaf0c225633e",
+]
 build = [
     # Native Metal extension source builds
     "cmake>=3.25; platform_system == 'Darwin' and platform_machine == 'arm64'",
@@ -84,6 +87,7 @@ dev = [
     "ruff==0.16.0",
     "mypy>=1.19.1",
 ]
+all = ["vllm-metal[build,omni,dev]"]
 
 [project.urls]
 Homepage = "https://github.com/vllm-project/vllm-metal"
@@ -91,6 +95,9 @@ Repository = "https://github.com/vllm-project/vllm-metal"
 Issues = "https://github.com/vllm-project/vllm-metal/issues"
 
 # vLLM Plugin Entry Points
+[project.entry-points."vllm_omni.platform_plugins"]
+metal = "vllm_metal:register_omni"
+
 [project.entry-points."vllm.platform_plugins"]
 metal = "vllm_metal:register"
 

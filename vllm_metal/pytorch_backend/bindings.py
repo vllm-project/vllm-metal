@@ -21,10 +21,13 @@ def register_kernel_overrides():
 
 def _install_input_ops():
     from vllm.v1.worker.gpu import block_table, input_batch, model_runner
+    from vllm.v1.worker.gpu.mm.rope import RopeState
     from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
     from vllm.v1.worker.gpu.sample import sampler
 
     from vllm_metal.pytorch_backend import input_ops
+
+    RopeState.prepare_positions = input_ops.prepare_rope_positions
 
     for name in (
         "prepare_prefill_inputs",
@@ -60,6 +63,19 @@ def _install_speculative_ops():
     rejection_sampler.get_num_sampled_and_rejected = (
         input_ops.get_num_sampled_and_rejected
     )
+
+
+def install_omni():
+    from vllm.v1.worker.gpu.sample import penalties
+
+    from vllm_metal.pytorch_backend import omni_logits
+    from vllm_metal.pytorch_backend.models.qwen3_code_predictor import (
+        install as install_predictor,
+    )
+
+    install_predictor()
+    penalties.bincount = omni_logits.bincount
+    penalties.apply_penalties = omni_logits.apply_penalties
 
 
 def install():

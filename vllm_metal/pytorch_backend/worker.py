@@ -38,7 +38,7 @@ def _patch_mps_mrv2_validation():
     VllmConfig._validate_v2_model_runner = validate
 
 
-def configure_mps(config):
+def configure_mps(config, *, omni=False):
     from vllm import envs as vllm_envs
     from vllm.config.compilation import CompilationMode, CUDAGraphMode
 
@@ -48,18 +48,23 @@ def configure_mps(config):
         if vllm_envs.VLLM_USE_V2_MODEL_RUNNER is not True:
             raise ValueError("Experimental MPS requires VLLM_USE_V2_MODEL_RUNNER=1")
 
+    if omni:
+        from vllm.config import DeviceConfig
+
+        config.device_config = DeviceConfig(device="mps")
+
     model = config.model_config
     state_layers = set(getattr(model.hf_text_config, "layer_types", None) or ())
     if (
         model.get_head_size() not in MPSAttentionBackend.get_supported_head_sizes()
         or model.is_encoder_decoder
         or model.is_diffusion
-        or model.is_multimodal_model
+        or (model.is_multimodal_model and not omni)
         or model.is_moe
         or (model.has_inner_state and state_layers != {"conv", "full_attention"})
         or model.use_mla
         or model.quantization is not None
-        or model.runner_type != "generate"
+        or (model.runner_type != "generate" and not omni)
         or model.dtype not in (torch.float16, torch.bfloat16)
         or config.parallel_config.world_size != 1
         or config.parallel_config.data_parallel_size != 1
@@ -106,12 +111,15 @@ def configure_mps(config):
 
 
 class MPSWorker(MetalWorker):
+    model_runner_cls = MPSModelRunner
+    is_omni = False
+
     def init_device(self):
         import vllm_metal.pytorch_backend.rotary  # noqa: F401
 
         if not torch.backends.mps.is_available():
             raise RuntimeError("The experimental backend requires PyTorch MPS")
-        configure_mps(self.vllm_config)
+        configure_mps(self.vllm_config, omni=self.is_omni)
         self.device = torch.device("mps:0")
         init_worker_distributed_environment(
             self.vllm_config,
@@ -120,7 +128,7 @@ class MPSWorker(MetalWorker):
             self.local_rank,
         )
         set_random_seed(self.model_config.seed)
-        self.model_runner = MPSModelRunner(self.vllm_config)
+        self.model_runner = self.model_runner_cls(self.vllm_config)
 
     def determine_available_memory(self):
         torch.mps.synchronize()
