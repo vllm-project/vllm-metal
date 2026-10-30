@@ -53,22 +53,18 @@ missing, ambiguous, or shard-only matches also fail before model load.
   vllm-metal does not load `mmproj` files. Files that embed a
   multi-token-prediction block, such as unsloth's `-MTP-GGUF` repos, load
   with that block skipped. MTP speculative decoding is not supported.
-- Supported qtypes: Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q2_K, Q3_K, Q4_K, Q5_K, and
-  Q6_K, plus plain F32/F16/BF16 tensors, mixed freely within one file, so
-  llama.cpp's Q4_K_M and Q5_K_M exports and bartowski's Q4_K_L load. Remote
-  reference tags accept Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q2_K and Q2_K_S/M/L,
-  Q3_K and Q3_K_S/M/L, Q4_K_S/M/L, Q5_K_S/M/L, Q6_K, Q6_K_L, and the plain
-  types.
-- llama.cpp falls back from Q4_K/Q5_K to Q5_0/Q5_1 on rows that are not a
-  multiple of 256 wide, as in Qwen2.5-0.5B's Q4_K_M and Q5_K_M files. Its
-  Q2_K/Q3_K exports write IQ4_NL on those rows instead, which stays
-  unsupported: 121 of the 291 tensors in Qwen2.5-0.5B-Instruct-GGUF's
-  `q2_k.gguf` are IQ4_NL, the embedding among them, so that file is
-  rejected while files without IQ4_NL rows load.
+- Supported qtypes: Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q2_K, Q3_K, Q4_K, Q5_K,
+  Q6_K, IQ4_NL, and IQ4_XS, plus plain F32/F16/BF16 tensors, mixed freely
+  within one file, so llama.cpp's Q4_K_M and Q5_K_M exports, bartowski's
+  Q4_K_L, and unsloth's UD-Q4_K_XL load. Remote reference tags accept Q8_0,
+  Q4_0, Q4_1, Q5_0, Q5_1, Q2_K and Q2_K_S/M/L, Q3_K and Q3_K_S/M/L,
+  Q4_K_S/M/L, Q5_K_S/M/L, Q6_K, Q6_K_L, and the plain types.
+- IQ4_NL and IQ4_XS weights need about twice their file size in memory, so
+  a mostly-IQ4 file uses more than the same model's Q4_K_M.
 - Q2_K/Q3_K/Q6_K weights stay in their GGUF blocks and run on custom Metal
   kernels. Small batches use a fused kernel on the packed blocks, and larger
   ones, such as a prefill, dequantize a transient dense copy of the weight
   for one GEMM and free it afterwards.
 - A tied model's unused `output.weight` is skipped whatever its qtype.
-- Unsupported: IQ and T-quants, MoE, SSM or hybrid models other than
+- Unsupported: IQ1/IQ2/IQ3 and T-quants, MoE, SSM or hybrid models other than
   Qwen3.5, vision input, sharded GGUF files, and LoRA (`--enable-lora`).

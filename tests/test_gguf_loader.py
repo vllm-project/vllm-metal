@@ -24,7 +24,10 @@ from mlx_lm import utils as mlx_lm_utils
 gguf = pytest.importorskip("gguf")
 
 import vllm_metal.gguf.loader as gguf_loader  # noqa: E402
-from tests.gguf_kquant_fixtures import build_kquant_blocks  # noqa: E402
+from tests.gguf_kquant_fixtures import (  # noqa: E402
+    build_iq4_blocks,
+    build_kquant_blocks,
+)
 from vllm_metal.gguf.adapter import GGUFModelAdapter  # noqa: E402
 from vllm_metal.gguf.loader import GGUFLoadError, GGUFModelLoader  # noqa: E402
 from vllm_metal.gguf.mlx_native import GGUFMLXQuantizedTensor  # noqa: E402
@@ -144,6 +147,8 @@ def _write_gguf(
             raw_dtype = qtype or quant_type
             if raw_dtype in (QT.Q2_K, QT.Q3_K, QT.Q4_K, QT.Q5_K, QT.Q6_K):
                 raw = build_kquant_blocks(shape[0], shape[-1], raw_dtype)
+            elif raw_dtype in (QT.IQ4_NL, QT.IQ4_XS):
+                raw = build_iq4_blocks(shape[0], shape[-1], raw_dtype)
             else:
                 quant_input = data.reshape(1, -1) if data.ndim == 1 else data
                 raw = gguf.quants.quantize(quant_input, raw_dtype)
@@ -1128,7 +1133,7 @@ def test_rejects_unsupported_kquant_weight_at_preflight(tmp_path):
 
     assert str(excinfo.value) == (
         "Unsupported qtype TQ2_0 on mapped weight 'blk.0.ffn_gate.weight'; "
-        "only Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K "
+        "only Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/IQ4_NL/IQ4_XS "
         "(and plain F32/F16/BF16) are supported."
     )
 
@@ -1143,11 +1148,13 @@ def test_rejects_unsupported_kquant_weight_at_preflight(tmp_path):
         pytest.param(QT.Q4_0, QT.Q6_K, id="q4_0-q6_k-embd"),
         pytest.param(QT.Q4_K, QT.Q5_0, id="q4_k-q5_0-embd"),
         pytest.param(QT.Q5_K, QT.Q5_1, id="q5_k-q5_1-embd"),
+        pytest.param(QT.IQ4_XS, QT.Q6_K, id="iq4_xs-q6_k-embd"),
+        pytest.param(QT.Q3_K, QT.IQ4_NL, id="q3_k-iq4_nl-embd"),
     ],
 )
 def test_loads_llama_cpp_qtype_mixes(tmp_path, body_type, embd_type):
-    # llama.cpp mixes qtypes inside one file: Q6_K, Q8_0 or Q5_0/Q5_1 fallback
-    # embeddings next to a K-quant or Q4_0 body.
+    # llama.cpp mixes qtypes inside one file: Q6_K, Q8_0, Q5_0/Q5_1 or IQ4_NL
+    # fallback embeddings next to a K-quant, Q4_0 or IQ4_XS body.
     gguf_path, cfg_dir = _build_dense_fixture(
         tmp_path,
         "qwen3",

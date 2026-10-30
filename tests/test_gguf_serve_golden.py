@@ -30,7 +30,9 @@ checkpoints, not synthetic fixtures). Run a family with its env trio, e.g.::
 ``VLLM_METAL_TEST_GGUF_QWEN25_*``, llama uses ``VLLM_METAL_TEST_GGUF_LLAMA_*``,
 mistral uses ``VLLM_METAL_TEST_GGUF_MISTRAL_*``, and Qwen3.5-9B Q4_K_M and
 Qwen3.5-4B Q5_K_M use ``VLLM_METAL_TEST_GGUF_QWEN35_9B_*`` and
-``VLLM_METAL_TEST_GGUF_QWEN35_4B_*`` for the same trio.)
+``VLLM_METAL_TEST_GGUF_QWEN35_4B_*`` for the same trio. Qwen3.5-9B IQ4_XS
+reuses the 9B tokenizer and dense paths and adds
+``VLLM_METAL_TEST_GGUF_QWEN35_9B_IQ4XS_SERVE_PATH``.)
 """
 
 from __future__ import annotations
@@ -302,6 +304,36 @@ _CASES = [
         gguf_env="VLLM_METAL_TEST_GGUF_QWEN35_4B_SERVE_PATH",
         tokenizer_env="VLLM_METAL_TEST_GGUF_QWEN35_4B_TOKENIZER_PATH",
         dense_env="VLLM_METAL_TEST_GGUF_QWEN35_4B_DENSE_PATH",
+        golden_ids=(
+            220,
+            16,
+            16,
+            11,
+            220,
+            16,
+            18,
+            11,
+            220,
+            16,
+            22,
+            11,
+            220,
+            16,
+            24,
+            11,
+        ),
+        dense_agree_prefix=16,
+        target_dtype=mx.bfloat16,
+    ),
+    # Qwen3.5-9B-IQ4_XS.gguf (unsloth, rev 3885219b): 168 IQ4_XS tensors on
+    # the 8-bit affine carrier. All 16 ids match the dense reference.
+    _GoldenCase(
+        label="qwen3.5-9b-iq4_xs",
+        quantization="IQ4_XS",
+        prompt="The first ten prime numbers are 2, 3, 5, 7,",
+        gguf_env="VLLM_METAL_TEST_GGUF_QWEN35_9B_IQ4XS_SERVE_PATH",
+        tokenizer_env="VLLM_METAL_TEST_GGUF_QWEN35_9B_TOKENIZER_PATH",
+        dense_env="VLLM_METAL_TEST_GGUF_QWEN35_9B_DENSE_PATH",
         golden_ids=(
             220,
             16,
