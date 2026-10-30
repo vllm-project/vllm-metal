@@ -14,6 +14,10 @@ per request through the same `pooler_output` contract.
 Canonical unquantized `BAAI/bge-m3` is supported on the encoder pooling path
 for dense `embed` output and sparse `token_classify` lexical weights.
 
+ModernBERT-based Laya checkpoints support `token_classify` decision
+outputs. See [Laya typed decisions](structured_decisions.md#laya) for native
+checkpoint loading and request examples.
+
 ## Scope
 
 Current scope is intentionally narrow:
@@ -35,6 +39,8 @@ Current scope is intentionally narrow:
   pooling and L2 normalization, including `intfloat/multilingual-e5-base`
 - BGE-M3 sparse lexical weights through `/pooling` with
   `pooler_config.task="token_classify"`
+- Laya option probabilities and action distributions through `/pooling`
+  with `task="token_classify"` and ALL token pooling
 
 ## Unsupported
 
@@ -43,7 +49,7 @@ The Metal runner rejects these cases with diagnostic errors:
 - generic classification heads, generic reranking models, and late interaction
 - decoder sequence pooling strategies other than LAST (`MEAN`, `CLS`, `ALL`,
   `STEP`)
-- generic token-level pooling outside the BGE-M3 `token_classify` path
+- generic token-level pooling outside the BGE-M3 and Laya `token_classify` paths
 - chunked long-input embedding aggregation (`enable_chunked_processing`)
 - multimodal embeddings and scheduled encoder inputs
 - prompt embeddings
