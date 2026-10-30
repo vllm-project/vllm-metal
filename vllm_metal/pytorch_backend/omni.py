@@ -6,6 +6,7 @@ from vllm_omni.worker.mixins import OmniWorkerMixin
 from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner
 from vllm_omni.worker_v2.omni_generation_model_runner import OmniGenerationModelRunner
 
+from vllm_metal.pytorch_backend.bindings import install_omni
 from vllm_metal.pytorch_backend.runner import MPSModelRunner
 from vllm_metal.pytorch_backend.worker import MPSWorker
 
@@ -13,11 +14,7 @@ from vllm_metal.pytorch_backend.worker import MPSWorker
 class MPSOmniARModelRunner(MPSModelRunner, OmniARModelRunner):
     def __init__(self, config):
         super().__init__(config)
-        from vllm_metal.pytorch_backend.models.qwen3_code_predictor import install
-        from vllm_metal.pytorch_backend.omni_logits import install as install_logits
-
-        install()
-        install_logits()
+        install_omni()
 
 
 class MPSOmniGenerationModelRunner(MPSModelRunner, OmniGenerationModelRunner):

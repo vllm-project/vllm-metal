@@ -43,10 +43,3 @@ def apply_penalties(
     penalty = repetition[slots, None]
     penalized = torch.where(logits > 0, logits / penalty, logits * penalty)
     logits.copy_(torch.where(seen_prompt | seen_output, penalized, logits))
-
-
-def install():
-    from vllm.v1.worker.gpu.sample import penalties
-
-    penalties.bincount = bincount
-    penalties.apply_penalties = apply_penalties

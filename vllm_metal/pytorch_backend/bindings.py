@@ -65,6 +65,19 @@ def _install_speculative_ops():
     )
 
 
+def install_omni():
+    from vllm.v1.worker.gpu.sample import penalties
+
+    from vllm_metal.pytorch_backend import omni_logits
+    from vllm_metal.pytorch_backend.models.qwen3_code_predictor import (
+        install as install_predictor,
+    )
+
+    install_predictor()
+    penalties.bincount = omni_logits.bincount
+    penalties.apply_penalties = omni_logits.apply_penalties
+
+
 def install():
     from vllm.model_executor.layers.mamba.short_conv import ShortConv
     from vllm.v1.worker.gpu import buffer_utils, model_runner
