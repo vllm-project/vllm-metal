@@ -161,8 +161,8 @@ exclusions (`attn_hc`, `ffn_hc`, `index_kpool_compress`).
 Its sparse attention layers keep vLLM's GLM-5-Next latent rows and pooled
 indexer keys (in the model dtype), with the unfinished pool's raw keys beside
 its latent block, and each step reads only the latent rows the indexer selects.
-Long prefill chunks are scored in query parts under
-`VLLM_METAL_SPARSE_INDEXER_MAX_SCORES_MIB`. mlx-vlm's indexed attention kernel
+Long prefill chunks are scored in query parts of at most 512 MiB of indexer
+scores. mlx-vlm's indexed attention kernel
 addresses at most 963 blocks of 4352 tokens: a larger automatic pool
 is capped, and a larger `--num-gpu-blocks-override` is refused. Speculative
 decoding and RoPE latents are refused at startup.

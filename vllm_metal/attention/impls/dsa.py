@@ -17,7 +17,6 @@ from mlx_vlm.models.linear import DECODE_BLOCK_SIZE, linear
 from mlx_vlm.models.sparse_attention import indexed_sparse_attention
 from vllm.v1.kv_cache_interface import MLAAttentionSpec, SparseCacheRole
 
-import vllm_metal.envs as envs
 from vllm_metal.attention.caches.mla_cache import MLAPagedLatentCache
 from vllm_metal.attention.caches.storage import KVCacheStorage
 from vllm_metal.attention.context import PagedAttentionContext, get_context
@@ -25,6 +24,10 @@ from vllm_metal.attention.impls.mla import _block_table_rows, _mla_metadata
 
 # vLLM's name for this cache, built inline by its GLM-5-Next Indexer.
 INDEXER_CACHE_SUFFIX = ".indexer.k_cache"
+# The most per-head float32 indexer scores one prefill query part may hold:
+# the default of vLLM's VLLM_SPARSE_INDEXER_MAX_LOGITS_MB, which bounds the
+# logits summed over the heads.
+_MAX_SCORES_BYTES = 512 * 2**20
 
 
 def is_sparse_mla(model_args: Mapping[str, Any]) -> bool:
@@ -85,7 +88,7 @@ def sparse_mla_reserve_bytes(
     heads = int(model_args["index_n_heads"])
     head_dim = int(model_args["index_head_dim"])
     kpool = int(model_args["index_kpool"])
-    cap = _score_cap_bytes()
+    cap = _MAX_SCORES_BYTES
     # One query part: per-head float32 scores at the cap, plus four [rows, pools]
     # float32 temporaries (head sum, mask, argpartition's values and indices).
     part = cap + 4 * cap // heads
@@ -102,11 +105,6 @@ def sparse_mla_reserve_bytes(
 def max_latent_blocks(*, block_size: int, latent_dim: int) -> int:
     """The most latent blocks mlx-vlm's kernel can address with 32-bit offsets."""
     return (2**31 - 1) // (block_size * latent_dim)
-
-
-def _score_cap_bytes() -> int:
-    """The most bytes of per-head float32 scores one query part may hold."""
-    return envs.VLLM_METAL_SPARSE_INDEXER_MAX_SCORES_MIB * 2**20
 
 
 @dataclass(frozen=True)
@@ -270,7 +268,7 @@ def query_parts(length: int, heads: int, pools: int) -> list[int]:
     imported. It bounds logits summed over the heads, while mlx-vlm keeps a
     float32 score per head, so it gets the per-head cap divided by the heads.
     """
-    cap = _score_cap_bytes() // heads
+    cap = _MAX_SCORES_BYTES // heads
     if length * pools * 4 <= cap:
         return [0, length]
     step = max(1, cap // 4 // pools)

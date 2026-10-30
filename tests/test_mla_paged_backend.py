@@ -1365,7 +1365,9 @@ class TestGlm5NextSparseAttention:
         from mlx_vlm.models.glm5_next.language import _sparse_prefill_attention
         from mlx_vlm.models.linear import linear
 
-        monkeypatch.setenv("VLLM_METAL_SPARSE_INDEXER_MAX_SCORES_MIB", str(cap_mib))
+        monkeypatch.setattr(
+            "vllm_metal.attention.impls.dsa._MAX_SCORES_BYTES", cap_mib * 2**20
+        )
         inner = _glm5_next_layer(ties=ties)
         runtime, wrapper = _glm5_next_paged(inner, num_blocks=40, block_size=block_size)
         blocks = list(range(math.ceil((history + chunk) / block_size), 0, -1))
@@ -1396,10 +1398,8 @@ class TestGlm5NextSparseAttention:
         assert _relative_error(actual, projected) < 3e-2
         _assert_pages_match(runtime, request)
 
-    def test_query_parts_stay_within_the_cap(self, monkeypatch) -> None:
+    def test_query_parts_stay_within_the_cap(self) -> None:
         """At the default cap and 32 index heads, a 1024-row chunk after 17k
         tokens (4352 pools) splits into parts of 512 MiB // (4 * 32 * 4352)
         rows, the part the reserve covers."""
-        monkeypatch.setenv("VLLM_METAL_SPARSE_INDEXER_MAX_SCORES_MIB", "512")
-
         assert query_parts(1024, 32, 4352) == [0, 963, 1024]
