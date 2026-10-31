@@ -2,6 +2,7 @@
 """Host-side NAX split/unsplit pipeline choice (vllm_metal.attention.nax_split)."""
 
 import mlx.core as mx
+import numpy as np
 import pytest
 
 from tests.gqa_test_utils import _primitive
@@ -11,6 +12,74 @@ from vllm_metal.attention.nax_split import (
     nax_split_kwargs,
     nax_tile_work,
 )
+
+
+@pytest.fixture(params=[(144, 3, 0), (1328, 6, 1)], ids=["h3", "h6"])
+def grouped_prefill_inputs(nax_prefill, request):
+    """Exercise both native widths with shuffled, interleaved 784-token pages."""
+    import os
+
+    if os.environ.get("VLLM_METAL_NAX_GQA_PREFILL", "1") != "1":
+        pytest.skip("Grouped layout coverage requires GQA prefill enabled")
+    ops = nax_prefill
+    query_tokens, width, hint = request.param
+    prefix = 31360
+    # Fix host planning to cover both widths on every NAX-capable test host.
+    # This override is not a measurement of a 40-core GPU.
+    ops._override_detected_gpu_core_count_for_test(40)
+    try:
+        inputs = _mixed_inputs(
+            [1],
+            prefill_kv=prefix + query_tokens,
+            geometry=(24, 4, 256, 16),
+            cache_block=784,
+        )
+        inputs.update(
+            query=mx.random.normal((query_tokens, 24, 256)).astype(mx.bfloat16),
+            block_tables=inputs["block_tables"][-1:],
+            seq_lens=mx.array([prefix + query_tokens], mx.int32),
+            cu_seqlens_q=mx.array([0, query_tokens], mx.int32),
+            num_decode_requests=0,
+            num_decode_tokens=0,
+            max_decode_context_len=0,
+        )
+        yield ops, inputs, width, hint
+    finally:
+        mx.synchronize()
+        ops._override_detected_gpu_core_count_for_test(-1)
+
+
+def test_nax_grouped_translated_pages_match_compact_cache(grouped_prefill_inputs):
+    """Each selected width must execute and preserve logical-page attention."""
+    ops, inputs, width, hint = grouped_prefill_inputs
+    assert inputs["key_cache"].shape[1] == 784 and inputs["block_size"] == 16
+    translated = _mixed_call(inputs, nax_split_hint=hint)
+    assert ops.last_paged_dispatch() == "nax_gqa6_prefill"
+    assert ops.last_nax_heads_per_threadgroup() == width
+
+    # Independent contiguous kernel-page storage removes physical-page and
+    # interleaved-head strides while preserving logical tokens/block IDs.
+    compact = inputs | {
+        "key_cache": mx.contiguous(inputs["key_cache"]).reshape(-1, 16, 4, 256),
+        "value_cache": mx.contiguous(inputs["value_cache"]).reshape(-1, 16, 4, 256),
+    }
+    direct = _mixed_call(compact, nax_split_hint=hint)
+    assert ops.last_paged_dispatch() == "nax_gqa6_prefill"
+    assert ops.last_nax_heads_per_threadgroup() == width
+    assert mx.array_equal(translated, direct)
+
+    ops._override_detected_gpu_core_count_for_test(0)
+    # A fresh input forces a new encode after changing the host override.
+    compact["query"] = mx.array(
+        np.array(inputs["query"].astype(mx.float32)), mx.bfloat16
+    )
+    upstream = _mixed_call(compact, nax_split_hint=hint)
+    assert ops.last_paged_dispatch() == "nax_prefill"
+    assert ops.last_nax_heads_per_threadgroup() == 1
+    assert mx.all(mx.isfinite(translated)) and mx.array_equal(translated, upstream)
+    ops._set_paged_dispatch_diagnostics(False)
+    assert ops.last_nax_heads_per_threadgroup() == 0
+    ops._set_paged_dispatch_diagnostics(True)
 
 
 def _work(seqs):
@@ -224,6 +293,7 @@ def test_native_prefill_hint_only_applies_after_decode_separation(
         "mixed_nax_prefill_decode" if separated else "nax_prefill"
     )
     assert ops.last_nax_split_pipeline() == int(separated)
+    assert ops.last_nax_heads_per_threadgroup() == 1
     if separated:
         assert mx.array_equal(actual[:1], decode).item()
         assert mx.array_equal(actual[1:], whole[1:]).item()
@@ -232,6 +302,7 @@ def test_native_prefill_hint_only_applies_after_decode_separation(
             fallback = _mixed_call(inputs, **defaults)
             assert ops.last_paged_dispatch() == "mixed_nax_prefill_decode"
             assert ops.last_nax_split_pipeline() == 0
+            assert ops.last_nax_heads_per_threadgroup() == 1
             assert mx.array_equal(fallback, actual).item()
     else:
         assert mx.array_equal(actual, whole).item()

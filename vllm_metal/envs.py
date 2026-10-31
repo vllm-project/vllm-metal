@@ -122,6 +122,7 @@ if TYPE_CHECKING:
     VLLM_METAL_NATIVE_SAMPLING: bool = True
     VLLM_METAL_MLA_KERNEL: bool = False
     VLLM_METAL_DISABLE_NAX: bool = False
+    VLLM_METAL_NAX_GQA_PREFILL: bool = True
     VLLM_METAL_DISABLE_GQA_DECODE: bool = False
     VLLM_METAL_TQ_PREFILL: str = "auto"
     VLLM_METAL_TQ_PREFILL_MAX_MIB: int | str = "auto"
@@ -184,6 +185,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_METAL_MLA_KERNEL": _bool("VLLM_METAL_MLA_KERNEL", False),
     # Emergency override for automatic M5 NAX prefill attention.
     "VLLM_METAL_DISABLE_NAX": _bool("VLLM_METAL_DISABLE_NAX", False),
+    # Automatic grouped NAX prefill admission; set to "0" for upstream only.
+    # The native module reads this once at load, so restart workers to change it.
+    "VLLM_METAL_NAX_GQA_PREFILL": _bool("VLLM_METAL_NAX_GQA_PREFILL", True),
     # Emergency override for the GQA-shared flash-decode dispatch gate
     # (issue #713): force long-context decode back to the established
     # per-token / split-KV kernels. Mainly a benchmarking/A-B escape
