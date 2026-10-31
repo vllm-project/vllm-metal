@@ -192,10 +192,7 @@ def apply_packed_rope(
         return rotated_q, rotated_k
 
     if rotary_emb is not None:
-        # M-RoPE angles depend only on each token's own position ids, so the
-        # whole packed batch rotates in one call over its concatenated
-        # positions, instead of one cos/sin/rotate chain per segment.
-        # The embedding owns its frequency layout and its fused Metal kernel.
+        # Each token rotates independently through the model's own M-RoPE.
         apply_rotary = getattr(rotary_emb, "apply_rotary", None)
         if apply_rotary is None:
             raise NotImplementedError(

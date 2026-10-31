@@ -18,6 +18,8 @@ from mlx_lm.models.rope_utils import (
     SuScaledRoPE,
     YarnRoPE,
 )
+from mlx_vlm.models.qwen3_5.language import Qwen3_5RotaryEmbedding
+from mlx_vlm.models.qwen3_vl.language import Qwen3VLRotaryEmbedding
 
 from vllm_metal.attention.context import (
     OffsetCache,
@@ -711,7 +713,6 @@ class TestPackedRoPE:
 
         class FakeRotaryEmbedding:
             def apply_rotary(self, q, k, position_ids):
-                # Only routing matters here, not the rotation math.
                 captured.append(position_ids)
                 return q, k
 
@@ -732,63 +733,57 @@ class TestPackedRoPE:
         assert len(captured) == 1
         assert captured[0] is provided
 
-    @pytest.mark.parametrize("model", ["qwen3_vl", "qwen3_5"])
-    @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
-    def test_batched_mrope_matches_per_segment_rotation(self, model, dtype):
-        """One ``rotary_emb.apply_rotary`` call over the packed batch (the
-        fused Metal path when available) equals rotating each segment on its
-        own with eager cos/sin, for decode rows, a prefill chunk and caller
-        (image) positions in one batch."""
-        import mlx.core as mx
+    @pytest.mark.parametrize(
+        "rotary_emb",
+        [
+            pytest.param(
+                Qwen3VLRotaryEmbedding(
+                    64,
+                    max_position_embeddings=4096,
+                    base=5_000_000,
+                    rope_scaling={
+                        "rope_type": "default",
+                        "mrope_section": [12, 10, 10],
+                    },
+                ),
+                id="qwen3_vl",
+            ),
+            pytest.param(
+                Qwen3_5RotaryEmbedding(
+                    64,
+                    max_position_embeddings=4096,
+                    base=10_000_000,
+                    mrope_section=[11, 11, 10],
+                ),
+                id="qwen3_5",
+            ),
+        ],
+    )
+    @pytest.mark.parametrize("dtype,atol", [(mx.float32, 1e-5), (mx.bfloat16, 2e-2)])
+    def test_batched_mrope_matches_per_segment_rotation(self, rotary_emb, dtype, atol):
+        """Packed decode, prefill, and image rows match eager segment rotation."""
         from mlx_vlm.models.rope_utils import apply_multimodal_rotary_pos_emb
 
         from vllm_metal.attention.impls.varlen_rope_compat import apply_packed_rope
 
-        if model == "qwen3_vl":
-            from mlx_vlm.models.qwen3_vl.language import Qwen3VLRotaryEmbedding
-
-            rotary_emb = Qwen3VLRotaryEmbedding(
-                64,
-                max_position_embeddings=4096,
-                base=5_000_000,
-                rope_scaling={"rope_type": "default", "mrope_section": [12, 10, 10]},
-            )
-        else:
-            from mlx_vlm.models.qwen3_5.language import Qwen3_5RotaryEmbedding
-
-            rotary_emb = Qwen3_5RotaryEmbedding(
-                64,
-                max_position_embeddings=4096,
-                base=10_000_000,
-                mrope_section=[11, 11, 10],
-            )
-
-        class Attention:
-            pass
-
-        attn = Attention()
-        attn.rotary_emb = rotary_emb
+        attn = SimpleNamespace(rotary_emb=rotary_emb)
         cu_seqlens = [0, 1, 2, 6, 9]
         offsets = [41, 7, 0, 0]
         image_pos = mx.array([[[3, 3, 3]], [[3, 4, 4]], [[3, 3, 4]]], dtype=mx.int32)
         positions = [None, None, None, image_pos]
-        mx.random.seed(0)
-        q = mx.random.normal((1, 4, 9, 64)).astype(getattr(mx, dtype))
-        k = mx.random.normal((1, 2, 9, 64)).astype(getattr(mx, dtype))
-        atol = 1e-5 if dtype == "float32" else 2e-2
-
-        q_out, k_out = apply_packed_rope(
-            attn, q, k, cu_seqlens, offsets=offsets, positions=positions
-        )
-
-        assert q_out.dtype == q.dtype and k_out.dtype == k.dtype
-        for i in range(len(cu_seqlens) - 1):
-            s, e = cu_seqlens[i], cu_seqlens[i + 1]
-            pos = positions[i]
-            if pos is None:
-                ids = mx.arange(offsets[i], offsets[i] + e - s, dtype=mx.int32)
-                pos = mx.broadcast_to(ids[None, None, :], (3, 1, e - s))
-            q_seg, k_seg = q[:, :, s:e], k[:, :, s:e]
+        reference_positions = [
+            mx.array([[[41]]] * 3, dtype=mx.int32),
+            mx.array([[[7]]] * 3, dtype=mx.int32),
+            mx.array([[[0, 1, 2, 3]]] * 3, dtype=mx.int32),
+            image_pos,
+        ]
+        q = mx.random.normal((1, 4, 9, 64), key=mx.random.key(0)).astype(dtype)
+        k = mx.random.normal((1, 2, 9, 64), key=mx.random.key(1)).astype(dtype)
+        expected_q, expected_k = [], []
+        for start, end, pos in zip(
+            cu_seqlens[:-1], cu_seqlens[1:], reference_positions, strict=True
+        ):
+            q_seg, k_seg = q[:, :, start:end], k[:, :, start:end]
             cos, sin = rotary_emb(q_seg, pos)
             q_ref, k_ref = apply_multimodal_rotary_pos_emb(
                 q_seg,
@@ -798,8 +793,17 @@ class TestPackedRoPE:
                 mrope_section=rotary_emb.mrope_section,
                 style=rotary_emb.style,
             )
-            assert mx.allclose(q_out[:, :, s:e], q_ref, atol=atol).item()
-            assert mx.allclose(k_out[:, :, s:e], k_ref, atol=atol).item()
+            expected_q.append(q_ref)
+            expected_k.append(k_ref)
+
+        q_out, k_out = apply_packed_rope(
+            attn, q, k, cu_seqlens, offsets=offsets, positions=positions
+        )
+
+        assert q_out.dtype == q.dtype
+        assert k_out.dtype == k.dtype
+        assert mx.allclose(q_out, mx.concatenate(expected_q, axis=2), atol=atol).item()
+        assert mx.allclose(k_out, mx.concatenate(expected_k, axis=2), atol=atol).item()
 
     def test_mrope_requires_apply_rotary(self):
         import mlx.core as mx
@@ -845,8 +849,6 @@ class TestPackedRoPE:
             positions=[None, caller_pos],
         )
 
-        # One rotation over the packed batch: arange(7, 10) for the first
-        # segment, the caller's positions verbatim for the second.
         assert len(recorded) == 1
         assert recorded[0].shape == (3, 1, 5)
         assert recorded[0].tolist() == [[[7, 8, 9, 10, 11]]] * 3
