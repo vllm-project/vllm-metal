@@ -93,7 +93,11 @@ class ShortConvPagedWrapper(nn.Module):
         if boundaries == list(range(len(slots) + 1)):
             # One token per request: a single batched convolution.
             conv_input = mx.concatenate(
-                [pool[ids], bx.reshape(len(slots), 1, -1)], axis=1
+                [
+                    state_cache.gather_conv_rows(cache_idx, ids),
+                    bx.reshape(len(slots), 1, -1),
+                ],
+                axis=1,
             )
             updates = conv_input[:, -n_keep:, :]
             conv_out = inner.conv(conv_input).reshape(1, len(slots), -1)

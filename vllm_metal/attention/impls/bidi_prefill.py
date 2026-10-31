@@ -25,9 +25,9 @@ import mlx.core as mx
 import numpy as np
 from vllm.logger import init_logger
 
-logger = init_logger(__name__)
+from vllm_metal.attention.caches.storage import gather_cache_rows
 
-_INT32_MAX = 2**31 - 1
+logger = init_logger(__name__)
 
 
 def intersecting_ranges(
@@ -87,22 +87,7 @@ def gather_kv(
     ``(len(slots), kv_heads, head_dim)``: the cache's zero-padded tail beyond
     the layer's real ``head_dim`` is sliced off.
     """
-    # MLX 0.32.1 gathers with 32-bit source offsets whenever the source holds
-    # at most INT32_MAX elements, even if its strides reach further, as a view
-    # of a pooled cache region does.  Past that offset the rows come back as
-    # garbage, so gather from block ranges whose offsets fit in 32 bits.
-    num_blocks, block_size = cache.shape[:2]
-    blocks_per_take = max(_INT32_MAX // block_stride, 1)
-    rows = None
-    for first in range(0, num_blocks, blocks_per_take):
-        part = cache[first : first + blocks_per_take]
-        flat = part.reshape(-1, part.shape[-2], part.shape[-1])
-        local = slots - first * block_size
-        inside = (local >= 0) & (local < flat.shape[0])
-        taken = mx.take(flat, mx.where(inside, local, 0), axis=0)
-        rows = taken if rows is None else mx.where(inside[:, None, None], taken, rows)
-    assert rows is not None
-    return rows[:, :, :head_dim]
+    return gather_cache_rows(cache, slots, block_stride)[:, :, :head_dim]
 
 
 def apply_bidirectional_segments(

@@ -458,6 +458,14 @@ def make_nemotron_hybrid_plan(
     )
 
 
+class DenseStateViews(list[mx.array]):
+    """Dense test storage with the same row-read contract as CacheViews."""
+
+    def gather_rows(self, layer_idx: int, ids: mx.array) -> mx.array:
+        """Read selected rows from one layer."""
+        return self[layer_idx][ids]
+
+
 def make_state_cache(
     *,
     num_layers,
@@ -473,19 +481,19 @@ def make_state_cache(
     from vllm_metal.attention.caches.state_cache import PagedStateCache
 
     states = [
-        [
+        DenseStateViews(
             mx.zeros((max_seqs, conv_kernel_dim - 1, conv_dim), dtype=dtype)
             for _ in range(num_layers)
-        ]
+        )
     ]
     if num_v_heads is not None:
         states.append(
-            [
+            DenseStateViews(
                 mx.zeros(
                     (max_seqs, num_v_heads, value_head_dim, key_head_dim),
                     dtype=recurrent_dtype,
                 )
                 for _ in range(num_layers)
-            ]
+            )
         )
     return PagedStateCache(states)

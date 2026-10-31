@@ -273,3 +273,44 @@ def test_count_initialized_runtime_refuses_sleep_release():
 
     with pytest.raises(NotImplementedError, match="Sleep mode does not support"):
         runtime.release_kv_memory()
+
+
+def test_state_gathers_read_slots_past_32_bit_offsets():
+    """State component views stride inside a wider packed per-block page, so a
+    slot's element offset is ``slot x page stride``. MLX gathers such views
+    with 32-bit offsets and slots past the limit came back as garbage (#1112),
+    as #1081 found for KV rows. The backing is uncommitted, as
+    ``KVCacheStorage`` allocates it, so only the written slots are resident.
+    """
+    from vllm_metal.attention.caches.state_cache import StateSlotArraysCache
+    from vllm_metal.attention.caches.storage import CacheViews
+    from vllm_metal.tensor_bridge import torch_to_mlx
+
+    page = 1 << 20
+    conv_row, rec_row = (2, 16), (1, 4, 8)
+    num_slots = (1 << 31) // page + 2  # the last slot starts past INT32_MAX
+    raw = torch.empty((num_slots, page), dtype=torch.uint8)
+    conv_t = raw.as_strided((num_slots, *conv_row), (page, conv_row[1], 1))
+    rec_t = raw.as_strided((num_slots, *rec_row), (page, 32, 8, 1), storage_offset=64)
+    storage = SimpleNamespace(region_offsets=[0], buffers=[torch_to_mlx(raw)])
+    cache = PagedStateCache(
+        [CacheViews(storage, [conv_t]), CacheViews(storage, [rec_t])]
+    )
+
+    low, high = 3, num_slots - 1
+    for slot, value in ((low, 5), (high, 9)):
+        raw[slot, :32] = value
+        raw[slot, 64:96] = value + 1
+
+    ids = mx.array([low, high], dtype=mx.int32)
+    arrays = StateSlotArraysCache(cache, 0, ids)
+    for component, rows in ((0, (5, 9)), (1, (6, 10))):
+        expected = np.stack(
+            [np.full(arrays[component].shape[1:], v, np.uint8) for v in rows]
+        )
+        np.testing.assert_array_equal(np.array(arrays[component]), expected)
+
+    # Slot copies read their sources through the same gather.
+    cache.copy_slots([high], [1], [0])
+    mx.eval(*storage.buffers)
+    assert (raw[1, :32] == 9).all() and (raw[1, 64:96] == 10).all()
