@@ -1382,16 +1382,38 @@ class TestMetalPoolingRunnerOutput:
 
 
 class TestMetalPoolingFailFast:
-    def test_embedding_gemma2_requires_text_only_mode(self) -> None:
+    @pytest.mark.parametrize(
+        ("model_type", "architecture"),
+        [
+            ("embedding_gemma2", "EmbeddingGemma2Model"),
+            ("xlm-roberta", "BgeM3EmbeddingModel"),
+            ("xlm-roberta", "XLMRobertaModel"),
+            ("roberta", "RobertaModel"),
+        ],
+    )
+    @pytest.mark.parametrize("entrypoint", ["factory", "lifecycle"])
+    def test_encoder_pooling_rejects_multimodal_config_before_loading(
+        self, model_type, architecture, entrypoint
+    ) -> None:
         runner = _make_runner(
             paged=False,
             model_config=_encoder_model_config(
-                hf_config=_hf_config(model_type="embedding_gemma2"),
+                hf_config=_hf_config(
+                    model_type=model_type, architectures=[architecture]
+                ),
                 multimodal_config=SimpleNamespace(language_model_only=False),
             ),
         )
-        with pytest.raises(NotImplementedError, match="--language-model-only"):
-            ModelLifecycle(runner, MagicMock()).load()
+        lifecycle = ModelLifecycle(runner, MagicMock())
+        with (
+            patch.object(lifecycle, "_load_generation") as load_generation,
+            pytest.raises(NotImplementedError, match="--language-model-only"),
+        ):
+            if entrypoint == "factory":
+                load_encoder_pooling_backend(runner.model_config)
+            else:
+                lifecycle.load()
+        load_generation.assert_not_called()
 
     def test_non_decoder_pooling_models_fail_fast_on_execute(
         self,

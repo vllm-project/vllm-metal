@@ -49,11 +49,10 @@ _ENCODER_BACKEND_LOADERS = (
 
 
 def supports_encoder_pooling_backend(model_config: Any) -> bool:
+    """Identify encoder pooling models; validate input mode during loading."""
     config = PoolingConfigView(model_config)
-    return (
-        config.runner_type == "pooling"
-        and config.is_text_only
-        and any(loader.supports(model_config) for loader in _ENCODER_BACKEND_LOADERS)
+    return config.runner_type == "pooling" and any(
+        loader.supports(model_config) for loader in _ENCODER_BACKEND_LOADERS
     )
 
 
@@ -62,6 +61,11 @@ def load_encoder_pooling_backend(
 ) -> LoadedEncoderBackend:
     for loader in _ENCODER_BACKEND_LOADERS:
         if loader.supports(model_config):
+            if not PoolingConfigView(model_config).is_text_only:
+                raise NotImplementedError(
+                    "Metal encoder pooling supports only text inputs. "
+                    "Use --language-model-only."
+                )
             return loader.load(model_config)
 
     config = PoolingConfigView(model_config)

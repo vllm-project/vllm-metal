@@ -247,15 +247,6 @@ class ModelLifecycle:
 
     def _load_encoder_pooling(self) -> LoadedEncoderBackend | None:
         runner = self._runner
-        if (
-            runner._is_pooling
-            and runner.model_config.hf_config.model_type == "embedding_gemma2"
-            and runner.model_config.multimodal_config is not None
-        ):
-            raise NotImplementedError(
-                "Metal EmbeddingGemma 2 pooling supports only text inputs. "
-                "Use --language-model-only."
-            )
         if not runner._is_pooling or not supports_encoder_pooling_backend(
             runner.model_config
         ):
