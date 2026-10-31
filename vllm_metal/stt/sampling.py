@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import NamedTuple
 
 import mlx.core as mx
 import torch
@@ -15,6 +16,22 @@ from vllm_metal.v1.sampling_batch import (
     create_request_generator,
     sample_from_logits,
 )
+
+
+class TokenLogprob(NamedTuple):
+    """The raw log-probability and vocabulary rank of one sampled token."""
+
+    logprob: float
+    rank: int
+
+
+def score_token(step_logits: mx.array, token: int) -> TokenLogprob:
+    """Score ``token`` against one decode step's raw logits (shape ``[1, vocab]``)."""
+    step = step_logits.reshape(-1).astype(mx.float32)
+    logprobs = step - mx.logsumexp(step)
+    chosen = logprobs[token]
+    rank = mx.sum(logprobs > chosen) + 1
+    return TokenLogprob(chosen.item(), int(rank.item()))
 
 
 @dataclass(frozen=True, slots=True)

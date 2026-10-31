@@ -37,12 +37,12 @@ from vllm_metal.stt.qwen3_asr.adapter import Qwen3ASRRuntimeAdapter
 from vllm_metal.stt.qwen3_asr.model import Qwen3ASRModel
 from vllm_metal.stt.qwen3_asr.transcriber import Qwen3ASRTranscriber
 from vllm_metal.stt.runtime import STTRuntimeAdapter
-from vllm_metal.stt.sampling import STTSampling
+from vllm_metal.stt.sampling import STTSampling, TokenLogprob, score_token
 from vllm_metal.stt.whisper import WhisperConfig
 from vllm_metal.stt.whisper.adapter import WhisperRuntimeAdapter
 from vllm_metal.stt.whisper.transcriber import WhisperTranscriber
 from vllm_metal.v1 import sampling_batch
-from vllm_metal.v1.stt_model_runner import STTModelRunner
+from vllm_metal.v1.stt_model_runner import STTModelRunner, _pack_sample_logprobs
 
 
 class _StubRunner:
@@ -154,7 +154,7 @@ class TestWhisperRuntimeAdapterDecode:
 
         assert result == [100, 200, 50257]
         adapter._transcriber.decode_tokens.assert_called_once_with(
-            audio_features, [50258], sampling=sampling
+            audio_features, [50258], sampling=sampling, logprobs_out=None
         )
 
     def test_eot_always_appended(self) -> None:
@@ -321,6 +321,87 @@ class TestExecuteSTTProtocol:
         assert output is not None
         assert output.req_ids == ["r1", "r2"]
         assert output.req_id_to_index == {"r1": 0, "r2": 1}
+
+
+def _log_softmax(row: np.ndarray) -> np.ndarray:
+    row = row.astype(np.float64)
+    return row - (row.max() + np.log(np.exp(row - row.max()).sum()))
+
+
+class TestSampleLogprobs:
+    """Sample logprobs for STT requests (vLLM's verbose_json sets logprobs=1)."""
+
+    def test_score_token_matches_log_softmax(self) -> None:
+        row = np.array([2.0, 1.0, 0.0, -1.0], dtype=np.float32)
+
+        scored = score_token(mx.array(row[None, :]), 1)
+
+        assert scored.logprob == pytest.approx(_log_softmax(row)[1], rel=1e-6)
+        assert scored.rank == 2
+
+    def test_requests_without_logprobs_return_none(self) -> None:
+        runner = _make_runner()
+        req = _make_new_req(mm_features=_make_valid_mm_features())
+
+        runner._execute_stt(_make_scheduler_output(new_reqs=[req]))
+
+        assert runner._pending_output.logprobs is None
+
+    @pytest.mark.usefixtures("whisper_hub_tokenizer_cache")
+    def test_whisper_scores_each_sampled_token_including_eot(
+        self, tmp_path: Path
+    ) -> None:
+        n_vocab = 51866
+        eot = 50257
+        (tmp_path / "config.json").write_text(json.dumps({"n_vocab": n_vocab}))
+        rows = []
+        for token in (200, eot):
+            row = np.zeros(n_vocab, dtype=np.float32)
+            row[token] = 5.0
+            rows.append(row)
+        model = SimpleNamespace(
+            config=WhisperConfig(n_vocab=n_vocab),
+            encode=lambda _: mx.zeros((1, 1, 1)),
+            decode=MagicMock(
+                side_effect=[(mx.array(row[None, None, :]), None) for row in rows]
+            ),
+        )
+        runner = _StubRunner(WhisperRuntimeAdapter(model, str(tmp_path)))
+        request = _make_new_req(
+            prompt_token_ids=[eot + 1],
+            sampling_params=SamplingParams(temperature=0, logprobs=1),
+            mm_features=_make_valid_mm_features(),
+        )
+
+        runner._execute_stt(
+            _make_scheduler_output(new_reqs=[request], cached_req_ids=["cached"])
+        )
+
+        output = runner._pending_output
+        assert output.sampled_token_ids == [[200, eot], [eot]]
+        logprobs = output.logprobs
+        assert logprobs is not None
+        assert logprobs.cu_num_generated_tokens == [0, 2]
+        assert logprobs.logprob_token_ids[:, 0].tolist() == [200, eot, eot]
+        expected = _log_softmax(rows[0])[200]
+        assert logprobs.logprobs[:2, 0].tolist() == pytest.approx(
+            [expected, expected], rel=1e-5
+        )
+        assert logprobs.sampled_token_ranks[:2].tolist() == [1, 1]
+
+    def test_rows_slice_per_request_and_pad_unscored_tokens(self) -> None:
+        packed = _pack_sample_logprobs(
+            [[1, 2, 3], [4, 5]],
+            [[TokenLogprob(-0.1, 1), TokenLogprob(-0.2, 3)], None],
+        )
+
+        assert packed is not None
+        # The scheduler slices each request's rows by its index in the batch.
+        first = packed.slice_request(0, 3)
+        assert first.logprob_token_ids[:, 0].tolist() == [1, 2, 3]
+        assert first.logprobs[:, 0].tolist() == pytest.approx([-0.1, -0.2, 0.0])
+        assert first.sampled_token_ranks.tolist() == [1, 3, 1]
+        assert packed.slice_request(1, 2).logprob_token_ids[:, 0].tolist() == [4, 5]
 
 
 class TestExtractAudioFeaturesFormats:
