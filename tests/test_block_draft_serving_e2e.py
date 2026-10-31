@@ -143,10 +143,13 @@ def _serve(
             "rejected": 0,
             "preemptions": 0,
             "resumed": 0,
+            "injected_rejection": 0,
         }
         propose = proposer.propose
+        inject_rejection = False
 
         def check_propose(ctx):
+            nonlocal inject_rejection
             result = propose(ctx)
             if result is None:
                 return result
@@ -158,6 +161,17 @@ def _serve(
                 assert (
                     limit is None or len(drafts) + 1 <= limit - state.generated_tokens
                 )
+            if inject_rejection:
+                # Exercise correction even when this checkpoint predicts the
+                # repetitive workload perfectly, as in the width-change test.
+                state = ctx.request_states[result.req_ids[0]]
+                prompt_index = prompts.index(state.token_ids[: state.prompt_len])
+                correct = baseline[prompt_index][state.generated_tokens]
+                result.draft_token_ids[0][0] = (
+                    correct + 1
+                ) % proposer.model.config.vocab_size
+                inject_rejection = False
+                stats["injected_rejection"] += 1
             return result
 
         proposer.propose = check_propose
@@ -211,6 +225,7 @@ def _serve(
             if a != b
         ][:3]
         free = scheduler.kv_cache_manager.block_pool.get_num_free_blocks()
+        inject_rejection = True
         for i in (3, 4):
             engine.add_request(str(i), {"prompt_token_ids": prompts[i]}, sampling)
         pressured = drain()
