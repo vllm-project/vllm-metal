@@ -15,6 +15,7 @@ class BinaryDistribution(Distribution):
 setup(
     distclass=BinaryDistribution,
     package_data={
+        "vllm_metal": ["requirements-torch.txt"],
         "vllm_metal.pytorch_backend": [
             "*.mm",
             f"_mps_ops{sysconfig.get_config_var('EXT_SUFFIX')}",
