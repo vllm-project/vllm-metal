@@ -58,7 +58,7 @@ missing, ambiguous, or shard-only matches also fail before model load.
   within one file, so llama.cpp's Q4_K_M and Q5_K_M exports, bartowski's
   Q4_K_L, and unsloth's UD-Q4_K_XL load. Remote reference tags accept Q8_0,
   Q4_0, Q4_1, Q5_0, Q5_1, Q2_K and Q2_K_S/M/L, Q3_K and Q3_K_S/M/L,
-  Q4_K_S/M/L, Q5_K_S/M/L, Q6_K, Q6_K_L, and the plain types.
+  Q4_K_S/M/L, Q5_K_S/M/L, Q6_K, Q6_K_L, IQ4_NL, IQ4_XS, and the plain types.
 - IQ4_NL and IQ4_XS weights need about twice their file size in memory, so
   a mostly-IQ4 file uses more than the same model's Q4_K_M.
 - Q2_K/Q3_K/Q6_K weights stay in their GGUF blocks and run on custom Metal
