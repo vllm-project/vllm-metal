@@ -163,9 +163,19 @@ class TestPromptLogprobsTracker:
         # re-emit prompt logprobs for the same request.
         assert not tracker.wants("req-a")
 
-    def test_single_chunk_prompt_completes_immediately(self) -> None:
+    @pytest.mark.parametrize(
+        ("num_logprobs", "expected_token_ids"),
+        [
+            (0, [[0], [1]]),
+            (-1, [[0, 2, 1, 0], [1, 0, 2, 1]]),
+        ],
+        ids=["target_only", "full_vocabulary"],
+    )
+    def test_single_chunk_prompt_completes_immediately(
+        self, num_logprobs: int, expected_token_ids: list[list[int]]
+    ) -> None:
         tracker = PromptLogprobsTracker()
-        tracker.register("req-b", 0)
+        tracker.register("req-b", num_logprobs)
         prompt = [2, 0, 1]
         rows = mx.array(
             [[0.0, 1.0, 2.0], [2.0, 0.0, 1.0], [1.0, 2.0, 0.0]], dtype=mx.float32
@@ -181,9 +191,7 @@ class TestPromptLogprobsTracker:
         )
 
         assert tensors is not None
-        # The last row predicts the first sampled token and is not scored.
-        assert tensors.logprob_token_ids.shape == (2, 1)
-        assert tensors.logprob_token_ids[:, 0].tolist() == prompt[1:]
+        assert tensors.logprob_token_ids.tolist() == expected_token_ids
 
     def test_one_token_prompt_delivers_empty_tensors(self) -> None:
         tracker = PromptLogprobsTracker()
