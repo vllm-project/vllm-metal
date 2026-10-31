@@ -6,14 +6,11 @@ from __future__ import annotations
 from dataclasses import asdict
 from typing import Any
 
-import mlx.core as mx
-import mlx.nn as nn
 from mlx_vlm.models.xlm_roberta import Model, ModelConfig
 
-from vllm_metal.tensor_bridge import TORCH_TO_MLX_DTYPE
+from vllm_metal.v1.pooling.backends.encoder.models.adapter import MLXVLMEncoderAdapter
 from vllm_metal.v1.pooling.backends.encoder.models.loading import (
-    encoder_model_path,
-    load_encoder_weights,
+    load_encoder_checkpoint,
 )
 from vllm_metal.v1.pooling.backends.encoder.runtime import MetalEncoderPoolingBackend
 from vllm_metal.v1.pooling.contract import LoadedEncoderBackend
@@ -21,22 +18,6 @@ from vllm_metal.v1.pooling.validation import PoolingConfigView
 
 _MODEL_TYPES = frozenset({"xlm-roberta", "roberta"})
 _ARCHITECTURES = frozenset({"XLMRobertaModel", "RobertaModel"})
-
-
-class XLMRobertaEncoderAdapter(nn.Module):
-    """Expose upstream hidden states to vllm-metal's dense and sparse poolers."""
-
-    def __init__(self, model: Model) -> None:
-        super().__init__()
-        self.model = model
-        self.config = model.config
-
-    def __call__(
-        self,
-        input_ids: mx.array,
-        attention_mask: mx.array | None = None,
-    ) -> mx.array:
-        return self.model(input_ids, attention_mask=attention_mask).last_hidden_state
 
 
 def supports_xlm_roberta_encoder(model_config: Any) -> bool:
@@ -66,22 +47,11 @@ def load_xlm_roberta_backend(
             "Metal XLM-R encoder pooling supports only GELU activation."
         )
 
-    target_dtype = TORCH_TO_MLX_DTYPE[model_config.dtype]
     args = ModelConfig.from_dict(config)
     model = Model(args)
-    model_path = encoder_model_path(model_config)
-    weights = load_encoder_weights(model_path)
-    weights = model.sanitize(weights)
-    weights = {
-        name: value.astype(target_dtype)
-        if mx.issubdtype(value.dtype, mx.floating)
-        else value
-        for name, value in weights.items()
-    }
-    model.load_weights(list(weights.items()), strict=True)
-    mx.eval(model.parameters())
+    load_encoder_checkpoint(model, model_config)
 
-    encoder = XLMRobertaEncoderAdapter(model)
+    encoder = MLXVLMEncoderAdapter(model)
     pooling_backend = MetalEncoderPoolingBackend(
         PoolingConfigView(model_config),
         encoder,

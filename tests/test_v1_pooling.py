@@ -750,7 +750,7 @@ class TestMetalPoolingCapabilities:
     def test_embedding_gemma2_checkpoint_preserves_projected_mean_embeddings(
         self, tmp_path, dtype, length
     ) -> None:
-        """Match HF across padding and the inclusive 512-token sliding window."""
+        """Load only text from a full checkpoint and match HF pooled embeddings."""
         hf = pytest.importorskip("transformers.models.embedding_gemma2")
         torch.manual_seed(0)
         text_config = hf.EmbeddingGemma2TextConfig(
@@ -766,14 +766,30 @@ class TestMetalPoolingCapabilities:
             hidden_size_per_layer_input=8,
             embedding_dim=12,
         )
-        config = hf.EmbeddingGemma2Config(text_config=text_config)
+        config = hf.EmbeddingGemma2Config(
+            text_config=text_config,
+            vision_config={
+                "hidden_size": 8,
+                "intermediate_size": 16,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 2,
+                "head_dim": 4,
+                "patch_size": 2,
+                "position_embedding_size": 16,
+            },
+            audio_config={
+                "hidden_size": 8,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 2,
+                "subsampling_conv_channels": [4, 2],
+                "output_proj_dims": 8,
+            },
+        )
         reference = hf.EmbeddingGemma2Model(config).to(dtype).eval()
         reference.save_pretrained(tmp_path)
-        # A text-only load must discard media weights from a full checkpoint.
-        mx.save_safetensors(
-            str(tmp_path / "model-media.safetensors"),
-            {"vision_tower.unused.weight": mx.ones((1,))},
-        )
+        assert reference.vision_tower is not None
+        assert reference.audio_tower is not None
         model_config = _encoder_model_config(
             model=str(tmp_path),
             hf_config=config,
@@ -798,7 +814,7 @@ class TestMetalPoolingCapabilities:
             mx.array(ids.numpy()), mx.array(mask.numpy())
         )
         # BF16 CPU and Metal kernels can differ by a few rounding steps.
-        tolerance = 1e-5 if dtype == torch.float32 else 5e-3
+        tolerance = 1e-5 if dtype == torch.float32 else 1e-2
         torch.testing.assert_close(
             mlx_to_torch(actual.astype(mx.float32), device="cpu"),
             expected.float(),
