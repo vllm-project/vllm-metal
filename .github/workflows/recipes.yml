@@ -1,0 +1,25 @@
+name: Recipes
+
+on:
+  pull_request:
+    paths:
+      - 'recipes/**'
+      - '.github/workflows/recipes.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Recipes
+    if: github.repository_owner == 'vllm-project'
+    uses: vllm-project/recipes/.github/workflows/validate-recipes.yml@main
+    with:
+      source: vllm-metal
+      path: recipes
+      # Remove this override after recipes#1141 registers Metal on main.
+      renderer-ref: 73edcc5b7bb74660962e25ecaaa6851fa46311d0
