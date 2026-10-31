@@ -5,6 +5,16 @@ meta:
     apple_32gb: supported
     apple_64gb: supported
 
+features:
+  tool_calling:
+    hardware_overrides:
+      metal:
+        args: [--enable-auto-tool-choice, --tool-call-parser, qwen3_coder]
+  reasoning:
+    hardware_overrides:
+      metal:
+        args: [--reasoning-parser, qwen3]
+
 variants:
   mlx_int4:
     label: MLX 4-bit
@@ -23,7 +33,7 @@ variants:
           source ~/.venv-vllm-metal/bin/activate
       docker: false
     supported_frontends: [python]
-    supported_features: []
+    supported_features: [tool_calling, reasoning]
     base_args:
       - --host
       - "127.0.0.1"
@@ -31,12 +41,13 @@ variants:
       - "8192"
       - --max-num-batched-tokens
       - "2048"
-      - --enable-auto-tool-choice
-      - --tool-call-parser
-      - qwen3_coder
-      - --reasoning-parser
-      - qwen3
-    guide: |
+
+notes:
+  - title: Memory settings
+    when:
+      hardware: [apple_16gb, apple_32gb, apple_64gb]
+      variants: [mlx_int4]
+    body: |
       - The first run downloads 6.0 GB.
       - `--max-num-batched-tokens 2048` reads long text in smaller steps, so the
         model needs less memory. Without it this model does not fit on 16 GB.

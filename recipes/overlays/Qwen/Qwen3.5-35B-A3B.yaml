@@ -3,6 +3,16 @@ meta:
   hardware:
     apple_64gb: supported
 
+features:
+  tool_calling:
+    hardware_overrides:
+      metal:
+        args: [--enable-auto-tool-choice, --tool-call-parser, qwen3_coder]
+  reasoning:
+    hardware_overrides:
+      metal:
+        args: [--reasoning-parser, qwen3]
+
 variants:
   mlx_int4:
     label: MLX 4-bit
@@ -23,24 +33,23 @@ variants:
           source ~/.venv-vllm-metal/bin/activate
       docker: false
     supported_frontends: [python]
-    supported_features: []
+    supported_features: [tool_calling, reasoning]
     base_args:
       - --host
       - "127.0.0.1"
       - --max-model-len
       - "32768"
-      - --enable-auto-tool-choice
-      - --tool-call-parser
-      - qwen3_coder
-      - --reasoning-parser
-      - qwen3
-    guide: |
-      - The first run downloads 20 GB.
-      - It is the fastest of the three, because only part of the model runs for
-        each word.
 
 strategy_hardware:
   single_node_tep:
     metal: unsupported
   single_node_dep:
     metal: unsupported
+
+notes:
+  - title: Model download
+    when:
+      hardware: [apple_64gb]
+      variants: [mlx_int4]
+    body: |
+      - The first run downloads 20 GB.
