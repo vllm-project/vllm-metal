@@ -725,3 +725,419 @@ instantiate_paged_attention_nax_all(bfloat16_t);
 
 instantiate_paged_attention_nax_d512(half);
 instantiate_paged_attention_nax_d512(bfloat16_t);
+
+// Grouped prefill for supported long-prefix work. Keep guarded tails.
+// Fixed-layout ablation: only the full-tile bounds checks differ between
+// these two function-constant specializations. Tail tiles remain guarded.
+constant bool nax_gqa_skip_bounds [[function_constant(42)]];
+
+template <typename T, int HEAD_SIZE, int BLOCK_SIZE, bool GUARDED>
+METAL_FUNC void nax_gqa_full_tile(
+    const int tile_start,
+    const thread metal::array<const device T *, 2> &q_row,
+    const thread bool *q_ok,
+    device const T *k_cache,
+    device const T *v_cache,
+    device const int *block_tables,
+    const long bt_row,
+    const int kv_block_stride,
+    const long kv_token_stride,
+    const int kv_head_idx,
+    const int kv_head_stride,
+    const int seq_len,
+    const short fm,
+    const short fn,
+    const int row_lim,
+    const int q_abs_sg,
+    const int min_q_abs_sg,
+    const float scale_log2,
+    const float softcapping,
+    const int sliding_window,
+    thread nax_frag8<float> *Otile,
+    thread float *max_score,
+    thread float *sum_score) {
+  constexpr int TILE_KV = 32;
+  constexpr int TD = HEAD_SIZE / 16;
+  using T4 = metal::vec<T, 4>;
+  constexpr int page_size = BLOCK_SIZE;
+
+  // Resolve the tile's 4 half-bases (one block lookup each) and fold in
+  // this lane's row, so the load loops are pure `ptr + constant` vec4s.
+  const device T *k_row[4];
+  const device T *v_row[4];
+  bool kv_ok[4];
+#pragma clang loop unroll(full)
+  for (short h = 0; h < 4; h++) {
+    const int tok = tile_start + h * 8;
+    long off = 0;
+    short rows = 8;
+    if (!GUARDED || tok < seq_len) {
+      const long pb = long(block_tables[bt_row + tok / page_size]);
+      off = pb * long(kv_block_stride)
+          + long(tok % page_size) * kv_token_stride
+          + kv_head_idx * long(kv_head_stride);
+      if (GUARDED) rows = short(min(8, seq_len - tok));
+    } else {
+      rows = 0;
+    }
+    const long lane_off = off + fm * kv_token_stride + fn;
+    k_row[h] = k_cache + lane_off;
+    v_row[h] = v_cache + lane_off;
+    kv_ok[h] = !GUARDED || fm < rows;
+  }
+
+  // S = Q K^T.  Q is re-read per KV tile to reduce register pressure.
+  nax_frag8<float> S0 = nax_frag8<float>(0.0f);
+  nax_frag8<float> S1 = nax_frag8<float>(0.0f);
+#pragma clang loop unroll_count(4)
+  for (short id = 0; id < TD; id++) {
+    nax_frag8<T> Qf, K0, K1;
+#pragma clang loop unroll(full)
+    for (short i = 0; i < 2; i++) {
+      T4 qv, k0, k1;
+      if (GUARDED) {
+        qv = q_ok[i] ? *(const device T4 *)(q_row[i] + id * 16) : T4(T(0));
+        // K frag 0 rows 0-15 = halves {0,1}; frag 1 rows 16-31 = {2,3}.
+        k0 = kv_ok[i] ? *(const device T4 *)(k_row[i] + id * 16) : T4(T(0));
+        k1 = kv_ok[2 + i]
+            ? *(const device T4 *)(k_row[2 + i] + id * 16) : T4(T(0));
+      } else {
+        qv = *(const device T4 *)(q_row[i] + id * 16);
+        k0 = *(const device T4 *)(k_row[i] + id * 16);
+        k1 = *(const device T4 *)(k_row[2 + i] + id * 16);
+      }
+#pragma clang loop unroll(full)
+      for (short j = 0; j < 4; j++) {
+        Qf[i * 4 + j] = qv[j];
+        K0[i * 4 + j] = k0[j];
+        K1[i * 4 + j] = k1[j];
+      }
+    }
+    nax_mma<float, T, T, true>(S0, S1, Qf, K0, K1);
+  }
+
+  // Scale + softcap + mask.  Fast path when the whole tile is strictly
+  // causal-past for every row this SG owns and needs no other masking.
+  const bool tile_no_mask = (tile_start + TILE_KV - 1) < min_q_abs_sg
+      && softcapping <= 0.0f
+      && sliding_window < 0
+      && (!GUARDED
+          || ((tile_start + TILE_KV) <= seq_len && row_lim >= 16));
+  if (tile_no_mask) {
+#pragma clang loop unroll(full)
+    for (short e = 0; e < 8; e++) {
+      S0[e] *= scale_log2;
+      S1[e] *= scale_log2;
+    }
+  } else {
+#pragma clang loop unroll(full)
+    for (short i = 0; i < 2; i++) {
+      const int q_abs = q_abs_sg + fm + i * 8;
+      const bool row_masked = GUARDED && (fm + i * 8) >= row_lim;
+#pragma clang loop unroll(full)
+      for (short j = 0; j < 4; j++) {
+#pragma clang loop unroll(full)
+        for (short f = 0; f < 2; f++) {
+          const int kv_pos = tile_start + f * 16 + fn + j;
+          float s = (f == 0 ? S0[i * 4 + j] : S1[i * 4 + j]) * scale_log2;
+          if (softcapping > 0.0f) {
+            const float s_orig = s / M_LOG2E_F;
+            s = softcapping * precise::tanh(s_orig / softcapping)
+                * M_LOG2E_F;
+          }
+          bool masked = kv_pos > q_abs;
+          if (GUARDED) masked = masked || row_masked || (kv_pos >= seq_len);
+          if (sliding_window >= 0)
+            masked = masked || (kv_pos < q_abs + 1 - sliding_window);
+          const float v = masked ? NAX_FINITE_MIN : s;
+          if (f == 0) S0[i * 4 + j] = v; else S1[i * 4 + j] = v;
+        }
+      }
+    }
+  }
+
+  // Online softmax, finite-sentinel form: masked logits are NAX_FINITE_MIN
+  // and exp gets a zero select.  The select is what keeps rows whose
+  // sliding window has not opened yet exact; their running max is still
+  // the sentinel, and exp2(s - max) would otherwise be exp2(0) = 1.
+  float new_max[2] = {max_score[0], max_score[1]};
+  nax_row_reduce<NaxMaxOp>(S0, new_max);
+  nax_row_reduce<NaxMaxOp>(S1, new_max);
+
+  float factor[2];
+#pragma clang loop unroll(full)
+  for (short i = 0; i < 2; i++) {
+    factor[i] = fast::exp2(max_score[i] - new_max[i]);
+    max_score[i] = new_max[i];
+  }
+#pragma clang loop unroll(full)
+  for (short i = 0; i < 2; i++) {
+#pragma clang loop unroll(full)
+    for (short j = 0; j < 4; j++) {
+      const float s0 = S0[i * 4 + j];
+      const float s1 = S1[i * 4 + j];
+      S0[i * 4 + j] =
+          (s0 == NAX_FINITE_MIN) ? 0.0f : fast::exp2(s0 - new_max[i]);
+      S1[i * 4 + j] =
+          (s1 == NAX_FINITE_MIN) ? 0.0f : fast::exp2(s1 - new_max[i]);
+    }
+  }
+
+  float row_sum[2] = {0.0f, 0.0f};
+  nax_row_reduce<NaxSumOp>(S0, row_sum);
+  nax_row_reduce<NaxSumOp>(S1, row_sum);
+#pragma clang loop unroll(full)
+  for (short i = 0; i < 2; i++) {
+    sum_score[i] = sum_score[i] * factor[i] + row_sum[i];
+  }
+#pragma clang loop unroll(full)
+  for (short d = 0; d < TD; d++) {
+#pragma clang loop unroll(full)
+    for (short i = 0; i < 2; i++) {
+#pragma clang loop unroll(full)
+      for (short j = 0; j < 4; j++) {
+        Otile[d][i * 4 + j] *= factor[i];
+      }
+    }
+  }
+
+  simdgroup_barrier(mem_flags::mem_none);
+
+  // O += P @ V.  P is fp32 in registers, but the matmul2d descriptor is
+  // relaxed_precision (required by the register layout nax_coord() mirrors),
+  // so the tensor unit truncates it -- unlike pagedattention_tiled.metal,
+  // which keeps P fp32 through the MMA and is precision-neutral by contract.
+  // That divergence is what tools/nax_prefill_parity.py bounds.
+  // V is re-read per d-pair like MLX; the bases are already resolved.
+#pragma clang loop unroll(full)
+  for (short id = 0; id < TD; id += 2) {
+    if (TD >= 8 && id == TD / 2) {
+      // At TD=8 this is the MLX hd=128 scheduling barrier verbatim. The
+      // vLLM hd=256/512 extensions use the same midpoint split at TD=16/32.
+      threadgroup_barrier(mem_flags::mem_none);
+    }
+#pragma clang loop unroll(full)
+    for (short f = 0; f < 2; f++) {
+      nax_frag8<T> V0, V1;
+#pragma clang loop unroll(full)
+      for (short i = 0; i < 2; i++) {
+        const short h = 2 * f + i;
+        T4 v0, v1;
+        if (GUARDED) {
+          v0 = kv_ok[h]
+              ? *(const device T4 *)(v_row[h] + id * 16) : T4(T(0));
+          v1 = kv_ok[h]
+              ? *(const device T4 *)(v_row[h] + (id + 1) * 16) : T4(T(0));
+        } else {
+          v0 = *(const device T4 *)(v_row[h] + id * 16);
+          v1 = *(const device T4 *)(v_row[h] + (id + 1) * 16);
+        }
+#pragma clang loop unroll(full)
+        for (short j = 0; j < 4; j++) {
+          V0[i * 4 + j] = v0[j];
+          V1[i * 4 + j] = v1[j];
+        }
+      }
+      nax_mma<float, float, T, false>(
+          Otile[id], Otile[id + 1], (f == 0 ? S0 : S1), V0, V1);
+    }
+  }
+}
+
+template <typename T, int BLOCK_SIZE, int GROUP_SIZE,
+          int HEADS_PER_TG = GROUP_SIZE>
+[[kernel, max_total_threads_per_threadgroup(32 * HEADS_PER_TG)]]
+void paged_attention_nax_grouped_full(
+    device T *out [[buffer(2)]],
+    device const T *q [[buffer(3)]],
+    device const T *k_cache [[buffer(4)]],
+    device const T *v_cache [[buffer(5)]],
+    const constant int &num_kv_heads [[buffer(8)]],
+    const constant float &scale [[buffer(9)]],
+    const constant float &softcapping [[buffer(10)]],
+    device const int *block_tables [[buffer(11)]],
+    device const int *context_lens [[buffer(12)]],
+    const constant int &max_num_blocks_per_seq [[buffer(13)]],
+    const constant int &q_stride [[buffer(15)]],
+    const constant int &kv_block_stride [[buffer(16)]],
+    const constant int &kv_head_stride [[buffer(17)]],
+    device const float *sinks
+    [[buffer(18), function_constant(nax_use_sinks)]],
+    device const int *cu_seqlens_q [[buffer(19)]],
+    const constant int &num_seqs [[buffer(20)]],
+    const constant int &sliding_window [[buffer(21)]],
+    uint3 tgp [[threadgroup_position_in_grid]],
+    uint3 tgpg [[threadgroups_per_grid]],
+    uint sg_idx [[simdgroup_index_in_threadgroup]])
+{
+  constexpr int HEAD_SIZE = 256;
+  constexpr int BQ = 16;
+  constexpr int TILE_KV = 32;
+  constexpr int TD = HEAD_SIZE / 16;
+  static_assert(GROUP_SIZE == 6,
+                "unsupported grouped NAX head ratio");
+  static_assert(BLOCK_SIZE == 16,
+                "unsupported grouped NAX block size");
+
+  static_assert(HEADS_PER_TG > 0 && GROUP_SIZE % HEADS_PER_TG == 0,
+                "threadgroups must partition the original KV-head group");
+  // The group width may be smaller than the model's GQA ratio. Each SG
+  // still owns one head; smaller groups partition one KV head without
+  // changing the per-head attention calculation or the buffer ABI.
+  const int kv_head_idx = int(tgp.x) / (GROUP_SIZE / HEADS_PER_TG);
+  const int head_idx = int(tgp.x) * HEADS_PER_TG + int(sg_idx);
+  const int q_block_global_idx = int(tgp.y);
+  const long kv_token_stride = long(num_kv_heads) * kv_head_stride;
+
+  // Varlen: map global q-block -> (sequence, block-within-sequence).
+  // The host and this search must use the same BQ.
+  int seq_idx;
+  {
+    int lo = 0, hi = num_seqs;
+    while (lo < hi) {
+      int mid = (lo + hi + 1) / 2;
+      if (cu_seqlens_q[mid] / BQ + mid <= q_block_global_idx) lo = mid;
+      else hi = mid - 1;
+    }
+    seq_idx = lo;
+  }
+  const int q_seq_start = cu_seqlens_q[seq_idx];
+  const int cur_batch_query_len = cu_seqlens_q[seq_idx + 1] - q_seq_start;
+  const int q_pos_start =
+      (q_block_global_idx - (q_seq_start / BQ + seq_idx)) * BQ;
+  // Every SIMD-group owns the same query rows, so this return is uniform.
+  if (q_pos_start >= cur_batch_query_len) return;
+
+  const int seq_len = context_lens[seq_idx];
+  const int context_len = seq_len - cur_batch_query_len;
+
+  const int valid_q = min(BQ, cur_batch_query_len - q_pos_start);
+
+  const short2 sc = nax_coord();
+  const short fm = sc.y;
+  const short fn = sc.x;
+
+  // All bases and lane offsets keep vec4 fragment loads aligned. Row-half
+  // guards preserve those wide loads at partial-tile boundaries.
+  using T4 = metal::vec<T, 4>;
+
+  const device T *q_base = q
+      + long(q_seq_start + q_pos_start) * q_stride
+      + head_idx * HEAD_SIZE;
+  metal::array<const device T *, 2> q_row;
+  bool q_ok[2];
+#pragma clang loop unroll(full)
+  for (short i = 0; i < 2; i++) {
+    q_row[i] = q_base + (fm + i * 8) * q_stride + fn;
+    q_ok[i] = (fm + i * 8) < valid_q;
+  }
+  const long bt_row = long(seq_idx) * max_num_blocks_per_seq;
+
+  // Sinks enter the initial denominator-only softmax state.
+  float max_score[2];
+  float sum_score[2] = {0.0f, 0.0f};
+  if (nax_use_sinks) {
+    const float s = M_LOG2E_F * sinks[head_idx];
+    max_score[0] = s; max_score[1] = s;
+    sum_score[0] = 1.0f; sum_score[1] = 1.0f;
+  } else {
+    max_score[0] = NAX_FINITE_MIN; max_score[1] = NAX_FINITE_MIN;
+  }
+
+  nax_frag8<float> Otile[TD];
+#pragma clang loop unroll(full)
+  for (short d = 0; d < TD; d++) Otile[d] = nax_frag8<float>(0.0f);
+
+  const float scale_log2 = scale * M_LOG2E_F;
+  const int min_q_abs = context_len + q_pos_start;
+
+  // Sliding window: tiles before every row's window are fully masked -> skip.
+  int kb_start = 0;
+  if (sliding_window >= 0) {
+    kb_start = max(0, (context_len + q_pos_start + 1 - sliding_window)
+                          / TILE_KV);
+  }
+  const int num_kv_tiles = (seq_len + TILE_KV - 1) / TILE_KV;
+
+  const int kb_end = min(num_kv_tiles,
+      (context_len + q_pos_start + valid_q - 1) / TILE_KV + 1);
+  // Every SIMD-group has the same valid_q and loop bounds.
+  const int kb_full_end = valid_q == BQ
+      ? max(kb_start, min(kb_end, seq_len / TILE_KV)) : kb_start;
+  for (int kb = kb_start; kb < kb_full_end; kb++) {
+    if (nax_gqa_skip_bounds) {
+      nax_gqa_full_tile<T, HEAD_SIZE, BLOCK_SIZE, false>(
+          kb * TILE_KV, q_row, q_ok, k_cache, v_cache, block_tables, bt_row,
+          kv_block_stride, kv_token_stride, kv_head_idx, kv_head_stride,
+          seq_len, fm, fn, valid_q, min_q_abs, min_q_abs, scale_log2,
+          softcapping, sliding_window, Otile, max_score, sum_score);
+    } else {
+      nax_gqa_full_tile<T, HEAD_SIZE, BLOCK_SIZE, true>(
+          kb * TILE_KV, q_row, q_ok, k_cache, v_cache, block_tables, bt_row,
+          kv_block_stride, kv_token_stride, kv_head_idx, kv_head_stride,
+          seq_len, fm, fn, valid_q, min_q_abs, min_q_abs, scale_log2,
+          softcapping, sliding_window, Otile, max_score, sum_score);
+    }
+  }
+  for (int kb = kb_full_end; kb < kb_end; kb++) {
+    nax_gqa_full_tile<T, HEAD_SIZE, BLOCK_SIZE, true>(
+        kb * TILE_KV, q_row, q_ok, k_cache, v_cache, block_tables, bt_row,
+        kv_block_stride, kv_token_stride, kv_head_idx, kv_head_stride,
+        seq_len, fm, fn, valid_q, min_q_abs, min_q_abs, scale_log2,
+        softcapping, sliding_window, Otile, max_score, sum_score);
+  }
+
+  // Normalize and store valid rows only.
+  threadgroup_barrier(mem_flags::mem_none);
+  device T *out_base = out
+      + long(q_seq_start + q_pos_start) * q_stride
+      + head_idx * HEAD_SIZE;
+#pragma clang loop unroll(full)
+  for (short i = 0; i < 2; i++) {
+    if (q_ok[i]) {
+      // Match tiled attention's zero-denominator guard for fully masked rows.
+      const float rcp = 1.0f / (sum_score[i] + 1e-6f);
+      device T *out_row = out_base + (fm + i * 8) * q_stride + fn;
+#pragma clang loop unroll(full)
+      for (short d = 0; d < TD; d++) {
+        T4 ov;
+#pragma clang loop unroll(full)
+        for (short j = 0; j < 4; j++) {
+          ov[j] = static_cast<T>(Otile[d][i * 4 + j] * rcp);
+        }
+        *(device T4 *)(out_row + d * 16) = ov;
+      }
+    }
+  }
+}
+
+#define instantiate_paged_attention_nax_grouped_full(                             \
+    type, block_size, width, suffix)                                           \
+  template [[host_name("paged_attention_nax_" #type                          \
+                       "_hs256_bs" #block_size "_gqa6" #suffix)]]         \
+  [[kernel]] void paged_attention_nax_grouped_full<                               \
+      type, block_size, 6, width>(                                        \
+      device type *out [[buffer(2)]],                                        \
+      device const type *q [[buffer(3)]],                                    \
+      device const type *k_cache [[buffer(4)]],                              \
+      device const type *v_cache [[buffer(5)]],                              \
+      const constant int &num_kv_heads [[buffer(8)]],                        \
+      const constant float &scale [[buffer(9)]],                             \
+      const constant float &softcapping [[buffer(10)]],                      \
+      device const int *block_tables [[buffer(11)]],                         \
+      device const int *context_lens [[buffer(12)]],                         \
+      const constant int &max_num_blocks_per_seq [[buffer(13)]],             \
+      const constant int &q_stride [[buffer(15)]],                           \
+      const constant int &kv_block_stride [[buffer(16)]],                    \
+      const constant int &kv_head_stride [[buffer(17)]],                     \
+      device const float *sinks                                              \
+      [[buffer(18), function_constant(nax_use_sinks)]],                      \
+      device const int *cu_seqlens_q [[buffer(19)]],                         \
+      const constant int &num_seqs [[buffer(20)]],                           \
+      const constant int &sliding_window [[buffer(21)]],                     \
+      uint3 tgp [[threadgroup_position_in_grid]],                            \
+      uint3 tgpg [[threadgroups_per_grid]],                                  \
+      uint sg_idx [[simdgroup_index_in_threadgroup]]);
+
+instantiate_paged_attention_nax_grouped_full(bfloat16_t, 16, 6, _full);
+instantiate_paged_attention_nax_grouped_full(bfloat16_t, 16, 3, _sub_full);

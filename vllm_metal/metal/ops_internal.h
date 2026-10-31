@@ -30,7 +30,8 @@ constexpr int kPartitionSize = VLLM_METAL_PARTITION_SIZE;
 // Process-wide diagnostic for tests; not a per-request trace or routing input.
 enum class PagedDispatch {
   None, GqaDecode, PerToken, SplitKv, Window, WindowSplitKv, NaxPrefill,
-  TiledPrefill, MixedPrefillDecode, MixedNaxPrefillDecode, Count
+  TiledPrefill, MixedPrefillDecode, MixedNaxPrefillDecode,
+  NaxGqa6Prefill, Count
 };
 using hardware::detected_gpu_core_count;
 using hardware::gpu_core_count;
@@ -102,6 +103,7 @@ extern std::atomic<int> g_last_gqa_partition;
 extern std::atomic<int> g_last_gqa_requests;
 extern std::atomic<bool> g_dispatch_diagnostics_enabled;
 extern std::atomic<int> g_last_nax_split;
+extern std::atomic<int> g_last_nax_heads_per_tg;
 extern bool nax_lib_ready_;
 extern bool nax_enabled_;
 template <typename Lengths>
@@ -197,3 +199,26 @@ std::tuple<array, array> gdn_linear_attention_primitive_fn(
     const array& g, const array& beta, const array& state_pool,
     const array& cu_seqlens, const array& slot_mapping,
     int Hk, int Hv, int Dk, int Dv);
+
+struct NaxPrefillDispatchEvent {
+  const char* family;
+  const char* dtype;
+  int q, hq, hkv, d, page, numseq, gridx, gridy, threads, bq, heads_per_tg;
+  int32_t q_stride, key_block_stride, key_head_stride;
+  int64_t key_stride0, key_stride1, key_stride2;
+  int key_page_tokens, sliding_window;
+  float softcap;
+  bool use_sinks;
+  int value_slices, grouped_skip_bounds;
+  std::string function;
+  bool split_full;
+  int max_seq_len, q_block_offset;
+};
+struct NaxPrefillTraceResult {
+  std::vector<NaxPrefillDispatchEvent> events;
+  size_t capacity;
+  uint64_t dropped;
+  uint64_t append_ns;
+};
+void start_nax_prefill_dispatch_trace();
+NaxPrefillTraceResult take_nax_prefill_dispatch_trace();

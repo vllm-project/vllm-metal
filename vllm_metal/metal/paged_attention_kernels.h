@@ -56,6 +56,138 @@ inline std::optional<TileConfig> select_tile_config(int head_size) {
 inline constexpr int kNaxBQ = 64;
 inline constexpr int kNaxThreads = 128;
 
+struct NaxConfig {
+  int BQ;
+  int HEADS_PER_TG;
+  int NUM_THREADS;
+};
+
+inline constexpr NaxConfig kNaxBaseline{kNaxBQ, 1, kNaxThreads};
+
+// A shared source-work score for compiled grouped layouts. Complete SG work
+// supplies a capacity budget; whole Q tails and isolated KV edges are separate.
+// Coefficients are conservative empirical weights, not predicted milliseconds.
+// Calibration terms, measured counterexamples and hardware scope are recorded
+// in docs/gqa-prefill.md; keep kernel and serving evidence separate.
+// In particular, idle cores cannot amplify the baseline tail-work credit.
+struct NaxPrefillWork {
+  double issued, active, guarded, guarded_q, kv_edge, fast;
+  double stream, tail_stream;
+  int64_t groups, full_blocks;
+};
+inline NaxPrefillWork nax_prefill_work(int q, int prefix, int heads, int kv_heads, int bq, bool split) {
+  const int64_t full = q / bq, tail = q % bq;
+  const int64_t prefix_tiles = (int64_t(prefix) + 31) / 32;
+  const int64_t visits = bq == 64
+      ? full * prefix_tiles + full * (full + 1)
+      : full * prefix_tiles + full * full / 4
+        + (prefix % 32 == 0 || prefix % 32 > 16) * ((full + 1) / 2);
+  const int64_t end = tail ? (int64_t(prefix) + q + 31) / 32 : 0;
+  const int64_t full_end = ((int64_t(prefix) + q) / 32) * 32;
+  // C++ integer division truncates toward zero. Clamp before division so
+  // this matches the nonnegative source-loop count even below one KV tile.
+  const int64_t edge_blocks = full - std::min(full,
+      std::max(int64_t(0), full_end - prefix) / bq);
+  const int64_t fast_visits = split ? visits - edge_blocks : 0;
+  const int slices = bq / 16;
+  const double issued = double(heads) * slices * (visits + end);
+  const double active = double(heads) * (slices * visits + ((tail + 15) / 16) * end);
+  const double fast = double(heads) * slices * fast_visits;
+  return {issued, active, issued - fast, double(heads) * slices * end,
+          double(heads) * slices * edge_blocks, fast,
+          double(visits + end) / (full + (tail != 0)), double(end),
+          (bq == 64 ? heads : kv_heads) * (full + (tail != 0)), full};
+}
+struct NaxGqaScore { bool eligible; bool admit; double value; int heads_per_tg; };
+inline NaxGqaScore nax_gqa_work_score(int q, int prefix, int heads, int kv_heads, int page,
+                   int cores, bool upstream_split) {
+  if (q <= 1 || prefix < 0 || heads <= 0 || kv_heads <= 0 ||
+      heads % kv_heads || cores <= 0) return {false, false, 0, 0};
+  const int ratio = heads / kv_heads;
+  if (ratio != 6 || page != 16)
+    return {false, false, 0, 0};
+  const auto u = nax_prefill_work(q, prefix, heads, kv_heads, 64, upstream_split);
+  const auto full = nax_prefill_work(q, prefix, heads, kv_heads, 16, true);
+  const double full_work = full.fast;
+  const bool measured_stride = (kv_heads & (kv_heads - 1)) == 0;
+  // The guarded wide-group allowance is calibrated at ten cores. Scaling
+  // it by groups/core alone regresses the larger tested devices.
+  const bool guarded_wide = measured_stride &&
+      cores == 10 && !upstream_split &&
+      int64_t(heads) * (q / 16) >= int64_t(18) * cores &&
+      full_work >= 16384. * cores;
+  double memory_work_fraction = std::min(1., full_work / (65536. * cores));
+  if (guarded_wide) memory_work_fraction = 1.;
+  const int limit = int64_t(heads) * (q / 16) >= int64_t(48) * cores ||
+      full_work >= 65536. * cores || guarded_wide ? 6 : 4;
+  // Complete-work density is separate from guarded-query tail savings.
+  // A small Q or KV tail is allowed; the whole call need not be aligned.
+  const bool dense_full = measured_stride && upstream_split &&
+      int64_t(kv_heads) * (q / 16) >= int64_t(32) * cores &&
+      full.fast >= .95 * full.issued;
+  const double tail_depth = q % 16 ? (int64_t(prefix) + q + 31) / 32 : 0;
+  const double threshold = .5 + 8. * cores * (ratio / 2) * tail_depth / u.issued;
+  NaxGqaScore best{true, false, -1e300, 0};
+  for (const int h : {ratio / 2, ratio}) {
+    if (h > limit || (h > 4 && int64_t(heads / h) * (q / 16) < cores))
+      continue;
+    const auto g = nax_prefill_work(q, prefix, heads, heads / h, 16, true);
+    const double extra = std::max(0., double(h) / 4 - 1);
+    const double padding = u.issued - u.active - g.issued + g.active;
+    const double critical = std::min(int64_t(cores), int64_t(heads))
+        * ((q % 64 + 15) / 16) * u.tail_stream
+        - std::min(int64_t(cores), u.groups) * h * g.tail_stream;
+    double benefit, cost;
+    if (upstream_split) {
+      benefit = 13 * padding + 8 * critical + 2.5 * g.fast
+          + 15 * (u.guarded_q - g.guarded_q);
+      cost = (10. / h + 3.5 * extra * extra) * g.issued + 16 * g.guarded_q;
+    } else {
+      const double partial = (u.guarded_q - g.guarded_q) * std::min(
+          1., double(cores) / std::max(int64_t(1), heads * u.full_blocks));
+      const double reuse = (double(h) / 4 - 1)
+          * std::min(1., double(cores) / u.groups) * g.issued;
+      const double grid = std::max(int64_t(0),
+          std::min(int64_t(cores), u.groups)
+          - std::min(int64_t(cores), g.groups)) * g.stream;
+      benefit = 4 * partial + .875 * critical + 3.5 * reuse
+          + 4 * (u.guarded - u.guarded_q);
+      cost = (10.5 + 32 * extra * extra * std::min(
+          1., std::max(0., double(u.groups) / cores - 1))) * grid;
+      cost += (3 + 3.5 * extra * (1 - memory_work_fraction)) * g.issued + 11.5 * cores + 2 * g.kv_edge;
+      cost += .75 * extra * extra * g.issued
+          * std::min(1., double(g.groups) / cores) + 5 * g.guarded_q;
+    }
+    const double value = (benefit - cost) / u.issued;
+    if (dense_full && h == 6) return {true, true, value, h};
+    if (value > best.value) best = {true, value > threshold, value, h};
+  }
+  return best;
+}
+
+inline NaxConfig select_nax_config(
+    int num_heads, int num_kv_heads, int head_size, int block_size,
+    int query_tokens, int num_seqs, int max_seq_len, int q_block_offset,
+    bool grouped_enabled, bool bf16, bool unmasked, bool upstream_split,
+    int gpu_cores) {
+  // BQ64 mixed suffix offsets cannot address the BQ16 grouped shader.
+  if (!grouped_enabled || !bf16 || !unmasked || head_size != 256 ||
+      num_seqs != 1 || q_block_offset != 0 || query_tokens <= 1 ||
+      max_seq_len < query_tokens) return kNaxBaseline;
+  const auto choice = nax_gqa_work_score(
+      query_tokens, max_seq_len - query_tokens, num_heads, num_kv_heads,
+      block_size, gpu_cores, upstream_split);
+  return choice.admit
+      ? NaxConfig{16, choice.heads_per_tg, 32 * choice.heads_per_tg}
+      : kNaxBaseline;
+}
+
+inline constexpr NaxConfig nax_config_for_pipeline(
+    NaxConfig cfg, size_t max_threads) {
+  return cfg.HEADS_PER_TG > 1 && static_cast<size_t>(cfg.NUM_THREADS) > max_threads
+      ? kNaxBaseline : cfg;
+}
+
 inline std::string tiled_name(
     const std::string& dtype, int head_size, int block_size, TileConfig cfg) {
   return "paged_attention_tiled_" + dtype +
@@ -80,10 +212,14 @@ inline size_t tiled_shared_bytes(
 }
 
 inline std::string nax_name(
-    const std::string& dtype, int head_size, int block_size) {
-  return "paged_attention_nax_" + dtype +
+    const std::string& dtype, int head_size, int block_size,
+    NaxConfig cfg = kNaxBaseline) {
+  std::string name = "paged_attention_nax_" + dtype +
       "_hs" + std::to_string(head_size) +
       "_bs" + std::to_string(block_size);
+  if (cfg.HEADS_PER_TG > 1)
+    name += cfg.HEADS_PER_TG == 6 ? "_gqa6_full" : "_gqa6_sub_full";
+  return name;
 }
 
 // Engage the split while the base decode grid (num_q_heads * num_seqs) stays
