@@ -271,6 +271,13 @@ class PagedStateCache:
         arrays.extend(p for p in self.pending_conv_states if p is not None)
         arrays.extend(self.recurrent_states)
         arrays.extend(p for p in self.pending_recurrent_states if p is not None)
+        if self.spec_verify_stash is not None:
+            # Materialize compact gathers with the forward so they release
+            # their full-batch inputs before acceptance, even on full accept.
+            for layer in self.spec_verify_stash.layers:
+                arrays.extend(
+                    (layer.q, layer.k, layer.v, layer.g, layer.beta, layer.mixed_qkv)
+                )
         return arrays
 
     def _scatter_rows(self, pool: mx.array, rows: mx.array, ids: mx.array) -> mx.array:

@@ -2113,9 +2113,7 @@ class MetalModelRunner:
         if isinstance(hybrid_runtime, HybridPagedAttentionRuntime):
             state_cache = hybrid_runtime.state_cache
             if state_cache.spec_verify_stash is not None:
-                committed_rows = [len(ids) for ids in decode_token_ids] + [
-                    len(pr.token_ids) for pr in prefill_reqs
-                ]
+                committed_rows = [len(ids) for ids in decode_token_ids]
                 apply_spec_decode_acceptance(
                     state_cache, GDNLazyKernels.shared(), committed_rows
                 )
