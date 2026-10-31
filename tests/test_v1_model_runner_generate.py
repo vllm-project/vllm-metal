@@ -20,7 +20,6 @@ from vllm.v1.core.sched.output import (
     SchedulerOutput,
 )
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
-from vllm.v1.sample.sampler import Sampler
 
 import vllm_metal.attention.impls.mm_prefix as mm_prefix_module
 import vllm_metal.envs as metal_envs
@@ -39,6 +38,7 @@ from vllm_metal.distributed.pipeline import PipelineGroup
 from vllm_metal.v1.draft_model_proposer import DraftModelProposer
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPDraftSeed
 from vllm_metal.v1.proposer import Gemma4MTPProposer
+from vllm_metal.v1.sampling import Sampler
 from vllm_metal.v1.sampling_batch import _SamplingResult
 from vllm_metal.v1.spec_decode import PagedDecodeSegment
 

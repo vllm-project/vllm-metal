@@ -83,7 +83,9 @@ def compute_topk_scores(
     max_per_req_token_ids=0,
     logits_mode=False,
 ):
-    from vllm.v1.sample.sampler import Sampler
+    # TODO(M4): switch the MPS shim to upstream's gpu/sample stack once
+    # pluggable MRV2 components land (vllm#52719 / RFC vllm#51212).
+    from vllm_metal.v1.sampling import Sampler
 
     # Explicit-token and prompt logprobs remain rejected by validate_request.
     assert max_per_req_token_ids == 0
