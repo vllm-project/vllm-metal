@@ -148,37 +148,6 @@ class PromptLogprobsTracker:
             self._in_progress.pop(req_id, None)
 
 
-def full_prompt_logprobs(
-    logits_rows: mx.array,
-    prompt_token_ids: list[int],
-    num_logprobs: int,
-    logprobs_mode: str,
-) -> LogprobsTensors:
-    """One-shot prompt logprobs when the whole prompt ran in one forward.
-
-    ``logits_rows`` holds one row per prompt position. Rows past the scored
-    positions are ignored; the last row predicts the first sampled token.
-    """
-    prompt_len = len(prompt_token_ids)
-    window = prompt_logprobs_window(
-        start_pos=0, num_tokens=prompt_len, prompt_len=prompt_len
-    )
-    num_logprobs = _resolve_num_logprobs(num_logprobs, int(logits_rows.shape[-1]))
-    accumulator = PromptLogprobsAccumulator(
-        prompt_len=prompt_len, num_logprobs=num_logprobs
-    )
-    if window.num_logits > 0:
-        targets = prompt_token_ids[1 : 1 + window.num_logits]
-        chunk = gather_prompt_logprobs(
-            logits_rows[: window.num_logits],
-            targets,
-            num_logprobs,
-            logprobs_mode=logprobs_mode,
-        )
-        accumulator.fill(window, chunk)
-    return accumulator.tensors
-
-
 def _resolve_num_logprobs(num_logprobs: int, vocab_size: int) -> int:
     return vocab_size if num_logprobs == -1 else num_logprobs
 
