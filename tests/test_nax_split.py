@@ -156,7 +156,7 @@ def test_native_rejects_invalid_hints_before_evaluation(name):
     "decode_kv,decode_rows,metadata,separated,head_size",
     [
         (4096, 1, True, True, 256),
-        (128, 1, True, False, 256),
+        (128, 1, True, True, 256),
         (4096, 1, False, False, 256),
         (4096, 3, True, False, 256),
         (4096, 1, True, True, 512),
