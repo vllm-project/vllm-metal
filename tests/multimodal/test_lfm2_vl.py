@@ -14,6 +14,7 @@ from vllm_metal.compat import ensure_lfm2_vl_torch_outputs
 from vllm_metal.multimodal import MultiModalFeatureSpec, PlaceholderRange
 from vllm_metal.multimodal.lfm2_vl import Lfm2VlMultimodalAdapter
 from vllm_metal.v1 import model_lifecycle
+from vllm_metal.v1.model_adapter import DefaultModelAdapter
 
 
 @pytest.fixture
@@ -127,7 +128,7 @@ def test_model_load_preserves_processor_pixels_in_requested_format(
             revision=None, hf_config=SimpleNamespace(model_type=model_type)
         )
     )
-    lifecycle = model_lifecycle.ModelLifecycle(runner, Mock())
+    lifecycle = model_lifecycle.ModelLifecycle(runner, DefaultModelAdapter())
     assert lifecycle._load_generation_model("lfm2-checkpoint", is_vlm=True) is model
     pixels = processor(return_tensors=tensor_type)["pixel_values"]
     if tensor_type == "pt":

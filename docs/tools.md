@@ -9,6 +9,7 @@ python tools/check_parity.py --model Qwen/Qwen3-0.6B
 VLLM_METAL_BACKEND=mps PYTORCH_ENABLE_MPS_FALLBACK=0 \
   python tools/check_parity.py --model Qwen/Qwen3-0.6B --top-k 5
 python tools/check_parity.py --model /path/to/checkpoint --top-k 5 --batch-size 1 2 --output-dir parity-results
+python tools/check_parity.py --model LiquidAI/LFM3-1.7B-MLX-4bit --reference-backend mlx-vlm --trust-remote-code --top-k 5
 ```
 
 The tool generates the native MLX reference once and exits that process before starting one `vllm serve` instance. It checks `/health`, compares individual prompts and pairs of prompts through `/v1/completions`, then stops the server. The server's sequence limit is the largest requested batch size, and prefix caching is disabled. Each pair is submitted in one HTTP request. These are request batch sizes, not assertions about the actual GPU batch size. Both backends use the same checkpoint and input token IDs. MPS serving disables PyTorch's optional CPU fallback.

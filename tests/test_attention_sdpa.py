@@ -1921,6 +1921,66 @@ class TestApplyGProjGate:
         assert mx.allclose(result, expected, atol=1e-6).item()
 
 
+class TestLfm3Attention:
+    @pytest.mark.parametrize("layer_type", ["full_attention", "sliding_attention"])
+    @pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
+    def test_prefill_and_decode_match_native_head_gating(self, layer_type, dtype):
+        from mlx_vlm.models.base import create_attention_mask
+        from mlx_vlm.models.cache import KVCache, RotatingKVCache
+        from mlx_vlm.models.lfm3.config import ModelConfig
+        from mlx_vlm.models.lfm3.language import Attention
+
+        mx.random.seed(0)
+        window = 4 if layer_type == "sliding_attention" else -1
+        config = ModelConfig(
+            hidden_size=128,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=64,
+            num_hidden_layers=1,
+            layer_types=[layer_type],
+            sliding_window=4,
+        )
+        attention = Attention(config, layer_type)
+        attention.set_dtype(dtype)
+        reference_cache = RotatingKVCache(max_size=4) if window > 0 else KVCache()
+        cache = MetalPagedKVCache(
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=64,
+            num_blocks=1,
+            block_size=16,
+            dtype=dtype,
+            sliding_window_per_layer=[window],
+        )
+        offset = 0
+        for length in (6, 1):
+            x = mx.random.normal((1, length, 128)).astype(dtype)
+            mask = create_attention_mask(
+                x, reference_cache, window_size=window if window > 0 else None
+            )
+            expected = attention(x, mask=mask, cache=reference_cache)
+            context = PagedAttentionContext(
+                slot_mapping=list(range(offset, offset + length)),
+                block_tables=[[0]],
+                context_lens=[offset + length],
+                offsets=[offset],
+                cu_seqlens=[0, length],
+            )
+            actual, _ = sdpa_forward(
+                attention,
+                x,
+                context,
+                cache,
+                layer_idx=0,
+                attention_contract=attention_contract_for(attention),
+            )
+            mx.eval(actual, expected)
+            tolerance = 1e-2 if dtype == mx.bfloat16 else 2e-5
+            assert mx.allclose(actual, expected, atol=tolerance, rtol=tolerance).item()
+            offset += length
+
+
 class TestPhiAttention:
     """Phi-1/1.5 (``mlx_lm.models.phi``) reaches the paged kernel.
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Compare greedy serving with mlx-lm.
+"""Compare greedy serving with a native MLX reference.
 
 Generate one native reference, then compare individual and batched requests.
 Speculative modes observe target verification in isolated engine workers;
@@ -43,11 +43,10 @@ def mlx_generate(
     max_tokens: int,
     top_k: int | None = None,
     trust_remote_code: bool = False,
+    reference_backend: str = "mlx-lm",
 ) -> list[dict]:
     import mlx.core as mx
     import numpy as np
-    from mlx_lm import load
-    from mlx_lm.generate import generate_step
     from mlx_lm.sample_utils import make_sampler
 
     from vllm_metal.compat import (
@@ -58,9 +57,22 @@ def mlx_generate(
     _patch_transformers_exaone4_config()
     _patch_mlx_lm_minicpm4_model_type()
     # Mirror the server, which passes the setting to the tokenizer only.
-    model, tokenizer = load(
-        model_path, tokenizer_config={"trust_remote_code": trust_remote_code}
-    )
+    if reference_backend == "mlx-vlm":
+        from mlx_vlm.generate.ar import generate_step
+        from mlx_vlm.utils import load_model
+        from transformers import AutoTokenizer
+
+        model = load_model(Path(model_path))
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_path, trust_remote_code=trust_remote_code
+        )
+    else:
+        from mlx_lm import load
+        from mlx_lm.generate import generate_step
+
+        model, tokenizer = load(
+            model_path, tokenizer_config={"trust_remote_code": trust_remote_code}
+        )
     results = []
     for prompt in prompts:
         input_ids = tokenizer.encode(prompt)
@@ -68,15 +80,29 @@ def mlx_generate(
             raise ValueError("The prompt must encode to at least one token.")
         tokens = []
         top_logprobs = []
-        for token, logprobs in generate_step(
-            mx.array(input_ids),
-            model,
-            max_tokens=max_tokens,
-            sampler=make_sampler(temp=0),
-        ):
+        if reference_backend == "mlx-vlm":
+            steps = generate_step(
+                mx.array([input_ids]),
+                model,
+                pixel_values=None,
+                mask=None,
+                max_tokens=max_tokens,
+                temperature=0.0,
+                repetition_penalty=1.0,
+                top_k=0,
+                top_p=1.0,
+            )
+        else:
+            steps = generate_step(
+                mx.array(input_ids),
+                model,
+                max_tokens=max_tokens,
+                sampler=make_sampler(temp=0),
+            )
+        for token, logprobs in steps:
             tokens.append(int(token))
             if top_k is not None:
-                scores = np.array(logprobs.astype(mx.float32))
+                scores = np.array(logprobs.astype(mx.float32)).reshape(-1)
                 indices = np.argsort(-scores, kind="stable")[:top_k]
                 top_logprobs.append(
                     [
@@ -190,6 +216,7 @@ def check_parity(
     additional_config: str | None = None,
     trust_remote_code: bool = False,
     speculative_config: dict | None = None,
+    reference_backend: str = "mlx-lm",
 ) -> bool:
     """Generate one reference, then compare every request batch size on one server."""
     if not prompts or not batch_sizes or min(batch_sizes) < 1:
@@ -216,7 +243,7 @@ def check_parity(
     env.setdefault("GLOO_SOCKET_IFNAME", "lo0")
     reference_path = output_dir / "reference.json"
     reference_path.write_text(json.dumps(prompts))
-    print("Generating native mlx-lm reference...", flush=True)
+    print(f"Generating native {reference_backend} reference...", flush=True)
     with (output_dir / "reference.log").open("w") as log:
         subprocess.run(
             [
@@ -226,6 +253,8 @@ def check_parity(
                 model,
                 "--max-tokens",
                 str(max_tokens),
+                "--reference-backend",
+                reference_backend,
                 "--generate-reference",
                 str(reference_path),
             ]
@@ -257,14 +286,25 @@ def check_parity(
             log_path = output_dir / f"batch-{size}.log"
             with log_path.open("w") as log, redirect_stdout(log):
                 comparison = parity_report(
-                    reference, outputs, max_tokens=max_tokens, top_k=top_k
+                    reference,
+                    outputs,
+                    max_tokens=max_tokens,
+                    top_k=top_k,
+                    labels=(reference_backend, "metal"),
                 )
             report = log_path.read_text()
             print(report, end="")
             counts = comparison["counts"]
             matched = comparison["passed"]
             (output_dir / f"batch-{size}.json").write_text(
-                json.dumps({"outputs": outputs, "comparison": comparison}, indent=2)
+                json.dumps(
+                    {
+                        "reference_backend": reference_backend,
+                        "outputs": outputs,
+                        "comparison": comparison,
+                    },
+                    indent=2,
+                )
             )
             with summary.open("a") as output:
                 print(
@@ -299,6 +339,12 @@ def http_generate(
                     "model": model,
                     "prompt": input_ids[0] if len(batch) == 1 else input_ids,
                     "temperature": 0,
+                    "top_p": 1.0,
+                    "top_k": -1,
+                    "min_p": 0.0,
+                    "repetition_penalty": 1.0,
+                    "presence_penalty": 0.0,
+                    "frequency_penalty": 0.0,
                     "max_tokens": max_tokens,
                     "ignore_eos": True,
                     "logprobs": top_k,
@@ -359,6 +405,12 @@ def main() -> None:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("--model", required=True)
+    parser.add_argument(
+        "--reference-backend",
+        choices=["mlx-lm", "mlx-vlm"],
+        default="mlx-lm",
+        help="Native text-generation reference (default: mlx-lm)",
+    )
     parser.add_argument(
         "--prompt",
         action="append",
@@ -435,6 +487,8 @@ def main() -> None:
     ):
         parser.error("--speculative-config must be a JSON object")
     if args.method is not None:
+        if args.reference_backend != "mlx-lm":
+            parser.error("--method requires the mlx-lm reference backend")
         if args.speculative_config is not None:
             parser.error("--method cannot be combined with --speculative-config")
         if os.environ.get("VLLM_METAL_BACKEND", "mlx") != "mlx":
@@ -467,7 +521,12 @@ def main() -> None:
     if args.generate_reference:
         prompts = json.loads(args.generate_reference.read_text())
         reference = mlx_generate(
-            args.model, prompts, args.max_tokens, args.top_k, args.trust_remote_code
+            args.model,
+            prompts,
+            args.max_tokens,
+            args.top_k,
+            args.trust_remote_code,
+            args.reference_backend,
         )
         args.generate_reference.write_text(json.dumps(reference))
         return
@@ -483,6 +542,7 @@ def main() -> None:
         args.additional_config,
         args.trust_remote_code,
         speculative_config=args.speculative_config,
+        reference_backend=args.reference_backend,
     )
     raise SystemExit(0 if passed else 1)
 

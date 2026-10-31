@@ -17,7 +17,7 @@ from vllm.v1.core.kv_cache_utils import (
     get_kv_cache_config_from_groups,
     get_kv_cache_groups,
 )
-from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
+from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec, SlidingWindowSpec
 
 from tests.stub_runner import make_cache_config, make_stub_runner
 from vllm_metal.config import MetalConfig
@@ -86,20 +86,21 @@ def _ordinary_paged_cache(monkeypatch):
 
 
 def _runner(model, *, mode="align", cache_dtype="auto"):
+    args = getattr(model, "args", None) or model.config
     runner = make_stub_runner(
         model=model,
-        model_args=asdict(model.args),
+        model_args=asdict(args),
         is_hybrid=True,
         kv_cache_dtype=mx.bfloat16,
         model_config=SimpleNamespace(
             is_hybrid=True,
             model_impl="vllm",
             registry=ModelRegistry,
-            architecture=(
-                "Lfm2ForCausalLM"
-                if model.args.model_type == "lfm2"
-                else "Lfm2MoeForCausalLM"
-            ),
+            architecture={
+                "lfm2": "Lfm2ForCausalLM",
+                "lfm2_moe": "Lfm2MoeForCausalLM",
+                "lfm3": "Lfm3ForCausalLM",
+            }[args.model_type],
             dtype=torch.bfloat16,
         ),
         cache_config=make_cache_config(
@@ -115,6 +116,39 @@ def _runner(model, *, mode="align", cache_dtype="auto"):
     )
     ModelLifecycle(runner, runner._model_adapter).resolve_model_dims()
     return runner
+
+
+def test_lfm3_scheduler_preserves_conv_sliding_and_full_attention():
+    """The tri-hybrid model must retain all three kinds of scheduler state."""
+    from mlx_vlm.models.lfm3 import Model, ModelConfig
+
+    from vllm_metal.compat import register_model_compat
+
+    register_model_compat()
+    model = Model(
+        ModelConfig(
+            vocab_size=32,
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=3,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=32,
+            layer_types=["conv", "full_attention", "sliding_attention"],
+            sliding_window=32,
+        )
+    )
+    runner = _runner(model)
+    info, _ = ModelRegistry.inspect_model_cls(
+        "Lfm3ForCausalLM", model_config=runner.model_config
+    )
+    assert info.is_hybrid and info.has_inner_state
+    specs = runner.get_kv_cache_spec()
+    assert isinstance(specs["layers.0.conv"], MambaSpec)
+    assert specs["layers.0.conv"].shapes == ((6, 64),)
+    assert isinstance(specs["layers.1.self_attn"], FullAttentionSpec)
+    assert isinstance(specs["layers.2.self_attn"], SlidingWindowSpec)
+    assert specs["layers.2.self_attn"].sliding_window == 32
 
 
 @pytest.mark.parametrize("mode", ["none", "align"])

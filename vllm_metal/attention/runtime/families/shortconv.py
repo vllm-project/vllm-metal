@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""LFM2 / LFM2.5 ShortConv state family, including the MoE variants."""
+"""LFM ShortConv state family, including MoE and sliding-attention variants."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from vllm_metal.attention.runtime.hybrid_plan import (
     StateFamilySpec,
 )
 
-SHORTCONV_MODEL_TYPES = frozenset({"lfm2", "lfm2_moe"})
+SHORTCONV_MODEL_TYPES = frozenset({"lfm2", "lfm2_moe", "lfm3"})
 
 SHORTCONV_FAMILY = StateFamilySpec(
     label="shortconv",
@@ -52,16 +52,17 @@ def build_shortconv_hybrid_plan(
         ]
     if len(layer_types) != num_layers:
         raise ValueError("ShortConv layer_types must contain one entry per model layer")
-    unsupported = set(layer_types) - {"conv", "full_attention"}
+    attention_types = {"full_attention", "sliding_attention"}
+    unsupported = set(layer_types) - {"conv", *attention_types}
     if unsupported:
         raise ValueError(f"Unsupported ShortConv layer_types: {sorted(unsupported)}")
-    if set(layer_types) != {"conv", "full_attention"}:
+    if "conv" not in layer_types or not (set(layer_types) & attention_types):
         raise ValueError(
             "ShortConv hybrid requires both attention and convolution layers"
         )
     attention_indices = model_args.get("full_attn_idxs")
     if attention_indices is not None and set(attention_indices) != {
-        i for i, role in enumerate(layer_types) if role == "full_attention"
+        i for i, role in enumerate(layer_types) if role in attention_types
     }:
         # mlx-lm constructs layers from full_attn_idxs when both are present.
         # Do not report a different state/KV topology to the scheduler.
@@ -75,7 +76,7 @@ def build_shortconv_hybrid_plan(
     return HybridRuntimePlan(
         layers=HybridLayerPlan(
             layer_roles=tuple(
-                ATTENTION_LAYER if role == "full_attention" else STATE_LAYER
+                ATTENTION_LAYER if role in attention_types else STATE_LAYER
                 for role in layer_types
             )
         ),

@@ -3,6 +3,7 @@
 
 from dataclasses import dataclass
 from enum import Enum, auto
+from typing import Literal
 
 
 class QKNormPlacement(Enum):
@@ -29,13 +30,14 @@ class AttentionContract:
     scaleless_qk_norm: bool = False
     shared_qk_norm: bool = False
     post_norm_query_scale: bool = False
-    sigmoid_output_gate: bool = False
+    sigmoid_output_gate: Literal["elementwise", "per_head"] | None = None
     # Module attribute holding learned per-head attention sinks, if any.
     sinks_attr: str = "sinks"
 
 
 DEFAULT_ATTENTION_CONTRACT = AttentionContract()
 _ATTENTION_CONTRACTS: dict[str, AttentionContract] = {
+    "mlx_vlm.models.lfm3.language": AttentionContract(sigmoid_output_gate="per_head"),
     "mlx_lm.models.hunyuan_v1_dense": AttentionContract(
         qk_norm_placement=QKNormPlacement.AFTER_ROPE
     ),
@@ -62,13 +64,13 @@ _ATTENTION_CONTRACTS: dict[str, AttentionContract] = {
     "mlx_lm.models.muse_glimmer": AttentionContract(
         scaleless_qk_norm=True,
         post_norm_query_scale=True,
-        sigmoid_output_gate=True,
+        sigmoid_output_gate="elementwise",
     ),
     # VLLM_METAL_MULTIMODAL_MODE=multimodal-native loads mlx-vlm's port.
     "mlx_vlm.models.muse_glimmer.language": AttentionContract(
         shared_qk_norm=True,
         post_norm_query_scale=True,
-        sigmoid_output_gate=True,
+        sigmoid_output_gate="elementwise",
     ),
 }
 

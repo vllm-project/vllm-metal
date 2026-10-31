@@ -263,6 +263,11 @@ class MultimodalRuntimeAdapter(Protocol):
 class ModelAdapter(Protocol):
     """Model-specific hooks used by runner and cache orchestration."""
 
+    def generation_model_provider(
+        self, hf_config: Any, *, is_multimodal: bool
+    ) -> Literal["mlx-lm", "mlx-vlm"]:
+        """Choose model definitions independently of accepted input modalities."""
+
     def multimodal_backbone_mode(
         self, model_config: ModelConfig, *, speculative_config: Any | None = None
     ) -> BackboneMode:
@@ -435,6 +440,13 @@ _LFM2_VL_ARCHITECTURES: frozenset[str] = frozenset({"Lfm2VlForConditionalGenerat
 
 class DefaultModelAdapter(ModelAdapter):
     """Default adapter implementation for known model quirks."""
+
+    def generation_model_provider(
+        self, hf_config: Any, *, is_multimodal: bool
+    ) -> Literal["mlx-lm", "mlx-vlm"]:
+        if is_multimodal or getattr(hf_config, "model_type", None) == "lfm3":
+            return "mlx-vlm"
+        return "mlx-lm"
 
     def _multimodal_mode(self) -> str:
         from vllm_metal.config import get_config

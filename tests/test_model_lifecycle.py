@@ -230,7 +230,9 @@ def _make_lifecycle(
 
 class TestModelLifecycle:
     @pytest.mark.parametrize("revision", [None, "release-tag", "a" * 40])
-    @pytest.mark.parametrize("backend", ["text", "vlm", "awq", "pooling", "offload"])
+    @pytest.mark.parametrize(
+        "backend", ["text", "vlm", "lfm3", "awq", "pooling", "offload"]
+    )
     def test_generation_loads_only_weights_at_requested_revision(
         self, monkeypatch: pytest.MonkeyPatch, revision: str | None, backend: str
     ) -> None:
@@ -251,12 +253,16 @@ class TestModelLifecycle:
                 model="org/model",
                 revision=revision,
                 is_multimodal_model=backend == "vlm",
+                hf_config=SimpleNamespace(model_type="lfm3")
+                if backend == "lfm3"
+                else None,
             )
         )
         runner._is_pooling = backend == "pooling"
         resolve_path = Mock(return_value="resolved/model")
         monkeypatch.setattr(model_lifecycle, "get_model_download_path", resolve_path)
         request = GenerationLoadRequest.from_runner(runner, _mode_adapter("native"))
+        assert request.is_vlm is (backend == "vlm")
         if backend == "offload":
             monkeypatch.setattr(
                 model_lifecycle,
@@ -282,7 +288,8 @@ class TestModelLifecycle:
             )
         else:
             download.assert_called_once_with("resolved/model", revision=revision)
-            (loader if backend == "vlm" else weights_loader).assert_called_once_with(
+            selected_loader = loader if backend in {"vlm", "lfm3"} else weights_loader
+            selected_loader.assert_called_once_with(
                 Path("cached-model"), lazy=backend == "offload"
             )
         if backend == "offload":
@@ -290,7 +297,7 @@ class TestModelLifecycle:
                 model, "resolved/model", revision, 4096
             )
             assert runner._expert_store is install_experts.return_value
-        if backend != "vlm":
+        if backend not in {"vlm", "lfm3"}:
             detect_awq.assert_called_once_with("resolved/model", revision=revision)
 
     def test_private_mlx_lm_compatible_model_path_adapts_indexed_custom_shards(

@@ -115,6 +115,9 @@ class TestParityTool:
             assert payload["ignore_eos"] and payload["return_token_ids"]
             assert payload["return_tokens_as_token_ids"]
             assert payload["temperature"] == 0
+            assert payload["repetition_penalty"] == 1.0
+            assert payload["presence_penalty"] == payload["frequency_penalty"] == 0.0
+            assert payload["top_k"] == -1 and payload["top_p"] == 1.0
             sent.append(payload["prompt"])
             prompts = payload["prompt"]
             if isinstance(prompts[0], int):
@@ -282,8 +285,10 @@ class TestParityTool:
             batch_sizes=(1,),
             output_dir=tmp_path,
             trust_remote_code=True,
+            reference_backend="mlx-vlm",
         )
         assert "--trust-remote-code" in commands[0]
+        assert commands[0][commands[0].index("--reference-backend") + 1] == "mlx-vlm"
         assert trusted == [True]
 
     def test_trust_remote_code_is_rejected_with_speculative_method(
