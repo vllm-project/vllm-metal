@@ -1570,26 +1570,28 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
     // turn 0 * inf into NaN, stay unread here too).
     const int block_max_valid =
         MIN(BLOCK_SIZE, max_row_context_len - block_start_token);
+    // Each lane computes one token's weight per row. Broadcast it below
+    // instead of repeating exp2 in every lane, keeping the token-by-token
+    // accumulation order identical to the per-token dispatch.
+    static_assert(BLOCK_SIZE <= NUM_SIMD_LANES);
+    float lane_weights[PA_WINDOW_ROWS];
+#pragma unroll
+    for (int r = 0; r < rows_per_tg; r++) {
+      lane_weights[r] = 0.f;
+      const int row_valid_tokens =
+          MIN(BLOCK_SIZE, effective_context_len + r - block_start_token);
+      // A fully masked row keeps the -FLT_MAX sentinel. Its weights must
+      // remain zero: exp2(-FLT_MAX - -FLT_MAX) would otherwise produce 1.
+      if (r < num_rows && lane < row_valid_tokens && warp_m[r] != -FLT_MAX) {
+        const float score = warp_scores[r * BLOCK_SIZE + lane];
+        lane_weights[r] = exp2(score - warp_m[r]);
+      }
+    }
     for (int tok = 0; tok < block_max_valid; tok++) {
       float w[PA_WINDOW_ROWS];
 #pragma unroll
       for (int r = 0; r < rows_per_tg; r++) {
-        if (r >= num_rows) {
-          w[r] = 0.f;
-          continue;
-        }
-        const int row_valid_tokens =
-            MIN(BLOCK_SIZE, effective_context_len + r - block_start_token);
-        if (tok >= row_valid_tokens) {
-          w[r] = 0.f;
-          continue;
-        }
-        const float score = warp_scores[r * BLOCK_SIZE + tok];
-        // warp_m[r] == -FLT_MAX means step 2 skipped this row (block wholly
-        // left of its window): every score here is masked, emit 0 rather
-        // than exp2(-FLT_MAX - -FLT_MAX) = 1 (and keep w == 0 so the V
-        // accumulate below never touches a ±inf cache element).
-        w[r] = (warp_m[r] == -FLT_MAX) ? 0.f : exp2(score - warp_m[r]);
+        w[r] = simd_shuffle(lane_weights[r], tok);
         warp_l[r] += w[r];
       }
 
