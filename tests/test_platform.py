@@ -378,8 +378,19 @@ class TestMetalPlatform:
             model_config=SimpleNamespace(enable_sleep_mode=True),
             speculative_config=SimpleNamespace(method="draft_model"),
         )
-        with pytest.raises(NotImplementedError, match="only n-gram"):
+        with pytest.raises(NotImplementedError, match="only n-gram and suffix"):
             MetalPlatform.check_and_update_config(vllm_config)
+
+    @pytest.mark.parametrize("method", ["ngram", "suffix"])
+    def test_check_and_update_config_allows_sleep_mode_with_kv_free_drafting(
+        self, method: str
+    ) -> None:
+        vllm_config = self._platform_config(
+            model_config=SimpleNamespace(enable_sleep_mode=True),
+            speculative_config=SimpleNamespace(method=method),
+        )
+        # The sleep gate alone; the full check needs a complete spec config.
+        MetalPlatform._check_sleep_mode_config(vllm_config, "mlx")
 
     def test_check_and_update_config_rejects_sleep_mode_on_mps(
         self, monkeypatch: pytest.MonkeyPatch

@@ -1174,9 +1174,15 @@ class MetalPlatform(Platform):
                 f"(VLLM_METAL_BACKEND={backend!r})."
             )
         speculative_config = vllm_config.speculative_config
-        if speculative_config is not None and speculative_config.method != "ngram":
+        # n-gram and suffix keep no KV of their own (suffix trees are host
+        # memory keyed by token ids), so freeing the target KV covers them.
+        if speculative_config is not None and speculative_config.method not in (
+            "ngram",
+            "suffix",
+        ):
             raise NotImplementedError(
-                "Sleep mode on Metal supports only n-gram speculative decoding, "
+                "Sleep mode on Metal supports only n-gram and suffix "
+                "speculative decoding, "
                 f"got method={speculative_config.method!r}."
             )
 

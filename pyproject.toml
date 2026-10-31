@@ -133,5 +133,6 @@ asyncio_mode = "auto"
 # fast loop (CI already does this).
 markers = [
     "slow: opt-in performance or long-running tests",
+    "suffix: tests using the optional Arctic suffix backend",
     "network: tests that download from Hugging Face",
 ]

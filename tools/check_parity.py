@@ -390,7 +390,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--method",
-        choices=["dflash", "dspark", "draft_model"],
+        choices=["dflash", "dspark", "draft_model", "suffix"],
         help="Compare speculative serving with native MLX and target-only serving",
     )
     parser.add_argument(
@@ -410,7 +410,15 @@ def main() -> None:
     )
     parser.add_argument(
         "--worker",
-        choices=["native", "target", "dflash", "dspark", "draft_model", "replay"],
+        choices=[
+            "native",
+            "target",
+            "dflash",
+            "dspark",
+            "draft_model",
+            "suffix",
+            "replay",
+        ],
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
