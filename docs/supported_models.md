@@ -55,6 +55,7 @@ unsupported; leave `--video-pruning-rate` unset.
 | PaddleOCR-VL | 🔵 | | native multimodal paged generation | image input, no video | `PaddlePaddle/PaddleOCR-VL-1.6` |
 | LFM2-VL / LFM2.5-VL | 🔵 | | native multimodal paged generation on the ShortConv text tower | image input, no video; one tile grid plus thumbnail per image; needs a checkpoint packaged for Transformers, which the MLX conversions are not | `LiquidAI/LFM2.5-VL-1.6B` |
 | Gemma 4 | 🔵 | | mlx_lm text backbone + mlx-vlm encoder sidecar, paged generation | image input; audio and video input on E2B/E4B; bidirectional attention inside image blocks on sliding-window layers | `mlx-community/unsloth-gemma-4-26B-A4B-it-qat-oQ4`, `mlx-community/gemma-4-e2b-it-4bit` (audio, video) |
+| GLM-5.3-Flash | 🟡 | | native multimodal paged generation | image input, no video | — |
 
 Gemma 4 keeps its text path exactly as on the text-only table (mlx_lm model,
 selective logits, intermediate forward); only `vision_tower` and `embed_vision`
@@ -106,6 +107,13 @@ load time in sidecar mode because neither image-attention path supports it: the
 tiled kernel has no TurboQuant variant, and the recompute reads K/V back from
 the paged cache unquantized.
 
+GLM-5.3-Flash images need the checkpoint's `processor_config.json`. At
+startup the engine encodes one maximal image (7,921 tokens, a few seconds),
+whose peak comes out of the KV cache. Text-only servers should pass
+`--limit-mm-per-prompt '{"image": 0}'` (`--language-model-only` fails: it
+loads mlx_lm, which has no `glm5_next`): nothing is profiled, and under
+pipeline parallelism the vision tower is never loaded.
+
 ## Text-Only Language Models
 
 Prefix caching is enabled by default where supported, as shown in the table
@@ -149,6 +157,23 @@ image input. DFlash and DSpark speculative decoding need a Qwen3 target, so
 Glimmer's DFlash assistant is not supported; n-gram and draft-model speculation
 and TurboQuant are not validated.
 
+GLM-5.3-Flash loads through mlx-vlm's `glm5_next` model. The verified checkpoint was
+converted from `zai-org/GLM-5.3-Flash-BF16` with `mlx_vlm.convert`: routed
+experts 4-bit affine (`down_proj` 5-bit), other linear layers 8-bit affine,
+group size 64, hyper-connection, indexer and vision modules unquantized. A custom
+`quant_predicate` replaces mlx-vlm's own, so it must keep that predicate's
+exclusions (`attn_hc`, `ffn_hc`, `index_kpool_compress`) and must also skip the
+vision tower.
+
+Its sparse attention layers keep vLLM's GLM-5-Next latent rows and pooled
+indexer keys (in the model dtype), with the unfinished pool's raw keys beside
+its latent block, and each step reads only the latent rows the indexer selects.
+Long prefill chunks are scored in query parts of at most 512 MiB of indexer
+scores. mlx-vlm's indexed attention kernel
+addresses at most 963 blocks of 4352 tokens per stage: a larger automatic pool
+is capped, and a larger `--num-gpu-blocks-override` is refused. Speculative
+decoding and RoPE latents are refused at startup.
+
 | Model | MLX | PyTorch MPS | Attention Kernel | Automatic Prefix Cache | Example checkpoint |
 | --- | --- | --- | --- | --- | --- |
 | Qwen3 | ✅ | 🔵 | GQA (paged) | ✅ | `Qwen/Qwen3-0.6B` |
@@ -167,6 +192,7 @@ and TurboQuant are not validated.
 | GPT-OSS | 🔵 | | Sink attention (paged) | ✅ | `openai/gpt-oss-20b` |
 | Flint | 🔵 | | GQA + per-layer sliding window + learned sinks, no RoPE on full-attention layers (paged) | ✅ | `RecursiveSI/flint-int4` |
 | Ling-3.0 Tiny | 🔵 | | Hybrid MLA + KDA (paged latent + recurrent state) | 🔵 | `inclusionAI/Ling-3.0-tiny` (BF16 or converted MXFP8) |
+| GLM-5.3-Flash | 🔵 | | Hybrid sparse NoPE MLA + KDA (paged latent + indexer + recurrent state) | 🔵 | — |
 | GLM-4.5 | Not verified | | MLA (paged latent cache, MLX SDPA — no Metal kernel) | Not verified | — |
 | MiniCPM3-4B | ✅ | | MLA (paged latent cache) | ✅ | `mlx-community/MiniCPM3-4B-4bit` |
 | MiniCPM4 | ✅ | | GQA (paged) | ✅ | `openbmb/MiniCPM4-0.5B-mlx` (needs `--trust-remote-code`) |

@@ -1872,6 +1872,31 @@ class TestNormalizeModelConfigSidecar:
         assert config.multimodal_config is None
 
 
+def test_glm5_next_keeps_the_vlm_load_and_refuses_video() -> None:
+    config = SimpleNamespace(
+        model="x",
+        revision=None,
+        trust_remote_code=False,
+        mm_processor_kwargs=None,
+        quantization=None,
+        multimodal_config=SimpleNamespace(
+            language_model_only=False, limit_per_prompt={}
+        ),
+        hf_config=SimpleNamespace(
+            model_type="glm5_next",
+            architectures=["Glm5NextForConditionalGeneration"],
+        ),
+    )
+
+    DefaultModelAdapter().normalize_model_config(config)
+
+    assert config.multimodal_config is not None
+    limits = config.multimodal_config.limit_per_prompt
+    assert "image" not in limits
+    assert isinstance(limits["video"], VideoDummyOptions)
+    assert limits["video"].count == 0
+
+
 class TestBuildMultimodalAdapterPassesBidirectionalFlag:
     def test_flag_comes_from_text_config(self, monkeypatch: pytest.MonkeyPatch) -> None:
         import vllm_metal.multimodal.gemma4 as gemma4_pkg

@@ -6,14 +6,17 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import mlx.core as mx
+import pytest
 import torch
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_utils import get_uniform_page_size
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec, MLAAttentionSpec
 
 from tests.stub_runner import (
+    initialize_glm5_next_runtime,
     make_bailing_hybrid_plan,
     make_gdn_hybrid_plan,
+    make_glm5_next_stub_runner,
     make_nemotron_hybrid_plan,
     make_stub_runner,
 )
@@ -108,7 +111,19 @@ def test_plain_attention_spec_is_unchanged() -> None:
     assert _engine_blocks(specs, metal_per_block) == POOL_BLOCKS
 
 
-def test_hybrid_spec_omits_stateless_layers() -> None:
+@pytest.mark.parametrize(
+    ("first_layer_idx", "expected"),
+    [
+        (0, {"layers.0.mixer", "layers.2.self_attn", "layers.3.mixer"}),
+        # A pipeline stage names its layers globally: vLLM merges every
+        # stage's spec by name.
+        (1, {"layers.2.self_attn", "layers.3.mixer"}),
+    ],
+    ids=["whole_model", "pipeline_stage"],
+)
+def test_hybrid_spec_omits_stateless_layers(
+    first_layer_idx: int, expected: set[str]
+) -> None:
     runner = make_stub_runner(
         model_config=SimpleNamespace(
             runner_type="generate",
@@ -116,8 +131,11 @@ def test_hybrid_spec_omits_stateless_layers() -> None:
             max_model_len=2048,
             is_hybrid=True,
         ),
-        num_layers=4,
-        hybrid_runtime_plan=make_nemotron_hybrid_plan("M-*M"),
+        num_layers=4 - first_layer_idx,
+        first_layer_idx=first_layer_idx,
+        hybrid_runtime_plan=make_nemotron_hybrid_plan("M-*M").for_layers(
+            first_layer_idx, 4
+        ),
         num_kv_heads=1,
         head_dim=128,
         kv_cache_dtype=mx.float16,
@@ -131,11 +149,7 @@ def test_hybrid_spec_omits_stateless_layers() -> None:
 
     specs = runner._cache_policy.get_kv_cache_spec()
 
-    assert set(specs) == {
-        "layers.0.mixer",
-        "layers.2.self_attn",
-        "layers.3.mixer",
-    }
+    assert set(specs) == expected
 
 
 def test_hybrid_mamba_spec_reserves_one_state_block_per_request() -> None:
@@ -203,3 +217,44 @@ def test_bailing_hybrid_emits_mla_and_kda_specs() -> None:
 
     assert isinstance(specs["layers.0.linear_attn"], MambaSpec)
     assert isinstance(specs["layers.1.self_attn"], MLAAttentionSpec)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "error"),
+    [
+        ({"qk_rope_head_dim": 64}, "qk_rope_head_dim 0"),
+        ({"indexer_types": ["full"] * 3 + ["shared"]}, "shared"),
+        ({"block_size": 34}, "multiple of index_kpool"),
+        (
+            {"speculative_config": SimpleNamespace(num_speculative_tokens=1)},
+            "speculative",
+        ),
+    ],
+    ids=[
+        "rope",
+        "shared_indexer",
+        "split_pool",
+        "speculative",
+    ],
+)
+def test_glm5_next_specs_refuse_unsupported_configs(overrides, error) -> None:
+    """What the paged sparse layout cannot serve fails loudly instead of being
+    laid out: a RoPE latent, a layer reusing another layer's top-k, a block
+    that splits a pool, and speculative decoding (rejected drafts would stay
+    in the pooled keys and tails)."""
+    runner = make_glm5_next_stub_runner(**overrides)
+
+    with pytest.raises((ValueError, NotImplementedError), match=error):
+        runner._cache_policy.get_kv_cache_spec()
+
+
+def test_glm5_next_block_bytes_match_vllms_layout() -> None:
+    """The planner sizes a block as vLLM lays out GLM-5-Next's specs: the
+    pooled keys are a KV group of their own, so a block costs the latent pages
+    alone."""
+    runner = make_glm5_next_stub_runner()
+    runtime = initialize_glm5_next_runtime(runner, 12)
+
+    assert runtime.storage.nbytes == (
+        12 * runner._cache_policy.get_cache_block_size_bytes()
+    )

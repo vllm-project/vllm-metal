@@ -136,6 +136,76 @@ def _grouping_config(block_size: int, num_blocks: int) -> SimpleNamespace:
     )
 
 
+def make_glm5_next_stub_runner(
+    *, block_size: int = 32, speculative_config: Any = None, **model_args: Any
+) -> mr.MetalModelRunner:
+    """A bf16 GLM-5-Next stage: three KDA layers, then one sparse MLA layer."""
+    from vllm_metal.attention.runtime.families.glm5_next import (
+        build_glm5_next_hybrid_plan,
+    )
+
+    model_args = {
+        "kv_lora_rank": 32,
+        "qk_rope_head_dim": 0,
+        "index_kpool": 4,
+        "index_head_dim": 16,
+        "layer_types": ["linear_attention"] * 3 + ["deepseek_sparse_attention"],
+        "linear_num_heads": 1,
+        "linear_head_dim": 4,
+        "linear_conv_kernel_dim": 2,
+        **model_args,
+    }
+    runner = make_stub_runner(
+        model_args=model_args,
+        is_hybrid=True,
+        num_layers=4,
+        hybrid_runtime_plan=build_glm5_next_hybrid_plan(
+            model_args, 4, (torch.bfloat16, torch.float32)
+        ),
+        num_kv_heads=1,
+        head_dim=model_args["kv_lora_rank"],
+        kv_cache_dtype=mx.bfloat16,
+        cache_config=SimpleNamespace(
+            block_size=block_size,
+            mamba_block_size=4096,
+            mamba_page_size_padded=None,
+            mamba_cache_mode="none",
+        ),
+    )
+    runner.vllm_config.speculative_config = speculative_config
+    return runner
+
+
+def initialize_glm5_next_runtime(runner: mr.MetalModelRunner, num_blocks: int) -> Any:
+    """The runtime that vLLM's grouping and layout build from the runner's specs."""
+    from vllm.v1.core.kv_cache_utils import (
+        get_kv_cache_config_from_groups,
+        get_kv_cache_groups,
+    )
+
+    from vllm_metal.attention.runtime.hybrid import HybridPagedAttentionRuntime
+
+    config = SimpleNamespace(
+        speculative_config=None,
+        attention_config=AttentionConfig(),
+        cache_config=make_cache_config(
+            block_size=runner.cache_config.block_size,
+            num_gpu_blocks_override=num_blocks,
+        ),
+        scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
+        parallel_config=SimpleNamespace(pipeline_parallel_size=1),
+        model_config=SimpleNamespace(is_deepseek_v4=False),
+    )
+    groups = get_kv_cache_groups(config, runner._cache_policy.get_kv_cache_spec())
+    cache = get_kv_cache_config_from_groups(config, groups, 0)
+    cache.kv_cache_layout = "LBNHC"
+    runtime = HybridPagedAttentionRuntime(
+        hybrid_plan=runner.hybrid_runtime_plan, dtype=mx.bfloat16
+    )
+    runtime.initialize_from_config(cache)
+    return runtime
+
+
 def make_cache_config(**kwargs: Any) -> CacheConfig:
     """Build a real ``CacheConfig`` with Metal's KV cache layout already resolved."""
     cache_config = CacheConfig(**kwargs)
@@ -209,6 +279,7 @@ def make_stub_runner(
         "_selective_logits_supported": False,
         "pp": None,
         "_pp_model": None,
+        "first_layer_idx": 0,
         "_model_adapter": DefaultModelAdapter(),
         "_spec_decode_controller": SpeculativeDecodeController(),
         "kv_heads_per_layer": None,

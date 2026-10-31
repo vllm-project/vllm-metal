@@ -564,9 +564,14 @@ class TestModelLifecycle:
 
         assert runner._is_vlm is True
 
+    # Under pipeline parallelism only the first stage embeds tokens, so a later
+    # stage (rank 1 of 2) builds no adapter and no encoder cache, and accepts
+    # the encoder inputs the scheduler sends every stage.
+    @pytest.mark.parametrize("pp_rank", [None, 1])
     def test_load_multimodal_native_qwen35_builds_model_adapter(
         self,
         monkeypatch: pytest.MonkeyPatch,
+        pp_rank: int | None,
     ) -> None:
         monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "multimodal-native")
         reset_config()
@@ -593,13 +598,22 @@ class TestModelLifecycle:
                 is_multimodal_model=True,
             )
         )
+        if pp_rank is not None:
+            runner.pp = PipelineGroup(
+                SimpleNamespace(rank=lambda: pp_rank, size=lambda: 2)
+            )
 
         lifecycle.load()
 
         assert runner._is_vlm is True
-        assert isinstance(runner._multimodal_adapter, Qwen3VLMultimodalAdapter)
-        assert runner._multimodal_adapter.text_model() is language_model
-        assert isinstance(runner.encoder_cache, EncoderCache)
+        if pp_rank is None:
+            assert isinstance(runner._multimodal_adapter, Qwen3VLMultimodalAdapter)
+            assert runner._multimodal_adapter.text_model() is language_model
+            assert isinstance(runner.encoder_cache, EncoderCache)
+        else:
+            assert runner._multimodal_adapter is None
+            assert runner.encoder_cache is None
+            runner._reject_scheduled_encoder_inputs({"req-0": [0]})
 
     def test_load_generic_vlm_leaves_model_adapter_unset(
         self,
@@ -1456,6 +1470,20 @@ class TestResolveModelDims:
                     "kv_lora_rank": 256,
                 },
                 256 + MLA_DEFAULT_QK_ROPE_HEAD_DIM,
+            ),
+            (
+                # GLM-5-Next: the NoPE latent alone; the pooled indexer keys
+                # have specs of their own.
+                {
+                    "num_hidden_layers": 45,
+                    "num_attention_heads": 64,
+                    "hidden_size": 4096,
+                    "kv_lora_rank": 512,
+                    "qk_rope_head_dim": 0,
+                    "index_head_dim": 128,
+                    "index_kpool": 4,
+                },
+                512,
             ),
         ],
     )

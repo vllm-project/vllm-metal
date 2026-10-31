@@ -14,12 +14,15 @@ from mlx_lm.models.base import scaled_dot_product_attention
 
 import vllm_metal.attention.runtime.mla as mla_runtime
 from tests.stub_runner import (
+    initialize_glm5_next_runtime,
     initialize_hybrid_runtime,
     initialize_mla_runtime,
     make_bailing_hybrid_plan,
+    make_glm5_next_stub_runner,
 )
 from vllm_metal.attention import context as pac
 from vllm_metal.attention.caches.mla_cache import MLAPagedLatentCache
+from vllm_metal.attention.impls.dsa import DSAPagedAttentionWrapper, query_parts
 from vllm_metal.attention.impls.mla import MLAPagedAttentionWrapper
 from vllm_metal.attention.runtime.hybrid import HybridPagedAttentionRuntime
 from vllm_metal.attention.runtime.mla import MLAPagedAttentionRuntime
@@ -1084,3 +1087,320 @@ class TestMLAPerForwardMetadata:
         assert meta_b is not meta_a
         assert meta_b.slot_mapping is not meta_a.slot_mapping
         assert meta_b.slot_mapping.tolist() == [7]
+
+
+# ---------------------------------------------------------------------------
+# GLM-5-Next sparse MLA on vLLM's paged latent and pooled-key caches.
+# The layer cases run against mlx-vlm's own layer, indexer and caches.
+# ---------------------------------------------------------------------------
+
+_GLM_HIDDEN = 64
+_GLM_LATENT = 32
+_GLM_INDEX_DIM = 16
+
+
+def _glm5_next_layer(*, kpool: int = 4, ties: bool = False) -> nn.Module:
+    """A tiny bf16 GLM-5-Next sparse attention layer, in inference mode as
+    mlx-vlm's loader returns it. Its widths are multiples of 32, so mlx-vlm's
+    prefill takes its indexed kernel. ``ties`` zeroes the head weights, so
+    every pool scores exactly 0."""
+    from mlx_vlm.models.glm5_next.config import TextConfig
+    from mlx_vlm.models.glm5_next.language import Glm5NextAttention
+
+    mx.random.seed(0)
+    config = TextConfig(
+        hidden_size=_GLM_HIDDEN,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        q_lora_rank=32,
+        kv_lora_rank=_GLM_LATENT,
+        qk_nope_head_dim=32,
+        qk_head_dim=32,
+        v_head_dim=32,
+        index_n_heads=2,
+        index_head_dim=_GLM_INDEX_DIM,
+        index_topk=2 * kpool,
+        index_kpool=kpool,
+        num_hidden_layers=4,
+    )
+    # In training mode, mlx-vlm sends decode steps through its prefill path.
+    inner = Glm5NextAttention(config, layer_idx=3).eval()
+    inner.set_dtype(mx.bfloat16)
+    # Set after set_dtype: the checkpoint keeps the pool compression float32.
+    inner.indexer.index_kpool_compress_ape = mx.random.normal((kpool, _GLM_INDEX_DIM))
+    inner.indexer.index_kpool_compress_gate = mx.random.normal(
+        (_GLM_INDEX_DIM, _GLM_HIDDEN)
+    )
+    if ties:
+        weights = inner.indexer.weights_proj.weight
+        inner.indexer.weights_proj.weight = mx.zeros_like(weights)
+    return inner
+
+
+def _glm5_next_paged(inner, *, num_blocks: int = 12, block_size: int = 32):
+    """The paged layer over pages that all start with stale random rows, as
+    reused blocks do, so every step must read only its own rows."""
+    runner = make_glm5_next_stub_runner(
+        block_size=block_size,
+        kv_lora_rank=_GLM_LATENT,
+        index_head_dim=_GLM_INDEX_DIM,
+        index_kpool=inner.indexer.index_kpool,
+    )
+    runtime = initialize_glm5_next_runtime(runner, num_blocks)
+    caches = runtime.indexer_caches
+    for cache in (runtime.kv_cache, caches.pooled, caches.tail):
+        rows = cache.num_blocks * cache.block_size
+        cache.write_slots(
+            0, mx.arange(rows), mx.random.normal((rows, cache.latent_dim))
+        )
+    return runtime, DSAPagedAttentionWrapper(inner, 0, runtime.kv_cache, caches)
+
+
+class _GlmRequest:
+    """One request's latent and pooled-key blocks and mlx-vlm's own caches for
+    it."""
+
+    def __init__(
+        self, blocks: list[int], pooled_blocks: list[int], kpool: int = 4
+    ) -> None:
+        from mlx_vlm.models.cache import CacheList, KVCache, PoolingCache
+
+        self.blocks = blocks
+        self.pooled_blocks = pooled_blocks
+        self.kpool = kpool
+        self.offset = 0
+        # Every step so far ran this request alone, so its rows are mlx-vlm's.
+        self.alone = True
+        self.reference = CacheList(KVCache(), KVCache(), PoolingCache(kpool), KVCache())
+
+
+def _glm_step(inner, runtime, wrapper, step):
+    """Run one packed step (decode rows first) through the paged layer, and
+    each request alone through mlx-vlm's layer on its contiguous caches.
+
+    Returns per request ``(paged output, mlx-vlm output, mlx-vlm top-k, x)``.
+    """
+    dtype = inner.qkv_a_proj.weight.dtype
+    decode, prefill, xs = [], [], []
+    for request, num_tokens in step:
+        ids = [list(request.blocks), list(request.pooled_blocks)]
+        if num_tokens == 1 and request.offset:
+            assert not prefill, "decode rows come first"
+            decode.append((ids, request.offset))
+        else:
+            prefill.append((ids, num_tokens, request.offset))
+        xs.append(mx.random.normal((1, num_tokens, _GLM_HIDDEN)).astype(dtype))
+    pac.prepare_grouped(decode, prefill, runtime.kv_group_block_sizes())
+    try:
+        actual, _ = wrapper(mx.concatenate(xs, axis=1))
+    finally:
+        pac.clear_context()
+    results = []
+    start = 0
+    for (request, num_tokens), x in zip(step, xs, strict=True):
+        expected, topk = inner(x, cache=request.reference)
+        results.append((actual[:, start : start + num_tokens], expected, topk, x))
+        start += num_tokens
+        request.offset += num_tokens
+        request.alone = request.alone and len(step) == 1
+    return results
+
+
+def _relative_error(actual: mx.array, expected: mx.array) -> float:
+    actual, expected = actual.astype(mx.float32), expected.astype(mx.float32)
+    return float(mx.linalg.norm(actual - expected) / mx.linalg.norm(expected))
+
+
+def _assert_output_matches(actual, expected, num_tokens: int, alone: bool) -> None:
+    """Decode rows of a request served alone must be bitwise mlx-vlm's: the
+    same rows, selection and attention. Prefill rows, and the rows of a packed
+    step, are held to bf16 tolerance."""
+    if num_tokens == 1 and alone:
+        assert bool(mx.array_equal(actual, expected))
+    else:
+        assert _relative_error(actual, expected) < 3e-2
+
+
+def _assert_pages_match(runtime, request: _GlmRequest) -> None:
+    """The paged pools and tail hold bitwise what mlx-vlm's PoolingCache holds."""
+    caches = runtime.indexer_caches
+    tail_keys, tail_gates, pooled = request.reference[2].state
+    num_pools, remainder = divmod(request.offset, request.kpool)
+    if num_pools:
+        pages = caches.pooled.latent_caches[0][mx.array(request.pooled_blocks)]
+        rows = pages.reshape(-1, pages.shape[-1])[:num_pools]
+        assert bool(mx.array_equal(rows, pooled[0]))
+    if remainder:
+        block = request.blocks[(request.offset - 1) // runtime.kv_cache.block_size]
+        tail = caches.tail.latent_caches[0][block, :remainder]
+        assert bool(
+            mx.array_equal(tail, mx.concatenate([tail_keys[0], tail_gates[0]], -1))
+        )
+
+
+class TestGlm5NextSparseAttention:
+    @pytest.mark.parametrize(
+        ("kpool", "block_size", "chunks"),
+        [
+            # A chunk ending exactly on a block, then decode into the next.
+            (4, 32, (32, 1, 1, 3, 1)),
+            # Chunks start and end mid-pool, reading and overwriting the tail.
+            # One-token steps take mlx-vlm's decode path, the 5- and 9-token
+            # chunks the indexed kernel.
+            (4, 64, (1, 1, 11, 5, 9, 1, 1)),
+            (16, 512, (35, 13, 1, 1)),
+        ],
+        ids=["block_boundary", "short_chunks_block_64", "kpool_16"],
+    )
+    def test_layer_matches_mlx_vlm_across_steps(
+        self, kpool, block_size, chunks
+    ) -> None:
+        """One request through chunked prefill and decode past index_topk, on
+        permuted, non-contiguous blocks: each output against mlx-vlm's layer,
+        and the paged pools and tail against its PoolingCache, every step."""
+        inner = _glm5_next_layer(kpool=kpool)
+        runtime, wrapper = _glm5_next_paged(inner, block_size=block_size)
+        request = _GlmRequest([5, 2, 7], [10], kpool=kpool)
+
+        for num_tokens in chunks:
+            ((actual, expected, _, _),) = _glm_step(
+                inner, runtime, wrapper, [(request, num_tokens)]
+            )
+            _assert_output_matches(actual, expected, num_tokens, request.alone)
+            _assert_pages_match(runtime, request)
+
+    def test_packed_steps_match_each_request_alone(self) -> None:
+        """Decode rows packed with chunks that start and end mid-pool (what two
+        streams get at a 1024-token budget: 1023-token chunks), and prefills
+        with different block tables. Pools and tails stay bitwise each
+        request's own; outputs within bf16 tolerance."""
+        inner = _glm5_next_layer()
+        runtime, wrapper = _glm5_next_paged(inner)
+        a, b, c = (
+            _GlmRequest([3, 9], [10]),
+            _GlmRequest([6, 4, 11], [7]),
+            _GlmRequest([8], [5]),
+        )
+        steps = [
+            [(a, 13)],
+            [(a, 1), (b, 7)],
+            [(a, 1), (b, 7)],
+            [(a, 1), (b, 1), (c, 9)],
+            [(b, 1), (a, 5), (c, 3)],
+            [(a, 1), (b, 1), (c, 1)],
+        ]
+
+        for step in steps:
+            results = _glm_step(inner, runtime, wrapper, step)
+            for (request, num_tokens), (actual, expected, _, _) in zip(
+                step, results, strict=True
+            ):
+                _assert_output_matches(actual, expected, num_tokens, request.alone)
+                _assert_pages_match(runtime, request)
+
+    def test_prefix_hit_starts_on_the_shared_blocks(self) -> None:
+        """A prefix-cache hit: the second request starts on the first
+        request's whole first latent block and, as vLLM's partial hits do, on
+        a copy of its partly filled pooled-key block. It reads that block's
+        latent rows and pools, and matches mlx-vlm fed the same prefix rows."""
+        inner = _glm5_next_layer()
+        runtime, wrapper = _glm5_next_paged(inner)
+        first = _GlmRequest([4, 1], [10])
+        ((_, _, _, prefix),) = _glm_step(inner, runtime, wrapper, [(first, 32)])
+        # The first request goes on, into its own second block.
+        _glm_step(inner, runtime, wrapper, [(first, 5)])
+
+        second = _GlmRequest([4, 6], [7])
+        runtime.copy_blocks([(10, 7)])
+        inner(prefix, cache=second.reference)
+        second.offset = 32
+        for num_tokens in (7, 1, 1):
+            ((actual, expected, _, _),) = _glm_step(
+                inner, runtime, wrapper, [(second, num_tokens)]
+            )
+            _assert_output_matches(actual, expected, num_tokens, second.alone)
+            _assert_pages_match(runtime, second)
+
+    @pytest.mark.parametrize(
+        ("cap_mib", "ties", "block_size", "history", "chunk"),
+        [
+            (512, False, 32, 21, 19),
+            (0, True, 32, 21, 19),
+            # At 2 MiB, 1400 rows over 350 pools split 748 + 652, and 600 rows
+            # over 500 pools 524 + 76.
+            (2, False, 64, 1400, 600),
+        ],
+        ids=["one_part", "row_parts_ties", "multi_row_parts"],
+    )
+    def test_prefill_matches_mlx_vlms_kernel(
+        self, monkeypatch, cap_mib, ties, block_size, history, chunk
+    ) -> None:
+        """A bf16 prefill chunk over paged history, its indexer scored in one
+        part or in query parts (a cap of 0 makes every row a part), is bitwise
+        mlx-vlm's indexed kernel on the contiguous latent with the selection
+        of mlx-vlm's single indexer call, and close to mlx-vlm's projected
+        prefill."""
+        # mlx-vlm's own kernel call, private in mlx-vlm 0.7.6, is the reference.
+        from mlx_vlm.models.glm5_next.language import _sparse_prefill_attention
+        from mlx_vlm.models.linear import linear
+
+        monkeypatch.setattr(
+            "vllm_metal.attention.impls.dsa._MAX_SCORES_BYTES", cap_mib * 2**20
+        )
+        inner = _glm5_next_layer(ties=ties)
+        runtime, wrapper = _glm5_next_paged(inner, num_blocks=40, block_size=block_size)
+        blocks = list(range(math.ceil((history + chunk) / block_size), 0, -1))
+        num_pooled = math.ceil((history + chunk) / runtime.kv_group_block_sizes()[1])
+        pooled = list(range(len(blocks) + 1, len(blocks) + 1 + num_pooled))
+        request = _GlmRequest(blocks, pooled)
+        _glm_step(inner, runtime, wrapper, [(request, history)])
+
+        ((actual, projected, selected, x),) = _glm_step(
+            inner, runtime, wrapper, [(request, chunk)]
+        )
+
+        q_a, _ = mx.split(linear(inner.qkv_a_proj, x), (inner.q_lora_rank,), axis=-1)
+        q = (
+            linear(inner.q_b_proj, inner.q_a_layernorm(q_a))
+            .reshape(1, chunk, inner.num_heads, inner.q_head_dim)
+            .transpose(0, 2, 1, 3)
+        )
+        latent = request.reference[0].state[0]
+        out = _sparse_prefill_attention(
+            inner.embed_q(q), latent, latent, selected, inner.scale
+        )
+        absorbed = linear(
+            inner.o_proj,
+            inner.unembed_out(out).transpose(0, 2, 1, 3).reshape(1, chunk, -1),
+        )
+        assert bool(mx.array_equal(actual, absorbed))
+        assert _relative_error(actual, projected) < 3e-2
+        _assert_pages_match(runtime, request)
+
+    def test_query_parts_stay_within_the_cap(self) -> None:
+        """At the default cap and 32 index heads, a 1024-row chunk after 17k
+        tokens (4352 pools) splits into parts of 512 MiB // (4 * 32 * 4352)
+        rows, the part the reserve covers."""
+        assert query_parts(1024, 32, 4352) == [0, 963, 1024]
+
+    def test_decode_build_submits_no_gpu_work(self, monkeypatch) -> None:
+        """A later pipeline stage builds a decode-only forward before its
+        receive wait, so building one must evaluate nothing."""
+        inner = _glm5_next_layer()
+        runtime, wrapper = _glm5_next_paged(inner)
+        request = _GlmRequest([1, 2], [3])
+        _glm_step(inner, runtime, wrapper, [(request, 21)])
+        calls: list[str] = []
+        for name in ("eval", "async_eval", "synchronize"):
+            monkeypatch.setattr(mx, name, lambda *_, _n=name, **__: calls.append(_n))
+        pac.prepare_grouped(
+            [([request.blocks, request.pooled_blocks], 21)],
+            [],
+            runtime.kv_group_block_sizes(),
+        )
+        try:
+            wrapper(mx.random.normal((1, 1, _GLM_HIDDEN)).astype(mx.bfloat16))
+        finally:
+            pac.clear_context()
+
+        assert calls == []

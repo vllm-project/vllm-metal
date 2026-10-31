@@ -15,7 +15,6 @@ from mlx_vlm.utils import get_model_path as mlx_vlm_model_path
 from mlx_vlm.utils import load_model as mlx_vlm_load_model
 from vllm.logger import init_logger
 
-from vllm_metal.attention.impls.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
 from vllm_metal.attention.runtime.factory import build_hybrid_runtime_plan
 from vllm_metal.compat import (
     apply_compat_patches,
@@ -489,11 +488,16 @@ class ModelLifecycle:
         runner._is_vlm = request.is_vlm
 
         # Adapter state follows the effective VLM mode, not the raw config flag.
+        # Under pipeline parallelism only the first stage embeds tokens, so
+        # only it encodes and splices multimodal inputs.
         multimodal_adapter = (
             self._model_adapter.build_multimodal_adapter(
-                loaded_model.model, request.hf_config, sidecar=loaded_model.sidecar
+                loaded_model.model,
+                request.hf_config,
+                sidecar=loaded_model.sidecar,
+                vllm_config=runner.vllm_config,
             )
-            if request.is_vlm
+            if request.is_vlm and (runner.pp is None or runner.pp.is_first)
             else None
         )
         runner._multimodal_adapter = multimodal_adapter
@@ -542,9 +546,7 @@ class ModelLifecycle:
 
         if runner.is_mla:
             runner.num_kv_heads = 1
-            runner.head_dim = int(args["kv_lora_rank"]) + int(
-                args.get("qk_rope_head_dim", MLA_DEFAULT_QK_ROPE_HEAD_DIM)
-            )
+            runner.head_dim = runner.mla_latent_dim
         return int(default_head_dim) if default_head_dim is not None else None
 
     def _install_yoco_cache_mapping(self, args: dict[str, Any]) -> None:

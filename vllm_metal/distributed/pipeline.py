@@ -31,6 +31,7 @@ from mlx.utils import tree_flatten
 from vllm.distributed.utils import get_pp_indices
 
 import vllm_metal.envs as envs
+from vllm_metal.attention.runtime.families.glm5_next import GLM5_NEXT_MODEL_TYPES
 
 logger = logging.getLogger(__name__)
 
@@ -195,23 +196,25 @@ def apply_pipeline_split(model: nn.Module, pp: PipelineGroup) -> tuple[int, int]
     return start, end
 
 
+def is_glm5_next(model: Any) -> bool:
+    """Whether ``model`` is mlx-vlm's GLM-5-Next text model."""
+    return getattr(model, "model_type", None) in GLM5_NEXT_MODEL_TYPES
+
+
 def pipeline_recv(
     pp: PipelineGroup,
     n_tokens: int,
     hidden: int,
     dtype: mx.Dtype,
 ) -> mx.array:
-    """Receive the hidden state from the previous stage as ``(1, n_tokens, hidden)``.
+    """Receive the previous stage's compact 2D ``(n_tokens, hidden)`` activation.
 
-    The wire carries the compact 2D ``(n_tokens, hidden)`` activation; this adds
-    the batch axis back so the result feeds straight into the model forward as
-    ``input_embeddings``. Lazy: the transfer only happens on ``mx.eval`` of the
-    returned array. The declared ``(shape, dtype)`` MUST exactly match the
-    sender's wire array — a mismatch deadlocks (the ring backend does not
-    validate across peers).
+    Lazy: the transfer only happens on ``mx.eval`` of the returned array, which
+    has no inputs, so evaluating it alone runs nothing else. The declared
+    ``(shape, dtype)`` MUST exactly match the sender's wire array — a mismatch
+    deadlocks (the ring backend does not validate across peers).
     """
-    wire = mx.distributed.recv((n_tokens, hidden), dtype, pp.rank - 1, group=pp.group)
-    return wire[None]
+    return mx.distributed.recv((n_tokens, hidden), dtype, pp.rank - 1, group=pp.group)
 
 
 def pipeline_send(h: mx.array, pp: PipelineGroup) -> mx.array:
@@ -220,7 +223,7 @@ def pipeline_send(h: mx.array, pp: PipelineGroup) -> mx.array:
     ``h`` is the model-native ``(1, n_tokens, hidden)`` activation; the batch
     axis (always 1 under Phase 0 single-sequence batching) is dropped so the
     wire carries the compact 2D ``(n_tokens, hidden)`` that :func:`pipeline_recv`
-    restores. Lazy: returns an array that performs the send when evaluated, so
+    receives. Lazy: returns an array that performs the send when evaluated, so
     the caller MUST ``mx.eval`` (or otherwise materialize) it or the bytes never
     move.
     """
@@ -235,8 +238,9 @@ def pipeline_send(h: mx.array, pp: PipelineGroup) -> mx.array:
 class PipelinedModel:
     """PP-aware forward wrapper: runs an mlx_lm model as a single pipeline stage.
 
-    Owns the stage *forward*: the first stage embeds ``input_ids``; every later
-    stage receives the upstream hidden state and feeds it in as
+    Owns the stage *forward*: the first stage embeds ``input_ids`` unless the
+    caller passes ``inputs_embeds`` (a multimodal splice); every later stage
+    receives the upstream hidden state and feeds it in as
     ``input_embeddings``; the local (already-sliced) layers run, and the last
     stage applies the final norm + head. Returns this stage's raw model output
     on the last rank (the caller extracts logits), otherwise the raw hidden
@@ -252,6 +256,7 @@ class PipelinedModel:
     def __init__(self, model: Any, pp: PipelineGroup) -> None:
         self._model = model
         self._pp = pp
+        self._pending_recv: mx.array | None = None
 
     # Wire descriptor: (hidden, dtype) of the activation that crosses stages, read
     # from state every stage owns (config width + a stage-owned compute parameter),
@@ -259,7 +264,12 @@ class PipelinedModel:
     # own. Lazy: a singleton stage crosses no wire, so it never reads either half.
     @cached_property
     def _wire_hidden(self) -> int:
-        return self._model.args.hidden_size
+        return self._model.args.hidden_size * self._streams
+
+    @cached_property
+    def _streams(self) -> int:
+        # GLM-5-Next passes ``hc_mult`` residual streams per token between layers.
+        return self._model.args.hc_mult if is_glm5_next(self._model) else 1
 
     @cached_property
     def _wire_dtype(self) -> mx.Dtype:
@@ -272,13 +282,41 @@ class PipelinedModel:
             param.dtype for _, param in flat if mx.issubdtype(param.dtype, mx.floating)
         )
 
-    def __call__(self, input_ids: mx.array, *, cache: Any = None) -> mx.array:
-        h_in: mx.array | None = None
+    def __call__(
+        self,
+        input_ids: mx.array,
+        *,
+        cache: Any = None,
+        inputs_embeds: mx.array | None = None,
+        recv_first: bool = False,
+    ) -> mx.array:
+        """Build this stage's forward; a later stage's receive stays pending.
+
+        The caller calls :meth:`wait_for_recv` before it submits the forward.
+        ``recv_first`` waits before the build instead, for a forward that may
+        submit GPU work itself, as prefill attention does.
+        """
+        h_in = inputs_embeds
         if not self._pp.is_first:
-            h_in = pipeline_recv(
+            self._pending_recv = pipeline_recv(
                 self._pp, input_ids.shape[1], self._wire_hidden, self._wire_dtype
             )
+            h_in = self._pending_recv[None]
+            if recv_first:
+                self.wait_for_recv()
         return self._stage_forward(input_ids, h_in, cache=cache)
+
+    def wait_for_recv(self) -> None:
+        """Wait on the host until the pending upstream hidden state has arrived.
+
+        The ring backend receives on the CPU, so a GPU command buffer that read
+        the hidden state first would wait inside itself through the previous
+        stage's whole step, and the Metal watchdog counts that wait. vLLM's later
+        ranks likewise wait for their receive just before the forward reads it.
+        """
+        if self._pending_recv is not None:
+            mx.eval(self._pending_recv)
+            self._pending_recv = None
 
     def dummy_forward(self, input_ids: mx.array) -> mx.array:
         """Run this stage's forward locally for profiling/warm-up: no ring I/O.
@@ -300,13 +338,45 @@ class PipelinedModel:
     def _stage_forward(
         self, input_ids: mx.array, h_in: mx.array | None, *, cache: Any = None
     ) -> mx.array:
+        if is_glm5_next(self._model):
+            return self._glm5_next_stage_forward(input_ids, h_in, cache)
         if self._pp.is_last:
             # full backbone + final norm + tied/explicit head -> model output
             return self._model(input_ids, cache=cache, input_embeddings=h_in)
         # backbone only (norm is nn.Identity on non-last) -> raw hidden state.
+        return self._check_wire_dtype(
+            self._model.model(input_ids, cache=cache, input_embeddings=h_in)
+        )
+
+    def _glm5_next_stage_forward(
+        self, input_ids: mx.array, h_in: mx.array | None, cache: Any
+    ) -> mx.array:
+        """Run this stage's GLM-5-Next layers on all residual streams.
+
+        The backbone expands the embedding into ``hc_mult`` streams before its
+        first layer and averages them after its last, so the stage runs its
+        layers itself and the wire carries every stream. On the first stage,
+        ``h_in`` is the caller's input embeddings, if any.
+        """
+        from mlx_vlm.models.linear import linear
+
+        backbone = self._model.model
+        if h_in is None or self._pp.is_first:
+            embeds = backbone.embed_tokens(input_ids) if h_in is None else h_in
+            h = mx.repeat(embeds[:, :, None], self._streams, 2)
+        else:
+            h = h_in.reshape(*h_in.shape[:2], self._streams, -1)
+        layer_caches = cache or [None] * len(backbone.layers)
+        topk = None
+        for layer, layer_cache in zip(backbone.layers, layer_caches, strict=True):
+            h, topk = layer(h, None, layer_cache, topk)
+        if self._pp.is_last:
+            return linear(self._model.lm_head, backbone.norm(h.mean(axis=2)))
+        return self._check_wire_dtype(h.reshape(*h.shape[:2], -1))
+
+    def _check_wire_dtype(self, h_out: mx.array) -> mx.array:
         # The downstream stage receives at the wire dtype (pipeline_recv); a
         # mismatch deadlocks the ring, which does not validate across peers.
-        h_out = self._model.model(input_ids, cache=cache, input_embeddings=h_in)
         if h_out.dtype != self._wire_dtype:
             raise TypeError(
                 f"PP stage produced hidden {h_out.dtype}, but the wire dtype "
