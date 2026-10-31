@@ -149,6 +149,23 @@ image input. DFlash and DSpark speculative decoding need a Qwen3 target, so
 Glimmer's DFlash assistant is not supported; n-gram and draft-model speculation
 and TurboQuant are not validated.
 
+GLM-5.3-Flash loads through mlx-vlm's `glm5_next` text model and serves text
+only; image and video requests are refused. The verified checkpoint was
+converted from `zai-org/GLM-5.3-Flash-BF16` with `mlx_vlm.convert`: routed
+experts 4-bit affine (`down_proj` 5-bit), other linear layers 8-bit affine,
+group size 64, hyper-connection and indexer modules unquantized. A custom
+`quant_predicate` replaces mlx-vlm's own, so it must keep that predicate's
+exclusions (`attn_hc`, `ffn_hc`, `index_kpool_compress`).
+
+Its sparse attention layers keep vLLM's GLM-5-Next latent rows and pooled
+indexer keys (in the model dtype), with the unfinished pool's raw keys beside
+its latent block, and each step reads only the latent rows the indexer selects.
+Long prefill chunks are scored in query parts of at most 512 MiB of indexer
+scores. mlx-vlm's indexed attention kernel
+addresses at most 963 blocks of 4352 tokens per stage: a larger automatic pool
+is capped, and a larger `--num-gpu-blocks-override` is refused. Speculative
+decoding and RoPE latents are refused at startup.
+
 | Model | MLX | PyTorch MPS | Attention Kernel | Automatic Prefix Cache | Example checkpoint |
 | --- | --- | --- | --- | --- | --- |
 | Qwen3 | ✅ | 🔵 | GQA (paged) | ✅ | `Qwen/Qwen3-0.6B` |
@@ -167,6 +184,7 @@ and TurboQuant are not validated.
 | GPT-OSS | 🔵 | | Sink attention (paged) | ✅ | `openai/gpt-oss-20b` |
 | Flint | 🔵 | | GQA + per-layer sliding window + learned sinks, no RoPE on full-attention layers (paged) | ✅ | `RecursiveSI/flint-int4` |
 | Ling-3.0 Tiny | 🔵 | | Hybrid MLA + KDA (paged latent + recurrent state) | 🔵 | `inclusionAI/Ling-3.0-tiny` (BF16 or converted MXFP8) |
+| GLM-5.3-Flash | 🔵 | | Hybrid sparse NoPE MLA + KDA (paged latent + indexer + recurrent state) | 🔵 | — |
 | GLM-4.5 | Not verified | | MLA (paged latent cache, MLX SDPA — no Metal kernel) | Not verified | — |
 | MiniCPM3-4B | ✅ | | MLA (paged latent cache) | ✅ | `mlx-community/MiniCPM3-4B-4bit` |
 | MiniCPM4 | ✅ | | GQA (paged) | ✅ | `openbmb/MiniCPM4-0.5B-mlx` (needs `--trust-remote-code`) |

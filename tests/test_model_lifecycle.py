@@ -1457,6 +1457,20 @@ class TestResolveModelDims:
                 },
                 256 + MLA_DEFAULT_QK_ROPE_HEAD_DIM,
             ),
+            (
+                # GLM-5-Next: the NoPE latent alone; the pooled indexer keys
+                # have specs of their own.
+                {
+                    "num_hidden_layers": 45,
+                    "num_attention_heads": 64,
+                    "hidden_size": 4096,
+                    "kv_lora_rank": 512,
+                    "qk_rope_head_dim": 0,
+                    "index_head_dim": 128,
+                    "index_kpool": 4,
+                },
+                512,
+            ),
         ],
     )
     def test_mla_sets_expected_head_dim(

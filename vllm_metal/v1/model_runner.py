@@ -71,6 +71,7 @@ from vllm_metal.config import get_config
 from vllm_metal.distributed import (
     PipelinedModel,
     PipelineGroup,
+    is_glm5_next,
     is_non_last_stage,
     pipeline_send,
 )
@@ -477,6 +478,9 @@ class MetalModelRunner:
         # both to this stage's local slice under pipeline parallelism).
         self.num_layers: int = 0
         self.num_kv_cache_layers: int = 0
+        # Global index of this stage's first layer. KV cache specs name layers
+        # globally: vLLM merges every stage's specs by name.
+        self.first_layer_idx: int = 0
 
         # Per-layer KV cache shapes (None = uniform across layers)
         self.kv_heads_per_layer: list[int] | None = None
@@ -852,36 +856,40 @@ class MetalModelRunner:
         (``_start_paged_forward``) and the KV-cache spec size only this stage's
         layers — not the full model.
 
-        Only the validated path (uniform SDPA attention, e.g. Qwen3) is supported under
-        pipeline parallelism: fail loud on YOCO / hybrid / MLA models whose
-        KV-cache layer accounting does not map cleanly onto a contiguous layer
-        slice yet.
+        Only the validated paths (uniform SDPA attention, e.g. Qwen3, and
+        GLM-5-Next) are supported under pipeline parallelism: fail loud on other
+        YOCO / hybrid / MLA / pooling / VLM configs.
         """
         if pp.size == 1:
             return
 
         unsupported = (
             self._yoco_cache_mapping is not None
-            or self.is_hybrid
-            or self.is_mla
             or self._is_pooling
-            or self._is_vlm
+            or (
+                (self.is_hybrid or self.is_mla or self._is_vlm)
+                and not is_glm5_next(self._forward_model)
+            )
         )
         if unsupported:
             raise NotImplementedError(
                 "Pipeline parallelism on Metal is validated only for uniform-"
                 "attention generation on the paged path (e.g. Qwen3 with "
-                "paged attention); YOCO / hybrid / MLA / "
+                "paged attention) and GLM-5-Next; other YOCO / hybrid / MLA / "
                 "pooling / VLM (multimodal) configs are not "
                 "supported under PP yet."
             )
 
-        self._model_adapter.apply_pipeline_split(self.model, pp)
+        span = self._model_adapter.apply_pipeline_split(self.model, pp)
+        assert span is not None  # a multi-stage group always splits
         # Mirror the sliced backbone's local layer count onto the runner so
         # offset_caches and KV-cache sizing cover only this stage's layers.
-        local_num_layers = len(self._forward_model.model.layers)
-        self.num_layers = local_num_layers
-        self.num_kv_cache_layers = local_num_layers
+        start, end = span
+        self.first_layer_idx = start
+        self.num_layers = end - start
+        self.num_kv_cache_layers = end - start
+        if self.hybrid_runtime_plan is not None:
+            self.hybrid_runtime_plan = self.hybrid_runtime_plan.for_layers(start, end)
 
         # Install the PP-aware forward wrapper for this stage. It owns the stage
         # forward (recv -> local layers -> final norm + head on the last stage);
@@ -897,6 +905,8 @@ class MetalModelRunner:
         runtime = self._paged_attention_runtime
         if runtime is not None:
             runtime.extend_forward_eval_outputs(eval_outputs)
+        if self._pp_model is not None:
+            self._pp_model.wait_for_recv()
         mx.async_eval(*eval_outputs)
 
     def _extract_logits(self, model_output: Any) -> mx.array:
@@ -1006,6 +1016,11 @@ class MetalModelRunner:
     @property
     def moe_expert_reserved_bytes(self) -> int:
         return 0 if self._expert_store is None else self._expert_store.reserved_bytes
+
+    def sparse_mla_reserve_bytes(self, *, max_running_requests: int) -> int:
+        return self._cache_policy.sparse_mla_reserve_bytes(
+            max_running_requests=max_running_requests
+        )
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """Get KV cache specification.
@@ -1697,9 +1712,13 @@ class MetalModelRunner:
                 # layer slice -> final norm + head on the last stage). The runner
                 # owns the downstream send: only the last stage has logits; every
                 # other stage hands its raw hidden state to pipeline_send, whose
-                # lazy op is forced by the async_eval below.
+                # lazy op is forced by the async_eval below. A decode forward is
+                # built while the previous stage still runs; prefill attention
+                # may submit mid-forward, so a prefill step receives first.
                 assert self._pp_model is not None
-                stage_output = self._pp_model(input_ids, cache=offset_caches)
+                stage_output = self._pp_model(
+                    input_ids, cache=offset_caches, recv_first=bool(prefill_reqs)
+                )
                 if self.pp.is_last:
                     logits = self._extract_logits(stage_output)
                 else:
