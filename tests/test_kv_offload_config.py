@@ -43,6 +43,7 @@ def _base_config(**cache_overrides) -> SimpleNamespace:
             distributed_executor_backend="auto",
             pipeline_parallel_size=1,
             tensor_parallel_size=1,
+            prefill_context_parallel_size=1,
             data_parallel_size=1,
             disable_custom_all_reduce=False,
         ),
@@ -71,6 +72,7 @@ def _base_config(**cache_overrides) -> SimpleNamespace:
         ),
         lora_config=None,
         aux_output_config=AuxOutputConfig(),
+        watermark_config=None,
         kv_transfer_config=None,
         # Real VllmConfig always carries this; the events path reads it.
         kv_events_config=None,

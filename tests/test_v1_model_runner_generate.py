@@ -10,6 +10,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 import torch
+from vllm.config import VllmConfig
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import (
@@ -4658,7 +4659,7 @@ class TestStateBlockIdLifecycle:
 
 
 class TestPreemptedReadmission:
-    """Under MRv2 a preempted request comes back as a new request."""
+    """Preempted requests resume through the V1 and V2 scheduler contracts."""
 
     def _new_req(
         self,
@@ -4680,19 +4681,26 @@ class TestPreemptedReadmission:
         )
 
     def _scheduler_output(
-        self, new_req: NewRequestData, num_scheduled_tokens: int
+        self,
+        new_req: NewRequestData | None,
+        num_scheduled_tokens: int,
+        *,
+        preempted_req_ids: set[str] | None = None,
+        cached_reqs: CachedRequestData | None = None,
     ) -> SchedulerOutput:
         return SchedulerOutput(
-            scheduled_new_reqs=[new_req],
-            scheduled_cached_reqs=CachedRequestData.make_empty(),
-            num_scheduled_tokens={new_req.req_id: num_scheduled_tokens},
+            scheduled_new_reqs=[new_req] if new_req else [],
+            scheduled_cached_reqs=cached_reqs or CachedRequestData.make_empty(),
+            num_scheduled_tokens=(
+                {"r": num_scheduled_tokens} if num_scheduled_tokens else {}
+            ),
             total_num_scheduled_tokens=num_scheduled_tokens,
             scheduled_spec_decode_tokens={},
             scheduled_encoder_inputs={},
             num_common_prefix_blocks=[],
             finished_req_ids=set(),
             free_encoder_mm_hashes=[],
-            preempted_req_ids=set(),
+            preempted_req_ids=preempted_req_ids or set(),
             has_structured_output_requests=False,
         )
 
@@ -4718,13 +4726,24 @@ class TestPreemptedReadmission:
         )
         return runner
 
-    def test_readmission_continues_from_prefill_tokens(self) -> None:
+    def test_readmission_continues_from_prefill_tokens(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
         generator = torch.Generator().manual_seed(0)
         runner = self._preempted_runner(generator)
+        runner.vllm_config = VllmConfig()
+        assert runner.vllm_config.use_v2_model_runner
+        runner._paged_attention_runtime = Mock(spec=SDPAPagedAttentionRuntime)
+        forward = Mock()
+        monkeypatch.setattr(runner, "_start_paged_forward", forward)
         new_req = self._new_req([1, 2, 3, 4, 5, 6], num_computed_tokens=5)
 
-        runner._reconcile_request_lifecycle(set(), preempted_req_ids={"r"})
-        entry = self._admit(runner, new_req, 1)
+        runner.execute_model(self._scheduler_output(None, 0, preempted_req_ids={"r"}))
+        forward.assert_not_called()
+        runner.execute_model(self._scheduler_output(new_req, 1))
+        forward.assert_called_once()
+        entry = forward.call_args.args[0].paged_prefill_entries[0]
 
         state = runner._request_states["r"]
         assert entry.prefill.token_ids == [6]
@@ -4733,6 +4752,42 @@ class TestPreemptedReadmission:
         assert entry.result_mode == "cached_final"
         assert state.token_ids == [1, 2, 3, 4, 5, 6]
         assert state.prompt_len == 4
+
+    def test_v1_readmission_continues_from_cached_tokens(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+        generator = torch.Generator().manual_seed(0)
+        runner = self._preempted_runner(generator)
+        runner.vllm_config = VllmConfig()
+        assert not runner.vllm_config.use_v2_model_runner
+        runner._paged_attention_runtime = Mock(spec=SDPAPagedAttentionRuntime)
+        forward = Mock()
+        monkeypatch.setattr(runner, "_start_paged_forward", forward)
+        cached_reqs = CachedRequestData(
+            req_ids=["r"],
+            resumed_req_ids={"r"},
+            all_token_ids={"r": [1, 2, 3, 4, 5, 6]},
+            new_block_ids=[([10, 11],)],
+            num_computed_tokens=[5],
+            num_output_tokens=[2],
+            new_token_ids=[],
+        )
+
+        runner.execute_model(self._scheduler_output(None, 0, preempted_req_ids={"r"}))
+        forward.assert_not_called()
+        runner.execute_model(self._scheduler_output(None, 1, cached_reqs=cached_reqs))
+        forward.assert_called_once()
+        entry = forward.call_args.args[0].paged_prefill_entries[0]
+
+        state = runner._request_states["r"]
+        assert state.token_ids == [1, 2, 3, 4, 5, 6]
+        assert state.prompt_len == 4
+        assert state.generator is generator
+        assert entry.prefill.token_ids == [6]
+        assert entry.prefill.start_pos == 5
+        assert entry.prefill.generator is generator
+        assert entry.result_mode == "cached_final"
 
     @pytest.mark.parametrize(
         ("prefill_token_ids", "owes_prompt_logprobs"),

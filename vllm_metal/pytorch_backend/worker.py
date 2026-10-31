@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Opt-in vLLM worker for the MPS proof of concept."""
 
-from functools import wraps
-
 import torch
 from vllm.config.utils import getattr_iter
 from vllm.utils.torch_utils import set_random_seed
@@ -14,28 +12,6 @@ from vllm_metal.v1.worker import MetalWorker, init_worker_distributed_environmen
 
 # PyTorch's MPS allocator rounds large heaps up to this size (kRoundLarge).
 _MPS_HEAP_ALIGNMENT = 2 << 20
-
-
-def _patch_mps_mrv2_validation():
-    from vllm.config import VllmConfig
-
-    from vllm_metal import envs
-
-    original = VllmConfig._validate_v2_model_runner
-    if getattr(original, "_metal_mrv2", False):
-        return
-
-    @wraps(original)
-    def validate(config):
-        if envs.VLLM_METAL_BACKEND != "mps":
-            return original(config)
-        # Keep upstream feature validation; MPS replaces the Triton operations.
-        unsupported = config._get_v2_model_runner_unsupported_features()
-        if unsupported:
-            raise ValueError(f"MPS MRV2 does not support: {', '.join(unsupported)}")
-
-    validate._metal_mrv2 = True
-    VllmConfig._validate_v2_model_runner = validate
 
 
 def configure_mps(config):
@@ -88,16 +64,8 @@ def configure_mps(config):
         config.cache_config.block_size = 16
     if not MPSAttentionBackend.supports_block_size(config.cache_config.block_size):
         raise ValueError("MPS requires a cache block size divisible by 8")
-    unsupported = [
-        name
-        for name in ("use_fp64_gumbel", "enable_trace_replay", "return_sampling_mask")
-        if getattr(model, name, False)
-    ]
-    if unsupported:
-        raise NotImplementedError(
-            f"Experimental MPS does not support {', '.join(unsupported)}"
-        )
-    _patch_mps_mrv2_validation()
+    if getattr(model, "use_fp64_gumbel", False):
+        raise NotImplementedError("Experimental MPS does not support use_fp64_gumbel")
     if config.scheduler_config.async_scheduling is None:
         config.scheduler_config.async_scheduling = False
     config.compilation_config.mode = CompilationMode.NONE
