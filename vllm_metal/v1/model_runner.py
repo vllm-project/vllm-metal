@@ -1007,6 +1007,11 @@ class MetalModelRunner:
     def moe_expert_reserved_bytes(self) -> int:
         return 0 if self._expert_store is None else self._expert_store.reserved_bytes
 
+    def sparse_mla_reserve_bytes(self, *, max_running_requests: int) -> int:
+        return self._cache_policy.sparse_mla_reserve_bytes(
+            max_running_requests=max_running_requests
+        )
+
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """Get KV cache specification.
 

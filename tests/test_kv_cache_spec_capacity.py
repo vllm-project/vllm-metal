@@ -6,14 +6,17 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import mlx.core as mx
+import pytest
 import torch
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_utils import get_uniform_page_size
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec, MLAAttentionSpec
 
 from tests.stub_runner import (
+    initialize_glm5_next_runtime,
     make_bailing_hybrid_plan,
     make_gdn_hybrid_plan,
+    make_glm5_next_stub_runner,
     make_nemotron_hybrid_plan,
     make_stub_runner,
 )
@@ -203,3 +206,44 @@ def test_bailing_hybrid_emits_mla_and_kda_specs() -> None:
 
     assert isinstance(specs["layers.0.linear_attn"], MambaSpec)
     assert isinstance(specs["layers.1.self_attn"], MLAAttentionSpec)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "error"),
+    [
+        ({"qk_rope_head_dim": 64}, "qk_rope_head_dim 0"),
+        ({"indexer_types": ["full"] * 3 + ["shared"]}, "shared"),
+        ({"block_size": 34}, "multiple of index_kpool"),
+        (
+            {"speculative_config": SimpleNamespace(num_speculative_tokens=1)},
+            "speculative",
+        ),
+    ],
+    ids=[
+        "rope",
+        "shared_indexer",
+        "split_pool",
+        "speculative",
+    ],
+)
+def test_glm5_next_specs_refuse_unsupported_configs(overrides, error) -> None:
+    """What the paged sparse layout cannot serve fails loudly instead of being
+    laid out: a RoPE latent, a layer reusing another layer's top-k, a block
+    that splits a pool, and speculative decoding (rejected drafts would stay
+    in the pooled keys and tails)."""
+    runner = make_glm5_next_stub_runner(**overrides)
+
+    with pytest.raises((ValueError, NotImplementedError), match=error):
+        runner._cache_policy.get_kv_cache_spec()
+
+
+def test_glm5_next_block_bytes_match_vllms_layout() -> None:
+    """The planner sizes a block as vLLM lays out GLM-5-Next's specs: the
+    pooled keys are a KV group of their own, so a block costs the latent pages
+    alone."""
+    runner = make_glm5_next_stub_runner()
+    runtime = initialize_glm5_next_runtime(runner, 12)
+
+    assert runtime.storage.nbytes == (
+        12 * runner._cache_policy.get_cache_block_size_bytes()
+    )

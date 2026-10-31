@@ -431,6 +431,7 @@ _PADDLEOCR_VL_ARCHITECTURES: frozenset[str] = frozenset(
 # family rather than one conversion.
 _LFM2_VL_MODEL_TYPES: frozenset[str] = frozenset({"lfm2_vl", "lfm2-vl"})
 _LFM2_VL_ARCHITECTURES: frozenset[str] = frozenset({"Lfm2VlForConditionalGeneration"})
+_GLM5_NEXT_MODEL_TYPES: frozenset[str] = frozenset({"glm5_next"})
 
 
 class DefaultModelAdapter(ModelAdapter):
@@ -623,6 +624,16 @@ class DefaultModelAdapter(ModelAdapter):
                 keep_audio,
                 keep_video,
             )
+        elif getattr(hf_config, "model_type", None) in _GLM5_NEXT_MODEL_TYPES:
+            # No vision adapter: zero modality limits turn an image/video
+            # request into a per-request validation error. Not text_only: that
+            # routes the load to mlx_lm, which has no glm5_next.
+            from vllm.config.multimodal import ImageDummyOptions, VideoDummyOptions
+
+            model_config.multimodal_config.limit_per_prompt.update(
+                image=ImageDummyOptions(count=0), video=VideoDummyOptions(count=0)
+            )
+            logger.info("Metal: GLM-5-Next serves text; image and video are refused")
 
     @staticmethod
     def _restrict_modalities(
