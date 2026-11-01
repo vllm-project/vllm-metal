@@ -366,7 +366,7 @@ def _write_flint_config(path) -> None:
     )
 
 
-class TestFlintCompat:
+class TestModelMetadataCompat:
     @pytest.fixture(autouse=True)
     def metal_mlx(self, monkeypatch):
         import vllm.platforms as platforms
@@ -377,8 +377,8 @@ class TestFlintCompat:
         monkeypatch.setattr(platforms, "current_platform", MetalPlatform())
 
     @pytest.fixture
-    def without_flint(self, monkeypatch):
-        """Hide any Flint registration in Transformers and vLLM."""
+    def without_metadata(self, monkeypatch):
+        """Hide Flint config and both architecture registrations."""
         from vllm.model_executor.models import ModelRegistry
 
         config_mapping = configuration_auto.CONFIG_MAPPING
@@ -390,9 +390,10 @@ class TestFlintCompat:
         config_mapping._extra_content.pop("flint", None)
         monkeypatch.setattr(ModelRegistry, "models", dict(ModelRegistry.models))
         ModelRegistry.models.pop("FlintForCausalLM", None)
+        ModelRegistry.models.pop("Lfm3ForCausalLM", None)
         return ModelRegistry
 
-    def test_flint_checkpoint_metadata_loads(self, without_flint, tmp_path) -> None:
+    def test_missing_model_metadata_loads(self, without_metadata, tmp_path) -> None:
         with pytest.raises(ValueError, match="flint"):
             AutoConfig.for_model("flint")
 
@@ -401,7 +402,9 @@ class TestFlintCompat:
         compat.register_model_compat()
         config = AutoConfig.from_pretrained(tmp_path)
 
-        assert "FlintForCausalLM" in without_flint.get_supported_archs()
+        assert {"FlintForCausalLM", "Lfm3ForCausalLM"} <= set(
+            without_metadata.get_supported_archs()
+        )
         assert config.model_type == "flint"
         assert config.hidden_size == 128
         assert config.sliding_window == 513
@@ -412,7 +415,7 @@ class TestFlintCompat:
         assert config.initializer_range == 0.04
 
     def test_flint_config_rejects_inconsistent_layer_count(
-        self, without_flint, tmp_path
+        self, without_metadata, tmp_path
     ) -> None:
         _write_flint_config(tmp_path)
         path = tmp_path / "config.json"
@@ -425,24 +428,27 @@ class TestFlintCompat:
         ):
             AutoConfig.from_pretrained(tmp_path)
 
-    def test_existing_registrations_are_kept(self, without_flint) -> None:
+    @pytest.mark.parametrize("architecture", ["FlintForCausalLM", "Lfm3ForCausalLM"])
+    def test_existing_registrations_are_kept(
+        self, without_metadata, architecture
+    ) -> None:
         sentinel_config = type("Sentinel", (), {"model_type": "flint"})
         AutoConfig.register("flint", sentinel_config, exist_ok=True)
-        without_flint.register_model(
-            "FlintForCausalLM", "vllm.model_executor.models.llama:LlamaForCausalLM"
+        without_metadata.register_model(
+            architecture, "vllm.model_executor.models.llama:LlamaForCausalLM"
         )
 
         compat.register_model_compat()
 
         assert configuration_auto.CONFIG_MAPPING["flint"] is sentinel_config
-        assert without_flint.models["FlintForCausalLM"].class_name == "LlamaForCausalLM"
+        assert without_metadata.models[architecture].class_name == "LlamaForCausalLM"
 
     @pytest.mark.parametrize(
         ("is_metal", "backend"),
         [(False, "mlx"), (True, "mps")],
     )
-    def test_other_platforms_and_backends_keep_flint_unregistered(
-        self, without_flint, monkeypatch, is_metal, backend
+    def test_other_platforms_and_backends_keep_models_unregistered(
+        self, without_metadata, monkeypatch, is_metal, backend
     ) -> None:
         import vllm.platforms as platforms
         from vllm.platforms.cpu import CpuPlatform
@@ -453,7 +459,9 @@ class TestFlintCompat:
 
         compat.register_model_compat()
 
-        assert "FlintForCausalLM" not in without_flint.get_supported_archs()
+        assert {"FlintForCausalLM", "Lfm3ForCausalLM"}.isdisjoint(
+            without_metadata.get_supported_archs()
+        )
         with pytest.raises(ValueError, match="flint"):
             AutoConfig.for_model("flint")
 

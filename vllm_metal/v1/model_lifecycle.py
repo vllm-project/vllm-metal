@@ -362,6 +362,10 @@ class ModelLifecycle:
         model_config = (
             self._runner.model_config if model_config is None else model_config
         )
+        provider = self._model_adapter.generation_model_provider(
+            getattr(model_config, "hf_config", None), is_multimodal=is_vlm
+        )
+        use_mlx_vlm = provider == "mlx-vlm"
         if not is_vlm and target_dtype is None:
             target_dtype = TORCH_TO_MLX_DTYPE[model_config.dtype]
 
@@ -375,12 +379,12 @@ class ModelLifecycle:
         revision = model_config.revision
         awq_loader = (
             None
-            if is_gguf or is_vlm
+            if is_gguf or use_mlx_vlm
             else AWQQuantLoader.for_model(model_name, revision=revision)
         )
 
         expert_cache_bytes = get_config().moe_expert_cache_bytes
-        if expert_cache_bytes and (is_gguf or is_vlm or awq_loader is not None):
+        if expert_cache_bytes and (is_gguf or use_mlx_vlm or awq_loader is not None):
             raise NotImplementedError(
                 "MoE expert offloading supports mlx-lm text checkpoints only, "
                 "not GGUF, AWQ, or multimodal models."
@@ -393,7 +397,7 @@ class ModelLifecycle:
                 target_dtype,
             )
 
-        elif is_vlm:
+        elif use_mlx_vlm:
             load_label = "MLX-VLM model"
             model_path = mlx_vlm_model_path(model_name, revision=revision)
             model = mlx_vlm_load_model(model_path, lazy=lazy_weights)
