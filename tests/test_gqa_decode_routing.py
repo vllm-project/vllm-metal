@@ -351,6 +351,9 @@ def _assert_mixed_matches_standalone(inputs, lengths, family, partition, **routi
     rows = len(lengths)
     mixed = _mixed_call(inputs, **routing)
     assert _dispatch_family() == family
+    assert ops.last_nax_heads_per_threadgroup() == int(
+        family == "mixed_nax_prefill_decode"
+    )
     assert ops.last_gqa_partition_size() == partition
     assert ops.last_gqa_num_requests() == (rows if partition else 0)
     pure = _primitive(

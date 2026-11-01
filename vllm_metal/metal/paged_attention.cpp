@@ -3,6 +3,7 @@
 #include "ops_internal.h"
 
 #include <unordered_map>
+#include <cstdlib>
 
 // ---------------------------------------------------------------------------
 // Library caching
@@ -15,8 +16,9 @@ std::atomic<bool> g_dispatch_diagnostics_enabled{false};
 // NAX prefill pipeline of the most recent recorded NAX launch: 1 split,
 // 0 original loop, -1 none (non-NAX dispatch or diagnostics off).
 std::atomic<int> g_last_nax_split{-1};
+std::atomic<int> g_last_nax_heads_per_tg{0};
 inline void record_paged_dispatch(PagedDispatch family, int gqa_partition = 0,
-                                  int gqa_requests = 0) {
+                                  int gqa_requests = 0, int nax_heads_per_tg = 0) {
   if (!g_dispatch_diagnostics_enabled.load(std::memory_order_relaxed)) return;
   g_last_dispatch.store(family, std::memory_order_relaxed);
   if (family != PagedDispatch::NaxPrefill &&
@@ -24,6 +26,9 @@ inline void record_paged_dispatch(PagedDispatch family, int gqa_partition = 0,
     g_last_nax_split.store(-1, std::memory_order_relaxed);
   g_last_gqa_partition.store(gqa_partition, std::memory_order_relaxed);
   g_last_gqa_requests.store(gqa_requests, std::memory_order_relaxed);
+  // The mixed wrapper records its family after NAX records the executed width.
+  if (family != PagedDispatch::MixedNaxPrefillDecode)
+    g_last_nax_heads_per_tg.store(nax_heads_per_tg, std::memory_order_relaxed);
 }
 
 // Split a mixed batch's decode rows only when they carry at least this much
@@ -203,6 +208,11 @@ void init_library_path(const std::string& name, const std::string& path) {
 
 bool nax_lib_ready_ = false;   // a NAX library was registered
 bool nax_enabled_ = true;      // test / A-B switch
+// Read once at load; changing the switch requires a new worker.
+static const bool nax_gqa_prefill_enabled_ = []() {
+  const char* value = std::getenv("VLLM_METAL_NAX_GQA_PREFILL");
+  return value == nullptr || std::string(value) == "1";
+}();
 
 void init_nax_library_path(const std::string& path) {
   init_library_path("paged_attention_nax_kern", path);
@@ -315,10 +325,9 @@ struct NaxAttentionPlan {
 
 static NaxAttentionPlan make_nax_attention_plan(
     Dtype dtype, int total_q_tokens, int head_size, int num_seqs,
-    int block_size, int q_block_offset, bool use_sinks, bool split_full) {
-  using kernels::kNaxBQ;
-
-  int total_q_blocks = total_q_tokens / kNaxBQ + num_seqs;
+    int block_size, int q_block_offset, bool use_sinks, bool split_full,
+    kernels::NaxConfig cfg) {
+  int total_q_blocks = total_q_tokens / cfg.BQ + num_seqs;
   if (q_block_offset < 0 || q_block_offset > total_q_blocks) {
     throw std::invalid_argument(
         "dispatch_paged_attention_nax: q_block_offset (" +
@@ -327,16 +336,17 @@ static NaxAttentionPlan make_nax_attention_plan(
   }
 
   std::string base_kname =
-      kernels::nax_name(dtype_to_metal(dtype), head_size, block_size);
+      kernels::nax_name(dtype_to_metal(dtype), head_size, block_size, cfg);
+  split_full = split_full && cfg.HEADS_PER_TG == 1;
   const int value_slices = head_size == 512 && split_full ? 2 : 1;
   if (value_slices > 1) base_kname += "_v256";
   std::string hash_name = base_kname + "_sk" + (use_sinks ? "1" : "0")
                           + "_sf" + (split_full ? "1" : "0");
   return {std::move(base_kname), std::move(hash_name), use_sinks, split_full,
-          total_q_blocks - q_block_offset, kernels::kNaxThreads, value_slices};
+          total_q_blocks - q_block_offset, cfg.NUM_THREADS, value_slices};
 }
 
-// Same buffer ABI as the tiled kernel, with BQ=64 and no threadgroup memory.
+// Same buffer ABI as the tiled kernel, with no threadgroup memory.
 // q_block_offset skips leading q-blocks exactly as in the tiled dispatch.
 static void dispatch_paged_attention_nax(
     array& out, const array& query,
@@ -344,26 +354,56 @@ static void dispatch_paged_attention_nax(
     int num_kv_heads, float scale, float softcap,
     const array& block_tables, const array& seq_lens,
     const array& cu_seqlens_q,
-    int block_size, int sliding_window, int q_block_offset,
+    int block_size, int max_seq_len, int sliding_window, int q_block_offset,
     Stream s, const array* sinks, bool split_full) {
   auto& d = metal::device(s.device);
 
   int total_q_tokens = static_cast<int>(query.shape(0));
   int head_size  = static_cast<int>(query.shape(2));
   int num_seqs   = static_cast<int>(cu_seqlens_q.shape(0)) - 1;
-  auto plan = make_nax_attention_plan(
-      query.dtype(), total_q_tokens, head_size, num_seqs,
-      block_size, q_block_offset, sinks != nullptr, split_full);
-  if (g_dispatch_diagnostics_enabled.load(std::memory_order_relaxed))
-    g_last_nax_split.store(plan.split_full ? 1 : 0, std::memory_order_relaxed);
-
-  auto* lib = d.get_library("paged_attention_nax_kern");
-  auto* kernel = d.get_kernel(
-      plan.base_kname, lib, plan.hash_name,
-      {{&plan.use_sinks, MTL::DataType::DataTypeBool, NS::UInteger(40)},
-       {&plan.split_full, MTL::DataType::DataTypeBool, NS::UInteger(41)}});
-
   int num_heads = static_cast<int>(query.shape(1));
+  auto cfg = kernels::select_nax_config(
+      num_heads, num_kv_heads, head_size, block_size, total_q_tokens,
+      num_seqs, max_seq_len, q_block_offset, nax_gqa_prefill_enabled_,
+      query.dtype() == bfloat16,
+      sliding_window < 0 && softcap <= 0.0f && sinks == nullptr, split_full,
+      detected_gpu_core_count());
+  auto make_plan = [&](kernels::NaxConfig config) {
+    return make_nax_attention_plan(
+        query.dtype(), total_q_tokens, head_size, num_seqs,
+        block_size, q_block_offset, sinks != nullptr, split_full, config);
+  };
+  auto plan = make_plan(cfg);
+  auto* lib = d.get_library("paged_attention_nax_kern");
+  auto load_kernel = [&]() {
+    if (cfg.HEADS_PER_TG > 1) {
+      constexpr bool skip_bounds = true;
+      const std::string name = plan.hash_name + "_gb1";
+      return d.get_kernel(
+          plan.base_kname, lib, name,
+          {{&plan.use_sinks, MTL::DataType::DataTypeBool, NS::UInteger(40)},
+           {&skip_bounds, MTL::DataType::DataTypeBool, NS::UInteger(42)}});
+    }
+    return d.get_kernel(
+        plan.base_kname, lib, plan.hash_name,
+        {{&plan.use_sinks, MTL::DataType::DataTypeBool, NS::UInteger(40)},
+         {&plan.split_full, MTL::DataType::DataTypeBool, NS::UInteger(41)}});
+  };
+  auto* kernel = load_kernel();
+  const auto supported_cfg = kernels::nax_config_for_pipeline(
+      cfg, kernel->maxTotalThreadsPerThreadgroup());
+  if (supported_cfg.HEADS_PER_TG != cfg.HEADS_PER_TG) {
+    cfg = supported_cfg;
+    plan = make_plan(cfg);
+    kernel = load_kernel();
+  }
+  if (cfg.HEADS_PER_TG > 1) {
+    record_paged_dispatch(PagedDispatch::NaxGqa6Prefill, 0, 0, cfg.HEADS_PER_TG);
+  } else if (g_dispatch_diagnostics_enabled.load(std::memory_order_relaxed)) {
+    g_last_nax_split.store(plan.split_full ? 1 : 0, std::memory_order_relaxed);
+    g_last_nax_heads_per_tg.store(cfg.HEADS_PER_TG, std::memory_order_relaxed);
+  }
+
   auto& enc = metal::get_command_encoder(s);
   enc.set_compute_pipeline_state(kernel);
 
@@ -377,8 +417,9 @@ static void dispatch_paged_attention_nax(
   }
 
   enc.dispatch_threadgroups(
-      MTL::Size::Make(num_heads, plan.q_blocks, plan.value_slices),
+      MTL::Size::Make(num_heads / cfg.HEADS_PER_TG, plan.q_blocks, plan.value_slices),
       MTL::Size::Make(plan.num_threads, 1, 1));
+
 }
 
 struct TiledAttentionPlan {
@@ -1185,7 +1226,7 @@ static void dispatch_paged_attention_v2_online(
       record_paged_dispatch(PagedDispatch::NaxPrefill);
       dispatch_paged_attention_nax(
           out, query, key_cache, value_cache, num_kv_heads, scale, softcap,
-          block_tables, seq_lens, cu_seqlens_q, block_size, sliding_window,
+          block_tables, seq_lens, cu_seqlens_q, block_size, max_seq_len, sliding_window,
           0, s, sinks, plan.route == PagedAttentionRoute::NaxSplit);
       return;
     // TurboQuant stays excluded from the tiled kernel. Sink prefill can use it:
@@ -1249,7 +1290,7 @@ static void dispatch_paged_attention_mixed(
         arrays.out, arrays.query, arrays.key_cache, arrays.value_cache,
         metadata.num_kv_heads, metadata.scale, metadata.softcap,
         arrays.block_tables, arrays.seq_lens, arrays.cu_seqlens_q,
-        metadata.block_size, metadata.sliding_window,
+        metadata.block_size, metadata.max_seq_len, metadata.sliding_window,
         metadata.num_decode_tokens / kernels::kNaxBQ + metadata.num_decode_requests,
         arrays.s, arrays.sinks,
         plan.route == PagedAttentionRoute::MixedNaxSplit);

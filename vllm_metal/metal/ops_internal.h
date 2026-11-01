@@ -30,7 +30,8 @@ constexpr int kPartitionSize = VLLM_METAL_PARTITION_SIZE;
 // Process-wide diagnostic for tests; not a per-request trace or routing input.
 enum class PagedDispatch {
   None, GqaDecode, PerToken, SplitKv, Window, WindowSplitKv, NaxPrefill,
-  TiledPrefill, MixedPrefillDecode, MixedNaxPrefillDecode, Count
+  TiledPrefill, MixedPrefillDecode, MixedNaxPrefillDecode,
+  NaxGqa6Prefill, Count
 };
 using hardware::detected_gpu_core_count;
 using hardware::gpu_core_count;
@@ -102,6 +103,7 @@ extern std::atomic<int> g_last_gqa_partition;
 extern std::atomic<int> g_last_gqa_requests;
 extern std::atomic<bool> g_dispatch_diagnostics_enabled;
 extern std::atomic<int> g_last_nax_split;
+extern std::atomic<int> g_last_nax_heads_per_tg;
 extern bool nax_lib_ready_;
 extern bool nax_enabled_;
 template <typename Lengths>
