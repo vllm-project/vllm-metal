@@ -1,0 +1,88 @@
+# MiniCPM-o 4.5 native duplex on a 64 GB Apple Silicon Mac.
+pipeline: minicpmo_4_5
+model_runner: v2
+session_mode: duplex
+async_chunk: true
+trust_remote_code: true
+enable_prefix_caching: false
+duplex_session:
+  max_sessions: 8
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+      codec_chunk_frames: 25
+      codec_left_context_frames: 3
+      cfm_drop_upstream_att_buffer: true
+      token2wav_device_spk: true
+stages:
+- stage_id: 0
+  async_chunk: false
+  dtype: bfloat16
+  devices: '0'
+  enforce_eager: true
+  async_scheduling: false
+  max_num_seqs: 8
+  max_model_len: 8192
+  max_num_batched_tokens: 512
+  kv_cache_memory_bytes: 9932111872
+  interleave_mm_strings: true
+  media_io_kwargs:
+    video:
+      fps: 1
+      num_frames: 128
+  limit_mm_per_prompt:
+    image: 64
+    audio: 64
+    video: 1
+  default_sampling_params:
+    temperature: 0.0
+    top_p: 1.0
+    top_k: -1
+    max_tokens: 2048
+    seed: 42
+    detokenize: true
+    repetition_penalty: 1.0
+  gpu_memory_utilization: 0.6
+- stage_id: 1
+  dtype: bfloat16
+  devices: '0'
+  enforce_eager: true
+  async_scheduling: false
+  max_num_seqs: 8
+  max_model_len: 4096
+  max_num_batched_tokens: 1024
+  kv_cache_memory_bytes: 2147483648
+  output_connectors:
+    to_stage_2: connector_of_shared_memory
+  default_sampling_params:
+    temperature: 0.8
+    top_p: 0.85
+    top_k: 25
+    repetition_penalty: 1.05
+    min_tokens: 50
+    max_tokens: 4096
+    seed: 42
+    detokenize: false
+  gpu_memory_utilization: 0.08
+- stage_id: 2
+  dtype: bfloat16
+  devices: '0'
+  enforce_eager: true
+  async_scheduling: false
+  enable_chunked_prefill: false
+  max_num_seqs: 8
+  max_model_len: 8192
+  max_num_batched_tokens: 8192
+  input_connectors:
+    from_stage_1: connector_of_shared_memory
+  default_sampling_params:
+    temperature: 0.0
+    top_p: 1.0
+    top_k: -1
+    max_tokens: 8192
+    detokenize: true
+  gpu_memory_utilization: 0.32

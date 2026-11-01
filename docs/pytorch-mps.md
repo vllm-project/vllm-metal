@@ -20,7 +20,7 @@ Greedy decoding and seeded sampling with temperature, top-k, top-p, and min-p
 are supported. Output-token logprobs are supported; prompt logprobs and explicit
 token-ID scoring are not yet supported.
 
-For speech generation, see [Qwen3-TTS on Apple Silicon](qwen3-tts-mps.md).
+For speech generation and duplex conversations, see [Omni](omni.md).
 
 ## EAGLE3 speculative decoding
 
