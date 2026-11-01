@@ -104,16 +104,18 @@ def speech_request(index):
     }
 
 
-@pytest.mark.parametrize("concurrency", [1, 4, 8])
+@pytest.mark.parametrize("concurrency,temperature", [(1, 0), (4, 0), (8, 0), (1, 0.9)])
 async def test_speech_streams_complete_for_concurrent_requests(
-    speech_server, concurrency
+    speech_server, concurrency, temperature
 ):
     async with httpx.AsyncClient(timeout=90, trust_env=False) as client:
 
         async def generate(index):
             events, audio = [], bytearray()
+            request = speech_request(index)
+            request["extra_params"] = {"temperature": temperature}
             async with client.stream(
-                "POST", f"{speech_server}/v1/audio/speech", json=speech_request(index)
+                "POST", f"{speech_server}/v1/audio/speech", json=request
             ) as response:
                 assert response.status_code == 200
                 async for line in response.aiter_lines():
@@ -131,17 +133,3 @@ async def test_speech_streams_complete_for_concurrent_requests(
             assert events[-1] == "speech.audio.done"
 
         await asyncio.gather(*(generate(index) for index in range(concurrency)))
-
-
-async def test_speech_rejects_random_sampling(speech_server):
-    request = speech_request(0)
-    request["extra_params"] = {"temperature": 0.9}
-    async with httpx.AsyncClient(timeout=30, trust_env=False) as client:
-        response = await client.post(f"{speech_server}/v1/audio/speech", json=request)
-    events = [
-        json.loads(line[6:])
-        for line in response.text.splitlines()
-        if line.startswith("data: ")
-    ]
-    assert [event["type"] for event in events] == ["speech.audio.error"]
-    assert "temperature" in events[0]["error"]["message"]

@@ -401,26 +401,19 @@ class SamplingBatch:
         stateless, but the runner keeps a global counter, so unseeded draws
         depend on scheduling, sub-batch order and batch composition and are
         reproducible only for a fixed request schedule.
-        ``key`` may be ``None`` only when every other row is greedy; those
-        rows then take their top-1 candidate without a draw.
-
-        Greedy rows (temperature below ``GREEDY_TEMPERATURE_EPS``) ride along
-        as a top-1 candidate set at unit temperature so that every row of the
-        batch has a drawable distribution, and their drawn token is then
-        replaced by the argmax: top-k masks by value, so an exact tie at a
-        greedy row's maximum would otherwise leave the draw to pick between
-        the tied tokens where vLLM's greedy path is deterministic.
+        ``key`` may be ``None`` if no unseeded row needs a random draw.
+        Greedy rows use zero temperature and break ties by vocabulary ID.
         """
-        greedy_rows: list[bool] = []
+        from vllm_metal.metal import get_ops
+
         temperatures: list[float] = []
         top_k: list[int] = []
         top_p: list[float] = []
         min_p: list[float] = []
         for sp in sampling_params_list:
-            greedy_rows.append(sp.temperature < GREEDY_TEMPERATURE_EPS)
             if sp.temperature < GREEDY_TEMPERATURE_EPS:
-                temperatures.append(1.0)
-                top_k.append(1)
+                temperatures.append(0.0)
+                top_k.append(0)
                 top_p.append(1.0)
                 min_p.append(0.0)
             else:
@@ -428,31 +421,36 @@ class SamplingBatch:
                 top_k.append(sp.top_k)
                 top_p.append(sp.top_p)
                 min_p.append(sp.min_p)
-        scaled = (
-            logits_2d.astype(mx.float32)
-            / mx.array(temperatures, dtype=mx.float32)[:, None]
+        # Keep request-key ownership above the lazy primitive. Seeded rows use
+        # their own key; unseeded rows retain their position in the batch draw.
+        fallback_key = key if key is not None else mx.zeros((2,), dtype=mx.uint32)
+        row_keys = row_keys if row_keys is not None else [None] * len(temperatures)
+        keys = mx.stack([k if k is not None else fallback_key for k in row_keys])
+        seeds = keys.view(mx.int64).reshape(-1)
+        positions = mx.array(
+            [0 if k is not None else i for i, k in enumerate(row_keys)], dtype=mx.int64
         )
-        sorted_desc, sorted_idx = cls._sorted_candidate_logits(
-            scaled, top_k, top_p, min_p
-        )
-        if key is None:
-            position = mx.zeros((sorted_desc.shape[0],), dtype=mx.uint32)
-        else:
-            position = mx.random.categorical(sorted_desc, axis=-1, key=key)
-        if row_keys is not None and any(k is not None for k in row_keys):
-            rows = [
-                position[i]
-                if row_key is None
-                else mx.random.categorical(sorted_desc[i], axis=-1, key=row_key)
-                for i, row_key in enumerate(row_keys)
-            ]
-            position = mx.stack(rows).astype(position.dtype)
-        tokens = mx.take_along_axis(sorted_idx, position[:, None], axis=-1)[:, 0]
-        if any(greedy_rows):
-            tokens = mx.where(
-                mx.array(greedy_rows), mlx_greedy_tokens(logits_2d), tokens
+        values = logits_2d.astype(mx.float32)
+        token_ids = None
+        if any(
+            0 < k < logits_2d.shape[1] or p != 1.0 or m != 0.0
+            for k, p, m in zip(top_k, top_p, min_p, strict=True)
+        ):
+            # Filters consume scaled logits. Preserve zero for the final greedy draw.
+            scales = mx.array(
+                [t if t != 0 else 1.0 for t in temperatures], dtype=mx.float32
             )
-        return tokens
+            values, token_ids = cls._sorted_candidate_logits(
+                values / scales[:, None], top_k, top_p, min_p
+            )
+            temperatures = [1.0 if t != 0 else 0.0 for t in temperatures]
+        return get_ops().gumbel_sample(
+            values,
+            seeds,
+            positions,
+            mx.array(temperatures, dtype=mx.float32),
+            token_ids,
+        )
 
     def _make_temperature(self) -> torch.Tensor | None:
         if self.all_greedy:

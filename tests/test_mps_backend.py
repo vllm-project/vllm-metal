@@ -796,3 +796,120 @@ def test_gdn_state_carries_across_chunked_prefill_and_decode(pooled):
     assert all(
         torch.equal(t[2], u) for t, u in zip(layer.kv_cache, untouched, strict=True)
     )
+
+
+def test_seeded_sampling_preserves_distribution_and_batch_isolation(
+    run_in_spawn_process,
+):
+    # vLLM registers overrides at worker startup, before optional libraries load.
+    run_in_spawn_process(_check_seeded_sampling)
+
+
+def _check_seeded_sampling():
+    from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+
+    from vllm_metal.pytorch_backend.bindings import register_kernel_overrides
+
+    register_kernel_overrides()
+    rows = 8192
+    # Cross a reduction-block boundary, including a partial final block.
+    token_ids = torch.tensor([0, 1023, 1024])
+    logits = torch.full((rows, 1025), -float("inf"))
+    logits[:, token_ids] = torch.tensor([0.2, 0.3, 0.5]).log()
+    logits = logits.to("mps")
+    mapping = torch.zeros(rows, dtype=torch.int32, device="mps")
+    positions = torch.arange(rows, device="mps")
+    seed = torch.tensor([42], device="mps")
+    temperature = torch.ones(1, device="mps")
+    actual = gumbel_sample(logits, mapping, temperature, seed, positions, False, False)
+    frequencies = torch.bincount(actual.cpu(), minlength=1025)[token_ids] / rows
+    torch.testing.assert_close(
+        frequencies, torch.tensor([0.2, 0.3, 0.5]), atol=0.02, rtol=0
+    )
+    # Request scheduling must not change the random stream for a given position.
+    order = torch.arange(rows - 1, -1, -1, device="mps")
+    reordered = gumbel_sample(
+        logits, mapping, temperature, seed, positions[order], False, False
+    )
+    assert torch.equal(actual[order], reordered)
+    greedy = gumbel_sample(
+        logits, mapping, temperature * 0, seed, positions, False, False
+    )
+    assert greedy.eq(1024).all()
+    with pytest.raises(NotImplementedError, match="probabilistic draft sampling"):
+        gumbel_sample(
+            logits[:1],
+            mapping[:1],
+            temperature,
+            seed,
+            positions[:1],
+            apply_temperature=True,
+            is_drafting=True,
+            logits_cache=logits[:1, None, :],
+            logits_cache_col=positions[:1],
+        )
+
+
+def test_mrv2_sampling_filters_preserve_request_mapping(run_in_spawn_process):
+    run_in_spawn_process(_check_mrv2_sampling_filters)
+
+
+def _check_mrv2_sampling_filters():
+    from vllm.sampling_params import SamplingParams
+    from vllm.v1.worker.gpu.sample.sampler import Sampler
+
+    from vllm_metal.pytorch_backend.bindings import register_kernel_overrides
+
+    register_kernel_overrides()
+    install()
+    state = RequestState(4, 64, 16, 0, 64, torch.device("mps"))
+    state.prompt_len.np[:] = 10
+    state.prompt_len.copy_to_uva()
+    sampler = Sampler(
+        SimpleNamespace(reasoning_config=None), 4, 5, torch.device("mps"), state
+    )
+    params = [
+        SamplingParams(temperature=0),
+        SamplingParams(temperature=0.5, top_k=2, top_p=0.95, seed=17),
+        SamplingParams(
+            temperature=1,
+            top_k=3,
+            top_p=0.7,
+            min_p=0.2,
+            seed=42,
+        ),
+    ]
+    for slot, param in enumerate(params):
+        sampler.add_request(slot, param)
+    sampler.apply_staged_writes()
+    slots = np.array([2, 0, 1])
+    mapping = torch.tensor(slots, device="mps", dtype=torch.int32)
+    logits = torch.tensor(
+        [
+            [2.0, 3.0, 4.0, 5.0, 1.0],
+            [0.0, 1.0, 2.0, 3.0, 4.0],
+            [0.0, 4.0, 4.0, 0.0, 0.0],
+        ],
+        device="mps",
+    )
+    zeros = torch.zeros(3, device="mps", dtype=torch.int32)
+
+    def sample(position):
+        return sampler.sample(
+            logits,
+            mapping,
+            mapping,
+            slots,
+            torch.full((3,), position, device="mps"),
+            zeros,
+            zeros,
+            np.full(3, position + 1),
+        )
+
+    first, processed = sample(10)
+    assert first[:2].tolist() == [3, 4]
+    assert first[2].item() in (1, 2)
+    assert processed[0].isfinite().tolist() == [False, False, False, True, False]
+    assert processed[2, 1:3].tolist() == [8.0, 8.0]
+    assert processed[2].isfinite().tolist() == [False, True, True, False, False]
+    assert torch.equal(sample(10)[0], first)

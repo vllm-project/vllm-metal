@@ -567,3 +567,55 @@ class TestSeededNativeSampling:
                 next_native_rng_key=lambda: mx.random.key(0),
                 output_lengths=[0],
             )
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="requires MPS")
+def test_shared_sampler_matches_mps_after_candidate_reordering(run_in_spawn_process):
+    """Both adapters preserve RNG identity and token-ID ties across blocks."""
+    run_in_spawn_process(_check_shared_sampler_after_reordering)
+
+
+def _check_shared_sampler_after_reordering():
+    from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+
+    from vllm_metal.metal import get_ops
+    from vllm_metal.pytorch_backend.bindings import register_kernel_overrides
+
+    register_kernel_overrides()
+    for vocab_size in (3, 1025, 6562):
+        logits = torch.randn(5, vocab_size, generator=torch.Generator().manual_seed(9))
+        logits[0].zero_()
+        logits[:, 2::5] = -float("inf")
+        # An invalid row must still return a real ID, even across reordered tiles.
+        logits[3:].fill_(float("nan"))
+        logits[4, -1] = -20.0
+        seeds, positions, temperatures = (
+            [42, -1, (1 << 62) + 31, 42, 42],
+            [0, 2, 17, 0, 0],
+            [0.0, 0.8, 1.5, 1.0, 1.0],
+        )
+        expected = (
+            gumbel_sample(
+                logits.to("mps"),
+                torch.arange(len(seeds), dtype=torch.int32, device="mps"),
+                torch.tensor(temperatures, device="mps"),
+                torch.tensor(seeds, device="mps"),
+                torch.tensor(positions, device="mps"),
+                True,
+                False,
+            )
+            .cpu()
+            .tolist()
+        )
+        values = mx.array(logits.numpy())
+        order = mx.argsort(values, axis=-1)[:, ::-1]
+        actual = get_ops().gumbel_sample(
+            mx.take_along_axis(values, order, axis=-1),
+            mx.array(seeds, dtype=mx.int64),
+            mx.array(positions, dtype=mx.int64),
+            mx.array(temperatures, dtype=mx.float32),
+            order,
+        )
+        assert actual.tolist() == expected, vocab_size
+        assert expected[0] == 0
+        assert expected[3:] == [0, vocab_size - 1]
