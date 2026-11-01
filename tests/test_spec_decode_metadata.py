@@ -202,6 +202,28 @@ class TestSpecDecodePolicy:
         )
 
     @pytest.mark.parametrize(
+        "params",
+        [
+            SamplingParams(temperature=0.0, logit_bias={1: 5.0}),
+            SamplingParams(temperature=0.0, min_tokens=2),
+        ],
+        ids=["logit-bias", "min-tokens"],
+    )
+    def test_logits_processor_controls_are_not_drafted(
+        self, params: SamplingParams
+    ) -> None:
+        state = SimpleNamespace(sampling_params=params, generated_tokens=1)
+        assert not SpeculativeDecodeController().can_draft_greedy("r0", state, [1])
+
+    def test_min_tokens_request_is_drafted_once_reached(self) -> None:
+        params = SamplingParams(temperature=0.0, min_tokens=2)
+        controller = SpeculativeDecodeController()
+        pending = SimpleNamespace(sampling_params=params, generated_tokens=1)
+        reached = SimpleNamespace(sampling_params=params, generated_tokens=2)
+        assert not controller.can_draft_greedy("r0", pending, [1])
+        assert controller.can_draft_greedy("r0", reached, [1])
+
+    @pytest.mark.parametrize(
         "sampled,ignore_eos,stop_tokens,eligible",
         [
             ([2], False, [], False),

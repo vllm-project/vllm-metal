@@ -248,10 +248,40 @@ class TestMetalPlatform:
             MetalPlatform.set_device(torch.device("cpu", 1))
 
     @pytest.mark.parametrize(
+        "sampling_params",
+        [
+            SamplingParams(logit_bias={1: 2.0}),
+            SamplingParams(min_tokens=2),
+        ],
+        ids=["logit-bias", "min-tokens"],
+    )
+    def test_validate_request_accepts_logits_processor_controls(
+        self, sampling_params: SamplingParams
+    ) -> None:
+        MetalPlatform.validate_request({}, sampling_params)
+
+    @pytest.mark.parametrize(
         ("sampling_params", "control"),
         [
-            (SamplingParams(logit_bias={1: 2.0}), "logit_bias"),
-            (SamplingParams(min_tokens=2), "min_tokens"),
+            (SamplingParams(temperature=0.0, logit_bias={1: 2.0}), "logit_bias"),
+            (SamplingParams(temperature=0.0, min_tokens=2), "min_tokens"),
+        ],
+        ids=["logit-bias", "min-tokens"],
+    )
+    def test_validate_request_rejects_logits_processor_controls_on_mps(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        sampling_params: SamplingParams,
+        control: str,
+    ) -> None:
+        monkeypatch.setenv("VLLM_METAL_BACKEND", "mps")
+        with pytest.raises(VLLMValidationError, match=control) as exc_info:
+            MetalPlatform.validate_request({}, sampling_params)
+        assert exc_info.value.parameter == control
+
+    @pytest.mark.parametrize(
+        ("sampling_params", "control"),
+        [
             (
                 SamplingParams(thinking_token_budget=64),
                 "thinking_token_budget",
@@ -261,9 +291,9 @@ class TestMetalPlatform:
                 "thinking_token_budget",
             ),
         ],
-        ids=["logit-bias", "min-tokens", "thinking-budget", "thinking-budget-zero"],
+        ids=["thinking-budget", "thinking-budget-zero"],
     )
-    def test_validate_request_rejects_logits_processor_controls(
+    def test_validate_request_rejects_thinking_token_budget(
         self,
         sampling_params: SamplingParams,
         control: str,

@@ -101,6 +101,8 @@ class TestNativeRandomEligibility:
                 "allowed token ids",
                 [_random_params(allowed_token_ids=[1, 2])],
             ),
+            ("logit bias", [_random_params(logit_bias={1: 5.0})]),
+            ("min tokens still pending", [_random_params(min_tokens=2)]),
         ],
     )
     def test_ineligible_batches_fall_back(self, label, params_list) -> None:
@@ -111,6 +113,11 @@ class TestNativeRandomEligibility:
         params._bad_words_token_ids = [[99]]
 
         assert not SamplingBatch.params_allow_native_random([params])
+
+    def test_min_tokens_returns_to_native_random_once_reached(self) -> None:
+        params = [_random_params(min_tokens=2), _random_params()]
+        assert not SamplingBatch.params_allow_native_random(params, [1, 0])
+        assert SamplingBatch.params_allow_native_random(params, [2, 0])
 
 
 class TestTopKTopPMaskParity:

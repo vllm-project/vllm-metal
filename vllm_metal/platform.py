@@ -356,8 +356,6 @@ class MetalPlatform(Platform):
         unsupported_controls = [
             name
             for name, enabled in (
-                ("logit_bias", bool(params.logit_bias)),
-                ("min_tokens", params.min_tokens > 0),
                 (
                     "thinking_token_budget",
                     getattr(params, "thinking_token_budget", None) is not None,
@@ -366,6 +364,9 @@ class MetalPlatform(Platform):
             if enabled
         ]
         if envs.VLLM_METAL_BACKEND == "mps":
+            # The MPS sampler is greedy argmax. logit_bias and min_tokens
+            # change that choice, and this backend does not run the MLX
+            # torch-sampler bridge that applies them.
             unsupported_controls += [
                 name
                 for name, enabled in (
@@ -375,6 +376,8 @@ class MetalPlatform(Platform):
                     ("repetition_penalty", params.repetition_penalty != 1),
                     ("allowed_token_ids", bool(params.allowed_token_ids)),
                     ("bad_words", bool(params.bad_words)),
+                    ("logit_bias", bool(params.logit_bias)),
+                    ("min_tokens", params.min_tokens > 0),
                 )
                 if enabled
             ]
@@ -406,6 +409,8 @@ class MetalPlatform(Platform):
                 ("prompt_logprobs", params.prompt_logprobs is not None),
                 ("top_k", params.top_k > 0),
                 ("top_p", params.top_p < 1.0),
+                ("logit_bias", bool(params.logit_bias)),
+                ("min_tokens", params.min_tokens > 0),
             ):
                 if enabled:
                     raise VLLMValidationError(
