@@ -332,3 +332,61 @@ def test_controlled_rejection_recovers_after_prefix_hit(
     run_in_spawn_process(
         _run_controlled_recovery, batch_size, tmp_path / "metrics.json"
     )
+
+
+def _run_sleep_round_trip():
+    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+    import mlx.core as mx
+    from vllm import LLM, SamplingParams
+
+    llm = LLM(
+        model="Qwen/Qwen3-0.6B",
+        max_model_len=128,
+        max_num_seqs=2,
+        block_size=16,
+        num_gpu_blocks_override=32,
+        gpu_memory_utilization=0.2,
+        enable_sleep_mode=True,
+        async_scheduling=False,
+        disable_log_stats=False,
+        speculative_config={
+            "method": "draft_model",
+            "model": "Qwen/Qwen3-0.6B",
+            "num_speculative_tokens": 3,
+        },
+    )
+    runner = llm.llm_engine.model_executor.driver_worker.model_runner
+    try:
+        tokenizer = llm.get_tokenizer()
+        prompts = [
+            {"prompt_token_ids": tokenizer.encode(text * 20)[:55]}
+            for text in ("Explain how a computer works. ", "Describe why plants grow. ")
+        ]
+        params = SamplingParams(temperature=0, max_tokens=48, ignore_eos=True)
+
+        def generate():
+            before = _counters(llm)["num_accepted_tokens"]
+            outputs = llm.generate(prompts, params, use_tqdm=False)
+            accepted = _counters(llm)["num_accepted_tokens"] - before
+            return [list(output.outputs[0].token_ids) for output in outputs], accepted
+
+        baseline = generate()
+        assert baseline[1] > 0
+        active = mx.get_active_memory()
+        llm.sleep(level=1)
+        # The draft's layers live in the target's backing, so this frees both.
+        storage = runner.paged_attention_runtime.storage
+        assert storage.released
+        assert active - mx.get_active_memory() >= storage.nbytes
+        llm.wake_up()
+        # Greedy verification hides stale draft KV in the tokens; acceptance
+        # exposes it.
+        assert generate() == baseline
+    finally:
+        llm.llm_engine.engine_core.shutdown()
+
+
+@pytest.mark.slow
+def test_draft_model_sleep_round_trip_e2e(run_in_spawn_process):
+    """Wake re-creates target and draft KV: same tokens, same acceptance."""
+    run_in_spawn_process(_run_sleep_round_trip)

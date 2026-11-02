@@ -100,7 +100,7 @@ class TestHybridTurboQuantCachePolicy:
             patch("vllm_metal.v1.cache_policy.get_config", return_value=_tq_config()),
             pytest.raises(NotImplementedError, match="TurboQuant.*MLA"),
         ):
-            runner._cache_policy.build_paged_attention_runtime(block_size=BLOCK_SIZE)
+            runner._cache_policy._build_hybrid_backend()
 
     def test_sdpa_specs_report_packed_pages(self) -> None:
         runner = _hybrid_runner()
