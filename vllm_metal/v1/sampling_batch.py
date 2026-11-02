@@ -32,26 +32,6 @@ GREEDY_TEMPERATURE_EPS = 1e-5
 _EMPTY_LOGITSPROCS = LogitsProcessors()
 
 
-def min_tokens_pending(
-    sampling_params_list: Sequence[SamplingParams],
-    output_lengths: Sequence[int] | None,
-) -> bool:
-    """Whether any row still needs vLLM's min-tokens processor.
-
-    The processor masks stop tokens only while a row has generated fewer than
-    ``min_tokens``, so rows past the minimum can sample natively again.
-    ``None`` counts every row as having generated nothing.
-    """
-    if output_lengths is None:
-        output_lengths = [0] * len(sampling_params_list)
-    return any(
-        output_length < sampling_params.min_tokens
-        for sampling_params, output_length in zip(
-            sampling_params_list, output_lengths, strict=True
-        )
-    )
-
-
 @dataclass(frozen=True)
 class _SamplingResult:
     """Sampled token ids plus optional vLLM logprobs rows."""
@@ -227,9 +207,11 @@ class SamplingBatch:
         gate before constructing a :class:`SamplingBatch` (e.g. the decode
         pipeline) cannot drift from the sampling-time check.
         ``output_lengths`` is each row's generated-token count; see
-        :func:`min_tokens_pending`.
+        :meth:`_min_tokens_pending`.
         """
-        return not min_tokens_pending(sampling_params_list, output_lengths) and all(
+        return not SamplingBatch._min_tokens_pending(
+            sampling_params_list, output_lengths
+        ) and all(
             sampling_params.temperature < GREEDY_TEMPERATURE_EPS
             and sampling_params.top_k <= 0
             and sampling_params.top_p == 1.0
@@ -264,7 +246,9 @@ class SamplingBatch:
         """
         if not sampling_params_list:
             return False
-        return not min_tokens_pending(sampling_params_list, output_lengths) and all(
+        return not SamplingBatch._min_tokens_pending(
+            sampling_params_list, output_lengths
+        ) and all(
             (allow_seed or sp.seed is None)
             and sp.frequency_penalty == 0.0
             and sp.presence_penalty == 0.0
@@ -275,6 +259,26 @@ class SamplingBatch:
             and not sp.bad_words_token_ids
             and not sp.logit_bias
             for sp in sampling_params_list
+        )
+
+    @staticmethod
+    def _min_tokens_pending(
+        sampling_params_list: Sequence[SamplingParams],
+        output_lengths: Sequence[int] | None,
+    ) -> bool:
+        """Whether any row still needs vLLM's min-tokens processor.
+
+        The processor masks stop tokens only while a row has generated fewer
+        than ``min_tokens``, so rows past the minimum can sample natively
+        again. ``None`` counts every row as having generated nothing.
+        """
+        if output_lengths is None:
+            output_lengths = [0] * len(sampling_params_list)
+        return any(
+            output_length < sampling_params.min_tokens
+            for sampling_params, output_length in zip(
+                sampling_params_list, output_lengths, strict=True
+            )
         )
 
     @classmethod
@@ -671,7 +675,9 @@ class SamplingBatch:
                 ),
                 (
                     MinTokensLogitsProcessor,
-                    min_tokens_pending(self.sampling_params_list, self.output_lengths),
+                    self._min_tokens_pending(
+                        self.sampling_params_list, self.output_lengths
+                    ),
                 ),
             )
             if needed
