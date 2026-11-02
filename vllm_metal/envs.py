@@ -160,8 +160,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Set to "0" to force the eager conv / C++ recurrent fallback path.
     "VLLM_METAL_GDN_LAZY_KERNELS": _bool("VLLM_METAL_GDN_LAZY_KERNELS", True),
     # One-step-ahead decode pipelining (default on). Eligible pure-decode
-    # greedy steps defer the sampling sync one step so the next step's graph
-    # build and submit overlap the in-flight GPU forward. Set to "0" to
+    # native greedy or random steps (including seeded requests) defer the sampling
+    # sync one step so the next step's graph build and submit overlap the
+    # in-flight GPU forward. Set to "0" to
     # force the fully synchronous per-step sample path.
     "VLLM_METAL_DECODE_PIPELINE": _bool("VLLM_METAL_DECODE_PIPELINE", True),
     # Compiled stateless-MLP dispatch (opt-in): decode-shaped MLP/MoE
@@ -170,7 +171,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # set to "1" to enable, the default keeps the eager per-op dispatch.
     "VLLM_METAL_COMPILED_MLP": _bool("VLLM_METAL_COMPILED_MLP", False),
     # MLX-native random sampling (default on); greedy behavior is unchanged.
-    # Seeded requests use a per-request seed-derived MLX key (sync path only).
+    # Seeded requests use per-request MLX keys in sync and deferred sampling.
     # Penalties, sample logprobs,
     # allowed-token IDs, bad words, structured outputs, or any speculative
     # decoding config keep random sampling on torch. Set to "0" as the kill

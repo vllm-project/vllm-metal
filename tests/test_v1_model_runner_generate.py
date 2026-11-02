@@ -3379,24 +3379,27 @@ class TestPipelineGateSpecDecodeDerivation:
             num_spec_tokens_to_schedule=0,
         )
 
-    def _native_random_decode_setup(self, runner) -> SchedulerOutput:
+    def _native_random_decode_setup(self, runner, *, seed=None) -> SchedulerOutput:
         runner._request_states = {
             "r0": mr.RequestState(
                 token_ids=[1, 7],
                 prompt_len=1,
-                sampling_params=SamplingParams(temperature=0.7, top_k=20, top_p=0.95),
+                sampling_params=SamplingParams(
+                    temperature=0.7, top_k=20, top_p=0.95, seed=seed
+                ),
                 generator=None,
                 generated_tokens=1,
             )
         }
         return self._cached_decode_output("r0")
 
-    def test_native_random_decode_step_eligible_when_enabled(self) -> None:
+    @pytest.mark.parametrize("seed", [None, 7])
+    def test_native_random_decode_step_eligible_when_enabled(self, seed) -> None:
         # Arrange — a plain temperature/top-k/top-p decode step with the
         # native sampling capability enabled must defer like a greedy step.
         runner = self._runner(drafter=None)
         runner._native_sampling_enabled = True
-        scheduler_output = self._native_random_decode_setup(runner)
+        scheduler_output = self._native_random_decode_setup(runner, seed=seed)
 
         # Act
         decision = runner._evaluate_pipeline_gate(scheduler_output)
@@ -3405,12 +3408,13 @@ class TestPipelineGateSpecDecodeDerivation:
         assert decision.eligible is True
         assert decision.reason == "eligible"
 
-    def test_native_random_decode_step_blocked_when_disabled(self) -> None:
+    @pytest.mark.parametrize("seed", [None, 7])
+    def test_native_random_decode_step_blocked_when_disabled(self, seed) -> None:
         # Arrange — same step shape with native sampling disabled keeps the
         # synchronous torch path.
         runner = self._runner(drafter=None)
         runner._native_sampling_enabled = False
-        scheduler_output = self._native_random_decode_setup(runner)
+        scheduler_output = self._native_random_decode_setup(runner, seed=seed)
 
         # Act
         decision = runner._evaluate_pipeline_gate(scheduler_output)
@@ -3419,6 +3423,7 @@ class TestPipelineGateSpecDecodeDerivation:
         assert decision.eligible is False
         assert decision.reason == "non-native sampling"
 
+    @pytest.mark.parametrize("temperature", [0.0, 0.7])
     @pytest.mark.parametrize(
         ("token_ids", "expected_eligible", "expected_reason"),
         [
@@ -3429,6 +3434,7 @@ class TestPipelineGateSpecDecodeDerivation:
     )
     def test_min_tokens_blocks_pipeline_only_until_reached(
         self,
+        temperature: float,
         token_ids: list[int],
         expected_eligible: bool,
         expected_reason: str,
@@ -3436,11 +3442,14 @@ class TestPipelineGateSpecDecodeDerivation:
         # Stop tokens stay masked on the torch sampler until the request
         # has generated min_tokens outputs.
         runner = self._runner(drafter=None)
+        runner._native_sampling_enabled = True
         runner._request_states = {
             "r0": mr.RequestState(
                 token_ids=token_ids,
                 prompt_len=1,
-                sampling_params=SamplingParams(temperature=0.0, min_tokens=2),
+                sampling_params=SamplingParams(
+                    temperature=temperature, seed=7, min_tokens=2
+                ),
                 generator=None,
                 generated_tokens=len(token_ids) - 1,
             )
@@ -3452,13 +3461,17 @@ class TestPipelineGateSpecDecodeDerivation:
         assert decision.eligible is expected_eligible
         assert decision.reason == expected_reason
 
-    def test_logit_bias_blocks_pipeline(self) -> None:
+    @pytest.mark.parametrize("temperature", [0.0, 0.7])
+    def test_logit_bias_blocks_pipeline(self, temperature: float) -> None:
         runner = self._runner(drafter=None)
+        runner._native_sampling_enabled = True
         runner._request_states = {
             "r0": mr.RequestState(
                 token_ids=[1, 7],
                 prompt_len=1,
-                sampling_params=SamplingParams(temperature=0.0, logit_bias={1: 5.0}),
+                sampling_params=SamplingParams(
+                    temperature=temperature, seed=7, logit_bias={1: 5.0}
+                ),
                 generator=None,
                 generated_tokens=1,
             )
@@ -3793,8 +3806,15 @@ class TestDeferredDecodeSampleThreading:
         assert state.token_ids[-1] == 1
         assert result.sampled_token_ids == [[1]]
 
-    def test_deferred_random_samples_match_synchronous_seed_and_step(self) -> None:
-        """Deferring evaluation must preserve draws from the shared counter."""
+    @pytest.mark.parametrize(
+        ("seeds", "steps_per_call"),
+        [((None, None), 1), ((7, 42), 0), ((7, None), 1)],
+        ids=["unseeded", "seeded", "mixed"],
+    )
+    def test_deferred_random_samples_match_synchronous_seed_and_step(
+        self, seeds: tuple[int | None, ...], steps_per_call: int
+    ) -> None:
+        """Deferred draws preserve both per-row positions and the shared counter."""
         streams = []
         for deferred in (False, True):
             runner = make_stub_runner(
@@ -3802,30 +3822,52 @@ class TestDeferredDecodeSampleThreading:
                 _native_sampling_enabled=True,
                 _native_sampling_step=11,
             )
-            state = self._random_decode_state()
-            state.sampling_params = SamplingParams(temperature=0.8)
-            runner._paged_request_seq_lens = {"r0": 1}
+            decode_reqs = []
+            for row, seed in enumerate(seeds):
+                state = self._random_decode_state()
+                state.sampling_params = SamplingParams(temperature=0.8, seed=seed)
+                # Different row positions catch reuse of a batch-wide count.
+                state.token_ids.extend([9] * row)
+                state.generated_tokens += row
+                decode_reqs.append((f"r{row}", state))
             tokens = []
+            pending_output = None
             for step in range(8):
                 runner._decode_pipeline.begin_step(
                     mr.PipelineGateDecision(eligible=deferred, reason="test")
                 )
-                paged_state = self._paged_state(runner, [("r0", state)])._replace(
-                    logits=mx.zeros((1, 1, 512))
+                paged_state = self._paged_state(runner, decode_reqs)._replace(
+                    logits=mx.zeros((1, len(decode_reqs), 512))
                 )
                 paged_state.batch.paged_decode_reqs = paged_state.decode_reqs
                 runner._execute_model_state = paged_state
                 output = runner.sample_tokens(grammar_output=None)
-                assert runner._native_sampling_step == 12 + step
+                expected_steps = 11 + (step + 1) * steps_per_call
+                assert runner._native_sampling_step == expected_steps
+                for row, (_, state) in enumerate(decode_reqs):
+                    assert state.generated_tokens == row + step + 2
+                    assert (
+                        state.generated_tokens
+                        == len(state.token_ids) - state.prompt_len
+                    )
                 if deferred:
+                    # The engine submits the next step before reading the last.
+                    pending_output, output = output, pending_output
+                    if output is None:
+                        continue
                     output = output.get_output()
-                assert runner._native_sampling_step == 12 + step
-                tokens.extend(output.sampled_token_ids[0])
-                assert state.token_ids[-1] == tokens[-1]
+                assert runner._native_sampling_step == expected_steps
+                tokens.append([ids[0] for ids in output.sampled_token_ids])
+            if pending_output is not None:
+                output = pending_output.get_output()
+                tokens.append([ids[0] for ids in output.sampled_token_ids])
+            assert runner._native_sampling_step == 11 + 8 * steps_per_call
+            for row, (_, state) in enumerate(decode_reqs):
+                assert state.token_ids[-8:] == [sampled[row] for sampled in tokens]
             streams.append(tokens)
 
         assert streams[0] == streams[1]
-        assert len(set(streams[0])) > 1
+        assert len({row[0] for row in streams[0]}) > 1
 
     def test_deferred_random_step_never_samples_padded_vocab(self) -> None:
         """Columns past the model vocab must be unreachable even when a
@@ -4862,10 +4904,11 @@ class TestRequestAdmission:
         num_scheduled_tokens: int,
         *,
         preempted_req_ids: set[str] | None = None,
+        cached_reqs: CachedRequestData | None = None,
     ) -> SchedulerOutput:
         return SchedulerOutput(
             scheduled_new_reqs=[new_req] if new_req else [],
-            scheduled_cached_reqs=CachedRequestData.make_empty(),
+            scheduled_cached_reqs=cached_reqs or CachedRequestData.make_empty(),
             num_scheduled_tokens=(
                 {"r": num_scheduled_tokens} if num_scheduled_tokens else {}
             ),
@@ -4877,6 +4920,19 @@ class TestRequestAdmission:
             free_encoder_mm_hashes=[],
             preempted_req_ids=preempted_req_ids or set(),
             has_structured_output_requests=False,
+        )
+
+    def _cached_reqs(
+        self, token_ids: list[int], num_computed_tokens: int
+    ) -> CachedRequestData:
+        return CachedRequestData(
+            req_ids=["r"],
+            resumed_req_ids=set(),
+            all_token_ids={},
+            new_block_ids=[None],
+            num_computed_tokens=[num_computed_tokens],
+            num_output_tokens=[len(token_ids) - 4],
+            new_token_ids=[],
         )
 
     def _admit(
@@ -4961,6 +5017,104 @@ class TestRequestAdmission:
 
         with pytest.raises(RuntimeError, match="missing prefill_token_ids"):
             self._admit(runner, new_req, 4)
+
+    @pytest.mark.parametrize("resume_contract", [None, "v2"])
+    def test_seeded_deferred_decode_matches_sync_after_chunked_prefill(
+        self, monkeypatch: pytest.MonkeyPatch, resume_contract: str | None
+    ) -> None:
+        """Recompute may reset the phase counter, but decode must use the true n."""
+        monkeypatch.setattr(mr, "prepare_grouped", lambda *a, **k: None)
+        params = SamplingParams(temperature=0.8, seed=42)
+        streams = []
+        for deferred in (False, True):
+            monkeypatch.setenv("VLLM_METAL_DECODE_PIPELINE", str(int(deferred)))
+            runner = make_stub_runner(
+                model_args={"vocab_size": 512},
+                _native_sampling_enabled=True,
+                _paged_attention_runtime=ForwardOutputRuntimeStub([]),
+                _intermediate_forward_supported=False,
+                num_layers=0,
+            )
+            monkeypatch.setattr(
+                runner,
+                "_target_forward",
+                lambda input_ids, **kwargs: mr.TargetModelForwardOutput(
+                    logits=mx.zeros((*input_ids.shape, 512))
+                ),
+            )
+            new_req = self._new_req(
+                [1, 2, 3, 4], num_computed_tokens=0, sampling_params=params
+            )
+            runner.execute_model(self._scheduler_output(new_req, 2))
+            assert not runner._decode_pipeline.step_eligible
+            assert runner.sample_tokens(None).sampled_token_ids == [[]]
+            state = runner._request_states["r"]
+            assert state.generated_tokens == 0
+
+            runner.execute_model(
+                self._scheduler_output(
+                    None, 2, cached_reqs=self._cached_reqs(state.token_ids, 2)
+                )
+            )
+            assert not runner._decode_pipeline.step_eligible
+            tokens = list(runner.sample_tokens(None).sampled_token_ids[0])
+            assert state.generated_tokens == len(tokens) == 1
+
+            for step in range(7):
+                runner.execute_model(
+                    self._scheduler_output(
+                        None,
+                        1,
+                        cached_reqs=self._cached_reqs(
+                            state.token_ids, len(state.token_ids) - 1
+                        ),
+                    )
+                )
+                assert runner._decode_pipeline.step_eligible is deferred
+                output = runner.sample_tokens(None)
+                assert isinstance(output, mr.MetalAsyncModelRunnerOutput) is deferred
+                if deferred and resume_contract is not None and step == 1:
+                    # Preempt with a pending token that the scheduler discards.
+                    committed_tokens = state.token_ids[:-1]
+                    runner.execute_model(
+                        self._scheduler_output(None, 0, preempted_req_ids={"r"})
+                    )
+                    assert not runner._decode_pipeline.step_eligible
+                    discarded = output.get_output().sampled_token_ids
+                    resume = self._scheduler_output(
+                        self._new_req(
+                            committed_tokens,
+                            num_computed_tokens=0,
+                            sampling_params=params,
+                        ),
+                        2,
+                    )
+                    runner.execute_model(resume)
+                    assert not runner._decode_pipeline.step_eligible
+                    assert runner.sample_tokens(None).sampled_token_ids == [[]]
+                    state = runner._request_states["r"]
+                    assert state.generated_tokens == 0
+                    assert len(state.token_ids) - state.prompt_len == len(tokens)
+                    runner.execute_model(
+                        self._scheduler_output(
+                            None,
+                            len(committed_tokens) - 2,
+                            cached_reqs=self._cached_reqs(state.token_ids, 2),
+                        )
+                    )
+                    assert not runner._decode_pipeline.step_eligible
+                    output = runner.sample_tokens(None)
+                    assert output.sampled_token_ids == discarded
+                elif deferred:
+                    output = output.get_output()
+                tokens.extend(output.sampled_token_ids[0])
+                assert state.generated_tokens == len(state.token_ids) - state.prompt_len
+                assert state.generated_tokens == len(tokens)
+                assert runner._native_sampling_step == 0
+            streams.append(tokens)
+
+        assert streams[0] == streams[1]
+        assert len(set(streams[0])) > 1
 
     @pytest.mark.parametrize(
         ("prefill_token_ids", "owes_prompt_logprobs"),

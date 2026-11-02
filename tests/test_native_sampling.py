@@ -554,7 +554,7 @@ class TestSeededNativeSampling:
         mx.eval(base, mixed)
         assert [base.tolist()[i] for i in (0, 2)] == [mixed.tolist()[i] for i in (0, 2)]
 
-    def test_deferred_call_without_allow_seed_rejects_seeded_rows(self) -> None:
+    def test_native_call_without_allow_seed_rejects_seeded_rows(self) -> None:
         logits = mx.zeros((1, VOCAB_SIZE))
         with pytest.raises(RuntimeError, match="gate desync"):
             SamplingBatch.native_sample_tokens(
