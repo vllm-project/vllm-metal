@@ -10,6 +10,8 @@ import os
 
 import pytest
 
+from tests.scheduler_helpers import track_preemptions_and_resumptions
+
 DRAFT_MODELS = {
     "dflash": "z-lab/Qwen3-4B-DFlash-b16",
     "dspark": "deepseek-ai/dspark_qwen3_4b_block7",
@@ -175,10 +177,7 @@ def _serve(
             return result
 
         proposer.propose = check_propose
-        verify, schedule = (
-            runner._spec_decode_controller.verify_greedy,
-            scheduler.schedule,
-        )
+        verify = runner._spec_decode_controller.verify_greedy
 
         def record_verify(logits, requests, segments):
             result = verify(logits, requests, segments)
@@ -192,14 +191,8 @@ def _serve(
                 stats["rejected"] += len(segment.draft_token_ids) - len(tokens) + 1
             return result
 
-        def record_schedule(*args, **kwargs):
-            result = schedule(*args, **kwargs)
-            stats["preemptions"] += len(result.preempted_req_ids)
-            stats["resumed"] += len(result.scheduled_cached_reqs.resumed_req_ids)
-            return result
-
         runner._spec_decode_controller.verify_greedy = record_verify
-        scheduler.schedule = record_schedule
+        track_preemptions_and_resumptions(scheduler, stats, resumption_key="resumed")
         # The prefill's first output can finish the request by itself.
         assert (
             generate(

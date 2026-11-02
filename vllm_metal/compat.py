@@ -114,12 +114,11 @@ def apply_compat_patches() -> None:
 def ensure_vllm_v1_diffusion_guard_patch() -> None:
     """Let Metal-served diffusion models past vLLM's V1-runner guard.
 
-    vLLM 0.30 rejects diffusion models on Model Runner V1 because its V1 GPU
-    runner lacks the canvas step protocol. ``MetalModelRunner`` implements
-    the V1 contract (vllm-metal pins ``VLLM_USE_V2_MODEL_RUNNER=0``) and
-    serves DiffusionGemma itself (``vllm_metal/v1/diffusion.py``), so drop
-    that one entry for the supported model types; any other diffusion model
-    still fails upstream's check.
+    vLLM's V1 GPU runner lacks the canvas step protocol. Metal defaults to V2,
+    but users can explicitly select V1 with ``VLLM_USE_V2_MODEL_RUNNER=0``.
+    ``MetalModelRunner`` serves DiffusionGemma itself
+    (``vllm_metal/v1/diffusion.py``), so allow the supported model types through
+    that guard; any other diffusion model still fails upstream's check.
 
     Called from ``MetalPlatform.check_and_update_config``, which runs inside
     ``VllmConfig.__post_init__`` before the V1 validation: importing

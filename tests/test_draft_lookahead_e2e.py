@@ -9,6 +9,8 @@ import os
 
 import pytest
 
+from tests.scheduler_helpers import track_preemptions_and_resumptions
+
 
 def _run_lookahead_lifecycle(prefix_caching, target_model="Qwen/Qwen3-0.6B"):
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
@@ -36,15 +38,8 @@ def _run_lookahead_lifecycle(prefix_caching, target_model="Qwen/Qwen3-0.6B"):
     proposer = runner._drafter
     stats = {"preemptions": 0, "resumptions": 0, "drafted": 0, "accepted": 0}
     released = set()
-    original_schedule = scheduler.schedule
     original_verify = runner._spec_decode_controller.verify_greedy
     original_release = proposer.release_requests
-
-    def schedule(*args, **kwargs):
-        output = original_schedule(*args, **kwargs)
-        stats["preemptions"] += len(output.preempted_req_ids)
-        stats["resumptions"] += len(output.scheduled_cached_reqs.resumed_req_ids)
-        return output
 
     def verify(logits, requests, segments):
         outputs = original_verify(logits, requests, segments)
@@ -85,7 +80,7 @@ def _run_lookahead_lifecycle(prefix_caching, target_model="Qwen/Qwen3-0.6B"):
         assert llm.reset_prefix_cache()
         free_before = scheduler.kv_cache_manager.block_pool.get_num_free_blocks()
 
-        scheduler.schedule = schedule
+        track_preemptions_and_resumptions(scheduler, stats)
         runner._spec_decode_controller.verify_greedy = verify
         proposer.release_requests = release
         for i, prompt in enumerate(prompts):
