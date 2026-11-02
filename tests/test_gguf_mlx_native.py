@@ -6,7 +6,7 @@ through ``from_raw_blocks``; parity is checked against ``gguf.quants.dequantize`
 (the upstream reference), never a local re-implementation of the packing, and a
 canary pins the Q8_0/Q4_0/Q4_1 repack byte for byte to MLX's own ``mx.load``
 repack (``mx.load`` cannot read Q5_0/Q5_1).
-K-quant and IQ4 fixtures are built as raw blocks field-by-field because gguf-py
+K-quant and IQ fixtures are built as raw blocks field-by-field because gguf-py
 cannot quantize them; ``gguf.quants.dequantize`` still defines what those blocks
 mean.
 """
@@ -23,6 +23,7 @@ gguf = pytest.importorskip("gguf")
 
 import vllm_metal.gguf.mlx_native as mlx_native  # noqa: E402
 from tests.gguf_kquant_fixtures import (  # noqa: E402
+    build_iq3s_blocks,
     build_iq4_blocks,
     build_kquant_blocks,
 )
@@ -47,7 +48,12 @@ MX_LOAD_QTYPES = [
 ]
 KQUANT_QTYPES = [GGMLQuantizationType.Q4_K, GGMLQuantizationType.Q5_K]
 IQ4_QTYPES = [GGMLQuantizationType.IQ4_NL, GGMLQuantizationType.IQ4_XS]
-AFFINE_QTYPES = [*LEGACY_QTYPES, *KQUANT_QTYPES, *IQ4_QTYPES]
+AFFINE_QTYPES = [
+    *LEGACY_QTYPES,
+    *KQUANT_QTYPES,
+    *IQ4_QTYPES,
+    GGMLQuantizationType.IQ3_S,
+]
 
 
 def _write_single_tensor_gguf(path, raw: np.ndarray, qtype) -> None:
@@ -72,6 +78,8 @@ def _raw_blocks(qtype, rows: int, cols: int) -> np.ndarray:
         return build_kquant_blocks(rows, cols, qtype)
     if qtype in IQ4_QTYPES:
         return build_iq4_blocks(rows, cols, qtype)
+    if qtype == GGMLQuantizationType.IQ3_S:
+        return build_iq3s_blocks(rows, cols)
     weight = np.random.default_rng(0).standard_normal((rows, cols)).astype(np.float32)
     return gguf.quants.quantize(weight, qtype)
 
@@ -88,6 +96,7 @@ def _raw_blocks(qtype, rows: int, cols: int) -> np.ndarray:
         (GGMLQuantizationType.Q5_K, 5, mx.float32),
         (GGMLQuantizationType.IQ4_NL, 8, mx.float16),
         (GGMLQuantizationType.IQ4_XS, 8, mx.float32),
+        (GGMLQuantizationType.IQ3_S, 4, mx.float32),
     ],
 )
 def test_contract_matches_logical_shape(qtype, bits, scale_dtype):
@@ -525,7 +534,7 @@ def test_real_file_memory_below_dense(path):
         dense_f16 += qt.out_features * qt.in_features * 2
 
     # Per weight: IQ4_XS ~1.25 bytes and IQ4_NL/Q8_0 ~1.125 (8-bit codes),
-    # Q5_K ~0.875 and Q4_K ~0.75 (fp32 scale/bias), Q5_0/Q5_1 ~0.75,
+    # Q5_K ~0.875 and Q4_K/IQ3_S ~0.75 (fp32 scale/bias), Q5_0/Q5_1 ~0.75,
     # Q4_0/Q4_1 ~0.625 vs 2 for dense f16, so any mix stays below 0.65x dense.
     assert quantized < dense_f16 * 0.65
 
