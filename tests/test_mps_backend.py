@@ -755,4 +755,6 @@ def test_gdn_state_carries_across_chunked_prefill_and_decode():
         atol=1e-4,
         rtol=1e-4,
     )
-    assert all(torch.equal(t[2], u) for t, u in zip(layer.kv_cache, untouched, strict=True))
+    assert all(
+        torch.equal(t[2], u) for t, u in zip(layer.kv_cache, untouched, strict=True)
+    )
