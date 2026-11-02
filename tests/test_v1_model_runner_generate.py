@@ -1457,14 +1457,16 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         if mixed:
             state.sampling_params.top_k = 1
             if blocker == "mixed_decode_fallback":
-                state.sampling_params.seed = 42
+                state.sampling_params.presence_penalty = 0.5
             prefill = mr.PrefillRequest(
                 req_id="p0",
                 token_ids=[5],
                 sampling_params=SamplingParams(
                     temperature=0.7,
                     top_k=1,
-                    seed=42 if blocker == "mixed_prefill_fallback" else None,
+                    presence_penalty=(
+                        0.5 if blocker == "mixed_prefill_fallback" else 0.0
+                    ),
                 ),
                 block_ids=[[1]],
                 generator=None,
@@ -3605,7 +3607,9 @@ class TestDeferredDecodeSampleThreading:
 
         prefill = prefill._replace(
             req_id="p0",
-            sampling_params=SamplingParams(temperature=0.7, top_k=1, seed=42),
+            sampling_params=SamplingParams(
+                temperature=0.7, top_k=1, presence_penalty=0.5
+            ),
         )
         decode_reqs = [("r0", state)]
         paged_state = self._paged_state(runner, decode_reqs, prefill_reqs=[prefill])

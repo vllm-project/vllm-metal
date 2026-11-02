@@ -4,6 +4,7 @@
 Pure functions: logits in, token IDs out.  No model runner state accessed.
 """
 
+import hashlib
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import ClassVar
@@ -166,6 +167,19 @@ class SamplingBatch:
             cu_num_generated_tokens=None,
         )
 
+    def generators_are_seeded(self) -> bool:
+        """Whether every torch generator belongs to a seeded row.
+
+        Seeded rows get their generator from :func:`create_request_generator`;
+        on the native path the seed-derived MLX key replaces it. Any other
+        generator is an explicit caller RNG that only torch can honor.
+        """
+        return all(
+            0 <= i < len(self.sampling_params_list)
+            and self.sampling_params_list[i].seed is not None
+            for i in self.generators
+        )
+
     def can_use_native_greedy(self) -> bool:
         """Return whether MLX argmax matches the requested sampling behavior."""
         return self.params_allow_native_greedy(self.sampling_params_list)
@@ -196,18 +210,24 @@ class SamplingBatch:
     @staticmethod
     def params_allow_native_random(
         sampling_params_list: Sequence[SamplingParams],
+        *,
+        allow_seed: bool = False,
     ) -> bool:
         """Whether MLX categorical sampling matches *sampling_params_list*.
 
         Requests must use plain temperature/top-k/top-p/min-p sampling; the
         mask is built per row, so rows may mix greedy (temperature 0) with
-        random sampling and differ in top-k/top-p/min-p. Requests with seeds,
-        sample logprobs, or structured outputs stay on the torch path.
+        random sampling and differ in top-k/top-p/min-p. Requests with sample
+        logprobs or structured outputs stay on the torch path. Seeded requests
+        are admitted only with ``allow_seed``: the synchronous sample path
+        derives a per-request key from the seed and the row's output length
+        (see :func:`seeded_row_key`), while the deferred decode pipeline does
+        not track per-row positions and keeps them out.
         """
         if not sampling_params_list:
             return False
         return all(
-            sp.seed is None
+            (allow_seed or sp.seed is None)
             and sp.frequency_penalty == 0.0
             and sp.presence_penalty == 0.0
             and sp.repetition_penalty == 1.0
@@ -226,23 +246,45 @@ class SamplingBatch:
         *,
         vocab_size: int,
         next_native_rng_key: Callable[[], mx.array] | None,
+        output_lengths: Sequence[int] | None = None,
     ) -> mx.array:
         """Build the lazy native token graph for an eligible batch.
+
+        ``output_lengths`` (tokens already generated per row) admits seeded
+        rows: each draws from :func:`seeded_row_key` instead of the shared
+        step key. Without it, seeded rows are rejected as a gate desync.
 
         Uses greedy argmax when the batch allows it, otherwise the temperature/
         top-k/top-p categorical graph over the vocab-sliced logits (unlike
         argmax, categorical can select a padded lm_head column). The caller
-        owns evaluation and RNG state; ``next_native_rng_key`` is consumed only on the
-        random path. Raises on batches neither native path admits — the
-        caller must not let those reach here.
+        owns evaluation and RNG state; ``next_native_rng_key`` is consumed only
+        when an unseeded random row draws from it, so all-seeded batches leave
+        the engine key untouched (no unevaluated split accumulates on it).
+        Raises on batches neither native path admits — the caller must not
+        let those reach here.
         """
         if cls.params_allow_native_greedy(sampling_params_list):
             return mlx_greedy_tokens(logits_2d)
         if next_native_rng_key is not None and cls.params_allow_native_random(
-            sampling_params_list
+            sampling_params_list, allow_seed=output_lengths is not None
         ):
+            row_keys = None
+            if output_lengths is not None and any(
+                sp.seed is not None for sp in sampling_params_list
+            ):
+                row_keys = [
+                    None if sp.seed is None else seeded_row_key(sp.seed, n)
+                    for sp, n in zip(sampling_params_list, output_lengths, strict=True)
+                ]
+            needs_engine_key = any(
+                sp.seed is None and sp.temperature >= GREEDY_TEMPERATURE_EPS
+                for sp in sampling_params_list
+            )
             return cls._native_random_tokens(
-                logits_2d[..., :vocab_size], sampling_params_list, next_native_rng_key()
+                logits_2d[..., :vocab_size],
+                sampling_params_list,
+                next_native_rng_key() if needs_engine_key else None,
+                row_keys=row_keys,
             )
         key_state = "live" if next_native_rng_key is not None else "absent"
         raise RuntimeError(
@@ -300,9 +342,18 @@ class SamplingBatch:
         cls,
         logits_2d: mx.array,
         sampling_params_list: Sequence[SamplingParams],
-        key: mx.array,
+        key: mx.array | None,
+        *,
+        row_keys: Sequence[mx.array | None] | None = None,
     ) -> mx.array:
         """Lazy per-row temperature/top-k/top-p/min-p token ids.
+
+        Rows with an entry in ``row_keys`` (seeded requests) draw with their
+        own key over their own row, so their token depends only on their
+        logits, params and key, not on batch neighbors. Other rows share one
+        batched draw with ``key``, exactly as when no row keys are given.
+        ``key`` may be ``None`` only when every other row is greedy; those
+        rows then take their top-1 candidate without a draw.
 
         Greedy rows (temperature below ``GREEDY_TEMPERATURE_EPS``) ride along
         as a top-1 candidate set at unit temperature so that every row of the
@@ -335,7 +386,18 @@ class SamplingBatch:
         sorted_desc, sorted_idx = cls._sorted_candidate_logits(
             scaled, top_k, top_p, min_p
         )
-        position = mx.random.categorical(sorted_desc, axis=-1, key=key)
+        if key is None:
+            position = mx.zeros((sorted_desc.shape[0],), dtype=mx.uint32)
+        else:
+            position = mx.random.categorical(sorted_desc, axis=-1, key=key)
+        if row_keys is not None and any(k is not None for k in row_keys):
+            rows = [
+                position[i]
+                if row_key is None
+                else mx.random.categorical(sorted_desc[i], axis=-1, key=row_key)
+                for i, row_key in enumerate(row_keys)
+            ]
+            position = mx.stack(rows).astype(position.dtype)
         tokens = mx.take_along_axis(sorted_idx, position[:, None], axis=-1)[:, 0]
         if any(greedy_rows):
             tokens = mx.where(
@@ -616,6 +678,22 @@ def create_request_generator(
     return generator
 
 
+def seeded_row_key(seed: int, num_output_tokens: int) -> mx.array:
+    """MLX key for a seeded request's next draw.
+
+    A pure function of ``(seed, num_output_tokens)``: the draw for output
+    position ``n`` is the same however the request is batched, chunked,
+    preempted or resumed, and independent of the engine key chain. The pair
+    is hashed to 64 bits so neighbouring seeds and positions do not share
+    keys.
+    """
+    digest = hashlib.blake2b(
+        f"vllm-metal-seed:{int(seed)}:{int(num_output_tokens)}".encode(),
+        digest_size=8,
+    ).digest()
+    return mx.random.key(int.from_bytes(digest, "little"))
+
+
 def mlx_greedy_tokens(logits_2d: mx.array) -> mx.array:
     """Lazy native-greedy token ids for pre-sliced 2D logits.
 
@@ -653,15 +731,18 @@ def sample_from_logits(
 
     if (
         next_native_rng_key is not None
-        and not batch.generators
         and not batch.needs_logprobs
-        and SamplingBatch.params_allow_native_random(batch.sampling_params_list)
+        and batch.generators_are_seeded()
+        and SamplingBatch.params_allow_native_random(
+            batch.sampling_params_list, allow_seed=True
+        )
     ):
         tokens = SamplingBatch.native_sample_tokens(
             logits_2d,
             batch.sampling_params_list,
             vocab_size=batch.vocab_size,
             next_native_rng_key=next_native_rng_key,
+            output_lengths=[len(ids) for ids in batch.output_token_id_lists],
         )
         mx.eval(tokens)
         return _SamplingResult(tokens.tolist())

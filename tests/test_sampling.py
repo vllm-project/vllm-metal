@@ -354,7 +354,7 @@ class TestSamplerDevicePolicy:
         "overrides",
         [
             None,
-            {"seed": 7},
+            {"repetition_penalty": 1.1},
             {"logprobs": 1},
             {"logprob_token_ids": [1, 2]},
             {"presence_penalty": 0.5},
