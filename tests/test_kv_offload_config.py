@@ -263,6 +263,49 @@ def test_unknown_spec_name_rejected() -> None:
         MetalPlatform.check_and_update_config(vllm_config)
 
 
+def _canonical_config(connector, size, value) -> SimpleNamespace:
+    vllm_config = _base_config(kv_offloading_size=size)
+    vllm_config.kv_transfer_config = SimpleNamespace(
+        kv_connector=connector,
+        kv_connector_module_path=None,
+        kv_role=None,
+        kv_connector_extra_config={"canonical_layout": value},
+    )
+    return vllm_config
+
+
+# The engine core re-runs the hook with MetalOffloadingConnector set.
+_OFFLOAD_ENTRIES = [
+    (None, 1.0),
+    ("OffloadingConnector", None),
+    ("MetalOffloadingConnector", None),
+]
+
+
+@pytest.mark.parametrize("connector,size", _OFFLOAD_ENTRIES)
+@pytest.mark.parametrize("value", [True, 1, "false"])
+def test_canonical_layout_rejected(connector, size, value) -> None:
+    """Metal skips upstream's per-layer canonical check. Truthy as upstream
+    reads it (bool()), so the string "false" is refused too."""
+    vllm_config = _canonical_config(connector, size, value)
+    with pytest.raises(NotImplementedError, match="canonical_layout"):
+        MetalPlatform.check_and_update_config(vllm_config)
+
+
+@pytest.mark.parametrize("value", [False, 0, None])
+def test_canonical_layout_off_is_accepted(value) -> None:
+    vllm_config = _canonical_config(None, 1.0, value)
+    MetalPlatform.check_and_update_config(vllm_config)
+    assert vllm_config.kv_transfer_config.kv_connector == "MetalOffloadingConnector"
+
+
+def test_canonical_layout_on_another_connector_is_left_alone() -> None:
+    vllm_config = _canonical_config("NixlConnector", None, True)
+    before = vars(vllm_config.kv_transfer_config).copy()
+    MetalPlatform.check_and_update_config(vllm_config)
+    assert vars(vllm_config.kv_transfer_config) == before
+
+
 def test_simple_kv_offload_env_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("vllm.envs.VLLM_USE_SIMPLE_KV_OFFLOAD", True, raising=False)
     vllm_config = _base_config(kv_offloading_size=1.0)
