@@ -115,6 +115,9 @@ class TestParityTool:
             assert payload["ignore_eos"] and payload["return_token_ids"]
             assert payload["return_tokens_as_token_ids"]
             assert payload["temperature"] == 0
+            assert payload["repetition_penalty"] == 1.0
+            assert payload["presence_penalty"] == payload["frequency_penalty"] == 0.0
+            assert payload["top_k"] == -1 and payload["top_p"] == 1.0
             sent.append(payload["prompt"])
             prompts = payload["prompt"]
             if isinstance(prompts[0], int):
@@ -174,9 +177,20 @@ class TestParityTool:
         with pytest.raises(ValueError, match="input token IDs"):
             http_generate("http://localhost/v1", "model", [{"input_ids": [1]}], 1)
 
-    @pytest.mark.parametrize("backend", ["mlx", "mps"])
+    @pytest.mark.parametrize(
+        "backend,spec",
+        [
+            ("mlx", None),
+            ("mps", None),
+            (
+                "mps",
+                {"method": "eagle3", "model": "draft", "num_speculative_tokens": 3},
+            ),
+        ],
+        ids=["mlx", "mps", "mps-eagle3"],
+    )
     def test_canonical_flow_reuses_reference_and_server(
-        self, monkeypatch, tmp_path, backend
+        self, monkeypatch, tmp_path, backend, spec
     ):
         monkeypatch.setenv("VLLM_METAL_BACKEND", backend)
         monkeypatch.setenv("PYTORCH_ENABLE_MPS_FALLBACK", "1")
@@ -199,7 +213,9 @@ class TestParityTool:
             env,
             additional_config,
             trust_remote_code,
+            speculative_config=None,
         ):
+            assert speculative_config == spec
             assert not trust_remote_code
             assert max_num_seqs == 2
             assert gpu_memory_utilization == 0.65
@@ -224,6 +240,7 @@ class TestParityTool:
             1,
             top_k=2,
             output_dir=tmp_path,
+            speculative_config=spec,
         )
         assert events == [
             "reference exited",
@@ -252,7 +269,8 @@ class TestParityTool:
             path.write_text(json.dumps([row]))
 
         @contextmanager
-        def server(*args):
+        def server(*args, speculative_config=None):
+            assert speculative_config is None
             trusted.append(args[-1])
             yield "http://localhost/v1"
 
@@ -267,8 +285,10 @@ class TestParityTool:
             batch_sizes=(1,),
             output_dir=tmp_path,
             trust_remote_code=True,
+            reference_backend="mlx-vlm",
         )
         assert "--trust-remote-code" in commands[0]
+        assert commands[0][commands[0].index("--reference-backend") + 1] == "mlx-vlm"
         assert trusted == [True]
 
     def test_trust_remote_code_is_rejected_with_speculative_method(

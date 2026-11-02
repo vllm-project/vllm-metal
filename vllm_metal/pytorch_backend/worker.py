@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Opt-in vLLM worker for the MPS proof of concept."""
 
-from functools import wraps
-
 import torch
 from vllm.config.utils import getattr_iter
 from vllm.utils.torch_utils import set_random_seed
@@ -16,29 +14,7 @@ from vllm_metal.v1.worker import MetalWorker, init_worker_distributed_environmen
 _MPS_HEAP_ALIGNMENT = 2 << 20
 
 
-def _patch_mps_mrv2_validation():
-    from vllm.config import VllmConfig
-
-    from vllm_metal import envs
-
-    original = VllmConfig._validate_v2_model_runner
-    if getattr(original, "_metal_mrv2", False):
-        return
-
-    @wraps(original)
-    def validate(config):
-        if envs.VLLM_METAL_BACKEND != "mps":
-            return original(config)
-        # Keep upstream feature validation; MPS replaces the Triton operations.
-        unsupported = config._get_v2_model_runner_unsupported_features()
-        if unsupported:
-            raise ValueError(f"MPS MRV2 does not support: {', '.join(unsupported)}")
-
-    validate._metal_mrv2 = True
-    VllmConfig._validate_v2_model_runner = validate
-
-
-def configure_mps(config):
+def configure_mps(config, *, omni=False):
     from vllm import envs as vllm_envs
     from vllm.config.compilation import CompilationMode, CUDAGraphMode
 
@@ -48,22 +24,26 @@ def configure_mps(config):
         if vllm_envs.VLLM_USE_V2_MODEL_RUNNER is not True:
             raise ValueError("Experimental MPS requires VLLM_USE_V2_MODEL_RUNNER=1")
 
+    if omni:
+        from vllm.config import DeviceConfig
+
+        config.device_config = DeviceConfig(device="mps")
+
     model = config.model_config
     state_layers = set(getattr(model.hf_text_config, "layer_types", None) or ())
     if (
         model.get_head_size() not in MPSAttentionBackend.get_supported_head_sizes()
         or model.is_encoder_decoder
         or model.is_diffusion
-        or model.is_multimodal_model
+        or (model.is_multimodal_model and not omni)
         or model.is_moe
         or (model.has_inner_state and state_layers != {"conv", "full_attention"})
         or model.use_mla
         or model.quantization is not None
-        or model.runner_type != "generate"
+        or (model.runner_type != "generate" and not omni)
         or model.dtype not in (torch.float16, torch.bfloat16)
         or config.parallel_config.world_size != 1
         or config.parallel_config.data_parallel_size != 1
-        or config.speculative_config is not None
         or config.lora_config is not None
         or config.kv_transfer_config is not None
         or config.additional_config.get("turboquant", False)
@@ -72,22 +52,25 @@ def configure_mps(config):
             "Experimental MPS requires an unquantized dense autoregressive "
             "text decoder with a supported attention head size, optional "
             "ShortConv state, fp16/bf16, "
-            "one GPU, and no LoRA/speculative decoding/KV transfer."
+            "one GPU, and no LoRA/KV transfer."
         )
+    spec = config.speculative_config
+    if spec is not None and (
+        spec.method != "eagle3"
+        or spec.draft_sample_method != "greedy"
+        or spec.rejection_sample_method != "standard"
+        or spec.enable_adaptive_verification
+        or spec.parallel_drafting
+        or model.has_inner_state
+        or config.watermark_config is not None
+    ):
+        raise NotImplementedError("MPS speculation currently supports greedy EAGLE3")
     if config.cache_config.block_size is None:
         config.cache_config.block_size = 16
     if not MPSAttentionBackend.supports_block_size(config.cache_config.block_size):
         raise ValueError("MPS requires a cache block size divisible by 8")
-    unsupported = [
-        name
-        for name in ("use_fp64_gumbel", "enable_trace_replay", "return_sampling_mask")
-        if getattr(model, name, False)
-    ]
-    if unsupported:
-        raise NotImplementedError(
-            f"Experimental MPS does not support {', '.join(unsupported)}"
-        )
-    _patch_mps_mrv2_validation()
+    if getattr(model, "use_fp64_gumbel", False):
+        raise NotImplementedError("Experimental MPS does not support use_fp64_gumbel")
     if config.scheduler_config.async_scheduling is None:
         config.scheduler_config.async_scheduling = False
     config.compilation_config.mode = CompilationMode.NONE
@@ -96,12 +79,15 @@ def configure_mps(config):
 
 
 class MPSWorker(MetalWorker):
+    model_runner_cls = MPSModelRunner
+    is_omni = False
+
     def init_device(self):
         import vllm_metal.pytorch_backend.rotary  # noqa: F401
 
         if not torch.backends.mps.is_available():
             raise RuntimeError("The experimental backend requires PyTorch MPS")
-        configure_mps(self.vllm_config)
+        configure_mps(self.vllm_config, omni=self.is_omni)
         self.device = torch.device("mps:0")
         init_worker_distributed_environment(
             self.vllm_config,
@@ -110,7 +96,7 @@ class MPSWorker(MetalWorker):
             self.local_rank,
         )
         set_random_seed(self.model_config.seed)
-        self.model_runner = MPSModelRunner(self.vllm_config)
+        self.model_runner = self.model_runner_cls(self.vllm_config)
 
     def determine_available_memory(self):
         torch.mps.synchronize()

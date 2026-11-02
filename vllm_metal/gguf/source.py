@@ -28,6 +28,8 @@ _QUANT_TAG_RE = re.compile(
 _REMOTE_PREFIXES = ("*.", "*-")
 _REMOTE_SUFFIXES = ("-*", "")
 _SHARD_NAME_RE = re.compile(r"-\d+-of-(\d+)\.gguf$")
+# Multimodal projector files carry quant tags too, e.g. mmproj-BF16.gguf.
+_PROJECTOR_MARKER = "mmproj"
 _SUPPORTED_REMOTE_TAGS = frozenset(
     {
         "Q8_0",
@@ -51,22 +53,14 @@ _SUPPORTED_REMOTE_TAGS = frozenset(
         "Q5_K_L",
         "Q6_K",
         "Q6_K_L",
+        "IQ4_NL",
+        "IQ4_XS",
         "F16",
         "F32",
         "BF16",
     }
 )
 _CONFIG_ALLOW_PATTERNS = ("config.json", "generation_config.json")
-_TOKENIZER_ALLOW_PATTERNS = (
-    "*.json",
-    "*.py",
-    "tokenizer.model",
-    "*.tiktoken",
-    "tiktoken.model",
-    "*.txt",
-    "*.jsonl",
-    "*.jinja",
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,6 +173,11 @@ class RemoteGGUFReference:
         return str(snapshot_dir / filename)
 
     def _select_single_filename(self, filenames: list[str]) -> str:
+        filenames = [
+            filename
+            for filename in filenames
+            if _PROJECTOR_MARKER not in Path(filename).name.lower()
+        ]
         if not filenames:
             raise ValueError(
                 f"No {self.quant_type!r} GGUF file found in remote repository "
@@ -202,11 +201,10 @@ class RemoteGGUFReference:
 
 @dataclass(frozen=True, slots=True)
 class GGUFLoadSource:
-    """Local GGUF weights plus companion config/tokenizer sources."""
+    """Local GGUF weights and companion model config."""
 
     weights_path: str
     config_dir: str
-    tokenizer_dir: str
 
     @classmethod
     def from_model_config(
@@ -250,17 +248,9 @@ class GGUFLoadSource:
                 ignore_patterns=ignore_patterns,
                 token=token,
             )
-        tokenizer_dir = cls._resolve_companion_source(
-            model_config.tokenizer or model_config.model,
-            cache_dir=cache_dir,
-            revision=model_config.tokenizer_revision or model_config.revision,
-            token=token,
-            allow_patterns=_TOKENIZER_ALLOW_PATTERNS,
-        )
         return cls(
             weights_path=weights_path,
             config_dir=config_dir,
-            tokenizer_dir=tokenizer_dir,
         )
 
     @staticmethod

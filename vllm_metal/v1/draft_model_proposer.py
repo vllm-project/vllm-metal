@@ -57,7 +57,7 @@ from typing import TYPE_CHECKING, Any
 from weakref import WeakValueDictionary
 
 import mlx.core as mx
-from mlx_lm import load as mlx_lm_load
+from mlx_lm.utils import load_model as mlx_lm_load_model
 from vllm.logger import init_logger
 from vllm.v1.outputs import DraftTokenIds
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
@@ -70,7 +70,7 @@ from vllm_metal.attention.context import (
 )
 from vllm_metal.attention.runtime.sdpa import SDPAPagedAttentionRuntime
 from vllm_metal.metal.constants import PA_WINDOW_MAX_HEAD_SIZE
-from vllm_metal.utils import get_model_download_path
+from vllm_metal.utils import get_model_download_path, resolve_mlx_lm_model_path
 from vllm_metal.v1.mlx_lm_paths import mlx_lm_compatible_model_path
 from vllm_metal.v1.proposer import (
     _DECODE_INGEST_MAX_TOKENS,
@@ -220,7 +220,7 @@ class DraftModelProposer(NoOwnKVProposer):
     ) -> DraftModelProposer:
         """Load draft weights without binding the paged cache."""
         model, dims = _load_draft_model(speculative_config, parallel_config)
-        # The capability probe uses a cacheless forward and must run before
+        # The capability probe uses isolated native caches and must run before
         # patch_model() installs attention wrappers that require a paged
         # context. Unsupported model heads retain the full-logits fallback.
         selective_logits_supported = model_adapter.supports_selective_logits(model)
@@ -508,6 +508,7 @@ class DraftModelProposer(NoOwnKVProposer):
             ctx.decode_reqs,
             ctx.decode_token_ids,
             ctx.prefill_reqs,
+            ctx.prefill_token_ids,
             ctx.prefill_result_modes,
             ctx.request_states,
         ):
@@ -967,8 +968,9 @@ def _load_draft_model(
         draft_model_config.model, revision=draft_model_config.revision
     )
     with mlx_lm_compatible_model_path(model_path) as compatible_path:
-        model, _ = mlx_lm_load(
+        resolved_path = resolve_mlx_lm_model_path(
             str(compatible_path), revision=draft_model_config.revision
         )
+        model, _ = mlx_lm_load_model(resolved_path)
 
     return model, dims

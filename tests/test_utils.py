@@ -4,6 +4,7 @@
 import importlib.metadata
 import subprocess
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -19,6 +20,7 @@ from vllm_metal.utils import (
     _parse_swap_out_bytes,
     get_model_download_path,
     probe_commit,
+    resolve_mlx_lm_model_path,
     set_wired_limit,
 )
 
@@ -65,6 +67,49 @@ def test_local_model_path_is_preserved(tmp_path):
     assert get_model_download_path(str(tmp_path), revision="release-tag") == str(
         tmp_path
     )
+
+
+@pytest.mark.parametrize("modelscope_flag", [None, "false", "TrUe"])
+def test_mlx_lm_snapshot_preserves_provider_revision_and_filters(
+    monkeypatch, modelscope_flag
+):
+    from mlx_lm.utils import DEFAULT_ALLOW_PATTERNS
+
+    if modelscope_flag is None:
+        monkeypatch.delenv("MLXLM_USE_MODELSCOPE", raising=False)
+    else:
+        monkeypatch.setenv("MLXLM_USE_MODELSCOPE", modelscope_flag)
+    hf_download = Mock(return_value="/hf/snapshot")
+    ms_download = Mock(return_value="/modelscope/snapshot")
+    monkeypatch.setattr("huggingface_hub.snapshot_download", hf_download)
+    monkeypatch.setitem(
+        sys.modules, "modelscope", SimpleNamespace(snapshot_download=ms_download)
+    )
+    expected, unused = (
+        (ms_download, hf_download)
+        if modelscope_flag == "TrUe"
+        else (hf_download, ms_download)
+    )
+
+    assert resolve_mlx_lm_model_path("org/model", revision="release-tag") == Path(
+        expected.return_value
+    )
+    expected.assert_called_once_with(
+        "org/model", revision="release-tag", allow_patterns=DEFAULT_ALLOW_PATTERNS
+    )
+    unused.assert_not_called()
+
+
+def test_mlx_lm_local_path_skips_downloads(tmp_path, monkeypatch):
+    monkeypatch.setenv("MLXLM_USE_MODELSCOPE", "true")
+    download = Mock(side_effect=AssertionError("local model must not download"))
+    monkeypatch.setattr("huggingface_hub.snapshot_download", download)
+    monkeypatch.setitem(
+        sys.modules, "modelscope", SimpleNamespace(snapshot_download=download)
+    )
+
+    assert resolve_mlx_lm_model_path(str(tmp_path), revision="release-tag") == tmp_path
+    download.assert_not_called()
 
 
 def test_set_wired_limit_uses_pinned_mlx_api(monkeypatch) -> None:

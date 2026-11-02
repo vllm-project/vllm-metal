@@ -19,6 +19,22 @@ Selecting MPS defaults to MRv2. Use unquantized FP16/BF16 checkpoints and greedy
 requests (`temperature=0`). Output-token logprobs are supported; prompt logprobs
 and explicit token-ID scoring are not yet supported.
 
+For speech generation, see [Qwen3-TTS on Apple Silicon](qwen3-tts-mps.md).
+
+## EAGLE3 speculative decoding
+
+Use a matching EAGLE3 draft with a dense FP16/BF16 text target and greedy requests:
+
+```bash
+VLLM_METAL_BACKEND=mps PYTORCH_ENABLE_MPS_FALLBACK=0 \
+  vllm serve Qwen/Qwen3-8B --dtype bfloat16 \
+  --speculative-config '{"method":"eagle3","model":"RedHatAI/Qwen3-8B-speculator.eagle3","num_speculative_tokens":3,"use_local_argmax_reduction":true}'
+```
+
+Output logprobs are supported. Parallel drafting, probabilistic sampling, and
+hybrid recurrent targets are not supported. Measure draft length on your workload;
+more draft tokens do not always improve throughput.
+
 ## Models
 
 - Use `model_impl="auto"` and vLLM's resolver. Keep model definitions and weight
@@ -32,10 +48,26 @@ and explicit token-ID scoring are not yet supported.
   Continuous batching and duplex are requirements for the corresponding serving
   features, not optional follow-ups to a single-request implementation.
 
+## Adding Omni models
+
+- Keep model definitions, weight loading, audio processing, and cache algorithms
+  in vllm-omni. Reuse its worker and runner interfaces through `omni.py`.
+- Put MPS deployment defaults in `pytorch_backend/deploy/`; keep
+  `omni_platform.py` limited to platform capabilities.
+- Put model-family operator registrations in `pytorch_backend/models/`.
+  Follow `qwen3_code_predictor.py`: a small `install()` function, upstream
+  `register_oot` hooks, and shared MPS operations. Register before model loading.
+- Add a shared helper only when another model needs the same behavior. Validate
+  matching-checkpoint parity and real serving at batch sizes 1, 4, and 8.
+
 ## Kernels: choose the existing integration point
 
-Choose the implementation and its upstream hook separately. Our RMSNorm provider
-reuses a PyTorch fused operation through a vLLM IR registration.
+Choose the implementation and its upstream hook separately. Plain RMSNorm reuses
+PyTorch's fused operation through a vLLM IR registration. Residual-add RMSNorm
+uses a bundled Metal kernel for contiguous two-dimensional FP16/BF16 inputs and
+one-dimensional weights; other supported layouts retain the PyTorch path. The
+kernel computes variance from the FP32 residual sum, then rounds the normalized
+value before applying the learned weight, preserving vLLM's numerical contract.
 
 | What needs changing? | Use |
 | --- | --- |

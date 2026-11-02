@@ -116,13 +116,30 @@ jobs:
           python tools/check_parity.py --model "$MODEL_PATH" --top-k 5 --max-tokens 20 \
             --batch-size 1 2 --output-dir "$RUNNER_TEMP/parity" \
             --gpu-memory-utilization "$PARITY_GPU_MEMORY_UTILIZATION"
+      - name: Compare same-model speculative parity
+        if: matrix.model.name == 'qwen3-0.6b'
+        run: |
+          source .venv-vllm-metal/bin/activate
+          python -m tools.check_parity --model "$MODEL_PATH" --draft "$MODEL_PATH" \
+            --method draft_model --num-draft-tokens 3 --top-k 5 --max-tokens 20 \
+            --batch-size 1 2 --output-dir "$RUNNER_TEMP/parity/speculative" \
+            --gpu-memory-utilization "$PARITY_GPU_MEMORY_UTILIZATION"
+      - name: Check FP32 acceptance and rejection recovery
+        if: matrix.model.name == 'qwen3-0.6b'
+        run: |
+          source .venv-vllm-metal/bin/activate
+          uv pip install pytest
+          python -m pytest tests/test_draft_stats_e2e.py -k 'same_model_acceptance or controlled_rejection' \
+            -q -s --basetemp "$RUNNER_TEMP/parity/acceptance" \
+            --junitxml "$RUNNER_TEMP/parity/acceptance.xml"
       - name: Summarize parity
         if: always()
         run: |
-          printf '### %s\n\nCommit: %s\n\n' "$MODEL_ID" "$TESTED_SHA" >> "$GITHUB_STEP_SUMMARY"
-          if [ -f "$RUNNER_TEMP/parity/summary.md" ]; then
-            cat "$RUNNER_TEMP/parity/summary.md" >> "$GITHUB_STEP_SUMMARY"
-          fi
+          if [ -x .venv-vllm-metal/bin/python ]; then
+            .venv-vllm-metal/bin/python .github/scripts/parity.py summary
+          else
+            printf '### %s\n\nCommit: %s\n\nEnvironment setup did not complete; parity results are unavailable.\n' "$MODEL_ID" "$TESTED_SHA"
+          fi >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: always()
         with:

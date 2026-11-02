@@ -126,6 +126,5 @@ ExecutablePoolingBackend: TypeAlias = DecoderPoolingBackend | EncoderPoolingBack
 @dataclass(frozen=True, slots=True)
 class LoadedEncoderBackend:
     model: Any
-    tokenizer: Any
     model_args: dict[str, Any]
     pooling_backend: EncoderPoolingBackend

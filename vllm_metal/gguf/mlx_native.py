@@ -17,6 +17,10 @@ also 32 wide, but their scales are the fp32 products ``d*sc`` / ``-dmin*m``, so
 those triples store ``float32`` to reproduce ``gguf.quants.dequantize`` bit for
 bit (#761). K-quants with 16-element sub-groups (Q6_K/Q3_K/Q2_K) cannot repack,
 since MLX has no group_size=16 kernels, and stay out of scope for this path.
+
+IQ4_NL and IQ4_XS nibbles index llama.cpp's 16-entry int8 codebook, which is
+not affine in the nibble. Storing the codebook value plus 128 as an 8-bit code
+is, with ``bias = -128*scale``.
 """
 
 from __future__ import annotations
@@ -26,6 +30,7 @@ from dataclasses import dataclass
 import mlx.core as mx
 import numpy as np
 from gguf import GGML_QUANT_SIZES, GGMLQuantizationType
+from gguf.quants import IQ4_NL
 
 # qtypes that repack into MLX's affine representation, with their bit widths.
 _BITS: dict[GGMLQuantizationType, int] = {
@@ -36,11 +41,22 @@ _BITS: dict[GGMLQuantizationType, int] = {
     GGMLQuantizationType.Q5_1: 5,
     GGMLQuantizationType.Q4_K: 4,
     GGMLQuantizationType.Q5_K: 5,
+    GGMLQuantizationType.IQ4_NL: 8,
+    GGMLQuantizationType.IQ4_XS: 8,
 }
 AFFINE_GGUF_TYPES = frozenset(_BITS)
 
-# K-quant scales are fp32 products; the other qtypes store the file's fp16 scale.
-_FP32_SCALE_TYPES = frozenset({GGMLQuantizationType.Q4_K, GGMLQuantizationType.Q5_K})
+# Sub-block scales are fp32 products; the other qtypes store the file's fp16 scale.
+_FP32_SCALE_TYPES = frozenset(
+    {
+        GGMLQuantizationType.Q4_K,
+        GGMLQuantizationType.Q5_K,
+        GGMLQuantizationType.IQ4_XS,
+    }
+)
+
+# 8-bit code for each IQ4 nibble: its int8 codebook value plus 128.
+_IQ4_CODES = mx.array(np.array(IQ4_NL.kvalues, dtype=np.int16) + 128, dtype=mx.uint8)
 
 # Every affine qtype groups by 32 in MLX's affine quant mode.
 _GROUP_SIZE = 32
@@ -59,12 +75,14 @@ class GGUFMLXQuantizedTensor:
 
     * ``qweight`` — ``uint32`` packed weights, 2-D, shape :attr:`packed_shape`.
     * ``scales`` / ``biases`` — shape ``(out_features, in_features //
-      group_size)``; ``float32`` for Q4_K/Q5_K (required for a bit-exact
-      K-quant repack, #761) and ``float16`` for Q8_0/Q4_0/Q4_1/Q5_0/Q5_1.
+      group_size)``; ``float32`` for Q4_K/Q5_K/IQ4_XS (required for a
+      bit-exact sub-block repack, #761) and ``float16`` for
+      Q8_0/Q4_0/Q4_1/Q5_0/Q5_1/IQ4_NL.
     * ``qweight_type`` — a ``gguf.GGMLQuantizationType`` in
       :data:`AFFINE_GGUF_TYPES`.
     * logical weight is ``(out_features, in_features)``; :attr:`group_size` is 32;
-      :attr:`bits` is 8 for Q8_0, 5 for Q5_0/Q5_1/Q5_K, 4 for Q4_0/Q4_1/Q4_K.
+      :attr:`bits` is 8 for Q8_0/IQ4_NL/IQ4_XS, 5 for Q5_0/Q5_1/Q5_K, 4 for
+      Q4_0/Q4_1/Q4_K.
     * activations: :meth:`matmul` accepts float16/bfloat16/float32 ``x`` and
       returns ``x``'s dtype; :meth:`embedding` returns an explicit ``output_dtype``.
 
@@ -199,6 +217,8 @@ class GGUFMLXQuantizedTensor:
             GGMLQuantizationType.Q5_1: cls._parse_q5_1,
             GGMLQuantizationType.Q4_K: cls._parse_q4_k,
             GGMLQuantizationType.Q5_K: cls._parse_q5_k,
+            GGMLQuantizationType.IQ4_NL: cls._parse_iq4_nl,
+            GGMLQuantizationType.IQ4_XS: cls._parse_iq4_xs,
         }[qweight_type]
         bits = _BITS[qweight_type]
         num_groups = in_features // _GROUP_SIZE
@@ -330,6 +350,40 @@ class GGUFMLXQuantizedTensor:
         group_bits = mx.arange(8, dtype=mx.uint8)[None, :, None]
         high = ((qh[:, None, :] >> group_bits) & 1) << 4
         return low | high, scales, biases
+
+    @staticmethod
+    def _parse_iq4_nl(blocks: mx.array) -> tuple[mx.array, mx.array, mx.array]:
+        """Split 18-byte IQ4_NL blocks (fp16 ``d``, 16 nibble bytes).
+
+        The nibble order matches Q4_0 and ``w = d*kvalues[q]``, so the code is
+        ``kvalues[q]+128`` with ``scale = d`` and ``bias = -128*d``.
+        """
+        d = blocks[:, 0:2].view(mx.float16)
+        nibbles = GGUFMLXQuantizedTensor._split_nibbles(blocks[:, 2:18])
+        return _IQ4_CODES[nibbles], d, d * -128
+
+    @staticmethod
+    def _parse_iq4_xs(blocks: mx.array) -> tuple[mx.array, mx.array, mx.array]:
+        """Split IQ4_XS superblocks into 8-bit codes and fp32 group-32 affine.
+
+        A 136-byte superblock holds 256 weights: fp16 ``d``, a ``uint16``
+        ``scales_h``, four ``scales_l`` bytes, then eight 16-byte sub-blocks
+        in IQ4_NL nibble order. Sub-block ``j`` decodes as
+        ``d*(ls-32)*kvalues[q]``, where ``ls`` is nibble ``j`` of ``scales_l``
+        plus bits ``2j..2j+1`` of ``scales_h`` shifted up by four.
+        """
+        n_blocks = blocks.shape[0]
+        d = blocks[:, 0:2].view(mx.float16).astype(mx.float32)
+        scales_h = blocks[:, 2:4].view(mx.uint16)
+        scales_l = blocks[:, 4:8]
+        low = mx.stack([scales_l & 0x0F, scales_l >> 4], axis=-1).reshape(n_blocks, 8)
+        high = (scales_h >> (2 * mx.arange(8, dtype=mx.uint16))) & 3
+        sub_scales = (low.astype(mx.int32) | (high.astype(mx.int32) << 4)) - 32
+        scales = d * sub_scales.astype(mx.float32)
+        nibbles = GGUFMLXQuantizedTensor._split_nibbles(
+            blocks[:, 8:136].reshape(n_blocks, 8, 16)
+        )
+        return _IQ4_CODES[nibbles], scales, scales * -128
 
     @staticmethod
     def _parse_kquant_scale_mins(blocks: mx.array) -> tuple[mx.array, mx.array]:

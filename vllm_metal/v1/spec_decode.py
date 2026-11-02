@@ -327,7 +327,7 @@ class SpeculativeDecodeController:
             decode_token_ids,
             strict=True,
         ):
-            if not sampled_ids or not self.can_draft_greedy(req_id, state):
+            if not sampled_ids or not self.can_draft_greedy(req_id, state, sampled_ids):
                 continue
             accepted_offset = len(sampled_ids) - 1
             seeds.append(
@@ -346,7 +346,9 @@ class SpeculativeDecodeController:
             if result_mode == "intermediate":
                 continue
             state = request_states.get(prefill.req_id)
-            if state is None or not self.can_draft_greedy(prefill.req_id, state):
+            if state is None or not self.can_draft_greedy(
+                prefill.req_id, state, (token_id,)
+            ):
                 continue
             prefill_end = cu_seqlens[num_decode_segments + i + 1]
             seeds.append(
@@ -365,11 +367,21 @@ class SpeculativeDecodeController:
         self,
         req_id: str,
         request_state: _SpecDecodeRequestStateLike,
+        sampled_ids: Sequence[int],
     ) -> bool:
         """Whether a request may be drafted under greedy-only spec decode."""
         # Sampling updates the output count before the scheduler retires a request.
-        max_tokens = request_state.sampling_params.max_tokens
+        sampling_params = request_state.sampling_params
+        max_tokens = sampling_params.max_tokens
         if max_tokens is not None and request_state.generated_tokens >= max_tokens:
+            return False
+        # Match the scheduler's token-stop rules, including ignore_eos. A stop
+        # can occur before the last accepted token in a verification window.
+        if sampling_params.eos_token_id in sampled_ids:
+            return False
+        if any(
+            token in (sampling_params.stop_token_ids or ()) for token in sampled_ids
+        ):
             return False
         try:
             self._validate_greedy_sampling([(req_id, request_state)])
@@ -382,6 +394,7 @@ class SpeculativeDecodeController:
         decode_reqs: Sequence[tuple[str, _SpecDecodeRequestStateLike]],
         decode_token_ids: Sequence[Sequence[int]],
         prefill_reqs: Sequence[_SpecDecodePrefillLike],
+        prefill_token_ids: Sequence[int],
         prefill_result_modes: Sequence[str],
         request_states: Mapping[str, _SpecDecodeRequestStateLike],
     ) -> Sequence[tuple[str, RequestState]]:
@@ -389,7 +402,7 @@ class SpeculativeDecodeController:
 
         Shared eligibility filter for block-draft, draft-model and n-gram
         proposers: skip decode rows that did not sample this step, skip
-        exhausted or non-greedy requests via :meth:`can_draft_greedy`, skip
+        finished or non-greedy requests via :meth:`can_draft_greedy`, skip
         intermediate prefill chunks, and de-duplicate prefill rows whose
         ``req_id`` was already admitted through decode.
 
@@ -406,18 +419,20 @@ class SpeculativeDecodeController:
         ):
             if not sampled_ids:
                 continue
-            if not self.can_draft_greedy(req_id, state):
+            if not self.can_draft_greedy(req_id, state, sampled_ids):
                 continue
             eligible.append((req_id, state))  # type: ignore[arg-type]
             seen.add(req_id)
 
-        for prefill, result_mode in zip(
-            prefill_reqs, prefill_result_modes, strict=True
+        for i, (prefill, result_mode) in enumerate(
+            zip(prefill_reqs, prefill_result_modes, strict=True)
         ):
             if result_mode == "intermediate" or prefill.req_id in seen:
                 continue
             state = request_states.get(prefill.req_id)
-            if state is None or not self.can_draft_greedy(prefill.req_id, state):
+            if state is None or not self.can_draft_greedy(
+                prefill.req_id, state, (prefill_token_ids[i],)
+            ):
                 continue
             eligible.append((prefill.req_id, state))  # type: ignore[arg-type]
 

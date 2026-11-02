@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Numerical coverage for the private TurboQuant GQA decode producers.
+"""Numerical coverage for the TurboQuant GQA decode producers.
 
-Default routing keeps TurboQuant decode on the per-token / split-KV kernels
-(test_gqa_decode_routing.py). These tests force the GQA producer through the
-private test entry and compare it with that established TurboQuant path and
-with an FP32 reference over the dequantized cache.
+Default routing admits TurboQuant decode under the GQA work budget at P256
+(test_gqa_decode_routing.py). These tests force each producer through the
+private test entry and compare it with the established TurboQuant kernels,
+reached with GQA disabled, and with an FP32 reference over the dequantized
+cache.
 """
 
 from __future__ import annotations
@@ -137,6 +138,7 @@ def _run(
         num_decode_requests=batch,
         num_decode_tokens=batch,
         max_decode_context_len=max(kv_lens),
+        gqa_disabled=True,
     )
     mx.eval(established)
     assert _dispatch_family() in {"per_token_ps0", "per_token_ps512"}

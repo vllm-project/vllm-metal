@@ -9,6 +9,7 @@ python tools/check_parity.py --model Qwen/Qwen3-0.6B
 VLLM_METAL_BACKEND=mps PYTORCH_ENABLE_MPS_FALLBACK=0 \
   python tools/check_parity.py --model Qwen/Qwen3-0.6B --top-k 5
 python tools/check_parity.py --model /path/to/checkpoint --top-k 5 --batch-size 1 2 --output-dir parity-results
+python tools/check_parity.py --model LiquidAI/LFM3-1.7B-MLX-4bit --reference-backend mlx-vlm --trust-remote-code --top-k 5
 ```
 
 The tool generates the native MLX reference once and exits that process before starting one `vllm serve` instance. It checks `/health`, compares individual prompts and pairs of prompts through `/v1/completions`, then stops the server. The server's sequence limit is the largest requested batch size, and prefix caching is disabled. Each pair is submitted in one HTTP request. These are request batch sizes, not assertions about the actual GPU batch size. Both backends use the same checkpoint and input token IDs. MPS serving disables PyTorch's optional CPU fallback.
@@ -18,6 +19,8 @@ The default is the 40 prompts in `tools/parity_prompts.py`, greedy decoding, and
 - `EXACT`: every output token matches.
 - `TOP_K_MATCH`: the first divergence passes mutual top-K membership; later tokens are not compared. Enabled with `--top-k K`.
 - `FAIL`: a mismatch fails the comparison, or generation is incomplete.
+
+Parity checks may be unreliable for MoE models. When mismatches occur, investigate routing flips between experts with nearly tied scores.
 
 Exit status is 0 when all prompts pass, otherwise nonzero. No saved golden token IDs or regeneration step is needed.
 
@@ -63,4 +66,8 @@ Parity runs daily at 07:17 UTC on `main`. Users with repository write access can
 
 Both triggers invoke this same tool for Qwen3-0.6B and Qwen3.5-0.8B on a self-hosted Apple Silicon Mac: 40 shared prompts, 20 output tokens, top-K 5, and HTTP request batch sizes 1/2. CI supplies the checkpoint and environment and collects the tool's results.
 
-The `Parity` check links to job summaries and artifacts containing the native reference, server log, and per-batch results, retained for 14 days. Regular PR CI runs fast tests without starting model servers.
+The Qwen3-0.6B job also checks speculative output parity and FP32 acceptance
+and rejection recovery, including prefix-cache reuse.
+
+The `Parity` check links to summary tables and diagnostic artifacts, retained
+for 14 days. Regular PR CI runs fast tests without starting model servers.

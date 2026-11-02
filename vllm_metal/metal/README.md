@@ -94,6 +94,15 @@ appends and mixed decode/prefill batches. There is no prefix-length floor,
 device-name table or Q/KV-head-pair table. Native eligibility still owns
 architecture, dtype, page support and whether decode is separated.
 
+This score chooses the single-head BQ64 baseline. Eligible GQA6 workloads then
+compare grouped BQ16 h3/h6 layouts against that selected baseline, so changing
+the split hint can also change grouped admission or width. Grouped kernels use
+their own full-tile bounds handling; the BQ64 split flag is not applied to them.
+Setting `VLLM_METAL_NAX_GQA_PREFILL=0` and restarting workers disables this
+second choice while retaining the host-selected BQ64 pipeline. See
+[grouped NAX prefill](../../docs/gqa-prefill.md) for its separate eligibility
+and calibration limits.
+
 For each sequence, count complete 64-row Q blocks `Fi` and the 32-token KV
 tiles visited by complete / partial Q blocks, `Wfi` / `Wpi`. Keep the causal
 extent of each sequence; query rows from different requests never form one

@@ -143,14 +143,13 @@ def test_awq_load_aligns_non_quant_dtypes_to_runner_target(
     runner = None
     lifecycle = None
     model = None
-    tokenizer = None
     try:
         runner = make_stub_runner(
             model_config=_runner_model_config(awq_repo, dtype=torch.bfloat16)
         )
         lifecycle = ModelLifecycle(runner, runner._model_adapter)
 
-        model, tokenizer = lifecycle._load_generation_model(awq_repo, is_vlm=False)
+        model = lifecycle._load_generation_model(awq_repo, is_vlm=False)
 
         saw_quant_layer, saw_non_quant_floating, quant_dtype_pins = (
             _collect_awq_dtype_pins(model, expected_non_quant_dtype=mx.bfloat16)
@@ -203,5 +202,5 @@ def test_awq_load_aligns_non_quant_dtypes_to_runner_target(
         # for the next parametrized row. ``del`` here forces the
         # refcount to drop so ``gc.collect()`` + ``mx.clear_cache()``
         # actually reclaim the memory.
-        del model, tokenizer, lifecycle, runner
+        del model, lifecycle, runner
         _release_metal_state()

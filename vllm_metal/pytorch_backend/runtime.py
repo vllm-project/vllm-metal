@@ -5,8 +5,6 @@ PyTorch's native streams and events use the single MPS default queue. Staging
 buffers use explicit CPU-to-MPS copies.
 """
 
-from functools import partial
-
 import numpy as np
 import torch
 from vllm.utils.torch_utils import async_tensor_h2d
@@ -96,37 +94,3 @@ def compute_topk_scores(
     if isinstance(cu_num_logits, torch.Tensor):
         return result._replace(cu_num_generated_tokens_tensor=cu_num_logits)
     return result._replace(cu_num_generated_tokens=cu_num_logits)
-
-
-def install():
-    from vllm.model_executor.layers.mamba.short_conv import ShortConv
-    from vllm.v1.worker.gpu import buffer_utils, model_runner
-    from vllm.v1.worker.gpu.sample import sampler
-
-    from vllm_metal.pytorch_backend import input_ops
-
-    if getattr(buffer_utils, "_metal_installed", False):
-        return
-
-    @ShortConv.register_oot
-    class MPSShortConv(ShortConv):
-        # Reuse upstream Torch ops without its CPU/CUDA custom-op wrapper.
-        forward = ShortConv.forward_native
-
-    # MRV2 0.32 uses these CUDA names even with an MPS device. Use native
-    # PyTorch objects; partial avoids duplicate Dynamo handler registration.
-    torch.cuda.Stream = torch.Stream
-    torch.cuda.Event = partial(torch.Event, device="mps")
-    torch.cuda.current_stream = partial(torch.accelerator.current_stream)
-    torch.cuda.set_stream = partial(torch.accelerator.set_stream)
-    # Explicit vLLM 0.32 bindings for the supported single-device path.
-    buffer_utils.NonUvaBuffer = MPSStagingBuffer
-    model_runner.async_tensor_h2d = copy_to_device
-    buffer_utils.StagedWriteTensor.apply_write = staged_write
-    buffer_utils.UvaBackedTensor.copy_to_uva = copy_changed_state
-
-    input_ops.install()
-    # validate_request limits sampling to greedy; scoring uses upstream Torch ops.
-    sampler.gumbel_sample = lambda logits, *args, **kwargs: logits.argmax(dim=-1)
-    sampler.compute_topk_scores = compute_topk_scores
-    buffer_utils._metal_installed = True

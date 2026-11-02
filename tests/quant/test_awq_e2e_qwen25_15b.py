@@ -60,7 +60,7 @@ def test_awq_load_aligns_non_quant_dtypes_to_runner_target():
     runner = make_stub_runner(model_config=_runner_model_config(dtype=torch.bfloat16))
     lifecycle = ModelLifecycle(runner, runner._model_adapter)
 
-    model, _tokenizer = lifecycle._load_generation_model(_AWQ_REPO, is_vlm=False)
+    model = lifecycle._load_generation_model(_AWQ_REPO, is_vlm=False)
 
     saw_quant_layer = False
     saw_non_quant_floating = False

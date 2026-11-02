@@ -142,7 +142,6 @@ def load_bge_m3_backend(
     )
     return LoadedEncoderBackend(
         model=loaded_backbone.model,
-        tokenizer=loaded_backbone.tokenizer,
         model_args=loaded_backbone.model_args,
         pooling_backend=pooling_backend,
     )

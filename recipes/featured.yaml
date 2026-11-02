@@ -2,10 +2,13 @@
 picks:
   - recipe: Qwen/Qwen3.5-9B
     variant: mlx_int4
+    features: [tool_calling, reasoning]
     memory_tier_gb: 16
   - recipe: Qwen/Qwen3.5-27B
     variant: mlx_int4
+    features: [tool_calling, reasoning]
     memory_tier_gb: 32
   - recipe: Qwen/Qwen3.5-35B-A3B
     variant: mlx_int4
+    features: [tool_calling, reasoning]
     memory_tier_gb: 64

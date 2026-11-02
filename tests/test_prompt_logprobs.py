@@ -12,7 +12,6 @@ from vllm_metal.v1.prompt_logprobs import (
     PromptLogprobsAccumulator,
     PromptLogprobsTracker,
     PromptLogprobsWindow,
-    full_prompt_logprobs,
     gather_prompt_logprobs,
     prompt_logprobs_window,
 )
@@ -163,9 +162,19 @@ class TestPromptLogprobsTracker:
         # re-emit prompt logprobs for the same request.
         assert not tracker.wants("req-a")
 
-    def test_single_chunk_prompt_completes_immediately(self) -> None:
+    @pytest.mark.parametrize(
+        ("num_logprobs", "expected_token_ids"),
+        [
+            (0, [[0], [1]]),
+            (-1, [[0, 2, 1, 0], [1, 0, 2, 1]]),
+        ],
+        ids=["target_only", "full_vocabulary"],
+    )
+    def test_single_chunk_prompt_completes_immediately(
+        self, num_logprobs: int, expected_token_ids: list[list[int]]
+    ) -> None:
         tracker = PromptLogprobsTracker()
-        tracker.register("req-b", 0)
+        tracker.register("req-b", num_logprobs)
         prompt = [2, 0, 1]
         rows = mx.array(
             [[0.0, 1.0, 2.0], [2.0, 0.0, 1.0], [1.0, 2.0, 0.0]], dtype=mx.float32
@@ -181,9 +190,7 @@ class TestPromptLogprobsTracker:
         )
 
         assert tensors is not None
-        # The last row predicts the first sampled token and is not scored.
-        assert tensors.logprob_token_ids.shape == (2, 1)
-        assert tensors.logprob_token_ids[:, 0].tolist() == prompt[1:]
+        assert tensors.logprob_token_ids.tolist() == expected_token_ids
 
     def test_one_token_prompt_delivers_empty_tensors(self) -> None:
         tracker = PromptLogprobsTracker()
@@ -229,62 +236,6 @@ class TestPromptLogprobsTracker:
 
         assert tensors is not None
         assert tensors.logprob_token_ids.shape == (1, 1)
-
-
-class TestFullPromptLogprobs:
-    def test_matches_chunked_gather(self) -> None:
-        prompt = [0, 2, 1, 3]
-        rows = mx.array(
-            [
-                [0.0, 1.0, 2.0, 3.0],
-                [3.0, 2.0, 1.0, 0.0],
-                [1.0, 3.0, 0.0, 2.0],
-                [9.0, 9.0, 9.0, 9.0],  # predicts the sampled token; ignored
-            ],
-            dtype=mx.float32,
-        )
-
-        tensors = full_prompt_logprobs(
-            rows,
-            prompt,
-            num_logprobs=2,
-            logprobs_mode="raw_logprobs",
-        )
-
-        assert tensors.logprob_token_ids.shape == (3, 3)
-        assert tensors.logprob_token_ids[:, 0].tolist() == prompt[1:]
-        expected = gather_prompt_logprobs(rows[:3], prompt[1:], 2)
-        torch.testing.assert_close(tensors.logprobs, expected.logprobs)
-
-    def test_one_token_prompt(self) -> None:
-        tensors = full_prompt_logprobs(
-            mx.zeros((1, 4)),
-            [7],
-            num_logprobs=1,
-            logprobs_mode="raw_logprobs",
-        )
-
-        assert tensors.logprob_token_ids.shape == (0, 2)
-
-    def test_minus_one_resolves_to_full_vocab(self) -> None:
-        rows = mx.array(
-            [
-                [0.0, 1.0, 2.0],
-                [2.0, 0.0, 1.0],
-                [9.0, 9.0, 9.0],
-            ],
-            dtype=mx.float32,
-        )
-
-        tensors = full_prompt_logprobs(
-            rows,
-            [0, 1, 2],
-            num_logprobs=-1,
-            logprobs_mode="raw_logprobs",
-        )
-
-        assert tensors.logprob_token_ids.shape == (2, 4)
-        assert sorted(tensors.logprob_token_ids[0, 1:].tolist()) == [0, 1, 2]
 
 
 class TestRunnerWiring:

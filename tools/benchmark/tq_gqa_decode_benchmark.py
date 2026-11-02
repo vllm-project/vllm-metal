@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Time TurboQuant decode attention: established kernels vs the GQA producer.
 
-Default routing keeps TurboQuant decode on the per-token / split-KV kernels.
-The ``gqa_p256`` / ``gqa_p512`` arms force the GQA producer through the private
-test entry on the same quantized cache. Arms run interleaved in a random order
+The ``established`` arm runs the per-token / split-KV TurboQuant kernels with
+GQA disabled. The ``gqa_p256`` / ``gqa_p512`` arms force the GQA producer
+through the private test entry on the same quantized cache. Arms run interleaved in a random order
 per repetition, and every arm's output is checked against ``established``
 before timing. One JSON line per shape records the chip, the detected GPU core
 count, and the executed dispatch family of every arm.
@@ -67,7 +67,7 @@ def _arms(ops, geometry, context, requests, dtype, k_quant, v_bits, seed):
             key_zero_cache=k_zero, v_centroids=centroids, use_turboquant=True,
             quant_type=k_quant, v_bits=v_bits, num_decode_requests=requests,
             num_decode_tokens=requests, max_decode_context_len=context,
-            gqa_length_plan=plan,
+            gqa_length_plan=plan, gqa_disabled=True,
         )  # fmt: skip
 
     def gqa(partition):

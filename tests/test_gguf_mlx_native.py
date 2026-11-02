@@ -6,8 +6,9 @@ through ``from_raw_blocks``; parity is checked against ``gguf.quants.dequantize`
 (the upstream reference), never a local re-implementation of the packing, and a
 canary pins the Q8_0/Q4_0/Q4_1 repack byte for byte to MLX's own ``mx.load``
 repack (``mx.load`` cannot read Q5_0/Q5_1).
-K-quant fixtures are built as raw blocks field-by-field because gguf-py cannot
-quantize them; ``gguf.quants.dequantize`` still defines what those blocks mean.
+K-quant and IQ4 fixtures are built as raw blocks field-by-field because gguf-py
+cannot quantize them; ``gguf.quants.dequantize`` still defines what those blocks
+mean.
 """
 
 from __future__ import annotations
@@ -21,7 +22,10 @@ import pytest
 gguf = pytest.importorskip("gguf")
 
 import vllm_metal.gguf.mlx_native as mlx_native  # noqa: E402
-from tests.gguf_kquant_fixtures import build_kquant_blocks  # noqa: E402
+from tests.gguf_kquant_fixtures import (  # noqa: E402
+    build_iq4_blocks,
+    build_kquant_blocks,
+)
 from vllm_metal.gguf.mlx_native import (  # noqa: E402
     AFFINE_GGUF_TYPES,
     GGUFMLXQuantizedTensor,
@@ -41,6 +45,9 @@ MX_LOAD_QTYPES = [
     GGMLQuantizationType.Q4_0,
     GGMLQuantizationType.Q4_1,
 ]
+KQUANT_QTYPES = [GGMLQuantizationType.Q4_K, GGMLQuantizationType.Q5_K]
+IQ4_QTYPES = [GGMLQuantizationType.IQ4_NL, GGMLQuantizationType.IQ4_XS]
+AFFINE_QTYPES = [*LEGACY_QTYPES, *KQUANT_QTYPES, *IQ4_QTYPES]
 
 
 def _write_single_tensor_gguf(path, raw: np.ndarray, qtype) -> None:
@@ -60,33 +67,50 @@ def _make_tensor(qtype, shape=(64, 128)) -> tuple:
     return qt, oracle
 
 
+def _raw_blocks(qtype, rows: int, cols: int) -> np.ndarray:
+    if qtype in KQUANT_QTYPES:
+        return build_kquant_blocks(rows, cols, qtype)
+    if qtype in IQ4_QTYPES:
+        return build_iq4_blocks(rows, cols, qtype)
+    weight = np.random.default_rng(0).standard_normal((rows, cols)).astype(np.float32)
+    return gguf.quants.quantize(weight, qtype)
+
+
 @pytest.mark.parametrize(
-    ("qtype", "bits"),
+    ("qtype", "bits", "scale_dtype"),
     [
-        (GGMLQuantizationType.Q8_0, 8),
-        (GGMLQuantizationType.Q4_0, 4),
-        (GGMLQuantizationType.Q4_1, 4),
-        (GGMLQuantizationType.Q5_0, 5),
-        (GGMLQuantizationType.Q5_1, 5),
+        (GGMLQuantizationType.Q8_0, 8, mx.float16),
+        (GGMLQuantizationType.Q4_0, 4, mx.float16),
+        (GGMLQuantizationType.Q4_1, 4, mx.float16),
+        (GGMLQuantizationType.Q5_0, 5, mx.float16),
+        (GGMLQuantizationType.Q5_1, 5, mx.float16),
+        (GGMLQuantizationType.Q4_K, 4, mx.float32),
+        (GGMLQuantizationType.Q5_K, 5, mx.float32),
+        (GGMLQuantizationType.IQ4_NL, 8, mx.float16),
+        (GGMLQuantizationType.IQ4_XS, 8, mx.float32),
     ],
 )
-def test_contract_matches_logical_shape(qtype, bits):
-    qt, _ = _make_tensor(qtype, shape=(64, 128))
+def test_contract_matches_logical_shape(qtype, bits, scale_dtype):
+    qt = GGUFMLXQuantizedTensor.from_raw_blocks(
+        _raw_blocks(qtype, 8, 512), (8, 512), qtype
+    )
 
     assert qt.qweight_type == qtype
     assert qt.bits == bits
     assert qt.group_size == 32
-    assert qt.logical_shape == (64, 128)
-    assert qt.out_features == 64
-    assert qt.in_features == 128
+    assert qt.logical_shape == (8, 512)
+    assert qt.out_features == 8
+    assert qt.in_features == 512
     assert qt.packed_shape == tuple(qt.qweight.shape)
-    assert qt.scales.dtype == mx.float16
-    assert qt.biases.dtype == mx.float16
+    assert qt.scales.dtype == scale_dtype
+    assert qt.biases.dtype == scale_dtype
 
 
-@pytest.mark.parametrize("qtype", LEGACY_QTYPES)
+@pytest.mark.parametrize("qtype", AFFINE_QTYPES)
 def test_dequantize_f32_matches_oracle_bit_exact(qtype):
-    qt, oracle = _make_tensor(qtype)
+    raw = _raw_blocks(qtype, 8, 512)
+    qt = GGUFMLXQuantizedTensor.from_raw_blocks(raw, (8, 512), qtype)
+    oracle = gguf.quants.dequantize(raw, qtype).astype(np.float32)
 
     # The fp16 scales and biases are exact, but an fp16 dequantize output would
     # round, so cast them to f32 first.
@@ -294,41 +318,12 @@ def test_embedding_empty_ids(qtype):
 
 # --- K-quant raw-block repack (#761) -------------------------------------------
 
-KQUANT_QTYPES = [GGMLQuantizationType.Q4_K, GGMLQuantizationType.Q5_K]
-
 
 def _make_kquant_tensor(qtype, rows: int = 8, cols: int = 512) -> tuple:
     raw = build_kquant_blocks(rows, cols, qtype)
     qt = GGUFMLXQuantizedTensor.from_raw_blocks(raw, (rows, cols), qtype)
     oracle = gguf.quants.dequantize(raw, qtype).astype(np.float32)
     return qt, oracle
-
-
-@pytest.mark.parametrize(
-    ("qtype", "bits"),
-    [(GGMLQuantizationType.Q4_K, 4), (GGMLQuantizationType.Q5_K, 5)],
-)
-def test_kquant_contract_matches_logical_shape(qtype, bits):
-    qt, _ = _make_kquant_tensor(qtype, rows=8, cols=512)
-
-    assert qt.qweight_type == qtype
-    assert qt.logical_shape == (8, 512)
-    assert qt.bits == bits
-    assert qt.group_size == 32
-    assert qt.scales.dtype == mx.float32
-    assert qt.biases.dtype == mx.float32
-
-
-@pytest.mark.parametrize("qtype", KQUANT_QTYPES)
-def test_kquant_dequantize_matches_oracle_bit_exact(qtype):
-    qt, oracle = _make_kquant_tensor(qtype)
-
-    deq = mx.dequantize(
-        qt.qweight, qt.scales, qt.biases, group_size=qt.group_size, bits=qt.bits
-    )
-    mx.eval(deq)
-
-    assert np.array_equal(np.array(deq), oracle)
 
 
 @pytest.mark.parametrize("qtype", KQUANT_QTYPES)
@@ -412,14 +407,7 @@ def test_from_raw_blocks_rejects_non_uint8_payload():
         )
 
 
-def _raw_blocks(qtype, rows: int, cols: int) -> np.ndarray:
-    if qtype in KQUANT_QTYPES:
-        return build_kquant_blocks(rows, cols, qtype)
-    weight = np.random.default_rng(0).standard_normal((rows, cols)).astype(np.float32)
-    return gguf.quants.quantize(weight, qtype)
-
-
-@pytest.mark.parametrize("qtype", [*LEGACY_QTYPES, *KQUANT_QTYPES])
+@pytest.mark.parametrize("qtype", AFFINE_QTYPES)
 def test_chunked_repack_matches_single_pass(monkeypatch, qtype):
     raw = _raw_blocks(qtype, 16, 512)
     expected = GGUFMLXQuantizedTensor.from_raw_blocks(raw, (16, 512), qtype)
@@ -536,10 +524,10 @@ def test_real_file_memory_below_dense(path):
         quantized += qt.qweight.nbytes + qt.scales.nbytes + qt.biases.nbytes
         dense_f16 += qt.out_features * qt.in_features * 2
 
-    # Per weight: Q8_0 ~1.125 bytes, Q5_K ~0.875 and Q4_K ~0.75 (fp32
-    # scale/bias), Q5_0/Q5_1 ~0.75, Q4_0/Q4_1 ~0.625 vs 2 for dense f16, so
-    # any mix stays below 0.6x dense.
-    assert quantized < dense_f16 * 0.6
+    # Per weight: IQ4_XS ~1.25 bytes and IQ4_NL/Q8_0 ~1.125 (8-bit codes),
+    # Q5_K ~0.875 and Q4_K ~0.75 (fp32 scale/bias), Q5_0/Q5_1 ~0.75,
+    # Q4_0/Q4_1 ~0.625 vs 2 for dense f16, so any mix stays below 0.65x dense.
+    assert quantized < dense_f16 * 0.65
 
 
 # --- Real generate smoke (opt-in: needs a local dense Qwen3.5 checkpoint) ------

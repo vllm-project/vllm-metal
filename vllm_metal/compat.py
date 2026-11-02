@@ -1,15 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """Compatibility patches for vLLM + transformers version mismatches.
 
-Applied once at platform registration time. Optional missing dependencies are
-logged; unexpected runtime errors are allowed to surface so regressions remain
-diagnosable.
+Most patches run at platform registration; model-registry compatibility uses
+the later general-plugin hook. Unexpected runtime errors remain visible.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -26,6 +26,74 @@ _EMBEDDING_LOAD_SCOPE: ContextVar[bool] = ContextVar(
 _QWEN35_FP8_BLOCK_SIZE = 128
 _QWEN3_BACKBONE_ROOTS = frozenset({"embed_tokens", "layers", "norm", "lm_head"})
 _EXAONE4_LAYER_TYPE = {"L": "sliding_attention", "G": "full_attention"}
+
+
+# TODO: Remove Flint fallbacks once the pinned Transformers and vLLM know it.
+def _flint_config_class() -> type[Any]:
+    """Parse Flint checkpoint metadata on older Transformers releases."""
+    from transformers.configuration_utils import PretrainedConfig
+
+    class FlintCompatConfig(PretrainedConfig):
+        model_type = "flint"
+        keys_to_ignore_at_inference = ["past_key_values"]
+
+        def __init__(
+            self,
+            use_cache: bool = True,
+            initializer_range: float = 0.02,
+            **kwargs: Any,
+        ) -> None:
+            layer_types = kwargs.get("layer_types")
+            num_layers = kwargs.get("num_hidden_layers")
+            if layer_types is not None and len(layer_types) != num_layers:
+                raise ValueError(
+                    f"layer_types has {len(layer_types)} entries but "
+                    f"num_hidden_layers is {num_layers}"
+                )
+            self.use_cache = use_cache
+            self.initializer_range = initializer_range
+            super().__init__(**kwargs)
+
+    return FlintCompatConfig
+
+
+def register_model_compat() -> None:
+    """Register missing model metadata for the Metal MLX runner.
+
+    MLX executes the model, while vLLM still queries registered model classes
+    for hybrid capabilities and state-cache metadata. The general-plugin hook
+    runs before ModelConfig inspection, after vllm.config is importable;
+    registering in apply_compat_patches would create an import cycle.
+    """
+    if os.environ.get("VLLM_METAL_BACKEND", "mlx") != "mlx":
+        return
+    from vllm.platforms import current_platform
+
+    from vllm_metal.platform import MetalPlatform
+
+    if not isinstance(current_platform, MetalPlatform):
+        return
+
+    from transformers import AutoConfig
+    from vllm.model_executor.models import ModelRegistry
+
+    try:
+        AutoConfig.for_model("flint")
+    except ValueError:
+        AutoConfig.register("flint", _flint_config_class(), exist_ok=True)
+        logger.debug("Registered Flint config compatibility")
+
+    if "FlintForCausalLM" not in ModelRegistry.get_supported_archs():
+        ModelRegistry.register_model(
+            "FlintForCausalLM",
+            "vllm.model_executor.models.transformers:TransformersMoEForCausalLM",
+        )
+        logger.debug("Registered Flint architecture compatibility")
+
+    if "Lfm3ForCausalLM" not in ModelRegistry.get_supported_archs():
+        ModelRegistry.register_model(
+            "Lfm3ForCausalLM", "vllm_metal.patches.lfm3_registry:Lfm3ForCausalLM"
+        )
 
 
 def apply_compat_patches() -> None:
@@ -947,6 +1015,46 @@ def _wrap_model_sanitize(
     _patched_sanitize._vllm_metal_original_sanitize = original_sanitize
     model_cls.sanitize = _patched_sanitize
     return True
+
+
+def ensure_lfm2_vl_torch_outputs(model_type: str | None) -> None:
+    """Make transformers' LFM2-VL processor honor ``return_tensors="pt"`` again.
+
+    Importing ``mlx_vlm.models.lfm2_vl`` rebinds transformers'
+    ``Lfm2VlProcessor.__init__`` and ``.__call__`` so every instance swaps in
+    mlx-vlm's ``Lfm2VlNumpyImageProcessor``, which returns ``numpy.ndarray``.
+    vLLM's ``NestedTensors`` contract is ``torch.Tensor``, and
+    ``MultiModalFieldConfig.flat_from_sizes`` always builds tuple slices, so
+    ``MultiModalFlatField.build_elems`` asserts "torch.Tensor is required for
+    multiple slices" while the scheduler profiles the encoder budget — the engine
+    dies before serving a request.
+
+    Only ``"pt"`` requests are converted. mlx-vlm asks its own processor for
+    ``"mlx"``, so its forward path keeps the NumPy image processor it needs.
+    """
+    if model_type not in ("lfm2-vl", "lfm2_vl"):
+        return
+
+    try:
+        from transformers.models.lfm2_vl.processing_lfm2_vl import Lfm2VlProcessor
+    except ImportError as exc:
+        logger.debug("Skipping the LFM2-VL processor conversion: %s", exc)
+        return
+
+    original = Lfm2VlProcessor.__call__
+    if getattr(original, "_metal_torch_outputs", False):
+        return
+
+    @wraps(original)
+    def call(self: Any, *args: Any, **kwargs: Any) -> Any:
+        output = original(self, *args, **kwargs)
+        if kwargs.get("return_tensors") == "pt":
+            output.convert_to_tensors("pt")
+        return output
+
+    call._metal_torch_outputs = True
+    Lfm2VlProcessor.__call__ = call
+    logger.debug("LFM2-VL processor output will be converted to torch tensors")
 
 
 @contextmanager

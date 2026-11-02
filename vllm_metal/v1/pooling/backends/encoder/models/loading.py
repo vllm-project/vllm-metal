@@ -10,7 +10,7 @@ import mlx.core as mx
 import torch
 from huggingface_hub import snapshot_download
 
-from vllm_metal.tensor_bridge import torch_to_mlx
+from vllm_metal.tensor_bridge import TORCH_TO_MLX_DTYPE, torch_to_mlx
 
 _ENCODER_DOWNLOAD_PATTERNS = (
     "config.json",
@@ -19,6 +19,20 @@ _ENCODER_DOWNLOAD_PATTERNS = (
     "pytorch_model*.bin",
     "sparse_linear.pt",
 )
+
+
+def load_encoder_checkpoint(model: Any, model_config: Any) -> None:
+    """Load and materialize checkpoint weights in an encoder model."""
+    target_dtype = TORCH_TO_MLX_DTYPE[model_config.dtype]
+    weights = model.sanitize(load_encoder_weights(encoder_model_path(model_config)))
+    weights = {
+        name: value.astype(target_dtype)
+        if mx.issubdtype(value.dtype, mx.floating)
+        else value
+        for name, value in weights.items()
+    }
+    model.load_weights(list(weights.items()), strict=True)
+    mx.eval(model.parameters())
 
 
 def encoder_model_path(model_config: Any) -> Path:

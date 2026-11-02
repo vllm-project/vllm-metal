@@ -532,13 +532,12 @@ def test_remote_reference_grammar() -> None:
 
 
 @pytest.mark.parametrize("quant", ["Q8_0", "Q5_0", "Q5_1", "Q2_K", "Q3_K_M"])
-def test_remote_load_source_downloads_one_matching_gguf(
+def test_remote_load_source_downloads_weights_and_config_without_tokenizer(
     tmp_path, monkeypatch, quant: str
 ) -> None:
     weight_snapshot = tmp_path / "weights"
     config_snapshot = tmp_path / "config"
-    tokenizer_snapshot = tmp_path / "tokenizer"
-    for directory in (weight_snapshot, config_snapshot, tokenizer_snapshot):
+    for directory in (weight_snapshot, config_snapshot):
         directory.mkdir()
     (config_snapshot / "config.json").write_text(json.dumps(_TINY_CONFIG))
     gguf_path = weight_snapshot / f"Qwen3-0.6B-{quant}.gguf"
@@ -561,8 +560,6 @@ def test_remote_load_source_downloads_one_matching_gguf(
             return str(weight_snapshot)
         if kwargs["repo_id"] == "Qwen/Qwen3-0.6B":
             return str(config_snapshot)
-        if kwargs["repo_id"] == "Qwen/Qwen3-0.6B-Tokenizer":
-            return str(tokenizer_snapshot)
         raise AssertionError(f"unexpected repo_id={kwargs['repo_id']!r}")
 
     monkeypatch.setattr(
@@ -590,8 +587,7 @@ def test_remote_load_source_downloads_one_matching_gguf(
     assert source is not None
     assert source.weights_path == str(gguf_path)
     assert source.config_dir == str(config_snapshot)
-    assert source.tokenizer_dir == str(tokenizer_snapshot)
-    # The weights repo gets its own revision; the companion repos keep theirs.
+    # The weights repo gets its own revision; the config keeps its requested one.
     assert resolve_calls == [
         (
             "Qwen/Qwen3-0.6B-GGUF",
@@ -610,7 +606,7 @@ def test_remote_load_source_downloads_one_matching_gguf(
             "token": "hf-token",
         }
     ]
-    config_call, weight_call, tokenizer_call = calls
+    config_call, weight_call = calls
     assert weight_call == {
         "repo_id": "Qwen/Qwen3-0.6B-GGUF",
         "cache_dir": str(tmp_path / "cache"),
@@ -624,22 +620,6 @@ def test_remote_load_source_downloads_one_matching_gguf(
         "cache_dir": str(tmp_path / "cache"),
         "allow_patterns": ["config.json", "generation_config.json"],
         "revision": "rev-a",
-        "token": "hf-token",
-    }
-    assert tokenizer_call == {
-        "repo_id": "Qwen/Qwen3-0.6B-Tokenizer",
-        "cache_dir": str(tmp_path / "cache"),
-        "allow_patterns": [
-            "*.json",
-            "*.py",
-            "tokenizer.model",
-            "*.tiktoken",
-            "tiktoken.model",
-            "*.txt",
-            "*.jsonl",
-            "*.jinja",
-        ],
-        "revision": "tok-rev",
         "token": "hf-token",
     }
 
@@ -714,13 +694,18 @@ def test_remote_load_source_repins_the_config_repo_revision_offline(
         # Dropping a shard set still leaves its single file as a candidate.
         (
             [
-                "mmproj-model-Q8_0.gguf",
                 "model-Q8_0-00001-of-00002.gguf",
                 "model-Q8_0-00002-of-00002.gguf",
                 "model-Q8_0.gguf",
+                "other-Q8_0.gguf",
             ],
             "Remote GGUF reference 'Qwen/Qwen3-0.6B-GGUF:Q8_0' matched "
-            "multiple files: mmproj-model-Q8_0.gguf, model-Q8_0.gguf.",
+            "multiple files: model-Q8_0.gguf, other-Q8_0.gguf.",
+        ),
+        # A projector is never the backbone, even when it is the only match.
+        (
+            ["mmproj-model-Q8_0.gguf"],
+            "No 'Q8_0' GGUF file found in remote repository 'Qwen/Qwen3-0.6B-GGUF'.",
         ),
     ],
 )
@@ -871,18 +856,22 @@ def test_remote_load_source_admits_mistral_repo_config(tmp_path, monkeypatch) ->
 
 @pytest.mark.parametrize("offline", [False, True])
 @pytest.mark.parametrize("tag", ["F16", "F32", "BF16"])
-def test_remote_plain_type_tags_resolve(tmp_path, monkeypatch, tag, offline) -> None:
+def test_remote_plain_type_tags_resolve_past_projector_siblings(
+    tmp_path, monkeypatch, tag, offline
+) -> None:
     monkeypatch.setattr(hf_constants, "HF_HUB_OFFLINE", offline)
     snapshot = tmp_path / "weights"
     snapshot.mkdir()
     gguf_name = f"model-{tag}.gguf"
-    (snapshot / gguf_name).write_text("dummy")
+    repo_files = [gguf_name, f"mmproj-{tag}.gguf", f"mmproj-model-{tag.lower()}.gguf"]
+    for filename in repo_files:
+        (snapshot / filename).write_text("dummy")
     monkeypatch.setattr(
         gguf_source,
         "HfApi",
         lambda: SimpleNamespace(
             resolve_revision=_echo_revision,
-            list_repo_files=lambda **_: ["README.md", gguf_name],
+            list_repo_files=lambda **_: ["README.md", *repo_files],
         ),
     )
     monkeypatch.setattr(gguf_source, "snapshot_download", lambda **_: str(snapshot))
@@ -897,7 +886,7 @@ def test_remote_plain_type_tags_resolve(tmp_path, monkeypatch, tag, offline) -> 
     assert resolved == str(snapshot / gguf_name)
 
 
-@pytest.mark.parametrize("tag", ["Q6_K", "Q6_K_L", "Q8_0"])
+@pytest.mark.parametrize("tag", ["Q6_K", "Q6_K_L", "Q8_0", "IQ4_NL", "IQ4_XS"])
 def test_remote_tag_resolves_its_own_file(tmp_path, monkeypatch, tag) -> None:
     snapshot = tmp_path / "weights"
     repo_files = [
@@ -907,6 +896,8 @@ def test_remote_tag_resolves_its_own_file(tmp_path, monkeypatch, tag) -> None:
         "model-Q8_0-00001-of-00002.gguf",
         "model-Q8_0-00002-of-00002.gguf",
         "model-Q8_0.gguf",
+        "model-IQ4_NL.gguf",
+        "model-IQ4_XS.gguf",
     ]
     monkeypatch.setattr(
         gguf_source,
@@ -987,10 +978,10 @@ def test_remote_offline_rejects_ambiguous_cached_listing(tmp_path, monkeypatch) 
     monkeypatch.setattr(hf_constants, "HF_HUB_OFFLINE", True)
     snapshot = tmp_path / "weights"
     snapshot.mkdir()
-    (snapshot / "mmproj-model-Q8_0.gguf").write_text("dummy")
+    (snapshot / "other-Q8_0.gguf").write_text("dummy")
     listing = [
         RepoFile(path=path, size=0, oid="0")
-        for path in ("mmproj-model-Q8_0.gguf", "model-Q8_0.gguf")
+        for path in ("model-Q8_0.gguf", "other-Q8_0.gguf")
     ]
 
     def partial_snapshot_download(**_: object) -> str:
@@ -1012,5 +1003,5 @@ def test_remote_offline_rejects_ambiguous_cached_listing(tmp_path, monkeypatch) 
 
     assert str(excinfo.value) == (
         "Remote GGUF reference 'org/model:Q8_0' matched multiple files: "
-        "mmproj-model-Q8_0.gguf, model-Q8_0.gguf."
+        "model-Q8_0.gguf, other-Q8_0.gguf."
     )

@@ -17,6 +17,9 @@ cached prefills at every supported head size. Per-sequence loop depth keeps
 many short requests distinct from one long request with the same tile count.
 Native dispatch decides whether to use the whole-batch or prefill-subset score.
 Windowed attention and callers missing layout metadata retain the legacy rule.
+
+The hint describes the single-head BQ64 baseline. Native grouped GQA selection
+compares against this chosen baseline; grouped kernels do not use its split flag.
 """
 
 from __future__ import annotations

@@ -30,7 +30,9 @@ checkpoints, not synthetic fixtures). Run a family with its env trio, e.g.::
 ``VLLM_METAL_TEST_GGUF_QWEN25_*``, llama uses ``VLLM_METAL_TEST_GGUF_LLAMA_*``,
 mistral uses ``VLLM_METAL_TEST_GGUF_MISTRAL_*``, and Qwen3.5-9B Q4_K_M and
 Qwen3.5-4B Q5_K_M use ``VLLM_METAL_TEST_GGUF_QWEN35_9B_*`` and
-``VLLM_METAL_TEST_GGUF_QWEN35_4B_*`` for the same trio.)
+``VLLM_METAL_TEST_GGUF_QWEN35_4B_*`` for the same trio. Qwen3.5-9B IQ4_XS
+reuses the 9B tokenizer and dense paths and adds
+``VLLM_METAL_TEST_GGUF_QWEN35_9B_IQ4XS_SERVE_PATH``.)
 """
 
 from __future__ import annotations
@@ -46,6 +48,7 @@ import pytest
 pytest.importorskip("gguf")
 
 from mlx_lm import load as mlx_lm_load  # noqa: E402
+from mlx_lm.utils import load_tokenizer  # noqa: E402
 
 from vllm_metal.gguf.loader import GGUFModelLoader  # noqa: E402
 
@@ -322,6 +325,36 @@ _CASES = [
         dense_agree_prefix=16,
         target_dtype=mx.bfloat16,
     ),
+    # Qwen3.5-9B-IQ4_XS.gguf (unsloth, rev 3885219b): 168 IQ4_XS tensors on
+    # the 8-bit affine carrier. All 16 ids match the dense reference.
+    _GoldenCase(
+        label="qwen3.5-9b-iq4_xs",
+        quantization="IQ4_XS",
+        prompt="The first ten prime numbers are 2, 3, 5, 7,",
+        gguf_env="VLLM_METAL_TEST_GGUF_QWEN35_9B_IQ4XS_SERVE_PATH",
+        tokenizer_env="VLLM_METAL_TEST_GGUF_QWEN35_9B_TOKENIZER_PATH",
+        dense_env="VLLM_METAL_TEST_GGUF_QWEN35_9B_DENSE_PATH",
+        golden_ids=(
+            220,
+            16,
+            16,
+            11,
+            220,
+            16,
+            18,
+            11,
+            220,
+            16,
+            22,
+            11,
+            220,
+            16,
+            24,
+            11,
+        ),
+        dense_agree_prefix=16,
+        target_dtype=mx.bfloat16,
+    ),
 ]
 _CASE_IDS = [case.label for case in _CASES]
 
@@ -352,7 +385,8 @@ def test_gguf_greedy_matches_committed_golden(case: _GoldenCase) -> None:
     gguf_path = _require_path(case.gguf_env)
     tokenizer_dir = _require_path(case.tokenizer_env)
 
-    model, tokenizer = GGUFModelLoader(
+    tokenizer = load_tokenizer(tokenizer_dir)
+    model = GGUFModelLoader(
         gguf_path, config_dir=tokenizer_dir, target_dtype=case.target_dtype
     ).load()
 
@@ -374,7 +408,8 @@ def test_gguf_greedy_matches_dense_reference_prefix(case: _GoldenCase) -> None:
     del dense_model
     mx.clear_cache()
 
-    gguf_model, gguf_tokenizer = GGUFModelLoader(
+    gguf_tokenizer = load_tokenizer(tokenizer_dir)
+    gguf_model = GGUFModelLoader(
         gguf_path, config_dir=tokenizer_dir, target_dtype=case.target_dtype
     ).load()
     gguf_ids = _greedy_token_ids(
