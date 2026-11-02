@@ -103,6 +103,8 @@ class TestNativeRandomEligibility:
                 "allowed token ids",
                 [_random_params(allowed_token_ids=[1, 2])],
             ),
+            ("logit bias", [_random_params(logit_bias={1: 5.0})]),
+            ("min tokens still pending", [_random_params(min_tokens=2)]),
         ],
     )
     def test_ineligible_batches_fall_back(self, label, params_list) -> None:
@@ -113,6 +115,11 @@ class TestNativeRandomEligibility:
         params._bad_words_token_ids = [[99]]
 
         assert not SamplingBatch.params_allow_native_random([params])
+
+    def test_min_tokens_returns_to_native_random_once_reached(self) -> None:
+        params = [_random_params(min_tokens=2), _random_params()]
+        assert not SamplingBatch.params_allow_native_random(params, [1, 0])
+        assert SamplingBatch.params_allow_native_random(params, [2, 0])
 
 
 class TestTopKTopPMaskParity:
@@ -379,6 +386,7 @@ class TestSeededNativeSampling:
             vocab_size=VOCAB_SIZE,
             next_native_rng_key=lambda: key,
             output_lengths=output_lengths,
+            allow_seed=True,
         )
         mx.eval(tokens)
         return tokens.tolist()
@@ -405,6 +413,7 @@ class TestSeededNativeSampling:
                 vocab_size=VOCAB_SIZE,
                 next_native_rng_key=next_key,
                 output_lengths=[n] * len(params),
+                allow_seed=True,
             )
             mx.eval(tokens)
         assert next_key.call_count == expected_calls * steps
@@ -480,11 +489,12 @@ class TestSeededNativeSampling:
             vocab_size=VOCAB_SIZE,
             next_native_rng_key=lambda: key,
             output_lengths=[0, 0, 0],
+            allow_seed=True,
         )
         mx.eval(base, mixed)
         assert [base.tolist()[i] for i in (0, 2)] == [mixed.tolist()[i] for i in (0, 2)]
 
-    def test_deferred_call_without_lengths_rejects_seeded_rows(self) -> None:
+    def test_deferred_call_without_allow_seed_rejects_seeded_rows(self) -> None:
         logits = mx.zeros((1, VOCAB_SIZE))
         with pytest.raises(RuntimeError, match="gate desync"):
             SamplingBatch.native_sample_tokens(
@@ -492,4 +502,5 @@ class TestSeededNativeSampling:
                 [_random_params(seed=1)],
                 vocab_size=VOCAB_SIZE,
                 next_native_rng_key=lambda: mx.random.key(0),
+                output_lengths=[0],
             )

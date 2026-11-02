@@ -1003,9 +1003,14 @@ class TestPlatformDiffusionConfig:
 
     @pytest.mark.parametrize(
         ("params", "parameter"),
-        [({"top_k": 5}, "top_k"), ({"top_p": 0.9}, "top_p")],
+        [
+            ({"top_k": 5}, "top_k"),
+            ({"top_p": 0.9}, "top_p"),
+            ({"logit_bias": {1: 2.0}}, "logit_bias"),
+            ({"min_tokens": 2}, "min_tokens"),
+        ],
     )
-    def test_rejects_top_k_and_top_p_while_serving_diffusion(
+    def test_rejects_canvas_sampling_controls_while_serving_diffusion(
         self, monkeypatch, params, parameter
     ) -> None:
         from vllm.exceptions import VLLMValidationError
