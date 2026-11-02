@@ -152,7 +152,7 @@ and TurboQuant are not validated.
 | Model | MLX | PyTorch MPS | Attention Kernel | Automatic Prefix Cache | Example checkpoint |
 | --- | --- | --- | --- | --- | --- |
 | Qwen3 | ✅ | 🔵 | GQA (paged) | ✅ | `Qwen/Qwen3-0.6B` |
-| Qwen3.5 / 3.6 / 3.8 | ✅ | | Hybrid SDPA + GDN linear (3.6 adds MoE) | 🔵 | `mlx-community/Qwen3.8-27B-8bit` |
+| Qwen3.5 / 3.6 / 3.8 | ✅ | 🔵 | Hybrid SDPA + GDN linear (3.6 adds MoE) | 🔵 | `mlx-community/Qwen3.8-27B-8bit` |
 | Qwen3-Next | ✅ | | Hybrid SDPA + GDN linear | 🔵 | `mlx-community/Qwen3-Next-80B-A3B-Instruct-8bit` |
 | LFM2 / LFM2.5 | ✅ | 🔵 | Hybrid SDPA + ShortConv | ✅ | `LiquidAI/LFM2.5-1.2B-Instruct` |
 | LFM3 | 🔵 | | Hybrid full/sliding SDPA + ShortConv | ✅ | `LiquidAI/LFM3-1.7B-MLX-4bit` (needs `--trust-remote-code`) |

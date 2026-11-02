@@ -635,3 +635,124 @@ def test_omni_macos_transport_handles_long_names_and_page_padding(with_metadata)
         assert connector.get("0", "1", key) is None
     finally:
         connector.close()
+
+
+@pytest.mark.parametrize(
+    "length", [1, 5, 64, 65, 200], ids=["one", "short", "chunk", "chunk+1", "multi"]
+)
+def test_gdn_chunked_prefill_matches_transformers_recurrence(length):
+    from transformers.models.qwen3_5.modeling_qwen3_5 import (
+        torch_recurrent_gated_delta_rule,
+    )
+
+    from vllm_metal.pytorch_backend.models.qwen3_5 import delta_rule_chunked
+
+    heads, k_dim, v_dim = 3, 32, 16
+    q, k = (
+        torch.nn.functional.normalize(torch.randn(length, heads, k_dim), dim=-1)
+        for _ in range(2)
+    )
+    v = torch.randn(length, heads, v_dim)
+    g = -torch.rand(length, heads)
+    beta = torch.rand(length, heads)
+    state = torch.randn(heads, k_dim, v_dim) * 0.1
+    expected, expected_state = torch_recurrent_gated_delta_rule(
+        q[None], k[None], v[None], g[None], beta[None], state[None], True
+    )
+    out, final = delta_rule_chunked(
+        *(x.to("mps") for x in (q * k_dim**-0.5, k, v, g, beta, state))
+    )
+    # The chunked form reorders the recurrence's fp32 sums.
+    torch.testing.assert_close(out.cpu(), expected[0], atol=1e-5, rtol=1e-4)
+    torch.testing.assert_close(final.cpu(), expected_state[0], atol=1e-5, rtol=1e-4)
+
+
+def test_gdn_state_carries_across_chunked_prefill_and_decode():
+    from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+
+    from vllm_metal.pytorch_backend.models.qwen3_5 import _gdn_core
+
+    k_heads, v_heads, k_dim, v_dim, width = 2, 4, 16, 8, 4
+    channels = 2 * k_heads * k_dim + v_heads * v_dim
+    layer = SimpleNamespace(
+        key_dim=k_heads * k_dim,
+        value_dim=v_heads * v_dim,
+        tp_size=1,
+        head_k_dim=k_dim,
+        head_v_dim=v_dim,
+        activation="silu",
+        conv1d=SimpleNamespace(
+            weight=torch.randn(channels, 1, width, device="mps"), bias=None
+        ),
+        A_log=torch.randn(v_heads, device="mps"),
+        dt_bias=torch.randn(v_heads, device="mps"),
+        kv_cache=[
+            torch.randn(4, width - 1, channels, device="mps"),
+            torch.randn(4, v_heads, v_dim, k_dim, device="mps"),
+        ],
+    )
+    untouched = [t[2].clone() for t in layer.kv_cache]
+    qkv = torch.randn(76, channels, device="mps")
+    b, a = torch.randn(2, 76, v_heads, device="mps")
+
+    def step(lo, hi, decode, resumed):
+        # A padded decode row rides along with every prefill; it must stay zero.
+        x = torch.cat([qkv[:1] * 0, qkv[lo:hi]])
+        md = SimpleNamespace(
+            num_decodes=2 if decode else 1,
+            num_decode_tokens=2 if decode else 1,
+            num_prefills=0 if decode else 1,
+            num_prefill_tokens=0 if decode else hi - lo,
+            non_spec_state_indices_tensor=torch.tensor([PAD_SLOT_ID, 1], device="mps"),
+            non_spec_query_start_loc=torch.tensor([0, 1, 1 + hi - lo], device="mps"),
+            has_initial_state=torch.tensor([False, resumed], device="mps"),
+        )
+        out = torch.zeros(len(x), v_heads, v_dim, device="mps")
+        _gdn_core(
+            layer,
+            x,
+            torch.cat([b[:1], b[lo:hi]]),
+            torch.cat([a[:1], a[lo:hi]]),
+            out,
+            md,
+        )
+        assert torch.equal(out[0], torch.zeros_like(out[0]))
+        return out[1:].cpu()
+
+    got = torch.cat(
+        [step(0, 70, False, False), step(70, 75, False, True), step(75, 76, True, True)]
+    )
+
+    weight = layer.conv1d.weight[:, 0].cpu()
+    tail, state = torch.zeros(width - 1, channels), torch.zeros(v_heads, k_dim, v_dim)
+    for t in range(76):
+        hist = torch.cat([tail, qkv[t : t + 1].cpu()])
+        x, tail = torch.nn.functional.silu((hist.T * weight).sum(-1)), hist[1:]
+        q, k, v = x.split([k_heads * k_dim, k_heads * k_dim, v_heads * v_dim])
+        q, k = (
+            torch.nn.functional.normalize(
+                y.view(k_heads, k_dim), dim=-1
+            ).repeat_interleave(2, 0)
+            for y in (q, k)
+        )
+        g = -torch.exp(layer.A_log.cpu()) * torch.nn.functional.softplus(
+            a[t].cpu() + layer.dt_bias.cpu()
+        )
+        state = state * torch.exp(g)[:, None, None]
+        delta = (
+            v.view(v_heads, v_dim) - torch.einsum("hk,hkv->hv", k, state)
+        ) * torch.sigmoid(b[t].cpu())[:, None]
+        state = state + k[:, :, None] * delta[:, None, :]
+        torch.testing.assert_close(
+            got[t],
+            torch.einsum("hk,hkv->hv", q * k_dim**-0.5, state),
+            atol=1e-4,
+            rtol=1e-4,
+        )
+    torch.testing.assert_close(
+        layer.kv_cache[1][1].cpu().view(v_heads, k_dim, v_dim),
+        state,
+        atol=1e-4,
+        rtol=1e-4,
+    )
+    assert all(torch.equal(t[2], u) for t, u in zip(layer.kv_cache, untouched, strict=True))
