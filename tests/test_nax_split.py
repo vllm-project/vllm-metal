@@ -306,3 +306,92 @@ def test_native_prefill_hint_only_applies_after_decode_separation(
             assert mx.array_equal(fallback, actual).item()
     else:
         assert mx.array_equal(actual, whole).item()
+
+
+def test_nax_trace_reports_executed_layout(grouped_prefill_inputs):
+    """Trace fields describe the encoded layout without changing its output."""
+    ops, inputs, width, hint = grouped_prefill_inputs
+    query_tokens = inputs["query"].shape[0]
+    ops._take_nax_prefill_dispatch_trace()
+    plain = _mixed_call(inputs, nax_split_hint=hint)
+    inputs["query"] = mx.array(
+        np.array(inputs["query"].astype(mx.float32)), dtype=mx.bfloat16
+    )
+    try:
+        ops._start_nax_prefill_dispatch_trace()
+        observed = _mixed_call(inputs, nax_split_hint=hint)
+        trace = ops._take_nax_prefill_dispatch_trace()
+        assert mx.array_equal(plain, observed)
+        assert not trace["overflow"] and trace["dropped_events"] == 0
+        assert trace["dispatch_count"] == len(trace["events"]) == 1
+        event = trace["events"][0]
+        suffix = "_gqa6_sub_full" if width == 3 else "_gqa6_full"
+        assert event["function"].endswith(suffix)
+        assert event["HEADS_PER_TG"] == width and event["threads"] == width * 32
+        assert (event["gridx"], event["gridy"], event["BQ"]) == (
+            24 // width,
+            query_tokens // 16 + 1,
+            16,
+        )
+        assert event["max_seq_len"] == 31360 + query_tokens
+        assert event["q_block_offset"] == 0 and event["key_page_tokens"] == 784
+        assert event["key_block_stride"] == 16 * event["key_stride1"]
+        assert event["key_head_stride"] == event["key_stride2"] == 512
+    finally:
+        ops._take_nax_prefill_dispatch_trace()
+
+
+def test_nax_trace_overflow_restart_and_drain(nax_prefill):
+    """Bound the real API, reset active traces, and clear every drained counter."""
+    ops = nax_prefill
+    empty = ops._take_nax_prefill_dispatch_trace()
+    capacity = empty["capacity"]
+    assert capacity == 8192
+    inputs = _mixed_inputs([1], prefill_kv=2, geometry=(8, 2, 128, 16))
+
+    def encode(index):
+        # Each fresh lazy node must encode; re-evaluating one output would not.
+        inputs["query"] = mx.array(
+            np.full((3, 8, 128), (index % 7) / 8, dtype=np.float32), mx.bfloat16
+        )
+        _mixed_call(inputs, nax_split_hint=0)
+
+    def assert_empty(trace):
+        assert trace["capacity"] == capacity
+        assert (
+            trace["events"],
+            trace["overflow"],
+            trace["dropped_events"],
+            trace["dispatch_count"],
+            trace["append_time_ns"],
+        ) == ([], False, 0, 0, 0)
+
+    try:
+        ops._start_nax_prefill_dispatch_trace()
+        encode(0)
+        ops._start_nax_prefill_dispatch_trace()
+        ops._start_nax_prefill_dispatch_trace()
+        assert_empty(ops._take_nax_prefill_dispatch_trace())
+
+        ops._start_nax_prefill_dispatch_trace()
+        for index in range(capacity + 3):
+            encode(index)
+        trace = ops._take_nax_prefill_dispatch_trace()
+        assert len(trace["events"]) == capacity
+        assert trace["dispatch_count"] == capacity + 3
+        assert trace["overflow"] and trace["dropped_events"] == 3
+        assert [event["event_index"] for event in trace["events"]] == list(
+            range(capacity)
+        )
+        assert_empty(ops._take_nax_prefill_dispatch_trace())
+        encode(1)
+        assert_empty(ops._take_nax_prefill_dispatch_trace())
+
+        ops._start_nax_prefill_dispatch_trace()
+        encode(2)
+        trace = ops._take_nax_prefill_dispatch_trace()
+        assert trace["dispatch_count"] == len(trace["events"]) == 1
+        assert not trace["overflow"] and trace["dropped_events"] == 0
+        assert_empty(ops._take_nax_prefill_dispatch_trace())
+    finally:
+        ops._take_nax_prefill_dispatch_trace()
