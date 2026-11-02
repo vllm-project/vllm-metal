@@ -1,5 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Torch Gated DeltaNet for Qwen3.5; upstream uses FLA Triton outside CPU/XPU/ROCm."""
 
 from functools import cache
 
@@ -10,6 +9,7 @@ from vllm.model_executor.layers.mamba.ops.cpu.causal_conv1d import (
     causal_conv1d_fn_cpu,
     causal_conv1d_update_torch,
 )
+from vllm.utils.torch_utils import _resolve_layer_name
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
 _CHUNK_SIZE = 64
@@ -142,9 +142,7 @@ def _gdn_core(layer, mixed_qkv, b, a, out, md):
 @cache
 def install():
     from vllm import ModelRegistry
-    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
-        QwenGatedDeltaNetAttention,
-    )
+    from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn  # noqa: F401
     from vllm.model_executor.models.qwen3_5 import Qwen3_5ForCausalLM
     from vllm.model_executor.models.utils import WeightsMapper
 
@@ -161,23 +159,18 @@ def install():
 
     ModelRegistry.register_model("Qwen3_5ForCausalLM", MPSQwen35ForCausalLM)
 
-    @QwenGatedDeltaNetAttention.register_oot
-    class MPSQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
-        # Upstream dispatches to FLA Triton on MPS; run the GDN core in Torch.
-        def forward(self, hidden_states):
-            mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
-            ba, _ = self.in_proj_ba(hidden_states)
-            mixed_qkv, z, b, a = self.prepare_gdn_attention_core_inputs(
-                mixed_qkvz, ba, hidden_states.size(0)
-            )
-            out = torch.zeros(
-                hidden_states.size(0),
-                self.num_v_heads // self.tp_size,
-                self.head_v_dim,
-                dtype=hidden_states.dtype,
-                device=hidden_states.device,
-            )
-            md = get_forward_context().attn_metadata
-            if md is not None and (md := md[self.prefix]).num_actual_tokens:
-                _gdn_core(self, mixed_qkv, b, a, out, md)
-            return self._output_projection(out, z)
+    # Upstream's forward keeps the projections; only its core op needs MPS.
+    @torch.library.impl("vllm::qwen_gdn_attention_core", "MPS")
+    def mps_qwen_gdn_attention_core(
+        mixed_qkv, b, a, core_attn_out, layer_name, use_aiter=False
+    ):
+        if use_aiter:
+            raise NotImplementedError("The AITER GDN path requires ROCm")
+        context = get_forward_context()
+        if context.attn_metadata is None:
+            return
+        name = _resolve_layer_name(layer_name)
+        md = context.attn_metadata[name]
+        if md.num_actual_tokens:
+            layer = context.no_compile_layers[name]
+            _gdn_core(layer, mixed_qkv, b, a, core_attn_out, md)
