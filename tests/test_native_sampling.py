@@ -1,15 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for MLX-native temperature/top-k/top-p sampling."""
 
-from unittest.mock import Mock
-
 import mlx.core as mx
 import pytest
 import torch
 from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 
-from vllm_metal.v1.sampling_batch import SamplingBatch, seeded_row_key
+from tests.stub_runner import make_stub_runner
+from vllm_metal.v1.sampling_batch import SamplingBatch, native_sampling_key
 
 VOCAB_SIZE = 512
 BATCH_SIZE = 4
@@ -369,6 +368,54 @@ class TestMlxRandomTokens:
             assert abs(counts[index] / draws - expected) < 0.02
 
 
+class TestNativeSamplingKey:
+    @pytest.mark.parametrize(
+        ("seed", "step", "legacy_key_seed"),
+        [
+            (0, 0, 0xCFD8C22A91380BA0),
+            (7, 3, 0x3D1DD505FE98FC2C),
+            (-7, 3, 0xA9DE8C3DA842F403),
+        ],
+    )
+    def test_engine_keys_are_separate_from_legacy_request_keys(
+        self, seed: int, step: int, legacy_key_seed: int
+    ) -> None:
+        """Preserve #1233's request keys without sharing the engine stream."""
+        request_key = native_sampling_key(seed, step)
+        engine_key = native_sampling_key(seed, step, domain="engine")
+        legacy_key = mx.random.key(legacy_key_seed)
+        mx.eval(request_key, engine_key, legacy_key)
+        assert request_key.tolist() == legacy_key.tolist()
+        assert engine_key.tolist() != request_key.tolist()
+
+    @pytest.mark.parametrize("seed", [0, 42, -7])
+    def test_engine_seed_and_step_reproduce_keys_and_tokens(self, seed: int) -> None:
+        runner = make_stub_runner(
+            _native_sampling_enabled=True, _native_sampling_step=11
+        )
+        runner.model_config.seed = seed
+        key = runner._next_native_sample_key()
+        same_key = native_sampling_key(seed, 11, domain="engine")
+        next_key = runner._next_native_sample_key()
+        logits = mx.zeros((8, VOCAB_SIZE))
+        params = [_random_params(temperature=0.8, top_k=0, top_p=1.0)] * 8
+        tokens = [
+            SamplingBatch.native_sample_tokens(
+                logits,
+                params,
+                vocab_size=VOCAB_SIZE,
+                next_native_rng_key=lambda k=k: k,
+                output_lengths=[0] * len(params),
+            )
+            for k in (key, same_key, next_key)
+        ]
+        mx.eval(key, same_key, next_key, *tokens)
+        assert key.tolist() == same_key.tolist()
+        assert key.tolist() != next_key.tolist()
+        assert tokens[0].tolist() == tokens[1].tolist()
+        assert tokens[0].tolist() != tokens[2].tolist()
+
+
 class TestSeededNativeSampling:
     """Seeded requests draw from a seed-derived per-request MLX key."""
 
@@ -392,7 +439,7 @@ class TestSeededNativeSampling:
         return tokens.tolist()
 
     @pytest.mark.parametrize(
-        ("params", "expected_calls"),
+        ("params", "steps_per_call"),
         [
             ([_random_params(seed=1), _random_params(seed=2)], 0),
             ([_random_params(seed=1), _random_params(temperature=0.0)], 0),
@@ -400,23 +447,23 @@ class TestSeededNativeSampling:
         ],
         ids=["all-seeded", "seeded-plus-greedy", "seeded-plus-unseeded"],
     )
-    def test_engine_key_consumed_only_by_unseeded_random_rows(
-        self, params: list[SamplingParams], expected_calls: int
+    def test_engine_counter_advances_only_for_unseeded_random_rows(
+        self, params: list[SamplingParams], steps_per_call: int
     ) -> None:
         logits = mx.random.normal((len(params), VOCAB_SIZE), key=mx.random.key(3))
-        next_key = Mock(return_value=mx.random.key(0))
+        runner = make_stub_runner(_native_sampling_enabled=True)
         steps = 4
         for n in range(steps):
             tokens = SamplingBatch.native_sample_tokens(
                 logits,
                 params,
                 vocab_size=VOCAB_SIZE,
-                next_native_rng_key=next_key,
+                next_native_rng_key=runner._next_native_sample_key,
                 output_lengths=[n] * len(params),
                 allow_seed=True,
             )
             mx.eval(tokens)
-        assert next_key.call_count == expected_calls * steps
+        assert runner._native_sampling_step == steps_per_call * steps
 
     def test_seeded_rows_are_eligible_only_with_allow_seed(self) -> None:
         params = [_random_params(seed=7), _random_params()]
@@ -424,11 +471,15 @@ class TestSeededNativeSampling:
         assert SamplingBatch.params_allow_native_random(params, allow_seed=True)
 
     def test_row_key_is_pure_and_position_dependent(self) -> None:
-        a = seeded_row_key(7, 3)
-        b = seeded_row_key(7, 3)
+        a = native_sampling_key(7, 3)
+        b = native_sampling_key(7, 3)
         mx.eval(a, b)
         assert a.tolist() == b.tolist()
-        others = [seeded_row_key(7, 4), seeded_row_key(8, 3), seeded_row_key(-7, 3)]
+        others = [
+            native_sampling_key(7, 4),
+            native_sampling_key(8, 3),
+            native_sampling_key(-7, 3),
+        ]
         mx.eval(*others)
         assert all(o.tolist() != a.tolist() for o in others)
 
