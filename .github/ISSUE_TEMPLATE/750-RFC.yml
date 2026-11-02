@@ -1,0 +1,34 @@
+name: 💬 Request for comments (RFC)
+description: Ask for feedback on major architectural changes or design choices.
+title: "[RFC]: "
+
+body:
+- type: markdown
+  attributes:
+    value: >
+      #### Please take a look at previous [RFCs](https://github.com/vllm-project/vllm-metal/issues?q=is%3Aissue+%22%5BRFC%5D%22+in%3Atitle+sort%3Aupdated-desc) for reference.
+- type: textarea
+  attributes:
+    label: Motivation
+    description: >
+      The motivation of the RFC.
+  validations:
+    required: true
+- type: textarea
+  attributes:
+    label: Proposed change
+    description: >
+      The proposed change, and the alternatives you considered.
+  validations:
+    required: true
+- type: textarea
+  attributes:
+    label: CC list
+    description: >
+      The people you want to CC.
+- type: checkboxes
+  attributes:
+    label: Before submitting a new issue...
+    options:
+      - label: I have searched for relevant issues.
+        required: true
