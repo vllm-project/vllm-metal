@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for MLX-native temperature/top-k/top-p sampling."""
 
+from unittest.mock import Mock
+
 import mlx.core as mx
 import pytest
 import torch
@@ -380,6 +382,32 @@ class TestSeededNativeSampling:
         )
         mx.eval(tokens)
         return tokens.tolist()
+
+    @pytest.mark.parametrize(
+        ("params", "expected_calls"),
+        [
+            ([_random_params(seed=1), _random_params(seed=2)], 0),
+            ([_random_params(seed=1), _random_params(temperature=0.0)], 0),
+            ([_random_params(seed=1), _random_params()], 1),
+        ],
+        ids=["all-seeded", "seeded-plus-greedy", "seeded-plus-unseeded"],
+    )
+    def test_engine_key_consumed_only_by_unseeded_random_rows(
+        self, params: list[SamplingParams], expected_calls: int
+    ) -> None:
+        logits = mx.random.normal((len(params), VOCAB_SIZE), key=mx.random.key(3))
+        next_key = Mock(return_value=mx.random.key(0))
+        steps = 4
+        for n in range(steps):
+            tokens = SamplingBatch.native_sample_tokens(
+                logits,
+                params,
+                vocab_size=VOCAB_SIZE,
+                next_native_rng_key=next_key,
+                output_lengths=[n] * len(params),
+            )
+            mx.eval(tokens)
+        assert next_key.call_count == expected_calls * steps
 
     def test_seeded_rows_are_eligible_only_with_allow_seed(self) -> None:
         params = [_random_params(seed=7), _random_params()]

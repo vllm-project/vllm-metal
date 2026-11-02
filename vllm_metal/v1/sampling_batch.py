@@ -257,9 +257,11 @@ class SamplingBatch:
         Uses greedy argmax when the batch allows it, otherwise the temperature/
         top-k/top-p categorical graph over the vocab-sliced logits (unlike
         argmax, categorical can select a padded lm_head column). The caller
-        owns evaluation and RNG state; ``next_native_rng_key`` is consumed only on the
-        random path. Raises on batches neither native path admits — the
-        caller must not let those reach here.
+        owns evaluation and RNG state; ``next_native_rng_key`` is consumed only
+        when an unseeded random row draws from it, so all-seeded batches leave
+        the engine key untouched (no unevaluated split accumulates on it).
+        Raises on batches neither native path admits — the caller must not
+        let those reach here.
         """
         if cls.params_allow_native_greedy(sampling_params_list):
             return mlx_greedy_tokens(logits_2d)
@@ -274,10 +276,14 @@ class SamplingBatch:
                     None if sp.seed is None else seeded_row_key(sp.seed, n)
                     for sp, n in zip(sampling_params_list, output_lengths, strict=True)
                 ]
+            needs_engine_key = any(
+                sp.seed is None and sp.temperature >= GREEDY_TEMPERATURE_EPS
+                for sp in sampling_params_list
+            )
             return cls._native_random_tokens(
                 logits_2d[..., :vocab_size],
                 sampling_params_list,
-                next_native_rng_key(),
+                next_native_rng_key() if needs_engine_key else None,
                 row_keys=row_keys,
             )
         key_state = "live" if next_native_rng_key is not None else "absent"
@@ -336,7 +342,7 @@ class SamplingBatch:
         cls,
         logits_2d: mx.array,
         sampling_params_list: Sequence[SamplingParams],
-        key: mx.array,
+        key: mx.array | None,
         *,
         row_keys: Sequence[mx.array | None] | None = None,
     ) -> mx.array:
@@ -346,6 +352,8 @@ class SamplingBatch:
         own key over their own row, so their token depends only on their
         logits, params and key, not on batch neighbors. Other rows share one
         batched draw with ``key``, exactly as when no row keys are given.
+        ``key`` may be ``None`` only when every other row is greedy; those
+        rows then take their top-1 candidate without a draw.
 
         Greedy rows (temperature below ``GREEDY_TEMPERATURE_EPS``) ride along
         as a top-1 candidate set at unit temperature so that every row of the
@@ -378,7 +386,10 @@ class SamplingBatch:
         sorted_desc, sorted_idx = cls._sorted_candidate_logits(
             scaled, top_k, top_p, min_p
         )
-        position = mx.random.categorical(sorted_desc, axis=-1, key=key)
+        if key is None:
+            position = mx.zeros((sorted_desc.shape[0],), dtype=mx.uint32)
+        else:
+            position = mx.random.categorical(sorted_desc, axis=-1, key=key)
         if row_keys is not None and any(k is not None for k in row_keys):
             rows = [
                 position[i]
