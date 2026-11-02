@@ -7,7 +7,10 @@ from importlib.metadata import version
 
 import pytest
 
-from tests.scheduler_helpers import track_preemptions_and_resumptions
+from tests.scheduler_helpers import (
+    assert_v2_model_runner,
+    track_preemptions_and_resumptions,
+)
 from tests.test_block_draft_serving_e2e import _block_draft_llm, _spawn_env
 
 # Use the same checkpoint revisions as the serving/continuation qualification.
@@ -143,6 +146,7 @@ def _serve(pair, verify_window, caching, path):
 
     proposer.propose = record_propose
     runner._spec_decode_controller.verify_greedy = record_verify
+    assert_v2_model_runner(llm)
     track_preemptions_and_resumptions(scheduler, stats, resumption_key="resumed")
     records = {}
 

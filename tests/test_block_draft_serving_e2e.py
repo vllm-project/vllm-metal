@@ -10,7 +10,10 @@ import os
 
 import pytest
 
-from tests.scheduler_helpers import track_preemptions_and_resumptions
+from tests.scheduler_helpers import (
+    assert_v2_model_runner,
+    track_preemptions_and_resumptions,
+)
 
 DRAFT_MODELS = {
     "dflash": "z-lab/Qwen3-4B-DFlash-b16",
@@ -192,6 +195,7 @@ def _serve(
             return result
 
         runner._spec_decode_controller.verify_greedy = record_verify
+        assert_v2_model_runner(llm)
         track_preemptions_and_resumptions(scheduler, stats, resumption_key="resumed")
         # The prefill's first output can finish the request by itself.
         assert (

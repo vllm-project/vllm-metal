@@ -9,7 +9,10 @@ import os
 
 import pytest
 
-from tests.scheduler_helpers import track_preemptions_and_resumptions
+from tests.scheduler_helpers import (
+    assert_v2_model_runner,
+    track_preemptions_and_resumptions,
+)
 
 
 def _run_lookahead_lifecycle(prefix_caching, target_model="Qwen/Qwen3-0.6B"):
@@ -80,6 +83,7 @@ def _run_lookahead_lifecycle(prefix_caching, target_model="Qwen/Qwen3-0.6B"):
         assert llm.reset_prefix_cache()
         free_before = scheduler.kv_cache_manager.block_pool.get_num_free_blocks()
 
+        assert_v2_model_runner(llm)
         track_preemptions_and_resumptions(scheduler, stats)
         runner._spec_decode_controller.verify_greedy = verify
         proposer.release_requests = release
