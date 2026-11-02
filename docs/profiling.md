@@ -173,8 +173,13 @@ ops._start_nax_prefill_dispatch_trace()  # clear and enable
 trace = ops._take_nax_prefill_dispatch_trace()  # disable, return and clear
 
 for event in trace["events"]:
-    print(event["function"], event["BQ"], event["HEADS_PER_TG"],
-          (event["gridx"], event["gridy"], event["gridz"]), event["threads"])
+    print(
+        event["function"],
+        event["BQ"],
+        event["HEADS_PER_TG"],
+        (event["gridx"], event["gridy"], event["gridz"]),
+        event["threads"],
+    )
 ```
 
 | Returned key | Meaning |
