@@ -354,7 +354,7 @@ class TestSamplerDevicePolicy:
         "overrides",
         [
             None,
-            {"seed": 7},
+            {"repetition_penalty": 1.1},
             {"logprobs": 1},
             {"logprob_token_ids": [1, 2]},
             {"presence_penalty": 0.5},
@@ -850,6 +850,7 @@ class TestV1SamplingBatch:
                     params,
                     vocab_size=len(probs),
                     next_native_rng_key=lambda: next(keys),
+                    output_lengths=[0],
                 ).item()
             )
             for _ in range(64)

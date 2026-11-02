@@ -66,6 +66,55 @@ static bool nax_hardware_supported() {
 // nanobind module
 // ---------------------------------------------------------------------------
 
+static nb::dict take_nax_prefill_dispatch_trace_python() {
+  const auto trace = take_nax_prefill_dispatch_trace();
+  nb::list events;
+  for (size_t i = 0; i < trace.events.size(); ++i) {
+    const auto& event = trace.events[i];
+    nb::dict row;
+    row["event_index"] = i;
+    row["function"] = event.function;
+    row["split_full"] = event.split_full;
+    row["max_seq_len"] = event.max_seq_len;
+    row["q_block_offset"] = event.q_block_offset;
+    row["family"] = event.family;
+    row["dtype"] = event.dtype;
+    row["q"] = event.q;
+    row["hq"] = event.hq;
+    row["hkv"] = event.hkv;
+    row["d"] = event.d;
+    row["page"] = event.page;
+    row["numseq"] = event.numseq;
+    row["gridx"] = event.gridx;
+    row["gridy"] = event.gridy;
+    row["gridz"] = event.value_slices;
+    row["grouped_skip_bounds"] = event.grouped_skip_bounds;
+    row["threads"] = event.threads;
+    row["BQ"] = event.bq;
+    row["HEADS_PER_TG"] = event.heads_per_tg;
+    row["q_stride"] = event.q_stride;
+    row["key_block_stride"] = event.key_block_stride;
+    row["key_head_stride"] = event.key_head_stride;
+    row["key_stride0"] = event.key_stride0;
+    row["key_stride1"] = event.key_stride1;
+    row["key_stride2"] = event.key_stride2;
+    row["key_page_tokens"] = event.key_page_tokens;
+    row["sliding_window"] = event.sliding_window;
+    row["softcap"] = event.softcap;
+    row["use_sinks"] = event.use_sinks;
+    events.append(row);
+  }
+  nb::dict result;
+  result["schema"] = "nax-prefill-dispatch-trace-v1";
+  result["events"] = events;
+  result["capacity"] = trace.capacity;
+  result["overflow"] = trace.dropped != 0;
+  result["dropped_events"] = trace.dropped;
+  result["dispatch_count"] = trace.events.size() + trace.dropped;
+  result["append_time_ns"] = trace.append_ns;
+  return result;
+}
+
 NB_MODULE(_paged_ops, m) {
   register_mlx_patch(m);
   m.attr("PARTITION_SIZE") = nb::int_(kPartitionSize);
@@ -81,6 +130,17 @@ NB_MODULE(_paged_ops, m) {
         "Call with evaluation idle, in the worker that executes attention. "
         "Clears the last family/partition and returns the previous enabled state. "
         "This does not change attention routing or numerical computation.");
+  m.def("_start_nax_prefill_dispatch_trace", &start_nax_prefill_dispatch_trace,
+        "Private bounded CPU diagnostic; clear and enable while evaluation is idle. "
+        "Records actual NAX encodes after pipeline fallback; no GPU synchronization.");
+  m.def("_take_nax_prefill_dispatch_trace", &take_nax_prefill_dispatch_trace_python,
+        "Disable, return and clear the CPU trace after natural sampling completes. "
+        "Returns schema, events, capacity, overflow, dropped_events, dispatch_count "
+        "and append_time_ns. Times lock acquisition, metadata and append/drop only; "
+        "excludes flag check, final clock/accounting, unlock and start/take conversion. "
+        "Call while evaluation is idle; this does not synchronize the GPU. "
+        "Events follow append order; serial encoding preserves encode order, "
+        "not GPU execution order.");
   nb::class_<GqaDecodeLengthPlan>(m, "GqaDecodeLengthPlan")
       .def_ro("num_requests", &GqaDecodeLengthPlan::num_requests)
       .def_ro("max_length", &GqaDecodeLengthPlan::max_length);

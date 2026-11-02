@@ -1809,7 +1809,7 @@ class MetalModelRunner:
         states_missing = False
         decode_req_ids: list[str] = []
         decode_params: list[SamplingParams] = []
-        decode_num_output_tokens: list[int] = []
+        decode_output_lengths: list[int] = []
         for req_id in cached_reqs.req_ids:
             state = self._request_states.get(req_id)
             if state is None:
@@ -1823,7 +1823,7 @@ class MetalModelRunner:
             decode_req_ids.append(req_id)
             if state.sampling_params is not None:
                 decode_params.append(state.sampling_params)
-                decode_num_output_tokens.append(len(state.token_ids) - state.prompt_len)
+                decode_output_lengths.append(len(state.token_ids) - state.prompt_len)
 
         adapter = self._multimodal_adapter
         mm_forward_forced = self._mm_forward_forced(adapter)
@@ -1865,14 +1865,14 @@ class MetalModelRunner:
             native_greedy=(
                 not states_missing
                 and SamplingBatch.params_allow_native_greedy(
-                    decode_params, decode_num_output_tokens
+                    decode_params, decode_output_lengths
                 )
             ),
             native_random=(
                 self._native_sample_key is not None
                 and not states_missing
                 and SamplingBatch.params_allow_native_random(
-                    decode_params, decode_num_output_tokens
+                    decode_params, decode_output_lengths
                 )
             ),
         )
@@ -2119,9 +2119,7 @@ class MetalModelRunner:
         if isinstance(hybrid_runtime, HybridPagedAttentionRuntime):
             state_cache = hybrid_runtime.state_cache
             if state_cache.spec_verify_stash is not None:
-                committed_rows = [len(ids) for ids in decode_token_ids] + [
-                    len(pr.token_ids) for pr in prefill_reqs
-                ]
+                committed_rows = [len(ids) for ids in decode_token_ids]
                 apply_spec_decode_acceptance(
                     state_cache, GDNLazyKernels.shared(), committed_rows
                 )
@@ -3511,7 +3509,7 @@ class MetalModelRunner:
                 if self._native_sample_key is not None
                 else None
             ),
-            num_output_tokens=[
+            output_lengths=[
                 len(state.token_ids) - state.prompt_len for _, state in decode_reqs
             ],
         )

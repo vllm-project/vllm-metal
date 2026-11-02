@@ -169,6 +169,7 @@ verify_wheel_artifacts() {
   local expected
   if ! expected=$(python -c "
 from vllm_metal.metal.build import METALLIB_NAMES, NAX_METALLIB_NAME, metallib_path, mlx_version_path, output_path, mps_output_path, mps_version_path
+print('requirements-torch.txt')
 print(output_path().name)
 print(mlx_version_path().name)
 print(mps_output_path().name)

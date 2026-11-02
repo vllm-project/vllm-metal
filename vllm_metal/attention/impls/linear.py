@@ -189,10 +189,7 @@ class GDNPagedAttentionWrapper(nn.Module):
             cache_idx=self._gdn_cache_idx,
             slot_ids=state.slot_ids,
             cu_seqlens=state.cu_seqlens,
-            span_lengths=tuple(
-                state.cu_seqlens[i + 1] - state.cu_seqlens[i]
-                for i in range(state.num_requests)
-            ),
+            num_decode_requests=state.num_decode_requests,
             compute_dtype=self._recurrent_prefill_compute_dtype(),
             decode_threadgroup_dv=self._recurrent_decode_threadgroup_dv(),
             q=q,
