@@ -158,6 +158,40 @@ process environment. Restart the engine with that variable set, then retry.
 
 **No semantic range markers.** Unlike CUDA's NVTX or torch.profiler's `record_function`, Metal frame capture has no API for inserting named ranges. Kernel-level granularity (each MLX op shows up as a labeled Metal dispatch) is what you get; if you need per-layer or per-stage labels, those would require adding `os_signpost` calls in the C++ extension — not currently supported.
 
+## Diagnostic: NAX prefill dispatch trace
+
+Frame capture shows every Metal command but is slow and large. To check only which NAX prefill kernel was encoded, and with what launch geometry, use the lightweight CPU-side dispatch trace instead. It needs no Xcode and no `MTL_CAPTURE_ENABLED`, and it is off by default.
+
+The trace records the kernel actually encoded, after any pipeline fallback. Call both functions while evaluation is idle, in the process that executes attention:
+
+```python
+from vllm_metal.metal import get_ops
+
+ops = get_ops()
+ops._start_nax_prefill_dispatch_trace()  # clear and enable
+# ... run the prefill you want to inspect ...
+trace = ops._take_nax_prefill_dispatch_trace()  # disable, return and clear
+
+for event in trace["events"]:
+    print(event["function"], event["BQ"], event["HEADS_PER_TG"],
+          (event["gridx"], event["gridy"], event["gridz"]), event["threads"])
+```
+
+| Returned key | Meaning |
+|---|---|
+| `events` | One dict per encoded dispatch: kernel `function`, `family`, `dtype`, `BQ`, `HEADS_PER_TG`, grid and `threads`, query geometry (`q`, `hq`, `hkv`, `d`, `numseq`, `max_seq_len`), translated KV strides, and `sliding_window` / `softcap` / `use_sinks` |
+| `capacity` | Maximum events kept per process (8192) |
+| `overflow`, `dropped_events` | Whether, and how many, events were dropped after the buffer filled |
+| `dispatch_count` | Kept plus dropped events |
+| `append_time_ns` | Host time spent recording; it does not include GPU time |
+
+Limitations:
+
+- Events are in append order. They do not show GPU execution order or which request a dispatch belonged to, and with concurrent encoding threads the order may differ from call order.
+- Only NAX prefill dispatches are recorded; other attention paths and other kernels are not.
+- Tracing adds host work while enabled, so don't use it for timing. Use frame capture for per-kernel GPU timing.
+- These are private (`_`-prefixed) diagnostic hooks and may change.
+
 ## Advanced: xctrace
 
 For users already familiar with **Instruments.app**, Apple's `xctrace` CLI can record a whole-process trace — useful for a high-level "is the engine running healthily?" view (GPU utilization, CPU stalls, thermal state) without bounding the workload:
