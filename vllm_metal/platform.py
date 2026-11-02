@@ -1164,8 +1164,8 @@ class MetalPlatform(Platform):
     @classmethod
     def _check_sleep_mode_config(cls, vllm_config: "VllmConfig", backend: str) -> None:
         """Sleep mode re-creates the MLX runner's shared KV storage in place.
-        Drafters that keep their own caches or arrays derived from it are not
-        covered, and the PyTorch MPS runner has no such storage.
+        Only drafters verified to keep no KV or only views of that storage are
+        allowed, and the PyTorch MPS runner has no such storage.
         """
         if backend != "mlx":
             raise NotImplementedError(
@@ -1173,10 +1173,13 @@ class MetalPlatform(Platform):
                 f"(VLLM_METAL_BACKEND={backend!r})."
             )
         speculative_config = vllm_config.speculative_config
-        if speculative_config is not None and speculative_config.method != "ngram":
+        if speculative_config is not None and speculative_config.method not in (
+            "ngram",
+            "draft_model",
+        ):
             raise NotImplementedError(
-                "Sleep mode on Metal supports only n-gram speculative decoding, "
-                f"got method={speculative_config.method!r}."
+                "Sleep mode on Metal supports only n-gram and draft-model "
+                f"speculative decoding, got method={speculative_config.method!r}."
             )
 
     @classmethod
