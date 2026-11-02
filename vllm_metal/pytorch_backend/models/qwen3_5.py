@@ -37,6 +37,8 @@ def delta_rule_step(q, k, v, g, beta, state):
 def delta_rule_chunked(q, k, v, g, beta, state, chunk=_CHUNK_SIZE):
     length, heads = q.shape[:2]
     v_dim = v.shape[-1]
+    # TODO: Use gdn_linear_attention.metal to avoid padding short prefills to
+    # 64 tokens and running 63 forward-substitution steps.
     pad = (-length) % chunk
     if pad:  # k = beta = g = 0 rows leave the state untouched
         q, k, v, g, beta = (
@@ -105,6 +107,8 @@ def _gdn_core(layer, mixed_qkv, b, a, out, md):
         conv[idx] = conv_state
         q, k, v = _split_qkv(layer, x)
         g, beta = _gating(layer.A_log, layer.dt_bias, a[:ndt][live], b[:ndt][live])
+        # TODO: Pass slot IDs and unexpanded Q/K heads to the shared Metal
+        # kernel so decode updates state in place without copying active slots.
         state = ssm[idx]
         o = delta_rule_step(q, k, v, g, beta, state)
         ssm[idx] = state
@@ -127,6 +131,8 @@ def _gdn_core(layer, mixed_qkv, b, a, out, md):
         ).transpose(0, 1)
         q, k, v = _split_qkv(layer, x)
         g, beta = _gating(layer.A_log, layer.dt_bias, a[lo:hi], b[lo:hi])
+        # TODO: Pass the packed sequence offsets and slots to the shared Metal
+        # kernel to avoid this per-request Python loop and its host reads.
         bounds, s_list, init = p_loc.tolist(), p_slots.tolist(), p_init.tolist()
         for i, slot in enumerate(s_list):
             s, e = bounds[i], bounds[i + 1]
