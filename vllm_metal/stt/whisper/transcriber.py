@@ -13,7 +13,6 @@ from transformers import WhisperTokenizer
 from transformers.models.whisper.tokenization_whisper import LANGUAGES, TO_LANGUAGE_CODE
 from vllm.config import SpeechToTextConfig
 from vllm.model_executor.models.whisper_utils import ISO639_1_SUPPORTED_LANGS
-from vllm.v1.sample.sampler import Sampler
 
 from vllm_metal.stt.audio import (
     N_SAMPLES,
@@ -26,6 +25,7 @@ from vllm_metal.stt.audio import (
 )
 from vllm_metal.stt.protocol import TranscriptionResult, TranscriptionSegment
 from vllm_metal.stt.sampling import STTSampling
+from vllm_metal.v1.sampling import Sampler
 
 from .config import WHISPER_MAX_DECODE_TOKENS
 from .model import WhisperModel
