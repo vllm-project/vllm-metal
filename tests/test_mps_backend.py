@@ -681,11 +681,29 @@ def test_gdn_chunked_prefill_matches_transformers_recurrence(length):
     torch.testing.assert_close(final.cpu(), expected_state[0], atol=1e-5, rtol=1e-4)
 
 
-def test_gdn_state_carries_across_chunked_prefill_and_decode():
+@pytest.mark.parametrize(
+    "pooled",
+    [
+        pytest.param(False, id="dense"),
+        pytest.param(True, id="pooled", marks=pytest.mark.slow),
+    ],
+)
+def test_gdn_state_carries_across_chunked_prefill_and_decode(pooled):
+    """``pooled`` puts the caches at the start of one buffer holding more than
+    INT_MAX fp32 elements, like the shared KV buffer on a large Mac. MPSGraph
+    matmuls reject a view into it at a non-zero offset, so resumed prefill must
+    copy its slot. Metal wires that whole buffer on first use, hence slow."""
     from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
     from vllm_metal.pytorch_backend.models.qwen3_5 import _gdn_core
+    from vllm_metal.pytorch_backend.mps_ops import _load_mps_module
 
+    pool_bytes = (2**31 + (1 << 20)) * 4
+    if pooled and (
+        _load_mps_module().max_buffer_length() <= pool_bytes
+        or torch.mps.recommended_max_memory() < 2 * pool_bytes
+    ):
+        pytest.skip("Needs a Metal buffer past INT_MAX fp32 elements, with headroom")
     k_heads, v_heads, k_dim, v_dim, width = 2, 4, 16, 8, 4
     channels = 2 * k_heads * k_dim + v_heads * v_dim
     layer = SimpleNamespace(
@@ -705,6 +723,12 @@ def test_gdn_state_carries_across_chunked_prefill_and_decode():
             torch.randn(4, v_heads, v_dim, k_dim, device="mps"),
         ],
     )
+    if pooled:
+        pool = torch.empty(pool_bytes // 4, device="mps")
+        start = 0
+        for i, t in enumerate(layer.kv_cache):
+            layer.kv_cache[i] = pool[start : start + t.numel()].view_as(t).copy_(t)
+            start += t.numel()
     untouched = [t[2].clone() for t in layer.kv_cache]
     qkv = torch.randn(76, channels, device="mps")
     b, a = torch.randn(2, 76, v_heads, device="mps")
