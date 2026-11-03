@@ -68,28 +68,32 @@ def get_mps_ops():
 @cache
 def get_mps_gdn_ops():
     from vllm_metal import envs
-    from vllm_metal.metal.build import build_gdn_metallib, prepare_metallib
+    from vllm_metal.metal.build import prepare_metallib
 
     module = _load_mps_module()
-    if envs.VLLM_METAL_BUILD_FROM_SOURCE:
-        build_gdn_metallib()
-    path = prepare_metallib("gdn_kern")
+    path = prepare_metallib(
+        "gdn_kern", build_from_source=envs.VLLM_METAL_BUILD_FROM_SOURCE
+    )
     return module.GDNLinearAttention(str(path))
 
 
-def gdn_linear_attention(q, k, v, g, beta, state_pool, cu_seqlens, slot_mapping, y):
+def gdn_linear_attention(
+    q, k, v, g, beta, state_pool, cu_seqlens, slot_mapping, y, has_initial_state
+):
     """Enqueue GDN on PyTorch's MPS stream; mutate fp32 state and write Y.
 
     Q/K are packed [T,Hk,Dk], V/Y [T,Hv,Dv], g/beta [T,Hv], all the same
     fp32/fp16/bf16 dtype. Q/K must already be normalized and Q scaled. The
-    shader consumes exp(log_g), while delta_rule_step/chunked consume log_g.
+    shader consumes the decay exp(log_g), not the log-space gate.
     State is [slots,Hv,Dv,Dk], with dense inner rows and an optional slot gap.
 
     Metadata is packed int32 on MPS. Callers supply monotonic cu_seqlens from
     0 to T and distinct valid slots or PAD (-1); metadata values are not read
     back to the CPU. PAD and empty sequences leave state and Y untouched.
+    has_initial_state is packed bool [B] on MPS; false starts from zero in
+    the same launch without reading the old slot contents.
     Inputs, state and Y must not overlap. Autograd is not supported.
     """
     get_mps_gdn_ops().gdn_linear_attention(
-        q, k, v, g, beta, state_pool, cu_seqlens, slot_mapping, y
+        q, k, v, g, beta, state_pool, cu_seqlens, slot_mapping, y, has_initial_state
     )

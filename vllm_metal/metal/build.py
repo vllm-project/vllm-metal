@@ -374,40 +374,6 @@ def build_metallibs() -> list[Path]:
     return list(digests)
 
 
-def build_gdn_metallib() -> Path:
-    """Build the shared GDN source for MPS without importing MLX's builder."""
-    name = "gdn_kern"
-    source = _metallib_source(name)
-    path = metallib_path(name)
-    if _metallib_is_current(name, source):
-        return path
-    with tempfile.TemporaryDirectory(prefix="vllm-metal-gdn-build-") as tmp:
-        metal = Path(tmp) / f"{name}.metal"
-        library = metal.with_suffix(".metallib")
-        metal.write_text(source)
-        subprocess.run(
-            [
-                "xcrun",
-                "-sdk",
-                "macosx",
-                "metal",
-                str(metal),
-                "-std=metal3.1",
-                "-fno-fast-math",
-                f"-fmodules-cache-path={tmp}/modules",
-                f"-mmacosx-version-min={MIN_MACOS_VERSION}",
-                "-o",
-                str(library),
-            ],
-            check=True,
-        )
-        path.write_bytes(library.read_bytes())
-    _stamp_path(path).write_text(_metallib_digest(name, source))
-    _toolchain_path(path).write_text(_metal_toolchain_id())
-    _build_config_path(path).write_text(_mlx_build_config())
-    return path
-
-
 def _package_version(name: str) -> str:
     from importlib.metadata import version
 

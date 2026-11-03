@@ -283,9 +283,10 @@ class GDNLinearAttention {
   void gdn_linear_attention(
       const Tensor& q, const Tensor& k, const Tensor& v,
       const Tensor& g, const Tensor& beta, const Tensor& state_pool,
-      const Tensor& cu_seqlens, const Tensor& slot_mapping, const Tensor& y) {
+      const Tensor& cu_seqlens, const Tensor& slot_mapping, const Tensor& y,
+      const Tensor& has_initial_state) {
     for (auto* t : {&q, &k, &v, &g, &beta, &state_pool,
-                   &cu_seqlens, &slot_mapping, &y})
+                   &cu_seqlens, &slot_mapping, &y, &has_initial_state})
       TORCH_CHECK(t->is_mps(), "All GDN buffers must be on MPS");
     TORCH_CHECK(q.scalar_type() == at::kFloat || q.scalar_type() == at::kHalf ||
                 q.scalar_type() == at::kBFloat16, "GDN requires fp32/fp16/bf16 inputs");
@@ -315,10 +316,15 @@ class GDNLinearAttention {
                 slot_mapping.numel() <= std::numeric_limits<int>::max() &&
                 cu_seqlens.numel() == slot_mapping.numel() + 1,
                 "GDN metadata must be packed int32 cu_seqlens [B+1], slots [B]");
+    TORCH_CHECK(has_initial_state.scalar_type() == at::kBool &&
+                has_initial_state.sizes() == slot_mapping.sizes() &&
+                has_initial_state.is_contiguous(),
+                "GDN has_initial_state must be packed bool [B]");
     const std::string dt = q.scalar_type() == at::kFloat ? "float" :
         q.scalar_type() == at::kHalf ? "half" : "bfloat16_t";
     const auto plan = kernels::make_gdn_linear_attention_plan(
-        dt, "float", slot_mapping.numel(), Hk, Hv, Dk, Dv, state_pool.stride(0));
+        dt, "float", slot_mapping.numel(), Hk, Hv, Dk, Dv,
+        state_pool.stride(0), true);
     if (plan.num_requests == 0 || tokens == 0) return;
     auto kernel = pipeline(plan.kernel_name);
     const auto threads = static_cast<NSUInteger>(plan.threads_x);
@@ -335,6 +341,7 @@ class GDNLinearAttention {
         buffer(enc, 6, cu_seqlens); buffer(enc, 7, slot_mapping); buffer(enc, 8, y);
         kernels::bind_gdn_linear_attention_params(
             plan, [&](int index, auto value) { scalar(enc, index, value); });
+        buffer(enc, 15, has_initial_state);
         [enc dispatchThreadgroups:MTLSizeMake(plan.grid_x, 1, plan.grid_z)
             threadsPerThreadgroup:MTLSizeMake(plan.threads_x, 1, 1)];
       }

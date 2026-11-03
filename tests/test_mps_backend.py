@@ -728,36 +728,6 @@ def test_omni_macos_transport_handles_long_names_and_page_padding(with_metadata)
 
 
 @pytest.mark.parametrize(
-    "length", [1, 5, 64, 65, 200], ids=["one", "short", "chunk", "chunk+1", "multi"]
-)
-def test_gdn_chunked_prefill_matches_transformers_recurrence(length):
-    from transformers.models.qwen3_5.modeling_qwen3_5 import (
-        torch_recurrent_gated_delta_rule,
-    )
-
-    from vllm_metal.pytorch_backend.models.qwen3_5 import delta_rule_chunked
-
-    heads, k_dim, v_dim = 3, 32, 16
-    q, k = (
-        torch.nn.functional.normalize(torch.randn(length, heads, k_dim), dim=-1)
-        for _ in range(2)
-    )
-    v = torch.randn(length, heads, v_dim)
-    g = -torch.rand(length, heads)
-    beta = torch.rand(length, heads)
-    state = torch.randn(heads, k_dim, v_dim) * 0.1
-    expected, expected_state = torch_recurrent_gated_delta_rule(
-        q[None], k[None], v[None], g[None], beta[None], state[None], True
-    )
-    out, final = delta_rule_chunked(
-        *(x.to("mps") for x in (q * k_dim**-0.5, k, v, g, beta, state))
-    )
-    # The chunked form reorders the recurrence's fp32 sums.
-    torch.testing.assert_close(out.cpu(), expected[0], atol=1e-5, rtol=1e-4)
-    torch.testing.assert_close(final.cpu(), expected_state[0], atol=1e-5, rtol=1e-4)
-
-
-@pytest.mark.parametrize(
     "pooled",
     [
         pytest.param(False, id="dense"),
@@ -765,10 +735,12 @@ def test_gdn_chunked_prefill_matches_transformers_recurrence(length):
     ],
 )
 def test_gdn_state_carries_across_chunked_prefill_and_decode(pooled):
-    """``pooled`` puts the caches at the start of one buffer holding more than
-    INT_MAX fp32 elements, like the shared KV buffer on a large Mac. MPSGraph
-    matmuls reject a view into it at a non-zero offset, so resumed prefill must
-    copy its slot. Metal wires that whole buffer on first use, hence slow."""
+    """Preserve #1244's resumed-prefill regression above INT_MAX fp32 elements.
+
+    The shared kernel copies the slot into private state before recurrence,
+    avoiding MPSGraph matmuls on the pooled view. Metal wires the whole buffer
+    on first use, so the large-pool case remains slow.
+    """
     from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
     from vllm_metal.pytorch_backend.models.qwen3_5 import _gdn_core
@@ -780,7 +752,7 @@ def test_gdn_state_carries_across_chunked_prefill_and_decode(pooled):
         or torch.mps.recommended_max_memory() < 2 * pool_bytes
     ):
         pytest.skip("Needs a Metal buffer past INT_MAX fp32 elements, with headroom")
-    k_heads, v_heads, k_dim, v_dim, width = 2, 4, 16, 8, 4
+    k_heads, v_heads, k_dim, v_dim, width = 2, 4, 32, 8, 4
     channels = 2 * k_heads * k_dim + v_heads * v_dim
     layer = SimpleNamespace(
         key_dim=k_heads * k_dim,
@@ -864,7 +836,7 @@ def test_gdn_state_carries_across_chunked_prefill_and_decode(pooled):
             rtol=1e-4,
         )
     torch.testing.assert_close(
-        layer.kv_cache[1][1].cpu().view(v_heads, k_dim, v_dim),
+        layer.kv_cache[1][1].cpu().transpose(-1, -2),
         state,
         atol=1e-4,
         rtol=1e-4,

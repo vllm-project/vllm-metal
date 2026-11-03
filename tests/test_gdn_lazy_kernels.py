@@ -2224,19 +2224,20 @@ class TestNativeGDNRecurrent:
             return first, second, state
 
         run = mx.compile(two_steps) if compiled else two_steps
+        # PAD owns no output/state; the trailing empty request preserves slot 1.
         first, second, state = run(
-            mx.array([1.0] + [0.0] * 31).reshape(1, 1, 32),
-            mx.full((1, 1, 4), 2, dtype=mx.float32),
-            mx.ones((1, 1)),
-            mx.full((1, 1), 0.5),
+            mx.array(([1.0] + [0.0] * 31) * 2).reshape(2, 1, 32),
+            mx.full((2, 1, 4), 2, dtype=mx.float32),
+            mx.ones((2, 1)),
+            mx.full((2, 1), 0.5),
             mx.zeros((3, 1, 4, 32)),
-            mx.array([0, 1], dtype=mx.int32),
-            mx.array([2], dtype=mx.int32),
+            mx.array([0, 1, 2, 2], dtype=mx.int32),
+            mx.array([2, -1, 1], dtype=mx.int32),
         )
         mx.eval(first, second, state)
         # The selected column follows s <- (s + 2) / 2 from an initial zero.
-        np.testing.assert_array_equal(np.array(first), 1)
-        np.testing.assert_array_equal(np.array(second), 1.5)
+        np.testing.assert_array_equal(np.array(first)[0], 1)
+        np.testing.assert_array_equal(np.array(second)[0], 1.5)
         expected = np.zeros((3, 1, 4, 32), dtype=np.float32)
         expected[2, ..., 0] = 1.5
         np.testing.assert_array_equal(np.array(state), expected)

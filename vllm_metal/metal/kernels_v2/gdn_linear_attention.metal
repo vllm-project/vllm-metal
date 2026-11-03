@@ -1,7 +1,7 @@
 #include <metal_stdlib>
 using namespace metal;
 
-template <typename T, typename S = T>
+template <typename T, typename S = T, bool use_initial_state_mask = false>
 [[kernel]] void gdn_linear_attention(
     const device T *__restrict__ q          [[buffer(0)]],
     const device T *__restrict__ k          [[buffer(1)]],
@@ -18,6 +18,7 @@ template <typename T, typename S = T>
     constant int &Dk                        [[buffer(12)]],
     constant int &Dv                        [[buffer(13)]],
     constant int64_t &state_stride [[buffer(14)]],
+    const device bool *has_initial_state    [[buffer(15)]],
     uint3 gid [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_simdgroup]])
 {
@@ -45,10 +46,11 @@ template <typename T, typename S = T>
 
     // n_per_t = Dk / 32 elements per thread (supports Dk up to 256)
     const int n_per_t = Dk / 32;
+    const bool load_state = !use_initial_state_mask || has_initial_state[req_idx];
     float state[8];
     for (int i = 0; i < n_per_t; ++i) {
         int s_idx = n_per_t * dk_idx + i;
-        state[i] = (s_idx < Dk)
+        state[i] = (load_state && s_idx < Dk)
             ? static_cast<float>(state_ptr[s_idx]) : 0.0f;
     }
 
@@ -110,9 +112,9 @@ template <typename T, typename S = T>
 }
 
 // Template instantiations — same pattern as reshape_and_cache.metal
-#define instantiate_gdn(type, state_type, suffix)                   \
+#define instantiate_gdn(type, state_type, use_initial, suffix)      \
   template [[host_name("gdn_linear_attention_" #type suffix)]]     \
-  [[kernel]] void gdn_linear_attention<type, state_type>(           \
+  [[kernel]] void gdn_linear_attention<type, state_type, use_initial>( \
       const device type*, const device type*,                      \
       const device type*, const device type*,                      \
       const device type*, device state_type*,                      \
@@ -120,12 +122,15 @@ template <typename T, typename S = T>
       device type*,                                                \
       constant int&, constant int&, constant int&,                 \
       constant int&, constant int&,                                \
-      constant int64_t&, uint3, uint);
+      constant int64_t&, const device bool*, uint3, uint);
 
 // Preserve all existing MLX entry points and their state storage precision.
-instantiate_gdn(float, float, "");
-instantiate_gdn(half, half, "");
-instantiate_gdn(bfloat16_t, bfloat16_t, "");
-instantiate_gdn(half, float, "_state_float");
-instantiate_gdn(bfloat16_t, float, "_state_float");
+instantiate_gdn(float, float, false, "");
+instantiate_gdn(half, half, false, "");
+instantiate_gdn(bfloat16_t, bfloat16_t, false, "");
+instantiate_gdn(half, float, false, "_state_float");
+instantiate_gdn(bfloat16_t, float, false, "_state_float");
+instantiate_gdn(float, float, true, "_initial");
+instantiate_gdn(half, float, true, "_state_float_initial");
+instantiate_gdn(bfloat16_t, float, true, "_state_float_initial");
 #undef instantiate_gdn
