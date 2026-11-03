@@ -455,6 +455,20 @@ def test_rope_matches_upstream(dtype, rows, heads, kv_heads, head_size, gapped_h
         torch.testing.assert_close(got, want, atol=0, rtol=0)
 
 
+def test_vision_encoder_attention_runs_on_mps():
+    # Upstream registers this op for the platform's CPU key only.
+    from vllm.v1.attention.ops.vit_attn_wrappers import vit_torch_sdpa_wrapper
+
+    install()
+    q, k, v = torch.randn(3, 1, 9, 4, 64).unbind(0)
+    cu_seqlens = torch.tensor([0, 2, 9], dtype=torch.int32)
+    expected = vit_torch_sdpa_wrapper(q, k, v, cu_seqlens=cu_seqlens)
+    actual = vit_torch_sdpa_wrapper(
+        q.to("mps"), k.to("mps"), v.to("mps"), cu_seqlens=cu_seqlens.to("mps")
+    )
+    torch.testing.assert_close(actual.cpu(), expected, atol=1e-5, rtol=1e-5)
+
+
 @pytest.mark.parametrize("logprobs", [None, 5])
 def test_chunked_verification_matches_full_batch(
     run_in_spawn_process, monkeypatch, logprobs
