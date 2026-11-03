@@ -80,10 +80,12 @@ def install_omni():
 
 def install():
     from vllm.model_executor.layers.mamba.short_conv import ShortConv
+    from vllm.v1.attention.ops import vit_attn_wrappers
     from vllm.v1.worker.gpu import buffer_utils, model_runner
     from vllm.v1.worker.gpu.sample import sampler
 
     from vllm_metal.pytorch_backend import runtime
+    from vllm_metal.pytorch_backend.models.qwen3_5 import install as install_qwen3_5
 
     if getattr(buffer_utils, "_metal_installed", False):
         return
@@ -92,6 +94,14 @@ def install():
     class MPSShortConv(ShortConv):
         # Reuse upstream Torch ops without its CPU/CUDA custom-op wrapper.
         forward = ShortConv.forward_native
+
+    install_qwen3_5()
+
+    # Vision encoders call this op. Upstream registers it for the platform's
+    # CPU dispatch key only; its Torch body runs on MPS unchanged.
+    torch.library.impl("vllm::torch_sdpa_wrapper", "MPS")(
+        vit_attn_wrappers.torch_sdpa_wrapper
+    )
 
     # MRV2 0.32 uses these CUDA names even with an MPS device. Use native
     # PyTorch objects; partial avoids duplicate Dynamo handler registration.
