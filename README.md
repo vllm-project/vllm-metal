@@ -6,6 +6,10 @@
 </p>
 
 <p align="center">
+  <b>English</b> · <a href="https://github.com/vllm-project/vllm-metal/blob/main/README.zh.md">简体中文</a>
+</p>
+
+<p align="center">
 | <a href="https://docs.vllm.ai/projects/vllm-metal/en/latest/"><b>Documentation</b></a> | <a href="https://docs.vllm.ai/projects/vllm-metal/en/latest/recipes/"><b>Recipes by Mac memory</b></a> | <a href="https://vllm.ai/blog/2026-09-22-vllm-metal-v0-28-0"><b>Blog</b></a> | <a href="https://slack.vllm.ai/"><b>Developer Slack</b></a> (#hw-metal) |
 </p>
 
