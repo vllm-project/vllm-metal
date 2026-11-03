@@ -191,8 +191,10 @@ def test_qwen_core_carries_state_in_one_launch(monkeypatch, dtype):
                 [-1 if r < 0 else r + 1 for r, _, _ in spans], device="mps"
             ),
             non_spec_query_start_loc=torch.tensor(bounds, device="mps"),
-            has_initial_state=torch.tensor(
-                [lo > 0 for _, lo, _ in spans], device="mps"
+            has_initial_state=(
+                torch.tensor([lo > 0 for _, lo, _ in spans], device="mps")
+                if nd < len(spans)
+                else None  # Upstream omits this metadata in decode-only batches.
             ),
         )
         packed = [

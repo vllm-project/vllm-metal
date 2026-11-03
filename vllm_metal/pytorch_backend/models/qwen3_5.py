@@ -82,12 +82,10 @@ def _gdn_core(layer, mixed_qkv, b, a, out, md):
 
     q, k, v = _split_qkv(layer, x)
     g, beta = _gating(layer.A_log, layer.dt_bias, a[:num_tokens], b[:num_tokens])
-    initial = torch.cat(
-        (
-            torch.ones(nd, dtype=torch.bool, device=x.device),
-            md.has_initial_state[nd:num_requests].to(device=x.device, dtype=torch.bool),
-        )
-    )
+    # Decode-only metadata has no has_initial_state tensor.
+    initial = torch.ones(num_requests, dtype=torch.bool, device=x.device)
+    if npf > 0:
+        initial[nd:] = p_init
     # The shader uses one dtype for Q/K/V and Y. Keeping fp32 Q/K/V requires
     # this output copy and cast back for fp16/bf16; it also preserves PAD rows.
     # A contiguous fp32 output already shares storage with result.
