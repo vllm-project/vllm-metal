@@ -7,6 +7,9 @@ from unittest.mock import Mock
 import mlx.core as mx
 import pytest
 import torch
+from PIL import Image
+from vllm.config import MultiModalConfig
+from vllm.exceptions import VLLMValidationError
 from vllm.multimodal.inputs import MultiModalFieldConfig, MultiModalKwargsItem
 
 from vllm_metal.multimodal import MultiModalFeatureSpec, PlaceholderRange
@@ -80,3 +83,42 @@ def test_processor_is_the_mlx_vlm_one():
     info = Lfm3VlProcessingInfo(ctx)
     info.get_hf_processor(min_pixels=64)
     ctx.get_hf_processor.assert_called_once_with(Lfm3VlProcessor, min_pixels=64)
+
+
+@pytest.fixture
+def processing_info():
+    from vllm_metal.patches.lfm3_registry import Lfm3VlProcessingInfo
+
+    mm_config = MultiModalConfig(enable_mm_embeds=True)
+    ctx = Mock()
+    ctx.model_config = SimpleNamespace(
+        multimodal_config=mm_config,
+        get_multimodal_config=lambda: mm_config,
+        get_inputs_embeds_size=lambda: 8,
+    )
+    ctx.get_mm_config.return_value = mm_config
+    ctx.get_hf_config.return_value = SimpleNamespace(
+        vision_config=SimpleNamespace(spatial_merge_size=2)
+    )
+    return Lfm3VlProcessingInfo(ctx)
+
+
+@pytest.mark.parametrize("as_dict", [False, True], ids=["tensor", "dictionary"])
+def test_precomputed_images_are_rejected_before_scheduling(processing_info, as_dict):
+    image = torch.zeros((4, 8))
+    if as_dict:
+        image = {
+            "image_embeds": image,
+            "image_grid_thw": torch.tensor([[1, 4, 4]]),
+        }
+    else:
+        image = image.unsqueeze(0)
+    with pytest.raises(VLLMValidationError, match="Precomputed image embeddings"):
+        processing_info.parse_mm_data({"image": image})
+
+
+def test_pixels_are_accepted_with_image_embeddings_enabled(processing_info):
+    image = Image.new("RGB", (64, 64))
+    items = processing_info.parse_mm_data({"image": image})
+    assert len(items["image"]) == 1
+    assert items["image"].get(0).size == image.size

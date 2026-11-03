@@ -5,6 +5,8 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 from mlx_vlm.models.lfm3_vl.processing_lfm3_vl import Lfm3VlProcessor
+from vllm.exceptions import VLLMValidationError
+from vllm.inputs import MultiModalDataDict
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateShapeCalculator
 from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.model_executor.models.lfm2 import Lfm2ForCausalLM
@@ -14,6 +16,11 @@ from vllm.model_executor.models.qwen2_vl import (
     Qwen2VLProcessingInfo,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.multimodal.parse import (
+    DictEmbeddingItems,
+    EmbeddingItems,
+    MultiModalDataItems,
+)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -54,6 +61,19 @@ class Lfm3VlProcessingInfo(Qwen2VLProcessingInfo):
 
     def get_hf_processor(self, **kwargs: object):
         return self.ctx.get_hf_processor(Lfm3VlProcessor, **kwargs)
+
+    def parse_mm_data(
+        self, mm_data: MultiModalDataDict, *, validate: bool = True
+    ) -> MultiModalDataItems:
+        items = super().parse_mm_data(mm_data, validate=validate)
+        if validate and isinstance(
+            items.get("image"), (EmbeddingItems, DictEmbeddingItems)
+        ):
+            raise VLLMValidationError(
+                "LFM3-VL requires image pixels. Precomputed image embeddings are unsupported.",
+                parameter="image",
+            )
+        return items
 
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
         return {"image": None}
