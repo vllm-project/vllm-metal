@@ -1026,9 +1026,15 @@ class MetalPlatform(Platform):
         if model_config is not None:
             from vllm_metal.v1.model_adapter import DefaultModelAdapter
 
-            DefaultModelAdapter().normalize_model_config(
-                model_config, speculative_config=vllm_config.speculative_config
-            )
+            if backend == "mlx":
+                DefaultModelAdapter().normalize_model_config(
+                    model_config, speculative_config=vllm_config.speculative_config
+                )
+            elif (
+                config.multimodal_mode == "text-only"
+                and model_config.multimodal_config is not None
+            ):
+                model_config.multimodal_config.language_model_only = True
 
             # Backbone-mode resolution below inspects hf_config fields (e.g.
             # architectures) that only genuinely multimodal checkpoints carry;
