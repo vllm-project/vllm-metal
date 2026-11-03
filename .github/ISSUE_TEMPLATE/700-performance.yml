@@ -1,0 +1,66 @@
+name: ⚡ Performance
+description: Report a performance regression or discuss vllm-metal performance
+title: "[Performance]: "
+
+body:
+- type: markdown
+  attributes:
+    value: >
+      #### Before submitting an issue, please make sure the issue hasn't been already addressed by searching through [the existing and past issues](https://github.com/vllm-project/vllm-metal/issues?q=is%3Aissue+sort%3Acreated-desc+).
+- type: textarea
+  attributes:
+    label: Describe the performance issue
+    description: >
+      What you measured and what you expected: a regression between two versions, a gap against another setup, or a proposal to improve performance.
+  validations:
+    required: true
+- type: textarea
+  attributes:
+    label: Command and results
+    description: |
+      The exact command, env vars and model, with the numbers from each side of the comparison. A rerunnable benchmark such as `vllm bench latency` or `vllm bench serve` is preferred.
+    placeholder: |
+      ```sh
+      vllm bench latency --model <model> --batch-size 1 ...
+      ```
+
+      ```text
+      Before: ...
+      After: ...
+      ```
+  validations:
+    required: true
+- type: input
+  attributes:
+    label: vllm-metal version
+    description: >
+      `brew list --versions vllm-metal` for Homebrew, `pip show vllm-metal` otherwise.
+      If you built from source, give the commit.
+  validations:
+    required: true
+- type: textarea
+  attributes:
+    label: Your Mac
+    description: |
+      Please run the following and paste the output below.
+      ```sh
+      sw_vers
+      sysctl -n machdep.cpu.brand_string hw.memsize
+      ```
+    render: text
+  validations:
+    required: true
+- type: dropdown
+  attributes:
+    label: Backend
+    options:
+      - MLX (default)
+      - PyTorch MPS (VLLM_METAL_BACKEND=mps)
+  validations:
+    required: true
+- type: checkboxes
+  attributes:
+    label: Before submitting a new issue...
+    options:
+      - label: I have searched for relevant issues.
+        required: true

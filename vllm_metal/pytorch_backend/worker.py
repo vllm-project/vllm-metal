@@ -35,7 +35,9 @@ def configure_mps(config, *, omni=False):
         model.get_head_size() not in MPSAttentionBackend.get_supported_head_sizes()
         or model.is_encoder_decoder
         or model.is_diffusion
-        or (model.is_multimodal_model and not omni)
+        # MPS attention is causal only; prefix LMs attend bidirectionally
+        # over image tokens.
+        or model.is_mm_prefix_lm
         or model.is_moe
         or (
             model.has_inner_state
@@ -58,7 +60,7 @@ def configure_mps(config, *, omni=False):
     ):
         raise NotImplementedError(
             "Experimental MPS requires an unquantized dense autoregressive "
-            "text decoder with a supported attention head size, optional "
+            "causal decoder with a supported attention head size, optional "
             "ShortConv or Gated DeltaNet state, fp16/bf16, "
             "one GPU, and no LoRA/KV transfer."
         )

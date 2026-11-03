@@ -436,6 +436,9 @@ _PADDLEOCR_VL_ARCHITECTURES: frozenset[str] = frozenset(
 # family rather than one conversion.
 _LFM2_VL_MODEL_TYPES: frozenset[str] = frozenset({"lfm2_vl", "lfm2-vl"})
 _LFM2_VL_ARCHITECTURES: frozenset[str] = frozenset({"Lfm2VlForConditionalGeneration"})
+# d1 checkpoints also declare ``lfm3_vl`` but add decision heads, so match the
+# generative architecture only.
+_LFM3_VL_ARCHITECTURES: frozenset[str] = frozenset({"Lfm3VlForConditionalGeneration"})
 
 
 class DefaultModelAdapter(ModelAdapter):
@@ -1030,6 +1033,14 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
             return cast(
                 MultimodalRuntimeAdapter,
                 PaddleOCRVLMultimodalAdapter.from_loaded_model(model),
+            )
+
+        if any(arch in _LFM3_VL_ARCHITECTURES for arch in architectures):
+            from vllm_metal.multimodal.lfm3_vl import Lfm3VlMultimodalAdapter
+
+            return cast(
+                MultimodalRuntimeAdapter,
+                Lfm3VlMultimodalAdapter.from_loaded_model(model),
             )
 
         if model_type in _LFM2_VL_MODEL_TYPES or any(

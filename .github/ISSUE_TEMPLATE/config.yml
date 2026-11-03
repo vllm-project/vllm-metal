@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Documentation
+    url: https://docs.vllm.ai/projects/vllm-metal/en/latest/
+    about: Installation, recipes by Mac memory, and configuration
+  - name: Questions
+    url: https://slack.vllm.ai
+    about: Ask questions and discuss with other vLLM community members

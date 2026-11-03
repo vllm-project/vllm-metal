@@ -366,6 +366,11 @@ def _write_flint_config(path) -> None:
     )
 
 
+_METADATA_ARCHS = frozenset(
+    {"FlintForCausalLM", "Lfm3ForCausalLM", "Lfm3VlForConditionalGeneration"}
+)
+
+
 class TestModelMetadataCompat:
     @pytest.fixture(autouse=True)
     def metal_mlx(self, monkeypatch):
@@ -378,7 +383,7 @@ class TestModelMetadataCompat:
 
     @pytest.fixture
     def without_metadata(self, monkeypatch):
-        """Hide Flint config and both architecture registrations."""
+        """Hide the Flint config and the fallback architecture registrations."""
         from vllm.model_executor.models import ModelRegistry
 
         config_mapping = configuration_auto.CONFIG_MAPPING
@@ -389,8 +394,8 @@ class TestModelMetadataCompat:
         config_mapping._mapping.pop("flint", None)
         config_mapping._extra_content.pop("flint", None)
         monkeypatch.setattr(ModelRegistry, "models", dict(ModelRegistry.models))
-        ModelRegistry.models.pop("FlintForCausalLM", None)
-        ModelRegistry.models.pop("Lfm3ForCausalLM", None)
+        for arch in _METADATA_ARCHS:
+            ModelRegistry.models.pop(arch, None)
         return ModelRegistry
 
     def test_missing_model_metadata_loads(self, without_metadata, tmp_path) -> None:
@@ -402,9 +407,7 @@ class TestModelMetadataCompat:
         compat.register_model_compat()
         config = AutoConfig.from_pretrained(tmp_path)
 
-        assert {"FlintForCausalLM", "Lfm3ForCausalLM"} <= set(
-            without_metadata.get_supported_archs()
-        )
+        assert _METADATA_ARCHS <= set(without_metadata.get_supported_archs())
         assert config.model_type == "flint"
         assert config.hidden_size == 128
         assert config.sliding_window == 513
@@ -428,7 +431,7 @@ class TestModelMetadataCompat:
         ):
             AutoConfig.from_pretrained(tmp_path)
 
-    @pytest.mark.parametrize("architecture", ["FlintForCausalLM", "Lfm3ForCausalLM"])
+    @pytest.mark.parametrize("architecture", sorted(_METADATA_ARCHS))
     def test_existing_registrations_are_kept(
         self, without_metadata, architecture
     ) -> None:
@@ -459,9 +462,7 @@ class TestModelMetadataCompat:
 
         compat.register_model_compat()
 
-        assert {"FlintForCausalLM", "Lfm3ForCausalLM"}.isdisjoint(
-            without_metadata.get_supported_archs()
-        )
+        assert _METADATA_ARCHS.isdisjoint(without_metadata.get_supported_archs())
         with pytest.raises(ValueError, match="flint"):
             AutoConfig.for_model("flint")
 

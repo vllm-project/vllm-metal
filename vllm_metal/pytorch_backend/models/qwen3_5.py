@@ -138,7 +138,9 @@ def _gdn_core(layer, mixed_qkv, b, a, out, md):
             s, e = bounds[i], bounds[i + 1]
             if slot == PAD_SLOT_ID or s == e:
                 continue
-            state = ssm[slot] if init[i] else torch.zeros_like(ssm[slot])
+            # Copy the slot: MPSGraph matmuls reject a view at a non-zero offset
+            # with more than INT_MAX elements after it, as the shared KV buffer has.
+            state = ssm[slot].clone() if init[i] else torch.zeros_like(ssm[slot])
             o, ssm[slot] = delta_rule_chunked(
                 q[s:e], k[s:e], v[s:e], g[s:e], beta[s:e], state
             )

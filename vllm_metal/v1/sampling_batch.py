@@ -7,7 +7,7 @@ Pure functions: logits in, token IDs out.  No model runner state accessed.
 import hashlib
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import ClassVar
+from typing import ClassVar, Literal
 
 import mlx.core as mx
 import numpy as np
@@ -241,7 +241,7 @@ class SamplingBatch:
         ``output_lengths`` is as in :meth:`params_allow_native_greedy`.
         Seeded requests are admitted only with ``allow_seed``: the synchronous
         sample path derives a per-request key from the seed and the row's
-        output length (see :func:`seeded_row_key`), while the deferred decode
+        output length (see :func:`native_sampling_key`), while the deferred decode
         pipeline keeps them out.
         """
         if not sampling_params_list:
@@ -295,7 +295,7 @@ class SamplingBatch:
         """Build the lazy native token graph for an eligible batch.
 
         ``output_lengths`` holds the tokens already generated per row. With
-        ``allow_seed`` each seeded row draws from :func:`seeded_row_key`
+        ``allow_seed`` each seeded row draws from :func:`native_sampling_key`
         instead of the shared step key; without it, seeded rows are rejected
         as a gate desync.
 
@@ -304,7 +304,7 @@ class SamplingBatch:
         argmax, categorical can select a padded lm_head column). The caller
         owns evaluation and RNG state; ``next_native_rng_key`` is consumed only
         when an unseeded random row draws from it, so all-seeded batches leave
-        the engine key untouched (no unevaluated split accumulates on it).
+        the engine's native sampling counter untouched.
         Raises on batches neither native path admits — the caller must not
         let those reach here.
         """
@@ -317,7 +317,7 @@ class SamplingBatch:
             row_keys = None
             if any(sp.seed is not None for sp in sampling_params_list):
                 row_keys = [
-                    None if sp.seed is None else seeded_row_key(sp.seed, n)
+                    None if sp.seed is None else native_sampling_key(sp.seed, n)
                     for sp, n in zip(sampling_params_list, output_lengths, strict=True)
                 ]
             needs_engine_key = any(
@@ -391,10 +391,16 @@ class SamplingBatch:
     ) -> mx.array:
         """Lazy per-row temperature/top-k/top-p/min-p token ids.
 
-        Rows with an entry in ``row_keys`` (seeded requests) draw with their
-        own key over their own row, so their token depends only on their
-        logits, params and key, not on batch neighbors. Other rows share one
-        batched draw with ``key``, exactly as when no row keys are given.
+        Rows with an entry in ``row_keys`` (seeded requests) draw over their
+        own row with an MLX key derived from the seed and output position.
+        Draws are reproducible for identical logits, sampling params, seed
+        and position. End-to-end tokens also require a compatible execution
+        environment and batching: batch shape can change logits numerics,
+        and native and torch-fallback paths use different random streams.
+        Other rows share one batched draw with ``key``. Its derivation is
+        stateless, but the runner keeps a global counter, so unseeded draws
+        depend on scheduling, sub-batch order and batch composition and are
+        reproducible only for a fixed request schedule.
         ``key`` may be ``None`` only when every other row is greedy; those
         rows then take their top-1 candidate without a draw.
 
@@ -759,17 +765,17 @@ def create_request_generator(
     return generator
 
 
-def seeded_row_key(seed: int, num_output_tokens: int) -> mx.array:
-    """MLX key for a seeded request's next draw.
+def native_sampling_key(
+    seed: int, step: int, *, domain: Literal["seed", "engine"] = "seed"
+) -> mx.array:
+    """Stateless MLX key from a seed and zero-based sampling position.
 
-    A pure function of ``(seed, num_output_tokens)``: the draw for output
-    position ``n`` is the same however the request is batched, chunked,
-    preempted or resumed, and independent of the engine key chain. The pair
-    is hashed to 64 bits so neighbouring seeds and positions do not share
-    keys.
+    Seeded rows use the request seed and output length; unseeded rows share
+    the engine seed and runner's native sampling counter in the "engine"
+    domain. The default "seed" domain preserves seeded request keys.
     """
     digest = hashlib.blake2b(
-        f"vllm-metal-seed:{int(seed)}:{int(num_output_tokens)}".encode(),
+        f"vllm-metal-{domain}:{int(seed)}:{int(step)}".encode(),
         digest_size=8,
     ).digest()
     return mx.random.key(int.from_bytes(digest, "little"))
