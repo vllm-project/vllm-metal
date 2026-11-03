@@ -217,7 +217,7 @@ def make_stub_runner(
         "use_async_scheduling": True,
         "_sampler": None,
         "_native_sample_key": None,
-        "_structured_output_applier": MetalStructuredOutputApplier(),
+        "_structured_output_applier": MetalStructuredOutputApplier(mask_stride=1),
         "_prompt_logprobs_tracker": PromptLogprobsTracker(),
         "_lora": MetalLoRARuntime(),
         "_yoco_cache_mapping": None,

@@ -504,7 +504,10 @@ class MetalModelRunner:
         self._pp_model: PipelinedModel | None = None
 
         # Structured-output bitmask applier for the paged path.
-        self._structured_output_applier = MetalStructuredOutputApplier()
+        self._structured_output_applier = MetalStructuredOutputApplier(
+            mask_stride=vllm_config.num_speculative_tokens
+            + (0 if self.model_config.is_diffusion else 1)
+        )
 
         # Per-request prompt-logprobs accumulation across prefill chunks
         # (populated only for requests whose SamplingParams ask for it).

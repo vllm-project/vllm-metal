@@ -41,6 +41,7 @@ from vllm_metal.v1.gemma4_mtp import Gemma4MTPDraftSeed
 from vllm_metal.v1.proposer import Gemma4MTPProposer
 from vllm_metal.v1.sampling_batch import _SamplingResult
 from vllm_metal.v1.spec_decode import PagedDecodeSegment
+from vllm_metal.v1.structured_output import MetalStructuredOutputApplier
 
 
 class HybridRuntimeStub:
@@ -260,10 +261,12 @@ class TestV1MetalModelRunnerGenerate:
                 logprobs_mode=logprobs_mode,
                 supports_multimodal_inputs=False,
                 seed=0,
+                is_diffusion=False,
             ),
             cache_config=SimpleNamespace(),
             scheduler_config=SimpleNamespace(async_scheduling=False),
             speculative_config=None,
+            num_speculative_tokens=0,
         )
 
         runner = mr.MetalModelRunner(vllm_config)
@@ -1610,6 +1613,8 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
 
     def test_structured_output_masks_same_request_spec_decode_rows(self) -> None:
         runner = self._make_runner()
+        # One speculative token: each structured request owns two bitmask rows.
+        runner._structured_output_applier = MetalStructuredOutputApplier(mask_stride=2)
         req_state = self._make_state([1, 6])
         decode_reqs = [("r0", req_state)]
         segment = mr.PagedDecodeSegment(
