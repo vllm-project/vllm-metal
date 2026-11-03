@@ -149,23 +149,7 @@ def _gdn_core(layer, mixed_qkv, b, a, out, md):
 
 @cache
 def install():
-    from vllm import ModelRegistry
     from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn  # noqa: F401
-    from vllm.model_executor.models.qwen3_5 import Qwen3_5ForCausalLM
-    from vllm.model_executor.models.utils import WeightsMapper
-
-    class MPSQwen35ForCausalLM(Qwen3_5ForCausalLM):
-        # vLLM 0.32 keeps the published vision-language checkpoints' vision
-        # tower in the text-only mapper, so loading them as text fails.
-        hf_to_vllm_mapper = WeightsMapper(
-            orig_to_new_prefix={
-                "model.language_model.": "model.",
-                "model.visual.": None,
-                "mtp.": None,
-            },
-        )
-
-    ModelRegistry.register_model("Qwen3_5ForCausalLM", MPSQwen35ForCausalLM)
 
     # Upstream's forward keeps the projections; only its core op needs MPS.
     @torch.library.impl("vllm::qwen_gdn_attention_core", "MPS")
