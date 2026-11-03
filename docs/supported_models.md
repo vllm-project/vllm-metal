@@ -55,6 +55,7 @@ unsupported; leave `--video-pruning-rate` unset.
 | PaddleOCR-VL | 🔵 | | native multimodal paged generation | image input, no video | `PaddlePaddle/PaddleOCR-VL-1.6` |
 | LFM2-VL / LFM2.5-VL | 🔵 | 🔵 | native multimodal paged generation on the ShortConv text tower | image input, no video; one tile grid plus thumbnail per image; needs a checkpoint packaged for Transformers, which the MLX conversions are not | `LiquidAI/LFM2.5-VL-1.6B` |
 | LFM3-VL | 🔵 | | native multimodal paged generation on the LFM3 text tower | image input, no video; needs `--trust-remote-code`; the image processor comes from mlx-vlm | `LiquidAI/LFM3-VL-2B-MLX-4bit` |
+| LFM3-Audio | 🔵 | | native multimodal paged generation on the LFM3 text tower | audio input to text, clips up to 30 seconds; needs `--trust-remote-code`; no speech output | `LiquidAI/LFM3-Audio-2B-MLX-4bit` |
 | Gemma 4 | 🔵 | | mlx_lm text backbone + mlx-vlm encoder sidecar, paged generation | image input; audio and video input on E2B/E4B; bidirectional attention inside image blocks on sliding-window layers | `mlx-community/unsloth-gemma-4-26B-A4B-it-qat-oQ4`, `mlx-community/gemma-4-e2b-it-4bit` (audio, video) |
 
 Gemma 4 keeps its text path exactly as on the text-only table (mlx_lm model,
@@ -193,8 +194,27 @@ and TurboQuant are not validated.
 **Hunyuan on MPS:** use `--generation-config vllm` to override the checkpoint’s unsupported `repetition_penalty=1.05` default.
 
 LFM3 support covers text generation with BF16 and MLX-quantized checkpoints.
-LFM3-VL image input is listed under multimodal models. Audio, omni, and d1
-variants require separate integrations.
+LFM3-VL image input and LFM3-Audio audio input are listed under multimodal models.
+Omni and d1 variants require separate integrations.
+
+LFM3-Audio accepts waveforms through the offline `multi_modal_data["audio"]`
+API and audio content in chat requests. Clips are resampled to 16 kHz mono;
+each must be nonempty and at most 30 seconds after resampling. Precomputed
+audio embeddings are unsupported. The processor and audio encoder come from
+mlx-vlm, and the adapter restricts generation to text. Speech synthesis,
+speech-output history, and the transcription/translation REST endpoints are
+outside this integration.
+
+For an initial single-request setup:
+
+```bash
+vllm serve LiquidAI/LFM3-Audio-2B-MLX-4bit --trust-remote-code \
+  --max-model-len 512 --max-num-seqs 1 --limit-mm-per-prompt '{"audio": 1}'
+```
+
+A 30-second clip uses 375 audio tokens; leave room for the prompt and reply
+within `--max-model-len`. This configuration is not a memory-fit guarantee.
+
 
 sliding-window attention (SWA) is not fully optimized.
 

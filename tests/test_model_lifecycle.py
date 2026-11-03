@@ -229,6 +229,17 @@ def _make_lifecycle(
 
 
 class TestModelLifecycle:
+    def test_audio_cache_dimensions_come_from_language_config(self):
+        lifecycle, _ = _make_lifecycle()
+        model = SimpleNamespace(
+            config=SimpleNamespace(
+                model_type="lfm3_audio",
+                lm_config=SimpleNamespace(**_TEXT_MODEL_ARGS),
+                audio_encoder_config=SimpleNamespace(hidden_size=1024),
+            )
+        )
+        assert lifecycle._extract_model_args(model, is_vlm=True) == _TEXT_MODEL_ARGS
+
     @pytest.mark.parametrize("revision", [None, "release-tag", "a" * 40])
     @pytest.mark.parametrize(
         "backend", ["text", "vlm", "lfm3", "awq", "pooling", "offload"]

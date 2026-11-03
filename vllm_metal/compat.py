@@ -54,6 +54,12 @@ def register_model_compat() -> None:
                 arch, f"vllm_metal.patches.lfm3_registry:{arch}"
             )
 
+    if "Lfm3AudioForConditionalGeneration" not in supported:
+        ModelRegistry.register_model(
+            "Lfm3AudioForConditionalGeneration",
+            "vllm_metal.patches.lfm3_audio_registry:Lfm3AudioForConditionalGeneration",
+        )
+
 
 def apply_compat_patches() -> None:
     """Apply all known compatibility patches (idempotent)."""
