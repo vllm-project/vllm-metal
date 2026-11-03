@@ -24,17 +24,20 @@ the actual upstream pipeline, using query/KV heads and detected GPU cores to
 limit credit for parallel work. These counts are source-work proxies, not DRAM
 traffic, register allocation, measured occupancy or predicted milliseconds.
 
-The coefficients are manual conservative calibration weights. They were
-calibrated with paired native-kernel comparisons on M5 (10 GPU cores), M5 Pro
-(20) and M5 Max (40), varying Q, prefix length, Q/KV head count, page alignment
-and execution order. The retained comparison includes upstream, h3 and h6;
-beating upstream alone does not establish the fastest layout.
+The coefficients are manual conservative calibration weights. The original
+weights were calibrated with paired native-kernel comparisons on M5 (10 GPU
+cores), M5 Pro (20) and M5 Max (40), varying Q, prefix length, Q/KV head count,
+page alignment and execution order. The added complete-grid weights and cubic
+taper were calibrated only on the 40-core M5 Max, as marked below. The retained
+comparison includes upstream, h3 and h6; beating upstream alone does not
+establish the fastest layout.
 
 | Score component | Weights in the implementation | What the measurements constrain |
 |---|---|---|
 | Optimized upstream: padding, tail critical path, full work and guarded-Q savings | 13, 8, 2.5, 15 | A smaller Q tile can remove wasted/tail work, but grouping still costs extra KV streams and state |
 | Optimized upstream: stream/state and guarded-Q cost | 10/h, 3.5, 16 | Do not assume shared KV makes all per-head loads disappear |
-| Optimized upstream: complete-grid credit and stream-depth discount | 104, 0.038 | Admit useful grouped work against split without losing long-stream short-query controls |
+| Optimized upstream: complete-grid credit and stream-depth discount | 104, 0.038 | 40-core M5 Max only: admit grouped work while retaining long-stream short-query controls |
+| Optimized upstream: complete-block taper | Cubic exponent 3 | 40-core M5 Max only: retain the Q256 split control while admitting Q128/Q192 |
 | Guarded upstream: partial work, critical path, reuse and non-tail guarded work | 4, 0.875, 3.5, 4 | Long-prefix short queries differ from dense cold-prefill blocks |
 | Guarded upstream: lost grid capacity and additional group state | 10.5, 32, 3, 3.5, 0.75 | Wider groups must supply enough independent work for the GPU |
 | Fixed/core cost, KV edges and guarded Q tails | 11.5, 2, 5 | Preserve a margin for launch/edge/tail work rather than crediting every complete tile as a win |
@@ -64,24 +67,39 @@ candidates, so their relative ranking and capacity gates stay unchanged.
 The real `upstream_split` still describes the work and fallback pipeline;
 there is no alternate flag pretending that split work is guarded work.
 
-These two additional weights were calibrated on M5 Max (40 cores), BF16,
-H24/K4/D256, page16, with fresh-process split/unsplit/h3/h6 measurements.
+The additional weights 104 and 0.038 and the cubic taper were calibrated only
+on M5 Max (40 cores), BF16, H24/K4/D256, page16, with fresh-process
+split/unsplit/h3/h6 measurements.
 At P31360, Q128 favors split (about 5.95 vs 6.32 ms for h3), while Q192
 favors h3 (6.25 vs 6.84 ms for split). With the grid weight 104, these two
 controls bound the depth weight to approximately 0.0373–0.0389; 0.038 leaves
 their scores below and above the 0.5 margin respectively. P8624/Q128 favors
-h3 (about 0.95 vs 1.04 ms for split) and also passes. An initial quadratic block decay also admitted P8192/Q256, where production
-ABBA retained a noisy regression after repetition. Cubic decay keeps that
-control on split while preserving the Q128/Q192 constraints; it is an
-empirical taper, not a hardware occupancy law. These are attention primitive
-wall times, not serving or pure GPU timestamps.
+h3 (about 0.95 vs 1.04 ms for split) and also passes. An initial quadratic
+block decay also admitted P8192/Q256, where production ABBA retained a noisy
+regression after repetition. Cubic decay keeps that control on split while
+preserving the Q128/Q192 constraints; it is an empirical taper, not a hardware
+occupancy law. These are attention primitive wall times, not serving or pure
+GPU timestamps.
 
-CPU route tests cover 10/20/32/40 cores, including H18/K3 Q64 and the APC
-geometry. They do not validate the new weights' performance on other GPUs.
-Some smaller-core Q192 cases still retain split; no cross-device restoration
-or globally fastest selection is claimed. In particular, an eligible h3 can
-still trail a forced h6 that the unchanged capacity policy excludes. Keep
-those qualification limits separate from the older multi-device calibration.
+CPU route tests cover 10/16/20/32/40 cores, including the APC geometry and
+H18/K3 at all four query lengths Q64/Q128/Q192/Q256 on 10 cores. They do not
+validate the new weights' performance on other GPUs. Known extrapolation
+limits for H24/K4/D256, page16, with a host split hint of 1 are:
+
+| GPU-core input | Geometry | Selector limitation |
+|---|---|---|
+| 10 | P8624/Q128 | Still routes split; the APC grouped route is not restored |
+| 12 → 13 | P8624/Q128 | Flips from split to h3 at the admission margin |
+| 40 → 42 | P31360/Q128 | The 40-core split control flips to h3 by 42 cores; 41 cores still routes split |
+
+These boundaries come from the compiled selector, not GPU measurements.
+They arise from the credit and admission margin, without new fixed core or
+shape gates. Host baseline changes and existing capacity policies also mean
+the final route has no global monotonicity guarantee. Some smaller-core Q192
+cases still retain split; no cross-device restoration or globally fastest
+selection is claimed. In particular, an eligible h3 can still trail a forced
+h6 that the unchanged capacity policy excludes. Keep those qualification
+limits separate from the older multi-device calibration.
 
 The source-work count is checked against an independent per-query-block loop
 in `tests/test_block_size_translation.py`. It compares all work fields with

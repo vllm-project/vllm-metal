@@ -660,24 +660,26 @@ def test_nax_grouped_compares_against_host_selected_baseline(
         (24, 8192, 32, (1, 3, 3, 1)),
         (24, 8192, 40, (1, 3, 3, 1)),
         (24, 8624, 10, (1, 1, 1, 1)),
+        (24, 8624, 16, (1, 3, 1, 1)),
         (24, 8624, 20, (1, 3, 1, 1)),
         (24, 8624, 32, (1, 3, 3, 1)),
         (24, 8624, 40, (1, 3, 3, 1)),
         (24, 31360, 10, (1, 1, 1, 1)),
+        (24, 31360, 16, (1, 1, 1, 1)),
         (24, 31360, 20, (1, 1, 1, 1)),
         (24, 31360, 32, (1, 1, 1, 1)),
         (24, 31360, 40, (1, 1, 3, 1)),
-        (18, 0, 10, (1,)),
-        (18, 8192, 10, (1,)),
-        (18, 8624, 10, (1,)),
-        (18, 31360, 10, (1,)),
+        (18, 0, 10, (1, 3, 1, 1)),
+        (18, 8192, 10, (1, 3, 1, 1)),
+        (18, 8624, 10, (1, 3, 1, 1)),
+        (18, 31360, 10, (1, 1, 1, 1)),
     ],
 )
 def test_nax_grouped_full_blocks_compare_with_split(
     nax_config_runner, heads, prefix, cores, widths
 ):
-    """Retain split controls while admitting grouped work against real split."""
-    for q, width in zip((64, 128, 192, 256), widths, strict=False):
+    """Lock small-core APC admission and split controls for every query length."""
+    for q, width in zip((64, 128, 192, 256), widths, strict=True):
         hint = nax_split_hint(
             nax_tile_work([0, q], [prefix + q]),
             256,
