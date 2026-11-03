@@ -60,6 +60,8 @@ class Lfm3AudioProcessingInfo(BaseProcessingInfo):
             )
         if validate and isinstance(audio, AudioProcessorItems):
             for i in range(len(audio)):
+                if audio.get(i) is None:  # vLLM resolves cached UUIDs separately.
+                    continue
                 length = audio.get_audio_length(i)
                 if not 0 < length <= MAX_AUDIO_SAMPLES:
                     raise VLLMValidationError(

@@ -35,6 +35,12 @@ def test_precomputed_audio_is_rejected(info):
         info.parse_mm_data({"audio": torch.zeros((1, 4, 8))})
 
 
+def test_cached_audio_reference_does_not_require_waveform_length(info):
+    items = info.parse_mm_data({"audio": [None, np.zeros(16000)]})
+    assert items["audio"].get(0) is None
+    assert items["audio"].get_audio_length(1) == 16000
+
+
 def test_encoder_receives_unpadded_lengths_and_preserves_rows():
     field = MultiModalFieldConfig.batched("audio")
     data = MultiModalKwargsItem(
