@@ -276,6 +276,9 @@ class TestApplyCompatPatches:
         ]
 
 
+_METADATA_ARCHS = frozenset({"Lfm3ForCausalLM", "Lfm3VlForConditionalGeneration"})
+
+
 class TestModelMetadataCompat:
     @pytest.fixture(autouse=True)
     def metal_mlx(self, monkeypatch):
@@ -288,29 +291,31 @@ class TestModelMetadataCompat:
 
     @pytest.fixture
     def without_metadata(self, monkeypatch):
-        """Hide the LFM3 architecture registration."""
+        """Hide the fallback architecture registrations."""
         from vllm.model_executor.models import ModelRegistry
 
         monkeypatch.setattr(ModelRegistry, "models", dict(ModelRegistry.models))
-        ModelRegistry.models.pop("Lfm3ForCausalLM", None)
+        for arch in _METADATA_ARCHS:
+            ModelRegistry.models.pop(arch, None)
         return ModelRegistry
 
     def test_missing_model_metadata_loads(self, without_metadata) -> None:
         compat.register_model_compat()
         compat.register_model_compat()
 
-        assert "Lfm3ForCausalLM" in without_metadata.get_supported_archs()
+        assert _METADATA_ARCHS <= set(without_metadata.get_supported_archs())
 
-    def test_existing_registrations_are_kept(self, without_metadata) -> None:
+    @pytest.mark.parametrize("architecture", sorted(_METADATA_ARCHS))
+    def test_existing_registrations_are_kept(
+        self, without_metadata, architecture
+    ) -> None:
         without_metadata.register_model(
-            "Lfm3ForCausalLM", "vllm.model_executor.models.llama:LlamaForCausalLM"
+            architecture, "vllm.model_executor.models.llama:LlamaForCausalLM"
         )
 
         compat.register_model_compat()
 
-        assert without_metadata.models["Lfm3ForCausalLM"].class_name == (
-            "LlamaForCausalLM"
-        )
+        assert without_metadata.models[architecture].class_name == "LlamaForCausalLM"
 
     @pytest.mark.parametrize(
         ("is_metal", "backend"),
@@ -328,7 +333,7 @@ class TestModelMetadataCompat:
 
         compat.register_model_compat()
 
-        assert "Lfm3ForCausalLM" not in without_metadata.get_supported_archs()
+        assert _METADATA_ARCHS.isdisjoint(without_metadata.get_supported_archs())
 
 
 def _install_fake_qwen35_modules(monkeypatch, *, include_moe: bool):

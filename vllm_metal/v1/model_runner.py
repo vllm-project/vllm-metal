@@ -128,6 +128,7 @@ from vllm_metal.v1.proposer import (
 from vllm_metal.v1.sampling_batch import (
     SamplingBatch,
     create_request_generator,
+    native_sampling_key,
     sample_decode_tokens,
     sample_from_logits,
     sample_prefill_tokens,
@@ -397,15 +398,8 @@ class MetalModelRunner:
         self.scheduler_config = vllm_config.scheduler_config
         self.use_async_scheduling = bool(self.scheduler_config.async_scheduling)
         self.metal_config = get_config()
-        # MLX-native sampling key chain (VLLM_METAL_NATIVE_SAMPLING, default on).
-        # Derived from the engine seed, so sampling is reproducible for a
-        # fixed request schedule; split once per sampling call. A live key is
-        # the single runtime capability signal for the native random path.
-        self._native_sample_key: mx.array | None = (
-            mx.random.key(self.model_config.seed)
-            if envs.VLLM_METAL_NATIVE_SAMPLING
-            else None
-        )
+        self._native_sampling_enabled = envs.VLLM_METAL_NATIVE_SAMPLING
+        self._native_sampling_step = 0
         self._model_adapter: ModelAdapter = DefaultModelAdapter()
         self._cache_policy = ModelCachePolicy(self, self._model_adapter)
         self._model_lifecycle = ModelLifecycle(self, self._model_adapter)
@@ -1872,7 +1866,7 @@ class MetalModelRunner:
                 )
             ),
             native_random=(
-                self._native_sample_key is not None
+                self._native_sampling_enabled
                 and not states_missing
                 and SamplingBatch.params_allow_native_random(
                     decode_params, decode_output_lengths
@@ -1882,14 +1876,23 @@ class MetalModelRunner:
         return self._decode_pipeline.evaluate_gate(capabilities, step, sampling)
 
     def _next_native_sample_key(self) -> mx.array:
-        """Split the runner's sampling key chain and return the step key."""
-        if self._native_sample_key is None:
+        """Derive a fresh key without retaining a lazy MLX RNG dependency.
+
+        The zero-based counter advances per native sampling sub-batch with
+        unseeded random rows (decode and prefill count separately). Greedy,
+        seeded-only and torch calls do not advance it. Deferred sampling
+        advances at graph construction, never again at resolution.
+        """
+        if not self._native_sampling_enabled:
             raise RuntimeError(
-                "native sampling key requested while the chain is disabled "
+                "native sampling key requested while native sampling is disabled "
                 "— gate desync."
             )
-        self._native_sample_key, subkey = mx.random.split(self._native_sample_key)
-        return subkey
+        key = native_sampling_key(
+            self.model_config.seed, self._native_sampling_step, domain="engine"
+        )
+        self._native_sampling_step += 1
+        return key
 
     def _sample_paged_batch(
         self,
@@ -1999,7 +2002,7 @@ class MetalModelRunner:
         vocab_size = self._vocab_size
         next_native_rng_key = (
             self._next_native_sample_key
-            if self._native_sample_key is not None
+            if self._native_sampling_enabled
             and self.vllm_config.speculative_config is None
             and self._drafter is None
             and grammar_output is None
@@ -3508,9 +3511,7 @@ class MetalModelRunner:
             [state.sampling_params for _, state in decode_reqs],
             vocab_size=self._vocab_size,
             next_native_rng_key=(
-                self._next_native_sample_key
-                if self._native_sample_key is not None
-                else None
+                self._next_native_sample_key if self._native_sampling_enabled else None
             ),
             output_lengths=[
                 len(state.token_ids) - state.prompt_len for _, state in decode_reqs

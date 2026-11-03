@@ -215,6 +215,23 @@ class TestV1MetalModelRunnerGenerate:
     def _make_runner(self) -> mr.MetalModelRunner:
         return make_stub_runner(tokenizer=object())
 
+    @pytest.fixture
+    def runner_config(self):
+        return SimpleNamespace(
+            model_config=SimpleNamespace(
+                logits_processors=None,
+                runner_type="generate",
+                logprobs_mode="raw_logprobs",
+                supports_multimodal_inputs=False,
+                seed=0,
+                is_diffusion=False,
+            ),
+            cache_config=SimpleNamespace(),
+            scheduler_config=SimpleNamespace(async_scheduling=False),
+            speculative_config=None,
+            num_speculative_tokens=0,
+        )
+
     @pytest.mark.parametrize(
         ("configured_processors", "installed_processors"),
         [
@@ -250,28 +267,42 @@ class TestV1MetalModelRunnerGenerate:
         ["raw_logprobs", "raw_logits", "processed_logprobs", "processed_logits"],
     )
     def test_init_passes_logprobs_mode_to_sampler(
-        self, monkeypatch: pytest.MonkeyPatch, logprobs_mode: str
+        self, monkeypatch: pytest.MonkeyPatch, runner_config, logprobs_mode: str
     ) -> None:
         # --logprobs-mode must reach the sample-logprobs path, not only prompt logprobs.
         monkeypatch.setattr(mr, "entry_points", lambda **_: (), raising=False)
-        vllm_config = SimpleNamespace(
-            model_config=SimpleNamespace(
-                logits_processors=None,
-                runner_type="generate",
-                logprobs_mode=logprobs_mode,
-                supports_multimodal_inputs=False,
-                seed=0,
-                is_diffusion=False,
-            ),
-            cache_config=SimpleNamespace(),
-            scheduler_config=SimpleNamespace(async_scheduling=False),
-            speculative_config=None,
-            num_speculative_tokens=0,
-        )
-
-        runner = mr.MetalModelRunner(vllm_config)
+        runner_config.model_config.logprobs_mode = logprobs_mode
+        runner = mr.MetalModelRunner(runner_config)
 
         assert runner._sampler.logprobs_mode == logprobs_mode
+
+    @pytest.mark.parametrize("enabled", [False, True])
+    def test_native_rng_retains_only_an_integer_counter(
+        self, monkeypatch: pytest.MonkeyPatch, runner_config, enabled: bool
+    ) -> None:
+        monkeypatch.setattr(mr, "entry_points", lambda **_: ())
+        monkeypatch.setenv("VLLM_METAL_NATIVE_SAMPLING", str(int(enabled)))
+        monkeypatch.setattr(
+            mx.random, "split", Mock(side_effect=AssertionError("No lazy key chain"))
+        )
+        runner = mr.MetalModelRunner(runner_config)
+        initial_state = vars(runner).copy()
+        assert not hasattr(runner, "_native_sample_key")
+        assert runner._native_sampling_enabled is enabled
+        assert type(runner._native_sampling_step) is int
+        assert runner._native_sampling_step == 0
+        assert not any(isinstance(value, mx.array) for value in initial_state.values())
+
+        if enabled:
+            # Leave keys unevaluated while advancing: only the integer may change.
+            keys = [runner._next_native_sample_key() for _ in range(4)]
+            assert vars(runner) == {**initial_state, "_native_sampling_step": 4}
+            mx.eval(*keys)
+            assert len({tuple(key.tolist()) for key in keys}) == 4
+        else:
+            with pytest.raises(RuntimeError, match="native sampling is disabled"):
+                runner._next_native_sample_key()
+            assert vars(runner) == initial_state
 
     def test_warm_up_propagates_dummy_forward_failure(self) -> None:
         runner = self._make_runner()
@@ -1388,7 +1419,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
     def test_prompt_logprobs_decode_stays_native(self, monkeypatch) -> None:
         monkeypatch.setenv("VLLM_METAL_DECODE_PIPELINE", "1")
         runner = self._make_runner()
-        runner._native_sample_key = mx.random.key(0)
+        runner._native_sampling_enabled = True
         runner._paged_attention_runtime = object()
         state = self._make_state([1, 6])
         state.sampling_params = SamplingParams(temperature=0.7, prompt_logprobs=0)
@@ -1418,9 +1449,8 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
     def test_sync_native_sampling_respects_runner_exclusions(self, blocker) -> None:
         """Only native sub-batches consume a key, respecting runner exclusions."""
         runner = self._make_runner()
-        runner._native_sample_key = mx.random.key(0)
-        initial_key = runner._native_sample_key.tolist()
-        expected_key = mx.random.split(runner._native_sample_key)[0]
+        runner._native_sampling_enabled = True
+        expected_steps = 1
         runner._sampler = Mock(spec=Sampler)
         runner._sampler.forward.side_effect = Sampler().forward
         state = self._make_state([1, 6], temperature=0.7)
@@ -1491,7 +1521,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
                 logits_cu_seqlens=[0, 1, 2],
             )
             if blocker == "eligible_mixed":
-                expected_key = mx.random.split(expected_key)[0]
+                expected_steps = 2
 
         batch, _ = runner._sample_paged_batch(grammar_output)
 
@@ -1502,9 +1532,9 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         else:
             runner._sampler.forward.assert_called_once()
         if blocker == "eligible" or mixed:
-            assert runner._native_sample_key.tolist() == expected_key.tolist()
+            assert runner._native_sampling_step == expected_steps
         else:
-            assert runner._native_sample_key.tolist() == initial_key
+            assert runner._native_sampling_step == 0
         if mixed:
             output = batch.to_model_runner_output()
             assert output.req_ids == ["p0", "r0"]
@@ -3350,11 +3380,11 @@ class TestPipelineGateSpecDecodeDerivation:
         }
         return self._cached_decode_output("r0")
 
-    def test_native_random_decode_step_eligible_with_live_key(self) -> None:
+    def test_native_random_decode_step_eligible_when_enabled(self) -> None:
         # Arrange — a plain temperature/top-k/top-p decode step with the
-        # native sampling key chain live must defer like a greedy step.
+        # native sampling capability enabled must defer like a greedy step.
         runner = self._runner(drafter=None)
-        runner._native_sample_key = mx.random.key(0)
+        runner._native_sampling_enabled = True
         scheduler_output = self._native_random_decode_setup(runner)
 
         # Act
@@ -3364,11 +3394,11 @@ class TestPipelineGateSpecDecodeDerivation:
         assert decision.eligible is True
         assert decision.reason == "eligible"
 
-    def test_native_random_decode_step_blocked_without_key(self) -> None:
+    def test_native_random_decode_step_blocked_when_disabled(self) -> None:
         # Arrange — same step shape with native sampling disabled keeps the
         # synchronous torch path.
         runner = self._runner(drafter=None)
-        runner._native_sample_key = None
+        runner._native_sampling_enabled = False
         scheduler_output = self._native_random_decode_setup(runner)
 
         # Act
@@ -3594,15 +3624,15 @@ class TestDeferredDecodeSampleThreading:
             generated_tokens=1,
         )
 
-    def test_sync_and_deferred_native_sampling_share_key_chain(self) -> None:
+    def test_sync_and_deferred_native_sampling_share_counter(self) -> None:
         """Sync/deferred transitions preserve RNG consumption and token ownership."""
         runner = make_stub_runner(model_args={"vocab_size": 4})
-        runner._native_sample_key = mx.random.key(0)
-        expected_key = mx.random.key(0)
+        runner._native_sampling_enabled = True
+        expected_steps = 0
         runner._sampler = Mock(spec=Sampler)
         runner._sampler.forward.side_effect = Sampler().forward
 
-        # 1. Synchronous prefill starts the shared native key chain.
+        # 1. Synchronous prefill advances the native sampling counter.
         runner._decode_pipeline.begin_step(
             mr.PipelineGateDecision(eligible=False, reason="prefill-phase requests")
         )
@@ -3630,8 +3660,8 @@ class TestDeferredDecodeSampleThreading:
         )
         result = runner.sample_tokens(grammar_output=None)
 
-        expected_key = mx.random.split(expected_key)[0]
-        assert runner._native_sample_key.tolist() == expected_key.tolist()
+        expected_steps += 1
+        assert runner._native_sampling_step == expected_steps
         runner._sampler.forward.assert_not_called()
         assert result.req_ids == ["r0"]
         assert result.sampled_token_ids == [[2]]
@@ -3645,8 +3675,8 @@ class TestDeferredDecodeSampleThreading:
         runner._execute_model_state = self._paged_state(runner, [("r0", state)])
         deferred_output = runner.sample_tokens(grammar_output=None)
 
-        expected_key = mx.random.split(expected_key)[0]
-        assert runner._native_sample_key.tolist() == expected_key.tolist()
+        expected_steps += 1
+        assert runner._native_sampling_step == expected_steps
         assert isinstance(deferred_output, mr.MetalAsyncModelRunnerOutput)
         assert state.token_ids == [3, 2, mr.PENDING_TOKEN_PLACEHOLDER]
         assert runner._decode_pipeline.has_pending
@@ -3658,7 +3688,7 @@ class TestDeferredDecodeSampleThreading:
         )
         assert not runner._decode_pipeline.has_pending
         assert state.token_ids == [3, 2, 1]
-        assert runner._native_sample_key.tolist() == expected_key.tolist()
+        assert runner._native_sampling_step == expected_steps
 
         prefill = prefill._replace(
             req_id="p0",
@@ -3693,8 +3723,8 @@ class TestDeferredDecodeSampleThreading:
         )
         result = runner.sample_tokens(grammar_output=None)
 
-        expected_key = mx.random.split(expected_key)[0]
-        assert runner._native_sample_key.tolist() == expected_key.tolist()
+        expected_steps += 1
+        assert runner._native_sampling_step == expected_steps
         runner._sampler.forward.assert_called_once()
         assert result.req_ids == ["p0", "r0"]
         assert result.sampled_token_ids == [[2], [1]]
@@ -3706,24 +3736,24 @@ class TestDeferredDecodeSampleThreading:
         assert result.req_ids == ["r0"]
         assert result.sampled_token_ids == [[1]]
         assert state.token_ids == [3, 2, 1, 1]
-        assert runner._native_sample_key.tolist() == expected_key.tolist()
+        assert runner._native_sampling_step == expected_steps
 
-        # 4. Deferred decode continues the same key chain after the mixed step.
+        # 4. Deferred decode continues the same counter after the mixed step.
         runner._decode_pipeline.begin_step(
             mr.PipelineGateDecision(eligible=True, reason="eligible")
         )
         runner._execute_model_state = self._paged_state(runner, [("r0", state)])
         output = runner.sample_tokens(grammar_output=None)
 
-        expected_key = mx.random.split(expected_key)[0]
-        assert runner._native_sample_key.tolist() == expected_key.tolist()
+        expected_steps += 1
+        assert runner._native_sampling_step == expected_steps
         assert isinstance(output, mr.MetalAsyncModelRunnerOutput)
         assert state.token_ids == [3, 2, 1, 1, mr.PENDING_TOKEN_PLACEHOLDER]
         result = output.get_output()
         assert result.req_ids == ["r0"]
         assert result.sampled_token_ids == [[1]]
         assert state.token_ids == [3, 2, 1, 1, 1]
-        assert runner._native_sample_key.tolist() == expected_key.tolist()
+        assert runner._native_sampling_step == expected_steps
         runner._sampler.forward.assert_called_once()
 
     def test_deferred_random_step_samples_natively_and_backfills(self) -> None:
@@ -3731,31 +3761,64 @@ class TestDeferredDecodeSampleThreading:
         # the backfilled value is deterministic while still exercising the
         # native random graph.
         runner = make_stub_runner(model_args={"vocab_size": 4})
-        runner._native_sample_key = mx.random.key(0)
+        runner._native_sampling_enabled = True
         state = self._random_decode_state()
         runner._paged_request_seq_lens = {"r0": 1}
         runner._execute_model_state = self._paged_state(runner, [("r0", state)])
         runner._decode_pipeline.begin_step(
             mr.PipelineGateDecision(eligible=True, reason="eligible")
         )
-        initial_key = runner._native_sample_key
 
         # Act — through the public seam the engine calls.
         output = runner.sample_tokens(grammar_output=None)
         result = output.get_output()
 
-        # Assert — the key chain advanced exactly once, the async backfill
+        # Assert — the counter advanced exactly once, the async backfill
         # resolved the placeholder, and top_k=1 pins the sampled value.
         assert isinstance(output, mr.MetalAsyncModelRunnerOutput)
-        assert runner._native_sample_key.tolist() != initial_key.tolist()
+        assert runner._native_sampling_step == 1
         assert state.token_ids[-1] == 1
         assert result.sampled_token_ids == [[1]]
+
+    def test_deferred_random_samples_match_synchronous_seed_and_step(self) -> None:
+        """Deferring evaluation must preserve draws from the shared counter."""
+        streams = []
+        for deferred in (False, True):
+            runner = make_stub_runner(
+                model_args={"vocab_size": 512},
+                _native_sampling_enabled=True,
+                _native_sampling_step=11,
+            )
+            state = self._random_decode_state()
+            state.sampling_params = SamplingParams(temperature=0.8)
+            runner._paged_request_seq_lens = {"r0": 1}
+            tokens = []
+            for step in range(8):
+                runner._decode_pipeline.begin_step(
+                    mr.PipelineGateDecision(eligible=deferred, reason="test")
+                )
+                paged_state = self._paged_state(runner, [("r0", state)])._replace(
+                    logits=mx.zeros((1, 1, 512))
+                )
+                paged_state.batch.paged_decode_reqs = paged_state.decode_reqs
+                runner._execute_model_state = paged_state
+                output = runner.sample_tokens(grammar_output=None)
+                assert runner._native_sampling_step == 12 + step
+                if deferred:
+                    output = output.get_output()
+                assert runner._native_sampling_step == 12 + step
+                tokens.extend(output.sampled_token_ids[0])
+                assert state.token_ids[-1] == tokens[-1]
+            streams.append(tokens)
+
+        assert streams[0] == streams[1]
+        assert len(set(streams[0])) > 1
 
     def test_deferred_random_step_never_samples_padded_vocab(self) -> None:
         """Columns past the model vocab must be unreachable even when a
         padded column holds the largest logit."""
         runner = make_stub_runner(model_args={"vocab_size": 4})
-        runner._native_sample_key = mx.random.key(0)
+        runner._native_sampling_enabled = True
         state = self._random_decode_state()
         runner._paged_request_seq_lens = {"r0": 1}
         paged_state = self._paged_state(runner, [("r0", state)])._replace(
@@ -3772,10 +3835,10 @@ class TestDeferredDecodeSampleThreading:
         assert result.sampled_token_ids == [[1]]
 
     def test_deferred_ineligible_batch_raises_gate_desync(self) -> None:
-        # Arrange — a non-greedy batch with no live native sampling key must
+        # Arrange — a non-greedy batch with native sampling disabled must
         # fail fast instead of silently sampling with the wrong semantics.
         runner = make_stub_runner()
-        runner._native_sample_key = None
+        runner._native_sampling_enabled = False
         state = self._random_decode_state()
         runner._paged_request_seq_lens = {"r0": 1}
         runner._execute_model_state = self._paged_state(runner, [("r0", state)])

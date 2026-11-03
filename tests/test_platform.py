@@ -2020,6 +2020,31 @@ class TestMetalPlatform:
         finally:
             reset_config()
 
+    @pytest.mark.parametrize(
+        ("language_model_only", "metal_mode"), [(True, "auto"), (False, "text-only")]
+    )
+    def test_mps_text_only_preserves_multimodal_config(
+        self, tmp_path, monkeypatch, language_model_only, metal_mode
+    ) -> None:
+        from transformers import Lfm2VlConfig
+
+        Lfm2VlConfig(
+            architectures=["Lfm2VlForConditionalGeneration"],
+            text_config={"hidden_size": 2048, "full_attn_idxs": [1]},
+        ).save_pretrained(tmp_path)
+        monkeypatch.setitem(vars(platform_module.envs), "VLLM_METAL_BACKEND", "mps")
+        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+        monkeypatch.setattr(vm_config.get_config(), "multimodal_mode", metal_mode)
+        config = EngineArgs(
+            model=str(tmp_path),
+            dtype="bfloat16",
+            skip_tokenizer_init=True,
+            language_model_only=language_model_only,
+            max_model_len=128,
+        ).create_engine_config()
+        mm_config = config.model_config.get_multimodal_config()
+        assert mm_config.get_limit_per_prompt("image") == 0
+
     def test_kept_multimodal_config_normalizes_pixels_on_the_host(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
