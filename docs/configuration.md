@@ -99,9 +99,8 @@ Sleep levels mean something different on unified memory than on a GPU:
 - With [KV offloading](kv_offloading.md), sleep also frees the host pool. It
   comes back empty at wake. Prompts already on the disk tier still restore.
 
-Sleep mode supports dense and hybrid models on the MLX backend. Standalone MLA
-models and speculative decoding methods other than `ngram` are not supported
-yet.
+Sleep mode supports dense, hybrid and MLA models on the MLX backend.
+Speculative decoding methods other than `ngram` are not supported yet.
 
 ## KV Cache Memory Settings
 
