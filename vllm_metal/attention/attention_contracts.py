@@ -3,6 +3,7 @@
 
 from dataclasses import dataclass
 from enum import Enum, auto
+from typing import Literal
 
 
 class QKNormPlacement(Enum):
@@ -29,11 +30,14 @@ class AttentionContract:
     scaleless_qk_norm: bool = False
     shared_qk_norm: bool = False
     post_norm_query_scale: bool = False
-    sigmoid_output_gate: bool = False
+    sigmoid_output_gate: Literal["elementwise", "per_head"] | None = None
+    # Module attribute holding learned per-head attention sinks, if any.
+    sinks_attr: str = "sinks"
 
 
 DEFAULT_ATTENTION_CONTRACT = AttentionContract()
 _ATTENTION_CONTRACTS: dict[str, AttentionContract] = {
+    "mlx_vlm.models.lfm3.language": AttentionContract(sigmoid_output_gate="per_head"),
     "mlx_lm.models.hunyuan_v1_dense": AttentionContract(
         qk_norm_placement=QKNormPlacement.AFTER_ROPE
     ),
@@ -60,20 +64,27 @@ _ATTENTION_CONTRACTS: dict[str, AttentionContract] = {
     "mlx_lm.models.muse_glimmer": AttentionContract(
         scaleless_qk_norm=True,
         post_norm_query_scale=True,
-        sigmoid_output_gate=True,
+        sigmoid_output_gate="elementwise",
     ),
     # VLLM_METAL_MULTIMODAL_MODE=multimodal-native loads mlx-vlm's port.
     "mlx_vlm.models.muse_glimmer.language": AttentionContract(
         shared_qk_norm=True,
         post_norm_query_scale=True,
-        sigmoid_output_gate=True,
+        sigmoid_output_gate="elementwise",
     ),
 }
 
 
 def attention_contract_for(module: object) -> AttentionContract:
     """Return the model's attention contract or the standard default."""
-    if type(module).__module__ == "mlx_lm.models.granitemoehybrid":
+    module_name = type(module).__module__
+    if module_name == "mlx_lm.models.granitemoehybrid":
         # Granite selects RoPE or position-free attention from the checkpoint.
         return AttentionContract(use_rope=module.rope is not None)
-    return _ATTENTION_CONTRACTS.get(type(module).__module__, DEFAULT_ATTENTION_CONTRACT)
+    if module_name == "mlx_lm.models.flint":
+        # Flint's full-attention layers are position-free; every layer has
+        # learned sinks named ``softmax_offset``.
+        return AttentionContract(
+            use_rope=module.rope is not None, sinks_attr="softmax_offset"
+        )
+    return _ATTENTION_CONTRACTS.get(module_name, DEFAULT_ATTENTION_CONTRACT)

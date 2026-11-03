@@ -1,10 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The KV offload host pool comes out of the Metal KV budget.
-
-On unified memory the pool is the same physical RAM as the wired cache, so
-``--gpu-memory-utilization`` must bound both. The budget reported to vLLM
-shrinks by the pool, and vLLM sizes a smaller KVCacheConfig from it.
-"""
+"""Host pools share automatic KV budgets but sit outside explicit cache budgets."""
 
 from __future__ import annotations
 
@@ -601,3 +596,66 @@ def test_recap_holds_for_every_case(monkeypatch) -> None:
         assert chunk <= pool <= pool_before, case
         assert budget >= request, case
         assert budget + pool <= min(past, 3 * _GB), case
+
+
+@pytest.mark.parametrize(
+    "automatic,expected_pool", [(False, _POOL), (True, 750_000_000)]
+)
+def test_explicit_cache_budget_does_not_subtract_offload_host_pool(
+    automatic, expected_pool
+):
+    config = _auto_pool(4 * _GB) if automatic else _offload("MetalOffloadingConnector")
+    planner = _planner(config, max_model_len=16 * 2999)
+    planner._worker.cache_config.kv_cache_memory_bytes = 3 * _GB
+    assert planner.determine_available_memory() == 3 * _GB
+    assert config.kv_connector_extra_config["cpu_bytes_to_use"] == expected_pool
+
+
+def test_block_override_cannot_bypass_explicit_budget_probe(monkeypatch):
+    planner = _planner(None)
+    planner._worker.cache_config.kv_cache_memory_bytes = 3 * _GB
+    planner._worker.cache_config.num_gpu_blocks_override = 1
+    _paging_probe(monkeypatch, free=4 * _GB)
+    with pytest.raises(
+        ValueError, match="Refusing to silently shrink an explicit budget"
+    ):
+        planner.determine_available_memory()
+
+
+def test_explicit_budget_survives_probe_when_the_sample_fits(monkeypatch):
+    planner = _planner(None)
+    planner._worker.cache_config.kv_cache_memory_bytes = 4 * _GB
+    _paging_probe(monkeypatch, free=8 * _GB, swap_out=lambda _: 0)
+    assert planner.determine_available_memory() == 4 * _GB
+
+
+@pytest.mark.parametrize("free_delta", [0, -1])
+@pytest.mark.parametrize("pool_mode", ["none", "explicit", "automatic"])
+def test_explicit_budget_probe_accounts_for_host_pool_and_workspace(
+    monkeypatch, free_delta, pool_mode
+):
+    """Paging may keep the exact byte budget, but cannot trim even one byte."""
+    config = {
+        "none": None,
+        "explicit": _offload("MetalOffloadingConnector"),
+        "automatic": _auto_pool(4 * _GB),
+    }[pool_mode]
+    planner = _planner(config)
+    planner._worker.cache_config.kv_cache_memory_bytes = 3 * _GB
+    workspace = 256 << 20
+    planner._worker.model_runner.tq_prefill_workspace_bytes = workspace
+    monkeypatch.setattr(
+        "vllm_metal.v1.cache_policy.get_config",
+        lambda: MetalConfig(mlx_device="gpu", turboquant=True),
+    )
+    pool = {"none": 0, "explicit": 2 * _GB, "automatic": 750_000_000}[pool_mode]
+    _paging_probe(monkeypatch, free=_RESERVE + 3 * _GB + pool + workspace + free_delta)
+
+    if free_delta < 0:
+        with pytest.raises(ValueError, match="Refusing to silently shrink"):
+            planner.determine_available_memory()
+    else:
+        assert planner.determine_available_memory() == 3 * _GB
+    if config is not None:
+        # Explicit cache sizing must not enter the automatic post-probe re-cap.
+        assert config.kv_connector_extra_config["cpu_bytes_to_use"] == pool

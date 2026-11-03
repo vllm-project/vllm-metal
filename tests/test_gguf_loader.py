@@ -24,7 +24,11 @@ from mlx_lm import utils as mlx_lm_utils
 gguf = pytest.importorskip("gguf")
 
 import vllm_metal.gguf.loader as gguf_loader  # noqa: E402
-from tests.gguf_kquant_fixtures import build_kquant_blocks  # noqa: E402
+from tests.gguf_kquant_fixtures import (  # noqa: E402
+    build_iq3s_blocks,
+    build_iq4_blocks,
+    build_kquant_blocks,
+)
 from vllm_metal.gguf.adapter import GGUFModelAdapter  # noqa: E402
 from vllm_metal.gguf.loader import GGUFLoadError, GGUFModelLoader  # noqa: E402
 from vllm_metal.gguf.mlx_native import GGUFMLXQuantizedTensor  # noqa: E402
@@ -79,7 +83,7 @@ def _dense_tensor_specs(config: dict, *, has_qk_norm: bool, with_bias: bool) -> 
     """Return ``{gguf_name: (kind, shape)}`` for a dense decoder GGUF.
 
     ``kind`` is ``"q"`` (quantized weight) or ``"f"`` (F32 plain weight/bias).
-    Tests may inject ``"iq4_xs"``/``"q6_k"`` zero blocks for tables that are
+    Tests may inject ``"tq2_0"``/``"q6_k"`` zero blocks for tables that are
     never read or must be rejected; K-quant ``"q"`` weights get field-built
     blocks because gguf-py can dequantize K-quants but not quantize them.
     """
@@ -120,15 +124,18 @@ def _write_gguf(
     quant_overrides: dict[str, QT] | None = None,
     inject: dict | None = None,
     values: dict[str, np.ndarray] | None = None,
+    nextn_predict_layers: int | None = None,
 ) -> None:
     rng = np.random.default_rng(0)
     writer = gguf.GGUFWriter(str(path), arch)
+    if nextn_predict_layers is not None:
+        writer.add_nextn_predict_layers(nextn_predict_layers)
     for name, (kind, shape) in {**specs, **(inject or {})}.items():
         data = rng.standard_normal(shape).astype(np.float32)
         data = (values or {}).get(name, data)
         qtype = (quant_overrides or {}).get(name)
-        if kind in ("iq4_xs", "q6_k"):
-            raw_qtype = {"iq4_xs": QT.IQ4_XS, "q6_k": QT.Q6_K}[kind]
+        if kind in ("tq2_0", "q6_k"):
+            raw_qtype = {"tq2_0": QT.TQ2_0, "q6_k": QT.Q6_K}[kind]
             block_size, type_size = gguf.GGML_QUANT_SIZES[raw_qtype]
             assert shape[-1] % block_size == 0
             packed_shape = (
@@ -141,6 +148,10 @@ def _write_gguf(
             raw_dtype = qtype or quant_type
             if raw_dtype in (QT.Q2_K, QT.Q3_K, QT.Q4_K, QT.Q5_K, QT.Q6_K):
                 raw = build_kquant_blocks(shape[0], shape[-1], raw_dtype)
+            elif raw_dtype in (QT.IQ4_NL, QT.IQ4_XS):
+                raw = build_iq4_blocks(shape[0], shape[-1], raw_dtype)
+            elif raw_dtype == QT.IQ3_S:
+                raw = build_iq3s_blocks(shape[0], shape[-1])
             else:
                 quant_input = data.reshape(1, -1) if data.ndim == 1 else data
                 raw = gguf.quants.quantize(quant_input, raw_dtype)
@@ -230,18 +241,16 @@ def _assert_forward_vocab_shape(model: nn.Module) -> None:
 
 @pytest.mark.parametrize("quant_type", [QT.Q8_0, QT.Q4_0, QT.Q4_1, QT.Q5_0, QT.Q5_1])
 @pytest.mark.parametrize(
-    ("model_type", "has_qk_norm", "needs_tokenizer"),
-    [("qwen3", True, False), ("llama", False, True)],
+    ("model_type", "has_qk_norm"),
+    [("qwen3", True), ("llama", False)],
 )
-def test_loads_dense_model_installs_wrappers(
-    tmp_path, quant_type, model_type, has_qk_norm, needs_tokenizer
+def test_loads_dense_model_without_tokenizer_files(
+    tmp_path, quant_type, model_type, has_qk_norm
 ):
     gguf_path, cfg_dir = _build_dense_fixture(
         tmp_path, model_type, has_qk_norm=has_qk_norm, quant_type=quant_type
     )
-    if needs_tokenizer:
-        _write_minimal_tokenizer(cfg_dir, 256)
-    model, _ = GGUFModelLoader(
+    model = GGUFModelLoader(
         gguf_path,
         config_dir=cfg_dir,
         target_dtype=mx.float32,
@@ -258,7 +267,7 @@ def test_plain_tensors_follow_target_dtype(tmp_path, target_dtype):
     whole forward pass runs in float32 whatever ``--dtype`` asked for.
     """
     gguf_path, cfg_dir = _build_dense_fixture(tmp_path, "qwen3", has_qk_norm=True)
-    model, _ = GGUFModelLoader(
+    model = GGUFModelLoader(
         gguf_path,
         config_dir=cfg_dir,
         target_dtype=target_dtype,
@@ -303,24 +312,23 @@ def test_loads_cached_remote_model_offline(tmp_path, monkeypatch):
         SimpleNamespace(download_dir=str(cache_dir), ignore_patterns=None),
     )
     assert source is not None
-    model, _ = GGUFModelLoader(
+    model = GGUFModelLoader(
         source.weights_path,
         config_dir=source.config_dir,
-        tokenizer_dir=source.tokenizer_dir,
         target_dtype=mx.float32,
     ).load()
-    reference, _ = GGUFModelLoader(
+    reference = GGUFModelLoader(
         weights_path, config_dir=config_dir, target_dtype=mx.float32
     ).load()
     tokens = mx.array([[1, 2, 3]])
     np.testing.assert_array_equal(np.array(model(tokens)), np.array(reference(tokens)))
 
 
-@pytest.mark.parametrize("output_kind", ["q6_k", "iq4_xs"])
+@pytest.mark.parametrize("output_kind", ["q6_k", "tq2_0"])
 def test_skips_tie_redundant_output(tmp_path, output_kind):
     # Tied config, but the GGUF still carries a redundant output.weight, as
     # llama.cpp exports of tied models do. It is never read, so even a qtype
-    # the loader cannot execute (IQ4_XS) does not block the model.
+    # the loader cannot execute (TQ2_0) does not block the model.
     d = _dims(_tiny_config("qwen3", **_KQUANT_CONFIG))
     gguf_path, cfg_dir = _build_dense_fixture(
         tmp_path,
@@ -330,7 +338,7 @@ def test_skips_tie_redundant_output(tmp_path, output_kind):
         inject={"output.weight": (output_kind, (d["vocab"], d["h"]))},
     )
 
-    model, _ = GGUFModelLoader(
+    model = GGUFModelLoader(
         gguf_path, config_dir=cfg_dir, target_dtype=mx.float32
     ).load()
 
@@ -361,7 +369,7 @@ def test_skips_tie_redundant_output_when_config_omits_tie_flag(
     if needs_tokenizer:
         _write_minimal_tokenizer(cfg_dir, 256)
 
-    model, _ = GGUFModelLoader(
+    model = GGUFModelLoader(
         gguf_path,
         config_dir=cfg_dir,
         target_dtype=mx.float32,
@@ -387,7 +395,7 @@ def test_untied_model_installs_lm_head_and_bias_policy(
     )
     if needs_tokenizer:
         _write_minimal_tokenizer(cfg_dir, 256)
-    model, _ = GGUFModelLoader(
+    model = GGUFModelLoader(
         gguf_path,
         config_dir=cfg_dir,
         target_dtype=mx.float32,
@@ -472,7 +480,7 @@ def test_quantized_llama_qk_are_row_unpermuted(tmp_path, quant_type):
     exp_q = raw_q.permute_rows(_rope_inv_index(d["qd"], cfg["num_attention_heads"]))
     exp_k = raw_k.permute_rows(_rope_inv_index(d["kvd"], cfg["num_key_value_heads"]))
 
-    model, _ = GGUFModelLoader(
+    model = GGUFModelLoader(
         gguf_path, config_dir=cfg_dir, target_dtype=mx.float32
     ).load()
 
@@ -510,7 +518,7 @@ def test_loads_untied_mistral_via_llama_arch_mapping(tmp_path):
     exp_k = raw_k.permute_rows(_rope_inv_index(d["kvd"], cfg["num_key_value_heads"]))
 
     # Act
-    model, _ = GGUFModelLoader(
+    model = GGUFModelLoader(
         gguf_path, config_dir=cfg_dir, target_dtype=mx.float32
     ).load()
     out = model(mx.array([[1, 2, 3]]))
@@ -628,7 +636,7 @@ def test_plain_llama_qk_are_row_unpermuted(tmp_path):
     gguf_path, cfg_dir, d = _plain_qk_fixture(tmp_path, "llama")
     raw_q = mx.load(gguf_path)["blk.0.attn_q.weight"]
 
-    model, _ = GGUFModelLoader(
+    model = GGUFModelLoader(
         gguf_path, config_dir=cfg_dir, target_dtype=mx.float32
     ).load()
 
@@ -649,7 +657,7 @@ def test_plain_qwen_qk_are_not_permuted(tmp_path):
     gguf_path, cfg_dir, _ = _plain_qk_fixture(tmp_path, "qwen3", has_qk_norm=True)
     raw_q = mx.load(gguf_path)["blk.0.attn_q.weight"]
 
-    model, _ = GGUFModelLoader(
+    model = GGUFModelLoader(
         gguf_path, config_dir=cfg_dir, target_dtype=mx.float32
     ).load()
 
@@ -668,7 +676,7 @@ def test_llama_loads_when_config_omits_head_dim(tmp_path):
     config.pop("head_dim")  # derived head_dim == hidden_size // heads == 16
     config_path.write_text(json.dumps(config))
 
-    model, _ = GGUFModelLoader(
+    model = GGUFModelLoader(
         gguf_path, config_dir=cfg_dir, target_dtype=mx.float32
     ).load()
 
@@ -699,7 +707,7 @@ def test_llama_qk_bias_is_row_unpermuted(tmp_path):
     arrays = mx.load(gguf_path)
     raw_q_bias, raw_v_bias = arrays["blk.0.attn_q.bias"], arrays["blk.0.attn_v.bias"]
 
-    model, _ = GGUFModelLoader(
+    model = GGUFModelLoader(
         gguf_path, config_dir=cfg_dir, target_dtype=mx.float32
     ).load()
 
@@ -853,7 +861,7 @@ def test_rejects_unsupported_qtype_before_model_allocation(tmp_path, monkeypatch
         "qwen3",
         config_overrides=_KQUANT_CONFIG,
         has_qk_norm=True,
-        inject={"blk.0.ffn_up.weight": ("iq4_xs", (256, 256))},
+        inject={"blk.0.ffn_up.weight": ("tq2_0", (256, 256))},
     )
 
     def fail_load_model(*args, **kwargs):
@@ -862,7 +870,7 @@ def test_rejects_unsupported_qtype_before_model_allocation(tmp_path, monkeypatch
     monkeypatch.setattr(gguf_loader, "load_model", fail_load_model)
     with pytest.raises(
         GGUFLoadError,
-        match="Unsupported qtype IQ4_XS on mapped weight 'blk.0.ffn_up.weight'",
+        match="Unsupported qtype TQ2_0 on mapped weight 'blk.0.ffn_up.weight'",
     ):
         GGUFModelLoader(
             gguf_path,
@@ -958,12 +966,12 @@ def test_mlx_quantized_companion_loads_like_plain_companion(tmp_path):
     mlx_lm_utils.save_model(quantized_dir, model)
     mlx_lm_utils.save_config(quantized_config, quantized_dir / "config.json")
     tokens = mx.array([[1, 2, 3]])
-    reference, _ = GGUFModelLoader(
+    reference = GGUFModelLoader(
         gguf_path, config_dir=plain_dir, target_dtype=mx.float32
     ).load()
     expected = np.array(reference(tokens))
 
-    loaded, _ = GGUFModelLoader(
+    loaded = GGUFModelLoader(
         gguf_path, config_dir=quantized_dir, target_dtype=mx.float32
     ).load()
     actual = np.array(loaded(tokens))
@@ -977,12 +985,12 @@ def test_rejects_unsupported_untied_output(tmp_path):
         "qwen3",
         config_overrides={**_KQUANT_CONFIG, "tie_word_embeddings": False},
         has_qk_norm=True,
-        inject={"output.weight": ("iq4_xs", (256, 256))},
+        inject={"output.weight": ("tq2_0", (256, 256))},
     )
 
     with pytest.raises(
         GGUFLoadError,
-        match="Unsupported qtype IQ4_XS on mapped weight 'output.weight'",
+        match="Unsupported qtype TQ2_0 on mapped weight 'output.weight'",
     ):
         GGUFModelLoader(
             gguf_path,
@@ -1028,7 +1036,7 @@ def test_direct_loader_keeps_quantized_wrappers(tmp_path):
     gguf_path, cfg_dir = _build_dense_fixture(tmp_path, "qwen3", has_qk_norm=True)
     loader = GGUFModelLoader(gguf_path, config_dir=cfg_dir, target_dtype=mx.float32)
     assert isinstance(loader, GGUFModelLoader)
-    model, _ = loader.load()
+    model = loader.load()
     _assert_dense_wrapper_histogram(model)
 
 
@@ -1076,7 +1084,7 @@ def test_loads_single_file_set_named_like_one_shard(tmp_path):
     single = tmp_path / "qwen3-Q8_0-00001-of-00001.gguf"
     Path(gguf_path).rename(single)
 
-    model, _ = GGUFModelLoader(
+    model = GGUFModelLoader(
         str(single), config_dir=cfg_dir, target_dtype=mx.float32
     ).load()
 
@@ -1103,7 +1111,7 @@ def test_loads_plain_typed_checkpoint_exactly(tmp_path, plain_type):
     )
     expected = gguf.quants.dequantize(source.data, plain_type).astype(np.float32)
 
-    model, _ = GGUFModelLoader(
+    model = GGUFModelLoader(
         gguf_path, config_dir=cfg_dir, target_dtype=mx.float32
     ).load()
     hist = _gguf_module_histogram(model)
@@ -1120,15 +1128,15 @@ def test_rejects_unsupported_kquant_weight_at_preflight(tmp_path):
         tmp_path,
         "qwen3",
         has_qk_norm=True,
-        inject={"blk.0.ffn_gate.weight": ("iq4_xs", (128, 256))},
+        inject={"blk.0.ffn_gate.weight": ("tq2_0", (128, 256))},
     )
 
     with pytest.raises(GGUFLoadError) as excinfo:
         GGUFModelLoader(gguf_path, config_dir=cfg_dir, target_dtype=mx.float32).load()
 
     assert str(excinfo.value) == (
-        "Unsupported qtype IQ4_XS on mapped weight 'blk.0.ffn_gate.weight'; "
-        "only Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K "
+        "Unsupported qtype TQ2_0 on mapped weight 'blk.0.ffn_gate.weight'; "
+        "only Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/IQ4_NL/IQ3_S/IQ4_XS "
         "(and plain F32/F16/BF16) are supported."
     )
 
@@ -1143,11 +1151,14 @@ def test_rejects_unsupported_kquant_weight_at_preflight(tmp_path):
         pytest.param(QT.Q4_0, QT.Q6_K, id="q4_0-q6_k-embd"),
         pytest.param(QT.Q4_K, QT.Q5_0, id="q4_k-q5_0-embd"),
         pytest.param(QT.Q5_K, QT.Q5_1, id="q5_k-q5_1-embd"),
+        pytest.param(QT.IQ4_XS, QT.Q6_K, id="iq4_xs-q6_k-embd"),
+        pytest.param(QT.Q3_K, QT.IQ4_NL, id="q3_k-iq4_nl-embd"),
+        pytest.param(QT.Q4_K, QT.IQ3_S, id="q4_k-iq3_s-embd"),
     ],
 )
 def test_loads_llama_cpp_qtype_mixes(tmp_path, body_type, embd_type):
-    # llama.cpp mixes qtypes inside one file: Q6_K, Q8_0 or Q5_0/Q5_1 fallback
-    # embeddings next to a K-quant or Q4_0 body.
+    # llama.cpp mixes qtypes inside one file: Q6_K, Q8_0, Q5_0/Q5_1, IQ4_NL or
+    # IQ3_S embeddings next to a K-quant, Q4_0 or IQ4_XS body.
     gguf_path, cfg_dir = _build_dense_fixture(
         tmp_path,
         "qwen3",
@@ -1157,7 +1168,7 @@ def test_loads_llama_cpp_qtype_mixes(tmp_path, body_type, embd_type):
         quant_overrides={"token_embd.weight": embd_type},
     )
 
-    model, _ = GGUFModelLoader(
+    model = GGUFModelLoader(
         gguf_path, config_dir=cfg_dir, target_dtype=mx.float32
     ).load()
 
@@ -1177,7 +1188,7 @@ def test_loads_untied_q6_k_output_head(tmp_path):
         quant_overrides={"output.weight": QT.Q6_K},
     )
 
-    model, _ = GGUFModelLoader(
+    model = GGUFModelLoader(
         gguf_path, config_dir=cfg_dir, target_dtype=mx.float32
     ).load()
 
@@ -1191,7 +1202,7 @@ def test_loads_read_only_gguf_file(tmp_path):
     gguf_path, cfg_dir = _build_dense_fixture(tmp_path, "qwen3", has_qk_norm=True)
     Path(gguf_path).chmod(0o444)
 
-    model, _ = GGUFModelLoader(
+    model = GGUFModelLoader(
         gguf_path, config_dir=cfg_dir, target_dtype=mx.float32
     ).load()
 
@@ -1388,6 +1399,7 @@ def _build_qwen35_fixture(
     quant_type=QT.Q8_0,
     quant_overrides: dict[str, QT] | None = None,
     inject: dict | None = None,
+    nextn_predict_layers: int | None = None,
 ) -> tuple[str, str, dict[str, np.ndarray]]:
     """Write a tiny Qwen3.5 config and the GGUF llama.cpp converts it to.
 
@@ -1420,8 +1432,31 @@ def _build_qwen35_fixture(
         quant_overrides=quant_overrides,
         inject=inject,
         values=values,
+        nextn_predict_layers=nextn_predict_layers,
     )
     return str(gguf_path), str(tmp_path), hf
+
+
+def _qwen35_mtp_block(bid: int) -> dict:
+    """The MTP layer llama.cpp appends, as small plain tensors under real names."""
+    kinds = (
+        "attn_norm",
+        "attn_q",
+        "attn_k",
+        "attn_v",
+        "attn_q_norm",
+        "attn_k_norm",
+        "attn_output",
+        "post_attention_norm",
+        "ffn_gate",
+        "ffn_up",
+        "ffn_down",
+        "nextn.eh_proj",
+        "nextn.enorm",
+        "nextn.hnorm",
+        "nextn.shared_head_norm",
+    )
+    return {f"blk.{bid}.{kind}.weight": ("f", (4,)) for kind in kinds}
 
 
 def _qwen35_source_model(cfg_dir: str, hf: dict[str, np.ndarray]) -> nn.Module:
@@ -1467,7 +1502,7 @@ def test_qwen35_loads_the_model_it_was_converted_from(tmp_path, geometry):
     tokens = mx.array([[1, 2, 3, 4, 5, 6, 7, 8]])
     expected = np.array(_qwen35_source_model(cfg_dir, hf)(tokens))
 
-    model, _ = GGUFModelLoader(
+    model = GGUFModelLoader(
         gguf_path, config_dir=cfg_dir, target_dtype=mx.float32
     ).load()
     logits = np.array(model(tokens))
@@ -1501,7 +1536,7 @@ def test_qwen35_quantized_v_head_rows_are_untiled(tmp_path, quant_type, geometry
         for key, qt in raw.items()
     }
 
-    model, _ = GGUFModelLoader(
+    model = GGUFModelLoader(
         gguf_path, config_dir=cfg_dir, target_dtype=mx.float32
     ).load()
 
@@ -1538,7 +1573,7 @@ def test_qwen35_ssm_out_reads_hf_order_columns(tmp_path, ssm_out_type, geometry)
     expected = {i: x @ w[:, columns].T for i, w in stored.items()}
     untransformed = {i: x @ w.T for i, w in stored.items()}
 
-    model, _ = GGUFModelLoader(
+    model = GGUFModelLoader(
         gguf_path, config_dir=cfg_dir, target_dtype=mx.float32
     ).load()
     out = {i: np.array(_gdn(model, i).out_proj(mx.array(x))) for i in stored}
@@ -1565,7 +1600,7 @@ def test_qwen35_tie_flag_resolves_on_text_model(tmp_path, tie, has_lm_head):
         tmp_path, _GDN_R1, tie=tie, inject=output
     )
 
-    model, _ = GGUFModelLoader(
+    model = GGUFModelLoader(
         gguf_path, config_dir=cfg_dir, target_dtype=mx.float32
     ).load()
 
@@ -1612,10 +1647,33 @@ def test_qwen35_rejects_out_of_scope_moe_tensor(tmp_path, moe_tensor):
         GGUFModelLoader(gguf_path, config_dir=cfg_dir, target_dtype=mx.float32).load()
 
 
+def test_qwen35_mtp_gguf_skips_appended_block_and_preserves_base_logits(tmp_path):
+    num_layers = _QWEN35_TEXT_CONFIG["num_hidden_layers"]
+    gguf_path, cfg_dir, hf = _build_qwen35_fixture(
+        tmp_path,
+        _GDN_R1,
+        tie=False,
+        quant_type=QT.F32,
+        inject=_qwen35_mtp_block(num_layers),
+        nextn_predict_layers=1,
+    )
+    tokens = mx.array([[1, 2, 3, 4, 5, 6, 7, 8]])
+    expected = np.array(_qwen35_source_model(cfg_dir, hf)(tokens))
+
+    model = GGUFModelLoader(
+        gguf_path, config_dir=cfg_dir, target_dtype=mx.float32
+    ).load()
+    logits = np.array(model(tokens))
+
+    np.testing.assert_allclose(
+        logits, expected, rtol=0, atol=float(np.abs(expected).max()) * 1e-6
+    )
+
+
 def test_qwen35_a_log_keeps_float32_under_bfloat16(tmp_path):
     gguf_path, cfg_dir, hf = _build_qwen35_fixture(tmp_path, _GDN_R1)
 
-    model, _ = GGUFModelLoader(
+    model = GGUFModelLoader(
         gguf_path, config_dir=cfg_dir, target_dtype=mx.bfloat16
     ).load()
 

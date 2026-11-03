@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """AWQ load owner for vllm-metal.
 
-Encapsulates the entry-point preflight, the ``mlx_lm.load`` invocation with a
+Encapsulates the entry-point preflight, the ``mlx_lm.utils.load_model`` invocation with a
 normalized ``model_config={"quantization_config": ...}`` kwarg, and the
 post-load alignment of non-quantized floating params. ``ModelLifecycle``
 delegates the entire AWQ branch to instances of this class so quantization
@@ -27,13 +27,14 @@ import mlx.core as mx
 import mlx.nn as nn
 from huggingface_hub import hf_hub_download
 from mlx.utils import tree_flatten
-from mlx_lm import load as mlx_lm_load
+from mlx_lm.utils import load_model as mlx_lm_load_model
 from vllm.logger import init_logger
 
 from vllm_metal.quant.awq_config import (
     UnsupportedQuantizationConfigError,
     normalize_quant_config,
 )
+from vllm_metal.utils import resolve_mlx_lm_model_path
 
 logger = init_logger(__name__)
 
@@ -56,7 +57,7 @@ class AWQQuantLoader:
     def __init__(self, normalized_quant_config: Mapping[str, Any]) -> None:
         # `normalize_quant_config` already canonicalized aliases and
         # rejected unsupported variants; stash a kwarg dict ready to hand
-        # to ``mlx_lm.load(model_config=...)``.
+        # to ``mlx_lm.utils.load_model(model_config=...)``.
         self._mlx_lm_model_config: dict[str, Any] = {
             "quantization_config": dict(normalized_quant_config)
         }
@@ -99,21 +100,18 @@ class AWQQuantLoader:
         model_path: str,
         *,
         target_dtype: Any,
-        tokenizer_config: Mapping[str, Any] | None = None,
         revision: str | None = None,
-    ) -> tuple[Any, Any]:
-        """Run ``mlx_lm.load`` with the normalized quant config, then align
+    ) -> Any:
+        """Run ``mlx_lm.utils.load_model`` with the normalized quant config, then align
         non-quantized floating params to ``target_dtype``.
 
         ``model_path`` is the (possibly compatibility-adapted) path that
         the lifecycle resolves via ``_mlx_lm_compatible_model_path``; the
         owner does not duplicate that path discovery.
         """
-        model, tokenizer = mlx_lm_load(
-            model_path,
-            tokenizer_config=dict(tokenizer_config) if tokenizer_config else None,
-            model_config=self._mlx_lm_model_config,
-            revision=revision,
+        resolved_path = resolve_mlx_lm_model_path(model_path, revision=revision)
+        model, _ = mlx_lm_load_model(
+            resolved_path, model_config=self._mlx_lm_model_config
         )
         n_cast = self._align_non_quantized_dtypes(model, target_dtype)
         logger.info(
@@ -121,7 +119,7 @@ class AWQQuantLoader:
             n_cast,
             target_dtype,
         )
-        return model, tokenizer
+        return model
 
     # -- private helpers (owned by the loader, not module-level) -----------
 
@@ -130,7 +128,7 @@ class AWQQuantLoader:
         model_name: str, *, revision: str | None = None
     ) -> Mapping[str, Any] | None:
         """Read ``quantization_config`` from the model's ``config.json``
-        without invoking ``mlx_lm.load``. Returns ``None`` if the field is
+        without invoking ``mlx_lm.utils.load_model``. Returns ``None`` if the field is
         absent (the checkpoint genuinely is not quantized) or the local
         directory exists but has no ``config.json``.
 

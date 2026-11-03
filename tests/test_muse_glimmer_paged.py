@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Paged-attention regressions for Muse Glimmer."""
+"""Paged-path regressions for Muse Glimmer."""
 
 import mlx.core as mx
 import pytest
@@ -11,6 +11,7 @@ from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
 from vllm_metal.attention.context import PagedAttentionContext
 from vllm_metal.attention.impls.sdpa import prepare_sdpa_qkv, sdpa_forward
 from vllm_metal.attention.impls.sdpa_wrapper import patch_sdpa_attention
+from vllm_metal.v1.model_adapter import DefaultModelAdapter
 
 # Four layers in Glimmer's [local, local, local, global] pattern.
 _CONFIG = {
@@ -131,3 +132,11 @@ def test_patched_mlx_lm_model_keeps_its_mask_selection() -> None:
     patch_sdpa_attention(model, object(), 16)
 
     assert mx.array_equal(model(tokens), expected).item()
+
+
+def test_split_head_reproduces_the_scaled_softcapped_logits() -> None:
+    """Glimmer's logits are scaled, then softcapped. The split head must do the
+    same, or the selective-logits probe makes prefill project every row."""
+    model = muse_glimmer.Model(muse_glimmer.ModelArgs(**_CONFIG))
+
+    assert DefaultModelAdapter().supports_selective_logits(model) is True

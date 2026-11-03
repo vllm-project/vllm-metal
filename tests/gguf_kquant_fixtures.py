@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Field-built K-quant GGUF blocks, since gguf-py can dequantize but not quantize them."""
+"""Field-built K-quant and IQ GGUF blocks, which gguf-py can dequantize but not quantize."""
 
 from __future__ import annotations
 
@@ -131,3 +131,44 @@ def _build_q3k(rows: int, cols: int, seed: int) -> np.ndarray:
             scales[:, 8 + j] |= ((sc6[:, 4 * k + j] >> 4) & 3) << (2 * k)
     blocks = np.concatenate([hmask, qs, scales, d.view(np.uint8)], axis=1)
     return blocks.reshape(rows, -1)
+
+
+def build_iq4_blocks(
+    rows: int, cols: int, qtype: gguf.GGMLQuantizationType, seed: int = 0
+) -> np.ndarray:
+    """Build valid random IQ4_NL/IQ4_XS blocks, one byte row per row."""
+    block_elems = gguf.GGML_QUANT_SIZES[qtype][0]
+    if cols % block_elems:
+        raise ValueError(
+            f"{qtype.name} rows need a multiple of {block_elems} columns, got {cols}"
+        )
+    rng = np.random.default_rng(seed)
+    n = rows * (cols // block_elems)
+    d = rng.uniform(2**-10, 2**-4, (n, 1)).astype(np.float16)
+    nibbles = rng.integers(0, 256, (n, block_elems // 2), dtype=np.uint8)
+    if qtype == QT.IQ4_NL:
+        return np.concatenate([d.view(np.uint8), nibbles], axis=1).reshape(rows, -1)
+    sub_scales = rng.integers(0, 64, (n, 8), dtype=np.uint8)
+    scales_l = (sub_scales[:, 0::2] & 0x0F) | ((sub_scales[:, 1::2] & 0x0F) << 4)
+    scales_h = np.zeros((n, 1), np.uint16)
+    for j in range(8):
+        scales_h |= (sub_scales[:, j : j + 1] >> 4).astype(np.uint16) << (2 * j)
+    blocks = np.concatenate(
+        [d.view(np.uint8), scales_h.view(np.uint8), scales_l, nibbles], axis=1
+    )
+    return blocks.reshape(rows, -1)
+
+
+def build_iq3s_blocks(rows: int, cols: int, seed: int = 0) -> np.ndarray:
+    """Build valid random IQ3_S superblocks, one byte row per row."""
+    block_elems, block_bytes = gguf.GGML_QUANT_SIZES[QT.IQ3_S]
+    if cols % block_elems:
+        raise ValueError(
+            f"IQ3_S rows need a multiple of {block_elems} columns, got {cols}"
+        )
+    rng = np.random.default_rng(seed)
+    n = rows * (cols // block_elems)
+    d = rng.uniform(2**-10, 2**-4, (n, 1)).astype(np.float16)
+    # Every grid index, sign bit and scale nibble is valid, so the rest is random.
+    rest = rng.integers(0, 256, (n, block_bytes - 2), dtype=np.uint8)
+    return np.concatenate([d.view(np.uint8), rest], axis=1).reshape(rows, -1)

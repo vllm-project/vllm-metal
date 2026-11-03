@@ -3,6 +3,7 @@
 
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import mlx.core as mx
 import pytest
@@ -17,6 +18,7 @@ from vllm.config.multimodal import (
 import vllm_metal.envs as envs
 import vllm_metal.v1.model_adapter as model_adapter_module
 from vllm_metal.config import reset_config
+from vllm_metal.multimodal.lfm2_vl import Lfm2VlMultimodalAdapter
 from vllm_metal.multimodal.paddleocr_vl import PaddleOCRVLMultimodalAdapter
 from vllm_metal.multimodal.qwen3_vl import Qwen3VLMultimodalAdapter
 from vllm_metal.v1.model_adapter import (
@@ -44,10 +46,19 @@ class TestShouldForceTextBackbone:
         result = adapter.should_force_text_backbone(hf_config)
         assert result is True
 
-    def test_qwen35_fp8_conditional_generation_uses_auto_override(self) -> None:
+    @pytest.mark.parametrize(
+        ("model_type", "architecture"),
+        [
+            ("qwen3_5", "Qwen3_5ForConditionalGeneration"),
+            ("qwen3_5_moe", "Qwen3_5MoeForConditionalGeneration"),
+        ],
+    )
+    def test_qwen35_fp8_conditional_generation_uses_auto_override(
+        self, model_type: str, architecture: str
+    ) -> None:
         hf_config = SimpleNamespace(
-            model_type="qwen3_5",
-            architectures=["Qwen3_5ForConditionalGeneration"],
+            model_type=model_type,
+            architectures=[architecture],
             quantization_config={"quant_method": "fp8"},
         )
         adapter = DefaultModelAdapter()
@@ -68,8 +79,8 @@ class TestShouldForceTextBackbone:
     @pytest.mark.parametrize(
         ("model_type", "architecture"),
         [
-            # Only the dense Qwen3.5 wrapper has a native multimodal adapter.
             ("qwen3_5", "Qwen3_5ForConditionalGeneration"),
+            ("qwen3_5_moe", "Qwen3_5MoeForConditionalGeneration"),
         ],
     )
     def test_mlx_quant_conditional_generation_keeps_native_path(
@@ -89,7 +100,6 @@ class TestShouldForceTextBackbone:
     @pytest.mark.parametrize(
         ("model_type", "architecture"),
         [
-            ("qwen3_5_moe", "Qwen3_5MoeForConditionalGeneration"),
             ("qwen3_6", "Qwen3_6ForConditionalGeneration"),
             ("qwen3_6_moe", "Qwen3_6MoeForConditionalGeneration"),
         ],
@@ -503,6 +513,114 @@ class TestSupportsSelectiveLogits:
     not reproduce, so the probe compares a one-row forward both ways and only
     accepts an exact match."""
 
+    @pytest.mark.parametrize("head_scale", [1.0, 0.5])
+    def test_cache_required_wrappers_use_independent_probe_state(
+        self, head_scale: float
+    ) -> None:
+        class Backbone:
+            def __call__(self, input_ids, *, cache):
+                # Reusing the reference cache changes the split output.
+                offset = cache[0].offset
+                values = mx.ones((1, 1, input_ids.size, 2))
+                cache[0].update_and_fetch(values, values)
+                return mx.full((*input_ids.shape, 2), offset + 1.0)
+
+        class TextModel:
+            def __init__(self):
+                self.model = Backbone()
+
+            def make_cache(self):
+                return [KVCache()]
+
+            def compute_logits(self, hidden_states):
+                return hidden_states * 3.0
+
+            def __call__(self, input_ids, cache=None):
+                return (
+                    self.compute_logits(self.model(input_ids, cache=cache)) * head_scale
+                )
+
+        class Wrapper:
+            def __init__(self):
+                self.language_model = TextModel()
+
+            def __call__(self, input_ids, cache=None):
+                return self.language_model(input_ids, cache=cache)
+
+        adapter = DefaultModelAdapter()
+        model = Wrapper()
+        assert adapter.supports_selective_logits(model) is (head_scale == 1.0)
+        assert adapter.supports_selective_logits(model) is (head_scale == 1.0)
+
+    @pytest.mark.parametrize("tied", [False, True], ids=["linear", "tied-embedding"])
+    def test_qwen35_quantized_head_supports_selective_logits(self, tied: bool) -> None:
+        """The real hybrid backbone needs a cache even for the load-time probe."""
+        import mlx.nn as nn
+        from mlx_vlm.models.qwen3_5.config import ModelConfig, TextConfig, VisionConfig
+        from mlx_vlm.models.qwen3_5.language import LanguageModel
+
+        mx.random.seed(7)
+        config = TextConfig(
+            model_type="qwen3_5",
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            linear_num_value_heads=2,
+            linear_num_key_heads=2,
+            linear_key_head_dim=32,
+            linear_value_head_dim=32,
+            linear_conv_kernel_dim=4,
+            rms_norm_eps=1e-6,
+            vocab_size=128,
+            max_position_embeddings=128,
+            tie_word_embeddings=tied,
+            rope_parameters={
+                "type": "default",
+                "mrope_section": [2, 2, 4],
+                "rope_theta": 100000,
+                "partial_rotary_factor": 1.0,
+            },
+        )
+        model = LanguageModel(
+            config,
+            ModelConfig(config, VisionConfig(), model_type="qwen3_5"),
+        )
+        model.eval()
+        nn.quantize(
+            model,
+            group_size=64,
+            bits=4,
+            class_predicate=lambda path, _: path in {"model.embed_tokens", "lm_head"},
+        )
+        adapter = DefaultModelAdapter()
+        assert adapter.supports_selective_logits(model)
+
+        # Startup profiling selects rows without a serving cache installed.
+        tokens = mx.array([[3, 4, 5]], dtype=mx.int32)
+        full = model(tokens).logits
+        selected = adapter.target_forward(
+            model, tokens, logits_indices=mx.array([1, 2], dtype=mx.int32)
+        ).logits
+        mx.eval(full, selected)
+        assert mx.allclose(selected, full[:, [1, 2]], atol=1e-6, rtol=1e-6).item()
+
+        full_cache, split_cache = model.make_cache(), model.make_cache()
+        prefix = mx.array([[1, 2]], dtype=mx.int32)
+        mx.eval(model(prefix, cache=full_cache).logits)
+        mx.eval(model(prefix, cache=split_cache).logits)
+        full = model(tokens, cache=full_cache).logits
+        selected = adapter.target_forward(
+            model,
+            tokens,
+            cache=split_cache,
+            logits_indices=mx.array([1, 2], dtype=mx.int32),
+        ).logits
+        mx.eval(full, selected)
+        assert mx.allclose(selected, full[:, [1, 2]], atol=1e-6, rtol=1e-6).item()
+
     def test_accepts_a_head_reproduced_by_the_split_path(self) -> None:
         class Model:
             def __init__(self) -> None:
@@ -821,6 +939,23 @@ class _Qwen35LanguageModelStub:
         return None
 
 
+class _Lfm2VlBackboneStub:
+    """Callable ``language_model.model``: the adapter rejects a non-callable one."""
+
+    def __init__(self) -> None:
+        self.embed_tokens = lambda input_ids: input_ids
+
+    def __call__(self, inputs: Any, **kwargs: Any) -> Any:
+        return inputs
+
+
+class _Lfm2VlLanguageModelStub:
+    """Minimal mlx_vlm LFM2-VL language tower for dispatch tests."""
+
+    def __init__(self) -> None:
+        self.model = _Lfm2VlBackboneStub()
+
+
 class _PaddleOCRLanguageModelStub:
     def __init__(self) -> None:
         self.model = _Qwen35BackboneStub()
@@ -845,7 +980,8 @@ _QWEN3_VL_FRAME_TOKEN_IDS = {
 
 
 class TestBuildMultimodalAdapter:
-    def test_builds_qwen35_adapter_from_loaded_vlm(self) -> None:
+    @pytest.mark.parametrize("model_type", ["qwen3_5", "qwen3_5_moe"])
+    def test_builds_qwen35_adapter_from_loaded_vlm(self, model_type: str) -> None:
         vision_tower = object()
         language_model = _Qwen35LanguageModelStub()
         model = SimpleNamespace(
@@ -855,7 +991,7 @@ class TestBuildMultimodalAdapter:
             vision_tower=vision_tower,
             language_model=language_model,
         )
-        hf_config = SimpleNamespace(model_type="qwen3_5", **_QWEN3_VL_FRAME_TOKEN_IDS)
+        hf_config = SimpleNamespace(model_type=model_type, **_QWEN3_VL_FRAME_TOKEN_IDS)
 
         adapter = DefaultModelAdapter().build_multimodal_adapter(model, hf_config)
 
@@ -912,6 +1048,36 @@ class TestBuildMultimodalAdapter:
         adapter = DefaultModelAdapter().build_multimodal_adapter(model, hf_config)
 
         assert isinstance(adapter, PaddleOCRVLMultimodalAdapter)
+
+    @pytest.mark.parametrize("model_type", ["lfm2_vl", "lfm2-vl"])
+    def test_builds_lfm2_vl_adapter_from_model_type(self, model_type: str) -> None:
+        # Both spellings ship: Transformers and the 3B/1.6B checkpoints use
+        # "lfm2_vl", the 450M MLX conversions use "lfm2-vl".
+        language_model = _Lfm2VlLanguageModelStub()
+        model = SimpleNamespace(
+            language_model=language_model,
+            encode_images=lambda *a, **k: [],
+        )
+        hf_config = SimpleNamespace(model_type=model_type)
+
+        adapter = DefaultModelAdapter().build_multimodal_adapter(model, hf_config)
+
+        assert isinstance(adapter, Lfm2VlMultimodalAdapter)
+        assert adapter.text_model() is language_model
+
+    def test_builds_lfm2_vl_adapter_from_architecture(self) -> None:
+        model = SimpleNamespace(
+            language_model=_Lfm2VlLanguageModelStub(),
+            encode_images=lambda *a, **k: [],
+        )
+        hf_config = SimpleNamespace(
+            model_type="custom",
+            architectures=["Lfm2VlForConditionalGeneration"],
+        )
+
+        adapter = DefaultModelAdapter().build_multimodal_adapter(model, hf_config)
+
+        assert isinstance(adapter, Lfm2VlMultimodalAdapter)
 
     def test_generic_vlm_has_no_model_owned_adapter(self) -> None:
         model = SimpleNamespace()

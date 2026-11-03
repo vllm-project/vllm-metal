@@ -99,7 +99,7 @@ def _apply_model_runner_default() -> None:
     ``setdefault`` keeps an explicit user value authoritative.
     """
     mps = os.environ.get("VLLM_METAL_BACKEND") == "mps"
-    os.environ.setdefault("VLLM_USE_V2_MODEL_RUNNER", "1" if mps else "0")
+    os.environ.setdefault("VLLM_USE_V2_MODEL_RUNNER", "1")
     if mps:
         os.environ.setdefault("VLLM_USE_HW_AGNOSTIC", "1")
 
@@ -166,4 +166,11 @@ def _register() -> str | None:
     if MetalPlatform.is_available():
         _apply_model_runner_default()
         return "vllm_metal.platform.MetalPlatform"
+    return None
+
+
+def register_omni() -> str | None:
+    """Register the optional Omni platform without importing Omni eagerly."""
+    if os.environ.get("VLLM_METAL_BACKEND") == "mps":
+        return "vllm_metal.pytorch_backend.omni_platform.MPSOmniPlatform"
     return None

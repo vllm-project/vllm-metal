@@ -397,7 +397,7 @@ class MetalModelRunner:
         self.scheduler_config = vllm_config.scheduler_config
         self.use_async_scheduling = bool(self.scheduler_config.async_scheduling)
         self.metal_config = get_config()
-        # MLX-native sampling key chain (opt-in via VLLM_METAL_NATIVE_SAMPLING).
+        # MLX-native sampling key chain (VLLM_METAL_NATIVE_SAMPLING, default on).
         # Derived from the engine seed, so sampling is reproducible for a
         # fixed request schedule; split once per sampling call. A live key is
         # the single runtime capability signal for the native random path.
@@ -413,7 +413,6 @@ class MetalModelRunner:
         self._spec_decode_controller = SpeculativeDecodeController()
 
         self.model: Any = None
-        self.tokenizer: Any = None
         self.model_args: dict[str, Any] = {}
         self._is_vlm: bool = False  # Will be set during model loading
         self._is_pooling: bool = (
@@ -737,7 +736,7 @@ class MetalModelRunner:
                 self._multimodal_adapter, "lora_weights_mapper", None
             ),
         )
-        # Probed here because it runs a cacheless one-token forward, which is
+        # Probed here because it runs an isolated one-token forward, which is
         # only safe before a paged context is installed. PP takes another
         # forward branch that never requests selection.
         self._selective_logits_supported = (
@@ -1810,6 +1809,7 @@ class MetalModelRunner:
         states_missing = False
         decode_req_ids: list[str] = []
         decode_params: list[SamplingParams] = []
+        decode_output_lengths: list[int] = []
         for req_id in cached_reqs.req_ids:
             state = self._request_states.get(req_id)
             if state is None:
@@ -1823,6 +1823,7 @@ class MetalModelRunner:
             decode_req_ids.append(req_id)
             if state.sampling_params is not None:
                 decode_params.append(state.sampling_params)
+                decode_output_lengths.append(len(state.token_ids) - state.prompt_len)
 
         adapter = self._multimodal_adapter
         mm_forward_forced = self._mm_forward_forced(adapter)
@@ -1863,12 +1864,16 @@ class MetalModelRunner:
         sampling = SamplingShape(
             native_greedy=(
                 not states_missing
-                and SamplingBatch.params_allow_native_greedy(decode_params)
+                and SamplingBatch.params_allow_native_greedy(
+                    decode_params, decode_output_lengths
+                )
             ),
             native_random=(
                 self._native_sample_key is not None
                 and not states_missing
-                and SamplingBatch.params_allow_native_random(decode_params)
+                and SamplingBatch.params_allow_native_random(
+                    decode_params, decode_output_lengths
+                )
             ),
         )
         return self._decode_pipeline.evaluate_gate(capabilities, step, sampling)
@@ -1989,6 +1994,15 @@ class MetalModelRunner:
 
         # ---- sample tokens ----
         vocab_size = self._vocab_size
+        next_native_rng_key = (
+            self._next_native_sample_key
+            if self._native_sample_key is not None
+            and self.vllm_config.speculative_config is None
+            and self._drafter is None
+            and grammar_output is None
+            and not scheduler_output.has_structured_output_requests
+            else None
+        )
         decode_token_ids: list[list[int]] = [[] for _ in decode_reqs]
         decode_logprobs_rows: list[LogprobsLists | None] = [None for _ in decode_reqs]
         if has_scheduled_drafts:
@@ -2046,7 +2060,10 @@ class MetalModelRunner:
                     generators=generators,
                 )
                 plain_result = sample_from_logits(
-                    plain_logits, plain_batch, self._sampler
+                    plain_logits,
+                    plain_batch,
+                    self._sampler,
+                    next_native_rng_key=next_native_rng_key,
                 )
                 for plain_index, (decode_index, _, _) in enumerate(plain_items):
                     decode_token_ids[decode_index] = [
@@ -2064,6 +2081,7 @@ class MetalModelRunner:
                 num_decode_tokens,
                 self._sampler,
                 vocab_size=vocab_size,
+                next_native_rng_key=next_native_rng_key,
             )
             decode_token_ids = [[token_id] for token_id in decode_result.token_ids]
             decode_logprobs = decode_result.logprobs
@@ -2074,6 +2092,7 @@ class MetalModelRunner:
             num_decode_segments,
             self._sampler,
             vocab_size=vocab_size,
+            next_native_rng_key=next_native_rng_key,
         )
 
         # ---- update decode state ----
@@ -2100,9 +2119,7 @@ class MetalModelRunner:
         if isinstance(hybrid_runtime, HybridPagedAttentionRuntime):
             state_cache = hybrid_runtime.state_cache
             if state_cache.spec_verify_stash is not None:
-                committed_rows = [len(ids) for ids in decode_token_ids] + [
-                    len(pr.token_ids) for pr in prefill_reqs
-                ]
+                committed_rows = [len(ids) for ids in decode_token_ids]
                 apply_spec_decode_acceptance(
                     state_cache, GDNLazyKernels.shared(), committed_rows
                 )
@@ -3483,15 +3500,18 @@ class MetalModelRunner:
         assert logits is not None
         self._draft_token_ids = None
 
-        tokens = SamplingBatch.native_decode_tokens(
+        tokens = SamplingBatch.native_sample_tokens(
             logits[0, : len(decode_reqs), :],
             [state.sampling_params for _, state in decode_reqs],
             vocab_size=self._vocab_size,
-            next_key=(
+            next_native_rng_key=(
                 self._next_native_sample_key
                 if self._native_sample_key is not None
                 else None
             ),
+            output_lengths=[
+                len(state.token_ids) - state.prompt_len for _, state in decode_reqs
+            ],
         )
         # Submit now: the token buffer is scheduled right after this step's
         # forward and ahead of the next step's encode, so the deferred

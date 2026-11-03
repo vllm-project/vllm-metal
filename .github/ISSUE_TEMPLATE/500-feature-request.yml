@@ -1,0 +1,28 @@
+name: 🚀 Feature request
+description: Request a new feature or model support for vllm-metal
+title: "[Feature]: "
+labels: ["enhancement"]
+
+body:
+- type: markdown
+  attributes:
+    value: >
+      #### Before submitting an issue, please make sure the issue hasn't been already addressed by searching through [the existing and past issues](https://github.com/vllm-project/vllm-metal/issues?q=is%3Aissue+sort%3Acreated-desc+).
+- type: textarea
+  attributes:
+    label: 🚀 The feature, motivation and pitch
+    description: >
+      What you want to do and why. For a model request, link the checkpoint (Hugging Face or mlx-community). If this is related to another issue, link it here too.
+  validations:
+    required: true
+- type: textarea
+  attributes:
+    label: Alternatives
+    description: >
+      Any alternative solutions or workarounds you've considered, if any.
+- type: checkboxes
+  attributes:
+    label: Before submitting a new issue...
+    options:
+      - label: I have searched for relevant issues.
+        required: true

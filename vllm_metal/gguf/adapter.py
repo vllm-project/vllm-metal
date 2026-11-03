@@ -77,6 +77,8 @@ class GGUFArchSpec:
     rope_permuted_qk: bool = False
     # Gated DeltaNet V heads tiled across the K heads instead of grouped.
     tiled_v_heads: bool = False
+    # MTP blocks appended after the decoder, which mlx-lm has no module for.
+    appended_mtp_blocks: bool = False
 
 
 class GGUFModelAdapter:
@@ -103,6 +105,7 @@ class GGUFModelAdapter:
                 "ssm_conv1d.weight": _SqueezedUnitAxis(),
             },
             tiled_v_heads=True,
+            appended_mtp_blocks=True,
         ),
     }
 
@@ -228,12 +231,14 @@ class GGUFModelAdapter:
         gguf: Any,
         arch: str,
         num_hidden_layers: int,
+        nextn_predict_layers: int,
     ) -> GGUFModelAdapter:
         """Build the reverse map by inverting ``get_tensor_name_map`` over ``model``.
 
         Enumerates the live model's parameter names so every translated path is a
         real attribute path on the freshly built skeleton (including any family
-        prefix), then maps each to its GGUF name via the ``gguf`` package.
+        prefix), then maps each to its GGUF name via the ``gguf`` package. The
+        ``nextn_predict_layers`` MTP blocks after the decoder are skipped.
         """
         spec = cls._ARCH_SPECS[arch]
         arch_enum = cls._resolve_arch_enum(gguf, arch)
@@ -257,6 +262,11 @@ class GGUFModelAdapter:
         translation_map.update(cls._STATIC_GLOBAL_OVERRIDE)
         for name in cls._KNOWN_SKIP:
             translation_map[name] = None
+        if spec.appended_mtp_blocks:
+            for name in cls._nextn_block_names(
+                gguf, arch_enum, num_hidden_layers, nextn_predict_layers
+            ):
+                translation_map[name] = None
         v_head_rows, v_head_columns = (
             cls._build_v_head_index(model) if spec.tiled_v_heads else ({}, {})
         )
@@ -339,6 +349,24 @@ class GGUFModelAdapter:
                 rows[f"blk.{i}.{tensor}"] = index
             columns[f"blk.{i}.ssm_out.weight"] = values
         return rows, columns
+
+    @staticmethod
+    def _nextn_block_names(
+        gguf: Any, arch_enum: Any, num_hidden_layers: int, nextn_predict_layers: int
+    ) -> list[str]:
+        """GGUF names of the MTP blocks llama.cpp appends after the decoder."""
+        kinds = [
+            *gguf.MODEL_TENSORS[arch_enum],
+            *(kind for kind in gguf.MODEL_TENSOR if kind.name.startswith("NEXTN_")),
+        ]
+        return [
+            f"{gguf.TENSOR_NAMES[kind].format(bid=bid)}.weight"
+            for bid in range(
+                num_hidden_layers, num_hidden_layers + nextn_predict_layers
+            )
+            for kind in kinds
+            if "{bid}" in gguf.TENSOR_NAMES[kind]
+        ]
 
     @staticmethod
     def _rope_permute_index(out_features: int, n_head: int) -> mx.array:

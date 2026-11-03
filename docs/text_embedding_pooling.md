@@ -33,6 +33,8 @@ Current scope is intentionally narrow:
 - BGE-M3 dense embeddings from the CLS hidden state, L2-normalized
 - unquantized XLM-R/RoBERTa encoder embeddings with CLS, LAST, or MEAN
   pooling and L2 normalization, including `intfloat/multilingual-e5-base`
+- unquantized EmbeddingGemma 2 text embeddings with MEAN pooling and L2
+  normalization, using `--language-model-only`
 - BGE-M3 sparse lexical weights through `/pooling` with
   `pooler_config.task="token_classify"`
 
@@ -190,6 +192,32 @@ curl http://localhost:8000/v1/embeddings \
   -d '{"model":"intfloat/multilingual-e5-base","input":["query: what is semantic search?","passage: Semantic search retrieves documents by meaning."]}'
 ```
 
+### EmbeddingGemma 2 Text Embeddings
+
+[`google/embeddinggemma-2`](https://huggingface.co/google/embeddinggemma-2)
+returns 768-dimensional, L2-normalized text embeddings. The encoder uses
+bidirectional attention, including the model's sliding-window layers, and
+applies its learned embedding projection before MEAN pooling.
+
+```bash
+VLLM_ENABLE_V1_MULTIPROCESSING=0 \
+vllm serve google/embeddinggemma-2 \
+  --runner pooling \
+  --language-model-only \
+  --max-model-len 1024
+```
+
+For retrieval, use the model's query and document prefixes:
+
+```bash
+curl http://localhost:8000/v1/embeddings \
+  -H "Content-Type: application/json" \
+  -d '{"model":"google/embeddinggemma-2","input":["task: search result | query: what is semantic search?","title: none | text: Semantic search retrieves documents by meaning."]}'
+```
+
+This path loads only the text backbone. Image, audio, video, and quantized
+checkpoints are not supported yet.
+
 ### BGE-M3 Dense Embeddings
 
 ```bash
@@ -229,3 +257,11 @@ Do not add a model row to [Supported Models](supported_models.md) until a real
 `LLM.embed`, `/v1/embeddings`, `LLM.score`, `/score`, or `/pooling` smoke
 passes on Apple Silicon with the model name, revision, command, and output
 shape recorded.
+
+EmbeddingGemma 2 was verified on Apple Silicon with the command above,
+checkpoint revision `914f7f89142e33e77833254d9c9b90c3cef7303b`, and BF16
+weights. `/v1/embeddings` returned shape `[4, 768]` for English and Chinese
+queries and documents, including a prompt longer than the 512-token sliding
+window. String inputs matched requests using the same token IDs. The vectors
+also matched direct mlx-vlm 0.7.10 within `1e-6`; HF Transformers comparisons
+used the same weights and token IDs with cosine similarity above `0.9998`.

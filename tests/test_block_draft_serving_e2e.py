@@ -10,6 +10,11 @@ import os
 
 import pytest
 
+from tests.scheduler_helpers import (
+    assert_v2_model_runner,
+    track_preemptions_and_resumptions,
+)
+
 DRAFT_MODELS = {
     "dflash": "z-lab/Qwen3-4B-DFlash-b16",
     "dspark": "deepseek-ai/dspark_qwen3_4b_block7",
@@ -143,10 +148,13 @@ def _serve(
             "rejected": 0,
             "preemptions": 0,
             "resumed": 0,
+            "injected_rejection": 0,
         }
         propose = proposer.propose
+        inject_rejection = False
 
         def check_propose(ctx):
+            nonlocal inject_rejection
             result = propose(ctx)
             if result is None:
                 return result
@@ -158,13 +166,21 @@ def _serve(
                 assert (
                     limit is None or len(drafts) + 1 <= limit - state.generated_tokens
                 )
+            if inject_rejection:
+                # Exercise correction even when this checkpoint predicts the
+                # repetitive workload perfectly, as in the width-change test.
+                state = ctx.request_states[result.req_ids[0]]
+                prompt_index = prompts.index(state.token_ids[: state.prompt_len])
+                correct = baseline[prompt_index][state.generated_tokens]
+                result.draft_token_ids[0][0] = (
+                    correct + 1
+                ) % proposer.model.config.vocab_size
+                inject_rejection = False
+                stats["injected_rejection"] += 1
             return result
 
         proposer.propose = check_propose
-        verify, schedule = (
-            runner._spec_decode_controller.verify_greedy,
-            scheduler.schedule,
-        )
+        verify = runner._spec_decode_controller.verify_greedy
 
         def record_verify(logits, requests, segments):
             result = verify(logits, requests, segments)
@@ -178,14 +194,9 @@ def _serve(
                 stats["rejected"] += len(segment.draft_token_ids) - len(tokens) + 1
             return result
 
-        def record_schedule(*args, **kwargs):
-            result = schedule(*args, **kwargs)
-            stats["preemptions"] += len(result.preempted_req_ids)
-            stats["resumed"] += len(result.scheduled_cached_reqs.resumed_req_ids)
-            return result
-
         runner._spec_decode_controller.verify_greedy = record_verify
-        scheduler.schedule = record_schedule
+        assert_v2_model_runner(llm)
+        track_preemptions_and_resumptions(scheduler, stats, resumption_key="resumed")
         # The prefill's first output can finish the request by itself.
         assert (
             generate(
@@ -211,6 +222,7 @@ def _serve(
             if a != b
         ][:3]
         free = scheduler.kv_cache_manager.block_pool.get_num_free_blocks()
+        inject_rejection = True
         for i in (3, 4):
             engine.add_request(str(i), {"prompt_token_ids": prompts[i]}, sampling)
         pressured = drain()

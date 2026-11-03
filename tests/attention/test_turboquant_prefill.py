@@ -200,6 +200,27 @@ def test_mixed_batch_routes_and_restores_rows(recorded_ops, prefill_backend):
     assert prefill[0][6][0, 0].item() == prefill[0][6][1, 0].item()
 
 
+@pytest.mark.parametrize("gqa_disabled", [False, True])
+def test_lone_decode_fallback_honours_the_gqa_kill_switch(
+    recorded_ops, monkeypatch, gqa_disabled
+):
+    """A decode row left compressed beside a prefill is a one-request decode
+    call, which native GQA would admit unless the kill switch reaches it."""
+    monkeypatch.setenv("VLLM_METAL_DISABLE_GQA_DECODE", str(int(gqa_disabled)))
+    case = build_case(
+        qlens=(1, 128), context_lens=(4097, 384), n_heads=16, n_kv_heads=2
+    )
+    case.ctx.num_decode_requests = 1
+    case.ctx.num_decode_tokens = 1
+    case.ctx.max_decode_context_len = 4097
+    assert_parity(case)
+    prefill, fallback = recorded_ops
+    assert not prefill[1].get("use_turboquant", False)
+    assert fallback[1]["use_turboquant"]
+    assert fallback[0][7].tolist() == [4097]
+    assert fallback[1].get("gqa_disabled", False) is gqa_disabled
+
+
 def test_nax_hint_describes_only_the_dequantized_prefill(recorded_ops):
     """The compressed short request must not suppress the full prefill blocks."""
     case = build_case(qlens=(256, 63), context_lens=(257, 2111))

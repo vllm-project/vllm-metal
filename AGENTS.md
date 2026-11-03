@@ -1,6 +1,7 @@
 # Agent instructions for vllm-metal
 
 Follow [the contributor guide](docs/CONTRIBUTING.md) for setup and general checks.
+For Omni additions, follow the [model ownership and layout](docs/pytorch-mps.md#adding-omni-models).
 
 ## Motivation
 
@@ -50,7 +51,7 @@ For model changes, use parity tools with matching checkpoints and input token ID
 
 Always set `PYTORCH_ENABLE_MPS_FALLBACK=0` for MPS runs to disable PyTorch's optional CPU fallback.
 
-- **MLX and PyTorch MPS:** compare top-K parity against `mlx_lm` using [the parity tool](tools/check_parity.py) with `--top-k 5`. Set `VLLM_METAL_BACKEND=mps` to check PyTorch MPS serving. Report `EXACT` and `TOP_K_MATCH` counts separately and investigate failures.
+- **MLX and PyTorch MPS:** compare top-K parity against `mlx_lm` using [the parity tool](tools/check_parity.py) with `--top-k 5`. Set `VLLM_METAL_BACKEND=mps` to check PyTorch MPS serving. Report `EXACT` and `TOP_K_MATCH` counts separately and investigate failures. Parity checks may be unreliable for MoE models. When mismatches occur, investigate routing flips between experts with nearly tied scores.
 
 For performance improvements, report before/after end-to-end serving speedup on meaningful workloads using `vllm bench serve`. Follow [the macOS benchmarking guide](docs/benchmarking-macos.md) and keep the model, workload, and serving configuration consistent between runs.
 

@@ -182,7 +182,6 @@ def make_stub_runner(
             is_hybrid=is_hybrid,
         ),
         "model": object(),
-        "tokenizer": None,
         "_is_vlm": False,
         "_multimodal_adapter": None,
         "_supports_mm_inputs": True,
@@ -243,7 +242,7 @@ def make_stub_runner(
             build_decoder_pooling_backend(
                 runner._forward_model,
                 runner.model_config,
-                runner.tokenizer,
+                attrs.get("tokenizer"),
             )
             if runner_type == "pooling"
             else None

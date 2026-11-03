@@ -265,12 +265,22 @@ class _PagedAttentionPlan:
     kv_budget: int
     num_blocks: int
     # KV offload host pool. Pageable, but the same physical RAM as the wired
-    # cache on unified memory, so it comes out of the same budget.
+    # cache on unified memory. Additional to an explicit cache byte budget.
     kv_offload_pool: int = 0
     kv_offload_pool_auto: bool = False
     sized_down_by_probe: bool = False
+    explicit_kv_budget: int | None = None
 
     def format_breakdown(self) -> str:
+        if self.explicit_kv_budget is not None:
+            return (
+                f"kv_cache_memory_bytes={self.explicit_kv_budget} "
+                f"({self.explicit_kv_budget / 1e9:.2f}GB), "
+                f"model_memory={self.model_memory / 1e9:.2f}GB, "
+                f"overhead={self.overhead / 1e9:.2f}GB, "
+                f"kv_offload_pool={self.kv_offload_pool / 1e9:.2f}GB, "
+                f"kv_budget={self.kv_budget / 1e9:.2f}GB"
+            )
         parts = [
             f"metal_limit={self.metal_limit / 1e9:.2f}GB",
             f"fraction={self.fraction}",
@@ -284,6 +294,11 @@ class _PagedAttentionPlan:
         return ", ".join(parts)
 
     def format_mitigations(self) -> str:
+        if self.explicit_kv_budget is not None:
+            return (
+                "Increase --kv-cache-memory-bytes or unset it to use automatic "
+                "sizing; --gpu-memory-utilization does not change an explicit budget."
+            )
         if self.sized_down_by_probe:
             mitigations = [
                 "close other applications to free memory (the startup probe "
@@ -1193,7 +1208,16 @@ class WorkerCachePlanner:
     def _paged_attention_plan(self, *, overhead: int) -> _PagedAttentionPlan:
         """Build the memory plan without applying caller-specific validation."""
         block_size = self._worker.vllm_config.cache_config.block_size
-        fraction = self._memory_fraction()
+        explicit = getattr(
+            self._worker.vllm_config.cache_config, "kv_cache_memory_bytes", None
+        )
+        if explicit is not None and explicit <= 0:
+            raise ValueError("--kv-cache-memory-bytes must be positive")
+        fraction = (
+            self._memory_fraction()
+            if explicit is None
+            else self._worker.vllm_config.cache_config.gpu_memory_utilization
+        )
         metal_limit = self._metal_limit_bytes()
         model_memory = self.get_model_memory_usage()
         per_block_bytes = self._worker.get_cache_block_size_bytes()
@@ -1221,14 +1245,29 @@ class WorkerCachePlanner:
             overhead += expert_bytes
             future_reserved_bytes += expert_bytes
         usable_metal = int(metal_limit * fraction)
-        base_kv_budget = self.base_kv_budget_bytes(
-            metal_limit,
-            model_memory,
-            fraction,
-            overhead,
+        kv_budget = (
+            explicit
+            if explicit is not None
+            else self.base_kv_budget_bytes(
+                metal_limit,
+                model_memory,
+                fraction,
+                overhead,
+            )
         )
-        kv_offload_pool = self._resolve_kv_offload_pool(base_kv_budget, per_block_bytes)
-        kv_budget = base_kv_budget - kv_offload_pool
+        kv_offload_pool = self._resolve_kv_offload_pool(kv_budget, per_block_bytes)
+        # Explicit bytes budget the paged storage alone. The offload host pool
+        # and other future allocations still count in the physical commit probe.
+        if explicit is None:
+            kv_budget -= kv_offload_pool
+        if explicit is not None:
+            logger.info(
+                "Paged attention: using --kv-cache-memory-bytes=%d (%.2fGB), overriding "
+                "--gpu-memory-utilization. Weights, activations and the offload "
+                "host pool need additional memory.",
+                explicit,
+                explicit / 1e9,
+            )
         plan, room = self._probe_committed_pool(
             _PagedAttentionPlan(
                 block_size=block_size,
@@ -1242,6 +1281,7 @@ class WorkerCachePlanner:
                 num_blocks=max(0, kv_budget // per_block_bytes),
                 kv_offload_pool=kv_offload_pool,
                 kv_offload_pool_auto=self._auto_pool_extra() is not None,
+                explicit_kv_budget=explicit,
             ),
             future_reserved_bytes=future_reserved_bytes,
         )
@@ -1291,6 +1331,7 @@ class WorkerCachePlanner:
         if (
             getattr(model_config, "original_max_model_len", None) != -1
             and cache_config.num_gpu_blocks_override is None
+            and getattr(cache_config, "kv_cache_memory_bytes", None) is None
         ):
             request_blocks = -(-model_config.max_model_len // block_size) + 1
             request = request_blocks * per_block_bytes
@@ -1302,10 +1343,11 @@ class WorkerCachePlanner:
     def _resolve_kv_offload_pool(self, kv_budget: int, per_block_bytes: int) -> int:
         """Host pool bytes of the Metal offloading connector, else 0.
 
-        The pool is the same physical RAM as the wired cache, so it comes out
-        of the same budget. An automatic pool is at most a quarter of the
-        budget, or one host chunk if that is larger, and leaves room for one
-        full-length request. Writes a changed size back to cpu_bytes_to_use.
+        The pool shares physical RAM with the cache. It comes out of an
+        automatic budget, but is additional to explicit cache bytes. An
+        automatic pool is at most a quarter of the budget, or one host chunk
+        if larger. Automatic cache sizing also leaves room for one full-length
+        request. Writes a changed size back to cpu_bytes_to_use.
         Offloading uses the uni executor, so the connector and scheduler share
         this config and read it after planning.
         """
@@ -1437,6 +1479,15 @@ class WorkerCachePlanner:
                     probe.describe(),
                 )
             return plan, None
+
+        if plan.explicit_kv_budget is not None:
+            raise ValueError(
+                "KV commit probe: the machine paged memory out while testing "
+                f"--kv-cache-memory-bytes={plan.explicit_kv_budget} "
+                f"({plan.explicit_kv_budget / 1e9:.2f}GB). Refusing to "
+                "silently shrink an explicit budget. Lower that value or free "
+                f"memory before retrying. {probe.describe()}"
+            )
 
         # Keep the unrounded fit as the budget: vLLM picks its own grouped
         # layout from the bytes it is handed, so rounding here to the dense
