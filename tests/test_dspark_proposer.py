@@ -275,8 +275,16 @@ def test_config_bridge_preserves_other_runner_rejections(monkeypatch, method, wo
         scheduler_config=SimpleNamespace(async_scheduling=True),
         speculative_config=None
         if method is None
-        else SimpleNamespace(method=method, enable_adaptive_verification=True),
-        model_config=SimpleNamespace(is_diffusion=True),
+        else SimpleNamespace(
+            method=method,
+            enable_adaptive_verification=True,
+            is_xpress=lambda: False,
+            draft_lm_head_quantization=None,
+            draft_model_config=None,
+        ),
+        model_config=SimpleNamespace(
+            is_diffusion=True, architecture="LlamaForCausalLM"
+        ),
         _dflash_needs_multi_kv_group=lambda: True,
         _is_dflash_candidate_draft=lambda: True,
     )

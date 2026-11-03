@@ -563,6 +563,8 @@ def _check_chunked_verification(logprobs):
             num_speculative_tokens=3,
             enable_adaptive_verification=False,
             rejection_sample_method="standard",
+            fly_entropy_threshold=0.3,
+            fly_entropy_top_k=3,
         ),
         torch.device("mps"),
     )
