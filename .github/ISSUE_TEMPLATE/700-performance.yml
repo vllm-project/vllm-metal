@@ -30,26 +30,24 @@ body:
       ```
   validations:
     required: true
+- type: input
+  attributes:
+    label: vllm-metal version
+    description: >
+      `brew list --versions vllm-metal` for Homebrew, `pip show vllm-metal` otherwise.
+      If you built from source, give the commit.
+  validations:
+    required: true
 - type: textarea
   attributes:
-    label: Your current environment
+    label: Your Mac
     description: |
       Please run the following and paste the output below.
       ```sh
       sw_vers
       sysctl -n machdep.cpu.brand_string hw.memsize
-      python --version
-      pip list 2>/dev/null | grep -iE "^(vllm|mlx|torch|transformers)"
       ```
-    value: |
-      <details>
-      <summary>Output of the commands above</summary>
-
-      ```text
-      Paste the output here
-      ```
-
-      </details>
+    render: text
   validations:
     required: true
 - type: dropdown
