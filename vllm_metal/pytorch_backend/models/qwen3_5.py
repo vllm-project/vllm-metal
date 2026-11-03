@@ -46,6 +46,8 @@ def _gdn_core(layer, mixed_qkv, b, a, out, md):
     nd, ndt = md.num_decodes, md.num_decode_tokens
     npf, npt = md.num_prefills, md.num_prefill_tokens
     num_tokens, num_requests = ndt + npt, nd + npf
+    # PAD decode rows stay uninitialized; the shader returns before reading
+    # their Q/K/V or touching output/state, so they cannot affect live rows.
     x = torch.empty_like(mixed_qkv[:num_tokens])
 
     if nd > 0:
@@ -86,7 +88,9 @@ def _gdn_core(layer, mixed_qkv, b, a, out, md):
             md.has_initial_state[nd:num_requests].to(device=x.device, dtype=torch.bool),
         )
     )
-    # Keep the existing fp32 normalization/gating/recurrence; round only the output.
+    # The shader uses one dtype for Q/K/V and Y. Keeping fp32 Q/K/V requires
+    # this output copy and cast back for fp16/bf16; it also preserves PAD rows.
+    # A contiguous fp32 output already shares storage with result.
     result = out[:num_tokens].float().contiguous()
     # The kernel copies resumed slots into private FP32 state before recurrence;
     # no pooled state view reaches an MPSGraph matmul (#1244).

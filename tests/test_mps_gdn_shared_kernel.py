@@ -2,6 +2,7 @@
 """Packed MPS GDN recurrence and the upstream Qwen3.5 core integration."""
 
 from itertools import accumulate
+from math import prod
 from types import SimpleNamespace
 
 import pytest
@@ -108,7 +109,14 @@ def test_packed_gdn_matches_recurrence(heads, dtype, prefill):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
 @torch.inference_mode()
 def test_qwen_core_carries_state_in_one_launch(monkeypatch, dtype):
+    from vllm.model_executor.layers.mamba.abstract import MambaBase
     from vllm.model_executor.layers.mamba.mamba_utils import MambaStateShapeCalculator
+    from vllm.v1.kv_cache_interface import (
+        KVCacheTensor,
+        MambaSpec,
+        create_kv_cache_views,
+    )
+    from vllm.v1.kv_cache_layout import KVCacheLayout
 
     from vllm_metal.pytorch_backend.models import qwen3_5
 
@@ -130,11 +138,27 @@ def test_qwen_core_carries_state_in_one_launch(monkeypatch, dtype):
         ),
         A_log=torch.randn(hv, device="mps"),
         dt_bias=torch.randn(hv, device="mps"),
-        kv_cache=[
-            torch.randn(5, *conv_shape).to("mps", dtype),
-            torch.randn(5, *state_shape, device="mps"),
-        ],
+        get_state_shape=lambda: (conv_shape, state_shape),
+        get_state_dtype=lambda: (dtype, torch.float32),
     )
+    # Exercise the real cache-spec view and layer binding, with a page gap.
+    spec = MambaSpec(
+        block_size=16, shapes=layer.get_state_shape(), dtypes=layer.get_state_dtype()
+    )
+    page_stride = spec.page_size_bytes + 64
+    raw = torch.zeros(64 + 5 * page_stride, dtype=torch.int8, device="mps")
+    placement = KVCacheTensor(
+        raw.numel(), ["gdn"], 5 * page_stride, page_stride, offset=64
+    )
+    pages = create_kv_cache_views(raw, spec, 5, KVCacheLayout.LBHNC, placement)[0]
+    MambaBase.bind_kv_cache(layer, pages)
+    ssm = layer.kv_cache[1]
+    assert ssm.shape == (5, hv, dv, dk)
+    assert ssm.stride() == (page_stride // 4, dv * dk, dk, 1)
+    assert ssm.storage_offset() == (64 + prod(conv_shape) * 2) // 4
+    assert ssm.untyped_storage().data_ptr() == raw.untyped_storage().data_ptr()
+    for state in layer.kv_cache:
+        state.normal_()
     untouched = [t[4].clone() for t in layer.kv_cache]
     qkv = [torch.randn(n, channels).to(dtype) for n in (76, 5)]
     a = [torch.randn(len(x), hv).to(dtype) for x in qkv]
