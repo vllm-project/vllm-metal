@@ -160,10 +160,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Set to "0" to force the eager conv / C++ recurrent fallback path.
     "VLLM_METAL_GDN_LAZY_KERNELS": _bool("VLLM_METAL_GDN_LAZY_KERNELS", True),
     # One-step-ahead decode pipelining (default on). Eligible pure-decode
-    # native greedy or random steps (including seeded requests) defer the sampling
-    # sync one step so the next step's graph build and submit overlap the
-    # in-flight GPU forward. Set to "0" to
-    # force the fully synchronous per-step sample path.
+    # native samples (including seeded requests) defer the sync one step so the
+    # next graph build and submit overlap the in-flight GPU forward.
+    # Set to "0" to force synchronous sampling.
     "VLLM_METAL_DECODE_PIPELINE": _bool("VLLM_METAL_DECODE_PIPELINE", True),
     # Compiled stateless-MLP dispatch (opt-in): decode-shaped MLP/MoE
     # block calls run through an mx.compile trace, fusing the per-layer

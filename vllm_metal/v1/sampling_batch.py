@@ -239,9 +239,8 @@ class SamplingBatch:
         random sampling and differ in top-k/top-p/min-p. Requests with sample
         logprobs, structured outputs, or ``logit_bias`` stay on the torch path.
         ``output_lengths`` is as in :meth:`params_allow_native_greedy`.
-        Seeded requests are admitted only with ``allow_seed``: both synchronous
-        and deferred sampling derive a per-request key from the seed and the
-        row's output length before sampling (see :func:`native_sampling_key`).
+        Sync and deferred seeded keys use the row's output length before
+        sampling (see :func:`native_sampling_key`).
         """
         if not sampling_params_list:
             return False

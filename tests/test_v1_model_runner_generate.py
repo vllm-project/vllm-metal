@@ -5018,103 +5018,143 @@ class TestRequestAdmission:
         with pytest.raises(RuntimeError, match="missing prefill_token_ids"):
             self._admit(runner, new_req, 4)
 
-    @pytest.mark.parametrize("resume_contract", [None, "v2"])
-    def test_seeded_deferred_decode_matches_sync_after_chunked_prefill(
-        self, monkeypatch: pytest.MonkeyPatch, resume_contract: str | None
-    ) -> None:
-        """Recompute may reset the phase counter, but decode must use the true n."""
+    def _seeded_chunked_prefill(
+        self, monkeypatch: pytest.MonkeyPatch, *, deferred: bool
+    ) -> tuple[mr.MetalModelRunner, list[int]]:
+        monkeypatch.setenv("VLLM_METAL_DECODE_PIPELINE", str(int(deferred)))
         monkeypatch.setattr(mr, "prepare_grouped", lambda *a, **k: None)
-        params = SamplingParams(temperature=0.8, seed=42)
-        streams = []
-        for deferred in (False, True):
-            monkeypatch.setenv("VLLM_METAL_DECODE_PIPELINE", str(int(deferred)))
-            runner = make_stub_runner(
-                model_args={"vocab_size": 512},
-                _native_sampling_enabled=True,
-                _paged_attention_runtime=ForwardOutputRuntimeStub([]),
-                _intermediate_forward_supported=False,
-                num_layers=0,
+        runner = make_stub_runner(
+            model_args={"vocab_size": 512},
+            _native_sampling_enabled=True,
+            _paged_attention_runtime=ForwardOutputRuntimeStub([]),
+            _intermediate_forward_supported=False,
+            num_layers=0,
+        )
+        monkeypatch.setattr(
+            runner,
+            "_target_forward",
+            lambda input_ids, **kwargs: mr.TargetModelForwardOutput(
+                logits=mx.zeros((*input_ids.shape, 512))
+            ),
+        )
+        new_req = self._new_req(
+            [1, 2, 3, 4],
+            num_computed_tokens=0,
+            sampling_params=SamplingParams(temperature=0.8, seed=42),
+        )
+        runner.execute_model(self._scheduler_output(new_req, 2))
+        assert not runner._decode_pipeline.step_eligible
+        assert runner.sample_tokens(None).sampled_token_ids == [[]]
+        state = runner._request_states["r"]
+        assert state.generated_tokens == 0
+
+        runner.execute_model(
+            self._scheduler_output(
+                None, 2, cached_reqs=self._cached_reqs(state.token_ids, 2)
             )
-            monkeypatch.setattr(
-                runner,
-                "_target_forward",
-                lambda input_ids, **kwargs: mr.TargetModelForwardOutput(
-                    logits=mx.zeros((*input_ids.shape, 512))
+        )
+        assert not runner._decode_pipeline.step_eligible
+        tokens = list(runner.sample_tokens(None).sampled_token_ids[0])
+        assert state.generated_tokens == len(tokens) == 1
+        return runner, tokens
+
+    def _seeded_decode_step(
+        self, runner: mr.MetalModelRunner, *, deferred: bool
+    ) -> ModelRunnerOutput | mr.MetalAsyncModelRunnerOutput:
+        state = runner._request_states["r"]
+        runner.execute_model(
+            self._scheduler_output(
+                None,
+                1,
+                cached_reqs=self._cached_reqs(
+                    state.token_ids, len(state.token_ids) - 1
                 ),
             )
-            new_req = self._new_req(
-                [1, 2, 3, 4], num_computed_tokens=0, sampling_params=params
-            )
-            runner.execute_model(self._scheduler_output(new_req, 2))
-            assert not runner._decode_pipeline.step_eligible
-            assert runner.sample_tokens(None).sampled_token_ids == [[]]
-            state = runner._request_states["r"]
-            assert state.generated_tokens == 0
+        )
+        assert runner._decode_pipeline.step_eligible is deferred
+        output = runner.sample_tokens(None)
+        assert isinstance(output, mr.MetalAsyncModelRunnerOutput) is deferred
+        assert state.generated_tokens == len(state.token_ids) - state.prompt_len
+        assert runner._native_sampling_step == 0
+        return output
 
-            runner.execute_model(
-                self._scheduler_output(
-                    None, 2, cached_reqs=self._cached_reqs(state.token_ids, 2)
-                )
-            )
-            assert not runner._decode_pipeline.step_eligible
-            tokens = list(runner.sample_tokens(None).sampled_token_ids[0])
-            assert state.generated_tokens == len(tokens) == 1
+    def _seeded_decode_tokens(
+        self, runner: mr.MetalModelRunner, count: int, *, deferred: bool
+    ) -> list[int]:
+        tokens = []
+        for _ in range(count):
+            output = self._seeded_decode_step(runner, deferred=deferred)
+            if deferred:
+                output = output.get_output()
+            tokens.extend(output.sampled_token_ids[0])
+        return tokens
 
-            for step in range(7):
-                runner.execute_model(
-                    self._scheduler_output(
-                        None,
-                        1,
-                        cached_reqs=self._cached_reqs(
-                            state.token_ids, len(state.token_ids) - 1
-                        ),
-                    )
-                )
-                assert runner._decode_pipeline.step_eligible is deferred
-                output = runner.sample_tokens(None)
-                assert isinstance(output, mr.MetalAsyncModelRunnerOutput) is deferred
-                if deferred and resume_contract is not None and step == 1:
-                    # Preempt with a pending token that the scheduler discards.
-                    committed_tokens = state.token_ids[:-1]
-                    runner.execute_model(
-                        self._scheduler_output(None, 0, preempted_req_ids={"r"})
-                    )
-                    assert not runner._decode_pipeline.step_eligible
-                    discarded = output.get_output().sampled_token_ids
-                    resume = self._scheduler_output(
-                        self._new_req(
-                            committed_tokens,
-                            num_computed_tokens=0,
-                            sampling_params=params,
-                        ),
-                        2,
-                    )
-                    runner.execute_model(resume)
-                    assert not runner._decode_pipeline.step_eligible
-                    assert runner.sample_tokens(None).sampled_token_ids == [[]]
-                    state = runner._request_states["r"]
-                    assert state.generated_tokens == 0
-                    assert len(state.token_ids) - state.prompt_len == len(tokens)
-                    runner.execute_model(
-                        self._scheduler_output(
-                            None,
-                            len(committed_tokens) - 2,
-                            cached_reqs=self._cached_reqs(state.token_ids, 2),
-                        )
-                    )
-                    assert not runner._decode_pipeline.step_eligible
-                    output = runner.sample_tokens(None)
-                    assert output.sampled_token_ids == discarded
-                elif deferred:
-                    output = output.get_output()
-                tokens.extend(output.sampled_token_ids[0])
-                assert state.generated_tokens == len(state.token_ids) - state.prompt_len
-                assert state.generated_tokens == len(tokens)
-                assert runner._native_sampling_step == 0
+    def test_seeded_deferred_decode_matches_sync_after_chunked_prefill(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        streams = []
+        for deferred in (False, True):
+            runner, tokens = self._seeded_chunked_prefill(
+                monkeypatch, deferred=deferred
+            )
+            tokens.extend(self._seeded_decode_tokens(runner, 7, deferred=deferred))
+            assert runner._request_states["r"].token_ids[4:] == tokens
             streams.append(tokens)
 
         assert streams[0] == streams[1]
         assert len(set(streams[0])) > 1
+
+    def test_seeded_deferred_decode_matches_sync_after_preemption(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Recompute may reset the phase counter, but must preserve seed positions."""
+        sync_runner, expected = self._seeded_chunked_prefill(
+            monkeypatch, deferred=False
+        )
+        expected.extend(self._seeded_decode_tokens(sync_runner, 7, deferred=False))
+        runner, tokens = self._seeded_chunked_prefill(monkeypatch, deferred=True)
+        tokens.extend(self._seeded_decode_tokens(runner, 1, deferred=True))
+
+        # Preempt with a pending token that the scheduler discards.
+        output = self._seeded_decode_step(runner, deferred=True)
+        state = runner._request_states["r"]
+        committed_tokens = state.token_ids[:-1]
+        runner.execute_model(self._scheduler_output(None, 0, preempted_req_ids={"r"}))
+        assert not runner._decode_pipeline.step_eligible
+        discarded = output.get_output().sampled_token_ids
+        resume = self._scheduler_output(
+            self._new_req(
+                committed_tokens,
+                num_computed_tokens=0,
+                sampling_params=state.sampling_params,
+            ),
+            2,
+        )
+        runner.execute_model(resume)
+        assert not runner._decode_pipeline.step_eligible
+        assert runner.sample_tokens(None).sampled_token_ids == [[]]
+        state = runner._request_states["r"]
+        assert state.generated_tokens == 0
+        assert len(state.token_ids) - state.prompt_len == len(tokens)
+
+        runner.execute_model(
+            self._scheduler_output(
+                None,
+                len(committed_tokens) - 2,
+                cached_reqs=self._cached_reqs(state.token_ids, 2),
+            )
+        )
+        assert not runner._decode_pipeline.step_eligible
+        output = runner.sample_tokens(None)
+        assert output.sampled_token_ids == discarded
+        tokens.extend(output.sampled_token_ids[0])
+        assert state.generated_tokens == len(tokens)
+        tokens.extend(self._seeded_decode_tokens(runner, 5, deferred=True))
+
+        assert tokens == expected
+        assert state.token_ids[4:] == tokens
+        assert state.generated_tokens == len(tokens)
+        assert len(set(tokens)) > 1
 
     @pytest.mark.parametrize(
         ("prefill_token_ids", "owes_prompt_logprobs"),

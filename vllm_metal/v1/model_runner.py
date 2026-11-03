@@ -506,9 +506,7 @@ class MetalModelRunner:
         # (populated only for requests whose SamplingParams ask for it).
         self._prompt_logprobs_tracker = PromptLogprobsTracker()
 
-        # One-step-ahead decode pipelining (owner: decode_pipeline.py).
-        # Gate-eligible pure-decode native samples defer the sampling sync one
-        # step so the next step's graph build overlaps the in-flight forward.
+        # Defer the sampling sync so the next graph build overlaps the forward.
         self._decode_pipeline = DecodePipeline(
             build_output=_ExecutionBatch.to_model_runner_output,
             validate=self._validate_scheduled_outputs,
