@@ -109,6 +109,8 @@ metal = "vllm_metal:register"
 gguf_metal = "vllm_metal.gguf.vllm_integration:register"
 # Scheduler/cache metadata for MLX architectures missing from the pinned vLLM.
 metal_model_metadata = "vllm_metal.compat:register_model_compat"
+# Keeps the target context for a shorter draft model on the MLX runner.
+metal_draft_context_limit = "vllm_metal.patches.draft_context_limit:register"
 
 [tool.setuptools]
 include-package-data = false
