@@ -102,14 +102,15 @@ class CacheViews(Sequence[mx.array]):
 
         region, shape, strides, offset, dtype = self.descriptors[index]
         return get_ops().as_strided(
-            self.storage.buffers[region].view(dtype), shape, strides, offset
+            self.storage._get_buffer(region).view(dtype), shape, strides, offset
         )
 
     def __setitem__(self, index: int, value: mx.array) -> None:
         # Native writes alias their input. Track the write on its region so
         # sibling views, including aliases with a different dtype, see it.
         region = self.descriptors[index][0]
-        self.storage.buffers[region] = mx.depends(self.storage.buffers[region], [value])
+        current = self.storage._get_buffer(region)
+        self.storage._set_buffer(region, mx.depends(current, [value]))
 
 
 class KVCacheStorage:
@@ -137,11 +138,11 @@ class KVCacheStorage:
         )
         first = next(iter(self.tensors.values()))
         backing = first.untyped_storage()
-        raw = torch.empty(0, dtype=torch.uint8).set_(backing)
+        self._raw_backing = torch.empty(0, dtype=torch.uint8).set_(backing)
         self.nbytes = backing.nbytes()
         # Metal advertises LBNHC: each distinct layer address starts a compact
-        # region. Import views of those regions from vLLM's one allocation, so
-        # the full cache need not fit in a single Metal buffer.
+        # region. Record the byte ranges now; create MLX buffers lazily below
+        # so the pool's pages stay uncommitted until the first GPU access.
         self.region_offsets = sorted(
             {
                 tensor.offset + i * tensor.layer_stride
@@ -150,10 +151,11 @@ class KVCacheStorage:
             }
         )
         ends = [*self.region_offsets[1:], self.nbytes]
-        self.buffers = [
-            torch_to_mlx(raw[start:end].view(config.num_blocks, -1))
-            for start, end in zip(self.region_offsets, ends, strict=True)
-        ]
+        self._region_ranges = list(
+            zip(self.region_offsets, ends, strict=True)
+        )
+        # Lazy cache: populated on first access to each region.
+        self._buffer_cache: list[mx.array | None] = [None] * len(self._region_ranges)
         # CoW/zeroing cover physical bytes exactly once. Layer-outer layouts
         # place a logical block in disjoint regions of this one allocation.
         regions = {}
@@ -162,18 +164,57 @@ class KVCacheStorage:
                 offset = tensor.offset + i * tensor.layer_stride
                 size = self.specs[name].page_size_bytes
                 regions[(offset, tensor.block_stride, size)] = torch.as_strided(
-                    raw, (config.num_blocks, size), (tensor.block_stride, 1), offset
+                    self._raw_backing,
+                    (config.num_blocks, size),
+                    (tensor.block_stride, 1),
+                    offset,
                 )
         self.pages = CacheViews(self, list(regions.values()))
 
     @property
+    def buffers(self) -> list[mx.array]:
+        """Materialize MLX Metal buffers lazily — pages commit only on first GPU use."""
+        result = []
+        for idx, (start, end) in enumerate(self._region_ranges):
+            buf = self._buffer_cache[idx]
+            if buf is None:
+                buf = self._materialize_region(idx, start, end)
+            result.append(buf)
+        return result
+
+    def _get_buffer(self, region: int) -> mx.array:
+        """Return a region's MLX buffer, materializing it lazily if needed."""
+        buf = self._buffer_cache[region]
+        if buf is None:
+            start, end = self._region_ranges[region]
+            buf = self._materialize_region(region, start, end)
+        return buf
+
+    def _set_buffer(self, region: int, value: mx.array) -> None:
+        """Update a region's buffer (used by mx.depends chains from CacheViews)."""
+        self._buffer_cache[region] = value
+
+    def _materialize_region(self, region: int, start: int, end: int) -> mx.array:
+        buf = torch_to_mlx(
+            self._raw_backing[start:end].view(self.config.num_blocks, -1)
+        )
+        self._buffer_cache[region] = buf
+        return buf
+
+    @buffers.setter
+    def buffers(self, value: list[mx.array]) -> None:
+        """Allow direct assignment (used by ``mx.depends`` chains and tests)."""
+        self._buffer_cache = list(value)
+
+    @property
     def released(self) -> bool:
-        return not self.buffers
+        return not self.tensors
 
     def release(self) -> None:
         """Free the backing memory. Its contents are discarded."""
         self.tensors = {}
-        self.buffers = []
+        self._raw_backing = None  # type: ignore[assignment]
+        self._buffer_cache = []
 
     def reallocate(self) -> None:
         """Re-create the backing memory with the layout vLLM scheduled against."""
