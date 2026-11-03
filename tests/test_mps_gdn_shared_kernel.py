@@ -59,7 +59,9 @@ def test_packed_gdn_matches_recurrence(heads, dtype, prefill):
     v = torch.randn(tokens, hv, dv) * 0.25
     decay = (-0.01 - torch.rand(tokens, hv) * 0.2).exp()
     beta = torch.rand(tokens, hv)
-    q, k, v, decay, beta = (t.to(dtype) for t in (q, k, v, decay, beta))
+    # Cover both the original same-dtype ABI and fp32 inputs with narrow Y.
+    input_dtype = dtype if prefill else torch.float32
+    q, k, v, decay, beta = (t.to(input_dtype) for t in (q, k, v, decay, beta))
     row_size = hv * dv * dk
     # Prefix, unused slot and page gaps detect negative indices/stride errors.
     storage = torch.randn(8, row_size + 17) * 0.1
@@ -67,7 +69,7 @@ def test_packed_gdn_matches_recurrence(heads, dtype, prefill):
     state[2].fill_(float("nan"))  # Fresh requests must not read stale state.
     expected_storage = storage.clone()
     expected_state = expected_storage[1:, :row_size].view_as(state)
-    expected = torch.full_like(v, 13.0)
+    expected = torch.full_like(v, 13.0, dtype=dtype)
     for i, (slot, length) in enumerate(zip(slots, lengths, strict=True)):
         if slot < 0 or not length:
             continue
@@ -80,7 +82,7 @@ def test_packed_gdn_matches_recurrence(heads, dtype, prefill):
 
     device_storage = storage.to("mps")
     device_state = device_storage[1:, :row_size].view_as(state)
-    output = torch.full_like(v, 13.0, device="mps")
+    output = torch.full_like(v, 13.0, dtype=dtype, device="mps")
     gdn_linear_attention(
         *(t.to("mps") for t in (q, k, v, decay, beta)),
         device_state,

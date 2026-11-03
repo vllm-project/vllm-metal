@@ -53,8 +53,9 @@ prefill in one launch, with unexpanded Q/K heads. Its FP32 state uses upstream
 `MambaSpec`'s `[slots, value_heads, value_dim, key_dim]` layout and physical page
 stride directly. Fresh sequences initialize their state inside the kernel;
 resumed sequences keep it, and PAD/empty rows leave state and output untouched.
-Normalization, log-gate conversion to decay, and recurrence remain FP32 before
-rounding the output to the model dtype. Convolution still uses upstream Torch.
+Normalization, log-gate conversion to decay, and recurrence remain FP32. The
+kernel writes output directly in the model dtype without an FP32 output scratch
+or copy back. Convolution still uses upstream Torch.
 
 ## Adding Omni models
 

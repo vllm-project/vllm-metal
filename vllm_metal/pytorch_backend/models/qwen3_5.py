@@ -86,10 +86,7 @@ def _gdn_core(layer, mixed_qkv, b, a, out, md):
     initial = torch.ones(num_requests, dtype=torch.bool, device=x.device)
     if npf > 0:
         initial[nd:] = p_init
-    # The shader uses one dtype for Q/K/V and Y. Keeping fp32 Q/K/V requires
-    # this output copy and cast back for fp16/bf16; it also preserves PAD rows.
-    # A contiguous fp32 output already shares storage with result.
-    result = out[:num_tokens].float().contiguous()
+    # Keep fp32 recurrence inputs/state; cast once when storing each live Y.
     # The kernel copies resumed slots into private FP32 state before recurrence;
     # no pooled state view reaches an MPSGraph matmul (#1244).
     gdn_linear_attention(
@@ -101,10 +98,9 @@ def _gdn_core(layer, mixed_qkv, b, a, out, md):
         ssm,
         loc[: num_requests + 1].to(device=x.device, dtype=torch.int32),
         slots[:num_requests].to(device=x.device, dtype=torch.int32),
-        result,
+        out[:num_tokens],
         initial,
     )
-    out[:num_tokens].copy_(result)
 
 
 @cache

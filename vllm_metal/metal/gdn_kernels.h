@@ -27,7 +27,8 @@ inline void validate_gdn_key_dim(int Dk) {
 inline GDNLinearAttentionPlan make_gdn_linear_attention_plan(
     const std::string& dtype, const std::string& state_dtype,
     int num_requests, int Hk, int Hv, int Dk, int Dv,
-    int64_t state_stride, bool use_initial_state_mask = false) {
+    int64_t state_stride, bool use_initial_state_mask = false,
+    const std::string& output_dtype = "") {
   validate_gdn_key_dim(Dk);
   if (num_requests < 0 || Hk <= 0 || Hv <= 0 || Hv % Hk || Dv <= 0 ||
       int64_t(num_requests) * Hv > std::numeric_limits<int>::max() ||
@@ -39,6 +40,12 @@ inline GDNLinearAttentionPlan make_gdn_linear_attention_plan(
     throw std::invalid_argument("Unsupported GDN input/state dtype pair");
   auto name = "gdn_linear_attention_" + dtype;
   if (state_dtype != dtype) name += "_state_" + state_dtype;
+  if (!output_dtype.empty() && output_dtype != dtype) {
+    if (dtype != "float" || state_dtype != "float" || !use_initial_state_mask ||
+        (output_dtype != "half" && output_dtype != "bfloat16_t"))
+      throw std::invalid_argument("Unsupported GDN output dtype");
+    name += "_out_" + output_dtype;
+  }
   if (use_initial_state_mask) name += "_initial";
   return {name, Dv, num_requests * Hv, 32,
           num_requests, Hk, Hv, Dk, Dv, state_stride};

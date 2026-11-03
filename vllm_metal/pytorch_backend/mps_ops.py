@@ -82,8 +82,9 @@ def gdn_linear_attention(
 ):
     """Enqueue GDN on PyTorch's MPS stream; mutate fp32 state and write Y.
 
-    Q/K are packed [T,Hk,Dk], V/Y [T,Hv,Dv], g/beta [T,Hv], all the same
-    fp32/fp16/bf16 dtype. Q/K must already be normalized and Q scaled. The
+    Q/K are packed [T,Hk,Dk], V/Y [T,Hv,Dv], g/beta [T,Hv]. Inputs share an
+    fp32/fp16/bf16 dtype; Y matches it or is fp16/bf16 with fp32 inputs.
+    Q/K must already be normalized and Q scaled. The
     shader consumes the decay exp(log_g), not the log-space gate.
     State is [slots,Hv,Dv,Dk], with dense inner rows and an optional slot gap.
 

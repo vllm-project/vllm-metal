@@ -290,12 +290,18 @@ class GDNLinearAttention {
       TORCH_CHECK(t->is_mps(), "All GDN buffers must be on MPS");
     TORCH_CHECK(q.scalar_type() == at::kFloat || q.scalar_type() == at::kHalf ||
                 q.scalar_type() == at::kBFloat16, "GDN requires fp32/fp16/bf16 inputs");
-    for (auto* t : {&q, &k, &v, &g, &beta, &y}) {
+    for (auto* t : {&q, &k, &v, &g, &beta}) {
       TORCH_CHECK(t->is_contiguous() && t->scalar_type() == q.scalar_type(),
-                  "GDN Q/K/V/g/beta/Y must be packed and have the same dtype");
+                  "GDN Q/K/V/g/beta must be packed and have the same dtype");
       TORCH_CHECK(t->numel() <= std::numeric_limits<int>::max(),
                   "GDN packed input/output exceeds int32 indexing");
     }
+    TORCH_CHECK(y.is_contiguous() &&
+                y.numel() <= std::numeric_limits<int>::max() &&
+                (y.scalar_type() == q.scalar_type() ||
+                 (q.scalar_type() == at::kFloat &&
+                  (y.scalar_type() == at::kHalf || y.scalar_type() == at::kBFloat16))),
+                "GDN Y must be packed, with the input dtype or fp32 inputs and fp16/bf16 output");
     TORCH_CHECK(q.dim() == 3 && k.sizes() == q.sizes() && v.dim() == 3 &&
                 v.size(0) == q.size(0) && y.sizes() == v.sizes(),
                 "GDN requires Q/K [T,Hk,Dk] and V/Y [T,Hv,Dv]");
@@ -322,9 +328,11 @@ class GDNLinearAttention {
                 "GDN has_initial_state must be packed bool [B]");
     const std::string dt = q.scalar_type() == at::kFloat ? "float" :
         q.scalar_type() == at::kHalf ? "half" : "bfloat16_t";
+    const std::string out_dt = y.scalar_type() == at::kFloat ? "float" :
+        y.scalar_type() == at::kHalf ? "half" : "bfloat16_t";
     const auto plan = kernels::make_gdn_linear_attention_plan(
         dt, "float", slot_mapping.numel(), Hk, Hv, Dk, Dv,
-        state_pool.stride(0), true);
+        state_pool.stride(0), true, out_dt);
     if (plan.num_requests == 0 || tokens == 0) return;
     auto kernel = pipeline(plan.kernel_name);
     const auto threads = static_cast<NSUInteger>(plan.threads_x);

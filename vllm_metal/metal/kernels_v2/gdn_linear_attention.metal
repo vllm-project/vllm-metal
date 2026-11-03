@@ -1,7 +1,8 @@
 #include <metal_stdlib>
 using namespace metal;
 
-template <typename T, typename S = T, bool use_initial_state_mask = false>
+template <typename T, typename S = T, bool use_initial_state_mask = false,
+          typename O = T>
 [[kernel]] void gdn_linear_attention(
     const device T *__restrict__ q          [[buffer(0)]],
     const device T *__restrict__ k          [[buffer(1)]],
@@ -11,7 +12,7 @@ template <typename T, typename S = T, bool use_initial_state_mask = false>
     device S *__restrict__ state_pool       [[buffer(5)]],
     const device int *__restrict__ cu_seqlens    [[buffer(6)]],
     const device int *__restrict__ slot_mapping  [[buffer(7)]],
-    device T *__restrict__ y                [[buffer(8)]],
+    device O *__restrict__ y                [[buffer(8)]],
     constant int &num_requests              [[buffer(9)]],
     constant int &Hk                        [[buffer(10)]],
     constant int &Hv                        [[buffer(11)]],
@@ -60,7 +61,7 @@ template <typename T, typename S = T, bool use_initial_state_mask = false>
     const device T *v_ = v + seq_start * Hv * Dv + hv_idx * Dv;
     const device T *g_ = g + seq_start * Hv;
     const device T *beta_ = beta + seq_start * Hv;
-    device T *y_ = y + seq_start * Hv * Dv + hv_idx * Dv;
+    device O *y_ = y + seq_start * Hv * Dv + hv_idx * Dv;
 
     // === Main recurrence loop ===
     for (int t = 0; t < seq_len; ++t) {
@@ -90,7 +91,7 @@ template <typename T, typename S = T, bool use_initial_state_mask = false>
 
         // First thread in SIMD group writes output
         if (dk_idx == 0) {
-            y_[dv_idx] = static_cast<T>(out);
+            y_[dv_idx] = static_cast<O>(out);
         }
 
         // Advance to next timestep
@@ -112,25 +113,27 @@ template <typename T, typename S = T, bool use_initial_state_mask = false>
 }
 
 // Template instantiations — same pattern as reshape_and_cache.metal
-#define instantiate_gdn(type, state_type, use_initial, suffix)      \
+#define instantiate_gdn(type, state_type, out_type, use_initial, suffix) \
   template [[host_name("gdn_linear_attention_" #type suffix)]]     \
-  [[kernel]] void gdn_linear_attention<type, state_type, use_initial>( \
+  [[kernel]] void gdn_linear_attention<type, state_type, use_initial, out_type>( \
       const device type*, const device type*,                      \
       const device type*, const device type*,                      \
       const device type*, device state_type*,                      \
       const device int*, const device int*,                        \
-      device type*,                                                \
+      device out_type*,                                            \
       constant int&, constant int&, constant int&,                 \
       constant int&, constant int&,                                \
       constant int64_t&, const device bool*, uint3, uint);
 
 // Preserve all existing MLX entry points and their state storage precision.
-instantiate_gdn(float, float, false, "");
-instantiate_gdn(half, half, false, "");
-instantiate_gdn(bfloat16_t, bfloat16_t, false, "");
-instantiate_gdn(half, float, false, "_state_float");
-instantiate_gdn(bfloat16_t, float, false, "_state_float");
-instantiate_gdn(float, float, true, "_initial");
-instantiate_gdn(half, float, true, "_state_float_initial");
-instantiate_gdn(bfloat16_t, float, true, "_state_float_initial");
+instantiate_gdn(float, float, float, false, "");
+instantiate_gdn(half, half, half, false, "");
+instantiate_gdn(bfloat16_t, bfloat16_t, bfloat16_t, false, "");
+instantiate_gdn(half, float, half, false, "_state_float");
+instantiate_gdn(bfloat16_t, float, bfloat16_t, false, "_state_float");
+instantiate_gdn(float, float, float, true, "_initial");
+instantiate_gdn(half, float, half, true, "_state_float_initial");
+instantiate_gdn(bfloat16_t, float, bfloat16_t, true, "_state_float_initial");
+instantiate_gdn(float, float, half, true, "_out_half_initial");
+instantiate_gdn(float, float, bfloat16_t, true, "_out_bfloat16_t_initial");
 #undef instantiate_gdn
