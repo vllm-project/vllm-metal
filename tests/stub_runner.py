@@ -47,7 +47,7 @@ def initialize_hybrid_runtime(
     """Build the test runtime from vLLM's real grouping and placement functions."""
     from dataclasses import replace
 
-    from vllm.v1.core.kv_cache_utils import (
+    from vllm.v1.core.kv_cache_planning import (
         get_kv_cache_config_from_groups,
         get_kv_cache_groups,
     )
@@ -96,7 +96,7 @@ def initialize_mla_runtime(
 ):
     """Build a standalone MLA runtime through the cache policy, from vLLM's real
     grouping and placement of the policy's specs."""
-    from vllm.v1.core.kv_cache_utils import (
+    from vllm.v1.core.kv_cache_planning import (
         get_kv_cache_config_from_groups,
         get_kv_cache_groups,
     )
@@ -320,6 +320,7 @@ def make_gemma4_mixed_attention_runner(
         model_config=SimpleNamespace(
             max_model_len=max_model_len,
             original_max_model_len=original_max_model_len,
+            supports_kv_cache_grouping=False,
         ),
         parallel_config=SimpleNamespace(
             tensor_parallel_size=1,

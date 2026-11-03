@@ -26,10 +26,11 @@ from vllm.pooling_params import LateInteractionParams, PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.selector import AttentionSelectorConfig
-from vllm.v1.core.kv_cache_utils import (
-    get_kv_cache_capacity,
+from vllm.v1.core.kv_cache_planning import (
+    get_global_kv_cache_groups,
     get_kv_cache_configs,
 )
+from vllm.v1.core.kv_cache_utils import get_kv_cache_capacity
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheSpec,
@@ -2504,7 +2505,12 @@ class TestAutoFitMaxModelLenChain:
         available = num_pool_blocks * self._PACKED_BLOCK_BYTES
         vllm_config, specs = self.gemma4_config_and_specs(original_max_model_len=-1)
 
-        config = get_kv_cache_configs(vllm_config, [specs], [available])[0]
+        config = get_kv_cache_configs(
+            vllm_config,
+            [specs],
+            [available],
+            get_global_kv_cache_groups(vllm_config, [specs]),
+        )[0]
 
         capacity, _ = get_kv_cache_capacity(vllm_config, config)
         assert vllm_config.model_config.max_model_len < self._DERIVED_MAX_LEN
@@ -2516,7 +2522,12 @@ class TestAutoFitMaxModelLenChain:
             original_max_model_len=self._DERIVED_MAX_LEN
         )
 
-        config = get_kv_cache_configs(vllm_config, [specs], [available])[0]
+        config = get_kv_cache_configs(
+            vllm_config,
+            [specs],
+            [available],
+            get_global_kv_cache_groups(vllm_config, [specs]),
+        )[0]
 
         full_groups = [
             group
@@ -2544,5 +2555,7 @@ class TestAutoFitMaxModelLenChain:
         available = self._PACKED_BLOCK_BYTES - 1
         vllm_config, specs = self.gemma4_config_and_specs(original_max_model_len=-1)
 
+        groups = get_global_kv_cache_groups(vllm_config, [specs])
+
         with pytest.raises(ValueError, match="Cannot auto-fit max_model_len"):
-            get_kv_cache_configs(vllm_config, [specs], [available])
+            get_kv_cache_configs(vllm_config, [specs], [available], groups)

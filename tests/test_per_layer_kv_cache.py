@@ -16,7 +16,8 @@ from vllm import SamplingParams
 from vllm.config import VllmConfig
 from vllm.v1.attention.backends.utils import record_kv_cache_layout
 from vllm.v1.core.kv_cache_manager import KVCacheManager
-from vllm.v1.core.kv_cache_utils import (
+from vllm.v1.core.kv_cache_planning import (
+    get_global_kv_cache_groups,
     get_kv_cache_config_from_groups,
     get_kv_cache_configs,
     get_kv_cache_groups,
@@ -75,6 +76,7 @@ def _make_uniform_olmo3_runner(*, disable_hybrid_manager: bool = False):
     config.model_config = SimpleNamespace(
         max_model_len=512,
         original_max_model_len=512,
+        supports_kv_cache_grouping=False,
     )
     config.scheduler_config.disable_hybrid_kv_cache_manager = disable_hybrid_manager
     config.scheduler_config.max_num_batched_tokens = 16
@@ -113,7 +115,12 @@ def test_uniform_olmo3_geometry_uses_window_groups(monkeypatch) -> None:
     assert sum(type(spec) is FullAttentionSpec for spec in specs.values()) == 2
     assert runner.scheduler_memory_reporting_mode() == "paged_attention_layout_budget"
     budget = runner.get_cache_block_size_bytes() * 64
-    grouped = get_kv_cache_configs(runner.vllm_config, [specs], [budget])[0]
+    grouped = get_kv_cache_configs(
+        runner.vllm_config,
+        [specs],
+        [budget],
+        get_global_kv_cache_groups(runner.vllm_config, [specs]),
+    )[0]
     grouped.kv_cache_layout = runner.cache_config.kv_cache_layout
     assert runner.paged_attention_runtime is None
     runner.initialize_kv_cache(grouped)
@@ -147,7 +154,12 @@ def test_uniform_olmo3_window_groups_release_old_blocks(monkeypatch) -> None:
     )
     specs = runner.get_kv_cache_spec()
     budget = runner.get_cache_block_size_bytes() * 64
-    grouped = get_kv_cache_configs(runner.vllm_config, [specs], [budget])[0]
+    grouped = get_kv_cache_configs(
+        runner.vllm_config,
+        [specs],
+        [budget],
+        get_global_kv_cache_groups(runner.vllm_config, [specs]),
+    )[0]
     grouped.kv_cache_layout = runner.cache_config.kv_cache_layout
     manager = KVCacheManager(
         grouped,
@@ -668,7 +680,12 @@ class TestUpstreamAttentionStorage:
             assert available == runner.cache_config.kv_cache_memory_bytes
 
         specs = runner.get_kv_cache_spec()
-        config = get_kv_cache_configs(runner.vllm_config, [specs], [available])[0]
+        config = get_kv_cache_configs(
+            runner.vllm_config,
+            [specs],
+            [available],
+            get_global_kv_cache_groups(runner.vllm_config, [specs]),
+        )[0]
         config.kv_cache_layout = runner.cache_config.kv_cache_layout
 
         assert runner.paged_attention_runtime is None
@@ -734,7 +751,12 @@ class TestUpstreamAttentionStorage:
 
         available = planner.determine_available_memory()
         specs = runner.get_kv_cache_spec()
-        config = get_kv_cache_configs(runner.vllm_config, [specs], [available])[0]
+        config = get_kv_cache_configs(
+            runner.vllm_config,
+            [specs],
+            [available],
+            get_global_kv_cache_groups(runner.vllm_config, [specs]),
+        )[0]
         config.kv_cache_layout = runner.cache_config.kv_cache_layout
         runner.initialize_kv_cache(config)
 
@@ -784,7 +806,12 @@ class TestUpstreamAttentionStorage:
 
         available = planner.determine_available_memory()
         specs = runner.get_kv_cache_spec()
-        config = get_kv_cache_configs(runner.vllm_config, [specs], [available])[0]
+        config = get_kv_cache_configs(
+            runner.vllm_config,
+            [specs],
+            [available],
+            get_global_kv_cache_groups(runner.vllm_config, [specs]),
+        )[0]
         config.kv_cache_layout = runner.cache_config.kv_cache_layout
 
         if explicit:
