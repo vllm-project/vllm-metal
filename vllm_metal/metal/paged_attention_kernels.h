@@ -114,8 +114,8 @@ struct NaxGqaScore {
 
 inline double nax_gqa_split_score(
     const NaxPrefillWork& baseline, const NaxPrefillWork& grouped,
-    int heads_per_group, double head_growth, double padding_savings,
-    double critical_savings) {
+    int heads_per_group, int heads, int gpu_cores, double head_growth,
+    double padding_savings, double critical_savings) {
   constexpr double kPaddingBenefit = 13;
   constexpr double kCriticalPathBenefit = 8;
   constexpr double kFullTileBenefit = 2.5;
@@ -123,9 +123,20 @@ inline double nax_gqa_split_score(
   constexpr double kStreamCost = 10;
   constexpr double kExtraStateCost = 3.5;
   constexpr double kGuardedQueryCost = 16;
+  constexpr double kSparseGridBenefit = 104;
+  constexpr double kStreamDepthCost = .038;
 
   const double extra_heads = std::max(0., head_growth);
-  const double benefit = kPaddingBenefit * padding_savings
+  const double full_blocks = std::max(int64_t(1), baseline.full_blocks);
+  const double full_grid_density = double(heads) * baseline.full_blocks / gpu_cores;
+  // Shared streams need multiple full blocks to amortize their cost. Their
+  // credit diminishes as the BQ64 grid fills or the KV stream grows deeper.
+  const double full_block_credit = std::max(0.,
+      kSparseGridBenefit * (full_blocks - 1) / (1 + full_grid_density)
+      - kStreamDepthCost * grouped.stream)
+      / (full_blocks * full_blocks * full_blocks);
+  const double benefit = full_block_credit * baseline.fast
+      + kPaddingBenefit * padding_savings
       + kCriticalPathBenefit * critical_savings + kFullTileBenefit * grouped.fast
       + kGuardedQueryBenefit * (baseline.guarded_q - grouped.guarded_q);
   const double cost = (kStreamCost / heads_per_group
@@ -242,8 +253,8 @@ inline NaxGqaScore nax_gqa_work_score(
         - std::min(int64_t(cores), baseline.groups)
         * heads_per_group * grouped.tail_stream;
     const double value = upstream_split
-        ? nax_gqa_split_score(baseline, grouped, heads_per_group, head_growth,
-                             padding_savings, critical_savings)
+        ? nax_gqa_split_score(baseline, grouped, heads_per_group, heads, cores,
+                             head_growth, padding_savings, critical_savings)
         : nax_gqa_guarded_score(baseline, grouped, heads, cores, head_growth,
                                critical_savings, memory_work_fraction);
     if (dense_full && heads_per_group == kSupportedRatio)

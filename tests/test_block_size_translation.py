@@ -649,10 +649,61 @@ def test_nax_grouped_compares_against_host_selected_baseline(
 
 
 @pytest.mark.parametrize(
+    "heads,prefix,cores,widths",
+    [
+        (24, 0, 10, (1, 3, 1, 1)),
+        (24, 0, 20, (1, 3, 3, 1)),
+        (24, 0, 32, (1, 3, 3, 1)),
+        (24, 0, 40, (1, 3, 3, 3)),
+        (24, 8192, 10, (1, 1, 1, 1)),
+        (24, 8192, 20, (1, 3, 1, 1)),
+        (24, 8192, 32, (1, 3, 3, 1)),
+        (24, 8192, 40, (1, 3, 3, 1)),
+        (24, 8624, 10, (1, 1, 1, 1)),
+        (24, 8624, 20, (1, 3, 1, 1)),
+        (24, 8624, 32, (1, 3, 3, 1)),
+        (24, 8624, 40, (1, 3, 3, 1)),
+        (24, 31360, 10, (1, 1, 1, 1)),
+        (24, 31360, 20, (1, 1, 1, 1)),
+        (24, 31360, 32, (1, 1, 1, 1)),
+        (24, 31360, 40, (1, 1, 3, 1)),
+        (18, 0, 10, (1,)),
+        (18, 8192, 10, (1,)),
+        (18, 8624, 10, (1,)),
+        (18, 31360, 10, (1,)),
+    ],
+)
+def test_nax_grouped_full_blocks_compare_with_split(
+    nax_config_runner, heads, prefix, cores, widths
+):
+    """Retain split controls while admitting grouped work against real split."""
+    for q, width in zip((64, 128, 192, 256), widths, strict=False):
+        hint = nax_split_hint(
+            nax_tile_work([0, q], [prefix + q]),
+            256,
+            num_heads=heads,
+            num_kv_heads=heads // 6,
+            gpu_core_count=cores,
+        )
+        assert hint == 1
+        cfg, _ = nax_config_runner(
+            heads=heads,
+            kv_heads=heads // 6,
+            q=q,
+            prefix=prefix,
+            cores=cores,
+            upstream_split=hint,
+        )
+        assert cfg == ((64, 1, 128) if width == 1 else (16, width, 32 * width))
+
+
+@pytest.mark.parametrize(
     ("changes", "capacity", "expected"),
     [
         ({}, 95, (64, 1, 128)),
         ({}, 96, (16, 3, 96)),
+        ({"q": 192, "upstream_split": 1}, 95, (64, 1, 128)),
+        ({"q": 192, "upstream_split": 1}, 96, (16, 3, 96)),
         ({"q": 1568, "prefix": 31199, "upstream_split": 1}, 191, (64, 1, 128)),
         ({"q": 1568, "prefix": 31199, "upstream_split": 1}, 192, (16, 6, 192)),
     ],

@@ -15,7 +15,16 @@ from vllm_metal.attention.nax_split import (
 )
 
 
-@pytest.fixture(params=[(144, 3), (1328, 6)], ids=["h3", "h6"])
+@pytest.fixture(
+    params=[
+        (144, 31360, 3),
+        (1328, 31360, 6),
+        (128, 8624, 3),
+        (192, 31360, 3),
+        (193, 8192, 3),
+    ],
+    ids=["h3", "h6", "apc-split-h3", "full-block-split-h3", "tail-split-h3"],
+)
 def grouped_prefill_inputs(nax_prefill, request):
     """Exercise both native widths with shuffled, interleaved 784-token pages."""
     import os
@@ -23,8 +32,7 @@ def grouped_prefill_inputs(nax_prefill, request):
     if os.environ.get("VLLM_METAL_NAX_GQA_PREFILL", "1") != "1":
         pytest.skip("Grouped layout coverage requires GQA prefill enabled")
     ops = nax_prefill
-    query_tokens, width = request.param
-    prefix = 31360
+    query_tokens, prefix, width = request.param
     # Fix host planning to cover both widths on every NAX-capable test host.
     # This override is not a measurement of a 40-core GPU.
     ops._override_detected_gpu_core_count_for_test(40)
@@ -505,7 +513,7 @@ def test_nax_trace_reports_executed_layout(grouped_prefill_inputs):
             query_tokens // 16 + 1,
             16,
         )
-        assert event["max_seq_len"] == 31360 + query_tokens
+        assert event["max_seq_len"] == inputs["seq_lens"].max().item()
         assert event["q_block_offset"] == 0 and event["key_page_tokens"] == 784
         assert event["key_block_stride"] == 16 * event["key_stride1"]
         assert event["key_head_stride"] == event["key_stride2"] == 512
