@@ -545,12 +545,19 @@ class MetalPlatform(Platform):
         """
         envs.validate_environment()
 
+        import vllm.envs as vllm_envs
+
+        backend = envs.VLLM_METAL_BACKEND
+        if backend == "mlx" and vllm_envs.VLLM_USE_V2_MODEL_RUNNER is False:
+            raise ValueError(
+                "MLX Model Runner V1 has been removed. Unset "
+                "VLLM_USE_V2_MODEL_RUNNER or set VLLM_USE_V2_MODEL_RUNNER=1."
+            )
+
         from vllm_metal.compat import ensure_vllm_bytelevel_tokenizer_patch
 
         # Retry after vLLM is fully imported, before serving tokenizers are built.
         ensure_vllm_bytelevel_tokenizer_patch()
-
-        import vllm.envs as vllm_envs
 
         # vLLM 0.32 calls this hook before runner validation, with VllmConfig
         # fully imported; importing it during platform discovery is circular.
@@ -621,7 +628,6 @@ class MetalPlatform(Platform):
 
         logger.debug("Metal config: %s", config)
 
-        backend = envs.VLLM_METAL_BACKEND
         if model_config is not None and model_config.enable_sleep_mode:
             cls._check_sleep_mode_config(vllm_config, backend)
         if config.moe_expert_cache_bytes:
@@ -725,10 +731,6 @@ class MetalPlatform(Platform):
                 )
 
         speculative_config = vllm_config.speculative_config
-        if speculative_config is not None and speculative_config.method == "dspark":
-            from vllm_metal.patches.dspark_config import enable_dspark_for_metal_runner
-
-            enable_dspark_for_metal_runner()
         # Upstream skips verify_equal_vocab_size_if_draft_model() when this is set,
         # so a draft model with a different vocabulary reaches the proposer, which
         # verifies draft ids against the target vocabulary with no mapping.
@@ -965,21 +967,13 @@ class MetalPlatform(Platform):
             parallel_config.pipeline_parallel_size > 1
             and scheduler_config.async_scheduling
         ):
-            if vllm_envs.VLLM_USE_V2_MODEL_RUNNER:
-                # V2 auto-enables async before this hook; an explicit True is
-                # indistinguishable by now, so both must be overridden.
-                logger.warning(
-                    "Pipeline parallelism on Metal requires synchronous scheduling; "
-                    "disabling async scheduling for Model Runner V2."
-                )
-                scheduler_config.async_scheduling = False
-            else:
-                raise NotImplementedError(
-                    "Pipeline parallelism on Metal requires synchronous scheduling. "
-                    "Async scheduling delivers each sampled token to the first stage "
-                    "through a GPU broadcast that is not implemented, so the stage "
-                    "would starve. Re-run with --no-async-scheduling."
-                )
+            # V2 auto-enables async before this hook; an explicit True is
+            # indistinguishable by now, so both must be overridden.
+            logger.warning(
+                "Pipeline parallelism on Metal requires synchronous scheduling; "
+                "disabling async scheduling for Model Runner V2."
+            )
+            scheduler_config.async_scheduling = False
 
         # Speculative decoding is not implemented under pipeline parallelism:
         # the PP forward path produces no target hidden states and draft
@@ -1199,7 +1193,6 @@ class MetalPlatform(Platform):
         through ``take_draft_token_ids()``, which only the synchronous engine
         loop calls; async scheduling would schedule placeholder drafts.
         """
-        from vllm_metal.compat import ensure_vllm_v1_diffusion_guard_patch
         from vllm_metal.v1.diffusion import SUPPORTED_DIFFUSION_MODEL_TYPES
 
         model_type = vllm_config.model_config.hf_config.model_type
@@ -1273,7 +1266,6 @@ class MetalPlatform(Platform):
                 "Diffusion models on Metal require synchronous scheduling; "
                 "disabled async_scheduling."
             )
-        ensure_vllm_v1_diffusion_guard_patch()
 
     @staticmethod
     def _disable_hybrid_prefix_caching(vllm_config: "VllmConfig", reason: str) -> None:

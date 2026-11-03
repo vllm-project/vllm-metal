@@ -151,7 +151,7 @@ def test_lookahead_pages_are_not_prefix_hits():
     assert [pos for _, pos in model.writes] == list(range(16, len(prompt) + 3))
 
 
-@pytest.mark.parametrize("event", ["finished", "preempted", "resumed"])
+@pytest.mark.parametrize("event", ["finished", "preempted"])
 def test_exhaustion_and_lifecycle_return_lookahead_to_scheduler(event):
     manager = _manager(num_blocks=5)
     free_before = manager.block_pool.get_num_free_blocks()
@@ -170,7 +170,6 @@ def test_exhaustion_and_lifecycle_return_lookahead_to_scheduler(event):
     runner._reconcile_request_lifecycle(
         {"first"} if event == "finished" else set(),
         preempted_req_ids={"first"} if event == "preempted" else set(),
-        resumed_req_ids={"first"} if event == "resumed" else set(),
     )
     assert "first" not in proposer._draft_seq_lens
     assert "first" not in proposer._spec_kv_writes

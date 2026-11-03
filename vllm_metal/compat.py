@@ -111,33 +111,6 @@ def apply_compat_patches() -> None:
     _patch_transformers_exaone4_config()
 
 
-def ensure_vllm_v1_diffusion_guard_patch() -> None:
-    """Let Metal-served diffusion models past vLLM's V1-runner guard.
-
-    vLLM's V1 GPU runner lacks the canvas step protocol. Metal defaults to V2,
-    but users can explicitly select V1 with ``VLLM_USE_V2_MODEL_RUNNER=0``.
-    ``MetalModelRunner`` serves DiffusionGemma itself
-    (``vllm_metal/v1/diffusion.py``), so allow the supported model types through
-    that guard; any other diffusion model still fails upstream's check.
-
-    Called from ``MetalPlatform.check_and_update_config``, which runs inside
-    ``VllmConfig.__post_init__`` before the V1 validation: importing
-    ``vllm.config`` at plugin registration is circular.
-    """
-    from vllm_metal.patches.v1_runner_guard import allow_v1_runner_feature
-
-    def serves_diffusion_model(vllm_config: Any) -> bool:
-        from vllm_metal.v1.diffusion import SUPPORTED_DIFFUSION_MODEL_TYPES
-
-        model_config = vllm_config.model_config
-        return (
-            model_config is not None
-            and model_config.hf_config.model_type in SUPPORTED_DIFFUSION_MODEL_TYPES
-        )
-
-    allow_v1_runner_feature("diffusion models", serves_diffusion_model)
-
-
 def _patch_torch_mps_empty_host_cache() -> None:
     """Avoid PyTorch's unsupported MPS host-cache cleanup during vLLM exit."""
     import torch

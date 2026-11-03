@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""High-value contract tests for Metal V1 text pooling."""
+"""Contract tests for MLX text pooling."""
 
 from __future__ import annotations
 
