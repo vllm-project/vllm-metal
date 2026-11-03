@@ -415,6 +415,18 @@ class TestNativeSamplingKey:
         assert tokens[0].tolist() == tokens[1].tolist()
         assert tokens[0].tolist() != tokens[2].tolist()
 
+    @pytest.mark.parametrize("seeds", [(0, 42), (0, 0), (42, 42)])
+    def test_runner_keys_respect_engine_seed(self, seeds: tuple[int, int]) -> None:
+        keys = []
+        for seed in seeds:
+            runner = make_stub_runner(
+                _native_sampling_enabled=True, _native_sampling_step=11
+            )
+            runner.model_config.seed = seed
+            keys.append(runner._next_native_sample_key())
+        mx.eval(*keys)
+        assert (keys[0].tolist() == keys[1].tolist()) == (seeds[0] == seeds[1])
+
 
 class TestSeededNativeSampling:
     """Seeded requests draw from a seed-derived per-request MLX key."""
