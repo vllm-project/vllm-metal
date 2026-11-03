@@ -63,3 +63,33 @@ def get_mps_ops():
         except (OSError, RuntimeError) as exc:
             logger.warning("NAX unavailable; using the non-NAX fallback: %s", exc)
     return module.PagedAttention(str(path), nax_path, gpu_cores)
+
+
+@cache
+def get_mps_gdn_ops():
+    from vllm_metal import envs
+    from vllm_metal.metal.build import build_gdn_metallib, prepare_metallib
+
+    module = _load_mps_module()
+    if envs.VLLM_METAL_BUILD_FROM_SOURCE:
+        build_gdn_metallib()
+    path = prepare_metallib("gdn_kern")
+    return module.GDNLinearAttention(str(path))
+
+
+def gdn_linear_attention(q, k, v, g, beta, state_pool, cu_seqlens, slot_mapping, y):
+    """Enqueue GDN on PyTorch's MPS stream; mutate fp32 state and write Y.
+
+    Q/K are packed [T,Hk,Dk], V/Y [T,Hv,Dv], g/beta [T,Hv], all the same
+    fp32/fp16/bf16 dtype. Q/K must already be normalized and Q scaled. The
+    shader consumes exp(log_g), while delta_rule_step/chunked consume log_g.
+    State is [slots,Hv,Dv,Dk], with dense inner rows and an optional slot gap.
+
+    Metadata is packed int32 on MPS. Callers supply monotonic cu_seqlens from
+    0 to T and distinct valid slots or PAD (-1); metadata values are not read
+    back to the CPU. PAD and empty sequences leave state and Y untouched.
+    Inputs, state and Y must not overlap. Autograd is not supported.
+    """
+    get_mps_gdn_ops().gdn_linear_attention(
+        q, k, v, g, beta, state_pool, cu_seqlens, slot_mapping, y
+    )

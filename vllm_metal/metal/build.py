@@ -24,6 +24,7 @@ _THIS_DIR = Path(__file__).resolve().parent
 _SRC = _THIS_DIR / "mlx_bindings.cpp"
 _PAGED_ATTENTION = _THIS_DIR / "paged_attention.cpp"
 _GDN = _THIS_DIR / "gdn.cpp"
+_GDN_KERNELS = _THIS_DIR / "gdn_kernels.h"
 _MLA = _THIS_DIR / "mla.cpp"
 _INTERNAL = _THIS_DIR / "ops_internal.h"
 _MLX_PATCH = _THIS_DIR / "mlx_patch.cpp"
@@ -373,6 +374,40 @@ def build_metallibs() -> list[Path]:
     return list(digests)
 
 
+def build_gdn_metallib() -> Path:
+    """Build the shared GDN source for MPS without importing MLX's builder."""
+    name = "gdn_kern"
+    source = _metallib_source(name)
+    path = metallib_path(name)
+    if _metallib_is_current(name, source):
+        return path
+    with tempfile.TemporaryDirectory(prefix="vllm-metal-gdn-build-") as tmp:
+        metal = Path(tmp) / f"{name}.metal"
+        library = metal.with_suffix(".metallib")
+        metal.write_text(source)
+        subprocess.run(
+            [
+                "xcrun",
+                "-sdk",
+                "macosx",
+                "metal",
+                str(metal),
+                "-std=metal3.1",
+                "-fno-fast-math",
+                f"-fmodules-cache-path={tmp}/modules",
+                f"-mmacosx-version-min={MIN_MACOS_VERSION}",
+                "-o",
+                str(library),
+            ],
+            check=True,
+        )
+        path.write_bytes(library.read_bytes())
+    _stamp_path(path).write_text(_metallib_digest(name, source))
+    _toolchain_path(path).write_text(_metal_toolchain_id())
+    _build_config_path(path).write_text(_mlx_build_config())
+    return path
+
+
 def _package_version(name: str) -> str:
     from importlib.metadata import version
 
@@ -388,6 +423,7 @@ def _input_hash() -> str:
         _SRC,
         _PAGED_ATTENTION,
         _GDN,
+        _GDN_KERNELS,
         _MLA,
         _INTERNAL,
         _MLX_PATCH,
@@ -506,6 +542,7 @@ def _mps_input_hash() -> str:
     h = hashlib.sha256(str(torch.__version__).encode())
     for path in (
         _MPS_DIR / "mps_ops.mm",
+        _GDN_KERNELS,
         _KERNELS,
         _DEVICE,
         _DEVICE_SRC,

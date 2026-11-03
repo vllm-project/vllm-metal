@@ -6,11 +6,13 @@
 #include <ATen/mps/MPSStream.h>
 #include <ATen/native/mps/OperationUtils.h>
 #include <atomic>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
 
 #include "../metal/metal_device.h"
+#include "../metal/gdn_kernels.h"
 #include "../metal/paged_attention_kernels.h"
 
 using at::Tensor;
@@ -42,6 +44,16 @@ static void override_max_buffer_length_for_test(int64_t nbytes) {
         "test max buffer length override must be -1 or positive (got " +
         std::to_string(nbytes) + ")");
   g_test_max_buffer_length.store(nbytes, std::memory_order_relaxed);
+}
+
+static void buffer(id<MTLComputeCommandEncoder> enc, int i, const Tensor& t) {
+  [enc setBuffer:at::native::mps::getMTLBufferStorage(t)
+          offset:t.storage_offset() * t.element_size() atIndex:i];
+}
+
+template<typename T>
+static void scalar(id<MTLComputeCommandEncoder> enc, int i, T value) {
+  [enc setBytes:&value length:sizeof(T) atIndex:i];
 }
 
 class PagedAttention {
@@ -80,15 +92,6 @@ class PagedAttention {
     TORCH_CHECK(pso, "MPS attention pipeline: ", error.localizedDescription.UTF8String);
     pipelines_[key] = pso;
     return pso;
-  }
-
-  static void buffer(id<MTLComputeCommandEncoder> enc, int i, const Tensor& t) {
-    [enc setBuffer:at::native::mps::getMTLBufferStorage(t)
-            offset:t.storage_offset() * t.element_size() atIndex:i];
-  }
-  template<typename T>
-  static void scalar(id<MTLComputeCommandEncoder> enc, int i, T value) {
-    [enc setBytes:&value length:sizeof(T) atIndex:i];
   }
 
  public:
@@ -241,6 +244,104 @@ class PagedAttention {
   }
 };
 
+class GDNLinearAttention {
+  id<MTLLibrary> library_;
+  std::unordered_map<std::string, id<MTLComputePipelineState>> pipelines_;
+
+  id<MTLComputePipelineState> pipeline(const std::string& name) {
+    auto it = pipelines_.find(name);
+    if (it != pipelines_.end()) return it->second;
+    // GDN has no function constants.
+    auto fn = [library_ newFunctionWithName:
+        [NSString stringWithUTF8String:name.c_str()]];
+    TORCH_CHECK(fn, "Missing MPS GDN function: ", name);
+    NSError* error = nil;
+    auto pso = [at::mps::getCurrentMPSStream()->device()
+        newComputePipelineStateWithFunction:fn error:&error];
+    [fn release];
+    TORCH_CHECK(pso, "MPS GDN pipeline: ", error.localizedDescription.UTF8String);
+    pipelines_[name] = pso;
+    return pso;
+  }
+
+ public:
+  explicit GDNLinearAttention(const std::string& path) {
+    @autoreleasepool {
+      NSError* error = nil;
+      library_ = [at::mps::getCurrentMPSStream()->device()
+          newLibraryWithURL:[NSURL fileURLWithPath:
+              [NSString stringWithUTF8String:path.c_str()]] error:&error];
+      TORCH_CHECK(library_, "Cannot load GDN metallib: ",
+                  error.localizedDescription.UTF8String);
+    }
+  }
+  ~GDNLinearAttention() {
+    for (auto& p : pipelines_) [p.second release];
+    [library_ release];
+  }
+
+  void gdn_linear_attention(
+      const Tensor& q, const Tensor& k, const Tensor& v,
+      const Tensor& g, const Tensor& beta, const Tensor& state_pool,
+      const Tensor& cu_seqlens, const Tensor& slot_mapping, const Tensor& y) {
+    for (auto* t : {&q, &k, &v, &g, &beta, &state_pool,
+                   &cu_seqlens, &slot_mapping, &y})
+      TORCH_CHECK(t->is_mps(), "All GDN buffers must be on MPS");
+    TORCH_CHECK(q.scalar_type() == at::kFloat || q.scalar_type() == at::kHalf ||
+                q.scalar_type() == at::kBFloat16, "GDN requires fp32/fp16/bf16 inputs");
+    for (auto* t : {&q, &k, &v, &g, &beta, &y}) {
+      TORCH_CHECK(t->is_contiguous() && t->scalar_type() == q.scalar_type(),
+                  "GDN Q/K/V/g/beta/Y must be packed and have the same dtype");
+      TORCH_CHECK(t->numel() <= std::numeric_limits<int>::max(),
+                  "GDN packed input/output exceeds int32 indexing");
+    }
+    TORCH_CHECK(q.dim() == 3 && k.sizes() == q.sizes() && v.dim() == 3 &&
+                v.size(0) == q.size(0) && y.sizes() == v.sizes(),
+                "GDN requires Q/K [T,Hk,Dk] and V/Y [T,Hv,Dv]");
+    const int tokens = q.size(0), Hk = q.size(1), Dk = q.size(2);
+    const int Hv = v.size(1), Dv = v.size(2);
+    TORCH_CHECK(g.dim() == 2 && g.size(0) == tokens && g.size(1) == Hv &&
+                beta.sizes() == g.sizes(), "GDN g/beta must be [T,Hv]");
+    TORCH_CHECK(state_pool.scalar_type() == at::kFloat && state_pool.dim() == 4 &&
+                state_pool.size(0) > 0 && state_pool.size(1) == Hv &&
+                state_pool.size(2) == Dv && state_pool.size(3) == Dk &&
+                state_pool.stride(3) == 1 && state_pool.stride(2) == Dk &&
+                state_pool.stride(1) == int64_t(Dv) * Dk,
+                "GDN state must be fp32 [slots,Hv,Dv,Dk] with dense inner rows");
+    TORCH_CHECK(cu_seqlens.scalar_type() == at::kInt &&
+                slot_mapping.scalar_type() == at::kInt &&
+                cu_seqlens.dim() == 1 && slot_mapping.dim() == 1 &&
+                cu_seqlens.is_contiguous() && slot_mapping.is_contiguous() &&
+                slot_mapping.numel() <= std::numeric_limits<int>::max() &&
+                cu_seqlens.numel() == slot_mapping.numel() + 1,
+                "GDN metadata must be packed int32 cu_seqlens [B+1], slots [B]");
+    const std::string dt = q.scalar_type() == at::kFloat ? "float" :
+        q.scalar_type() == at::kHalf ? "half" : "bfloat16_t";
+    const auto plan = kernels::make_gdn_linear_attention_plan(
+        dt, "float", slot_mapping.numel(), Hk, Hv, Dk, Dv, state_pool.stride(0));
+    if (plan.num_requests == 0 || tokens == 0) return;
+    auto kernel = pipeline(plan.kernel_name);
+    const auto threads = static_cast<NSUInteger>(plan.threads_x);
+    TORCH_CHECK(kernel.threadExecutionWidth == threads &&
+                kernel.maxTotalThreadsPerThreadgroup >= threads,
+                "GDN requires a 32-lane SIMD group");
+    auto stream = at::mps::getCurrentMPSStream();
+    at::mps::dispatch_sync_with_rethrow(stream->queue(), ^{
+      @autoreleasepool {
+        auto enc = stream->commandEncoder();
+        [enc setComputePipelineState:kernel];
+        buffer(enc, 0, q); buffer(enc, 1, k); buffer(enc, 2, v);
+        buffer(enc, 3, g); buffer(enc, 4, beta); buffer(enc, 5, state_pool);
+        buffer(enc, 6, cu_seqlens); buffer(enc, 7, slot_mapping); buffer(enc, 8, y);
+        kernels::bind_gdn_linear_attention_params(
+            plan, [&](int index, auto value) { scalar(enc, index, value); });
+        [enc dispatchThreadgroups:MTLSizeMake(plan.grid_x, 1, plan.grid_z)
+            threadsPerThreadgroup:MTLSizeMake(plan.threads_x, 1, 1)];
+      }
+    });
+  }
+};
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("detected_gpu_core_count", &hardware::detected_gpu_core_count);
   m.def("gpu_core_count", &hardware::gpu_core_count);
@@ -253,4 +354,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   pybind11::class_<PagedAttention>(m, "PagedAttention")
       .def(pybind11::init<const std::string&, const std::string&, int>())
       .def("forward", &PagedAttention::forward);
+  pybind11::class_<GDNLinearAttention>(m, "GDNLinearAttention")
+      .def(pybind11::init<const std::string&>())
+      .def("gdn_linear_attention", &GDNLinearAttention::gdn_linear_attention);
 }
