@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""End-to-end lossless check: n-gram speculative decode on hybrid GDN models.
+"""End-to-end lossless check: speculative decode on hybrid GDN models.
 
 Runs two arms of the same generate matrix in child processes (Metal is not
 fork-safe): a plain greedy reference, and the same run with
-``--speculative-config method=ngram``. Asserts token identity across arms,
+``--speculative-config method=ngram`` (default) or ``method=mtp`` (Qwen3.5's
+own MTP layer; the checkpoint must keep its ``mtp.*`` tensors, or pass a split
+drafter with ``--draft-model``). Asserts token identity across arms,
 and — via a spy on verify — that the speculative arm actually exercised both
 acceptance paths (a full-span accept and a partial accept), so the GDN state
 staging/fixup in ``gdn_spec`` is on the tested path, not just configured.
@@ -13,6 +15,7 @@ Arm pairs run under both mamba cache modes: ``none`` (per-request state) and
 
 Usage:
     python tools/hybrid_spec_parity.py --model /path/to/Qwen3.5-0.8B
+    python tools/hybrid_spec_parity.py --model Qwen/Qwen3.5-0.8B --method mtp
 """
 
 from __future__ import annotations
@@ -95,11 +98,34 @@ def build_restore_prompt(prompt, generated, checkpoint):
     return history[: checkpoint + 1]
 
 
-def run_child(model, enable_spec, prefix_caching, queue, canonical_prompts=None):
+def speculative_config(method, draft_model=None):
+    if method == "ngram":
+        return {
+            "method": "ngram",
+            "num_speculative_tokens": NUM_SPECULATIVE_TOKENS,
+            "prompt_lookup_min": 2,
+            "prompt_lookup_max": 3,
+        }
+    config = {"method": "mtp", "num_speculative_tokens": NUM_SPECULATIVE_TOKENS}
+    if draft_model is not None:
+        config["model"] = draft_model
+    return config
+
+
+def run_child(
+    model,
+    enable_spec,
+    prefix_caching,
+    queue,
+    canonical_prompts=None,
+    method="ngram",
+    draft_model=None,
+):
     _child_env()
     from vllm import LLM, SamplingParams
 
     import vllm_metal.v1.ngram_proposer as ng_mod
+    import vllm_metal.v1.qwen_mtp_proposer as mtp_mod
     import vllm_metal.v1.spec_decode as sd_mod
 
     active_tag = "initialization"
@@ -137,6 +163,7 @@ def run_child(model, enable_spec, prefix_caching, queue, canonical_prompts=None)
     mr_mod.MetalModelRunner._handle_new_requests = hnr_spy
     orig_propose = ng_mod.NgramProposer.propose
     orig_lookup = ng_mod.VllmNgramProposer.propose
+    orig_mtp_propose = mtp_mod.QwenMTPProposer.propose
     raw_drafts: list[list[int]] = []
     cap_events: list[dict] = []
 
@@ -168,8 +195,27 @@ def run_child(model, enable_spec, prefix_caching, queue, canonical_prompts=None)
             )
         return out
 
+    def mtp_propose_spy(self, ctx):
+        out = orig_mtp_propose(self, ctx)
+        # MTP always drafts num_speculative_tokens before the caps apply.
+        if active_tag == "edge_tail" and ctx.draft_caps and out:
+            assert len(ctx.draft_caps) == 1
+            req_id, cap = next(iter(ctx.draft_caps.items()))
+            final = dict(zip(out.req_ids, out.draft_token_ids, strict=True))
+            if req_id in final:
+                cap_events.append(
+                    {
+                        "start": len(ctx.request_states[req_id].token_ids) - 1,
+                        "raw": ctx.num_speculative_tokens,
+                        "cap": cap,
+                        "drafts": len(final[req_id]),
+                    }
+                )
+        return out
+
     ng_mod.VllmNgramProposer.propose = lookup_spy
     ng_mod.NgramProposer.propose = propose_spy
+    mtp_mod.QwenMTPProposer.propose = mtp_propose_spy
     try:
         kwargs = {
             "model": model,
@@ -188,12 +234,7 @@ def run_child(model, enable_spec, prefix_caching, queue, canonical_prompts=None)
             "block_size": 160,
         }
         if enable_spec:
-            kwargs["speculative_config"] = {
-                "method": "ngram",
-                "num_speculative_tokens": NUM_SPECULATIVE_TOKENS,
-                "prompt_lookup_min": 2,
-                "prompt_lookup_max": 3,
-            }
+            kwargs["speculative_config"] = speculative_config(method, draft_model)
         llm = LLM(**kwargs)
 
         tok = llm.get_tokenizer()
@@ -250,6 +291,7 @@ def run_child(model, enable_spec, prefix_caching, queue, canonical_prompts=None)
         mr_mod.MetalModelRunner._handle_new_requests = orig_hnr
         ng_mod.NgramProposer.propose = orig_propose
         ng_mod.VllmNgramProposer.propose = orig_lookup
+        mtp_mod.QwenMTPProposer.propose = orig_mtp_propose
 
     queue.put(
         {
@@ -334,7 +376,7 @@ def compare_arms(reference, spec, prefix_caching):
     }
 
 
-def run_pair(model, prefix_caching):
+def run_pair(model, prefix_caching, method="ngram", draft_model=None):
     ctx = mp.get_context("spawn")
     arms: dict[bool, dict] = {}
     for enable in (False, True):
@@ -347,6 +389,8 @@ def run_pair(model, prefix_caching):
                 prefix_caching,
                 queue,
                 arms[False]["prompts"] if enable else None,
+                method,
+                draft_model,
             ),
         )
         proc.start()
@@ -382,16 +426,22 @@ def run_pair(model, prefix_caching):
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=MODEL_DEFAULT)
+    parser.add_argument("--method", choices=("ngram", "mtp"), default="ngram")
+    parser.add_argument(
+        "--draft-model", help="Split Qwen MTP drafter (method mtp only)"
+    )
     parser.add_argument(
         "--output", type=Path, help="Save token IDs and coverage evidence as JSON"
     )
     args = parser.parse_args()
 
     ok = True
-    reports = {"model": args.model, "modes": {}}
+    if args.draft_model and args.method != "mtp":
+        parser.error("--draft-model requires --method mtp")
+    reports = {"model": args.model, "method": args.method, "modes": {}}
     for prefix_caching in (False, True):
         mode = "align" if prefix_caching else "none"
-        report = run_pair(args.model, prefix_caching)
+        report = run_pair(args.model, prefix_caching, args.method, args.draft_model)
         reports["modes"][mode] = report
         if args.output:
             args.output.parent.mkdir(parents=True, exist_ok=True)

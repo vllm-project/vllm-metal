@@ -125,6 +125,7 @@ from vllm_metal.v1.proposer import (
     MetalProposer,
     ProposeContext,
 )
+from vllm_metal.v1.qwen_mtp_proposer import QwenMTPProposer, is_qwen_mtp
 from vllm_metal.v1.sampling_batch import (
     SamplingBatch,
     create_request_generator,
@@ -1378,6 +1379,10 @@ class MetalModelRunner:
             return
         if Gemma4MTPAssistantSource.is_gemma4_mtp(spec):
             self._drafter = Gemma4MTPProposer(self)
+        elif is_qwen_mtp(spec):
+            # The MTP layer keeps request-local KV only, so num_blocks and
+            # block_size are unused here.
+            self._drafter = QwenMTPProposer.build(self)
         elif spec.method in ("dflash", "dspark"):
             from vllm_metal.v1.block_draft_proposer import BlockDraftProposer
 
@@ -1407,7 +1412,8 @@ class MetalModelRunner:
         else:
             raise NotImplementedError(
                 f"Speculative method {spec.method!r} is not supported on Metal "
-                "(supported: Gemma4 MTP, draft_model, ngram, dflash, dspark)."
+                "(supported: Gemma4 MTP, Qwen3.5 MTP, draft_model, ngram, dflash, "
+                "dspark)."
             )
 
     def get_draft_model_stats(self) -> dict[str, int] | None:
