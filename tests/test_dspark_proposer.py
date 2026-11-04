@@ -14,8 +14,9 @@ import pytest
 import torch
 from vllm import SamplingParams
 from vllm.config import VllmConfig
+from vllm.config.compilation import CUDAGraphMode
 
-from tests.test_block_draft_proposer import _features, _prefill
+from tests.test_block_draft_proposer import _assert_committed, _features, _prefill
 from tests.test_dspark_paged import make_cache
 from tests.test_dspark_quantization import make_model
 from vllm_metal.patches.dspark_config import enable_dspark_for_metal_runner
@@ -23,7 +24,7 @@ from vllm_metal.v1 import dspark_proposer
 from vllm_metal.v1.dspark_adaptive import AdaptiveVerificationProfile, VerificationCosts
 from vllm_metal.v1.dspark_proposer import DSparkProposer
 from vllm_metal.v1.model_runner import RequestState
-from vllm_metal.v1.spec_decode import SpeculativeDecodeController
+from vllm_metal.v1.spec_decode import PagedDecodeSegment, SpeculativeDecodeController
 
 
 @pytest.mark.parametrize("width", [1, 3, 7])
@@ -386,6 +387,42 @@ def test_adaptive_profile_rejects_stale_identity_and_incomplete_costs(tmp_path):
         load(data["identity"])
 
 
+@pytest.mark.parametrize("method", ["dspark", "dflash"])
+@pytest.mark.parametrize(
+    "worker", ["vllm_metal.v1.worker.MetalWorker", "vllm.v1.worker.gpu_worker.Worker"]
+)
+def test_only_native_dspark_can_adapt_without_cuda_graphs(monkeypatch, method, worker):
+    original = VllmConfig._validate_adaptive_verification
+    original = getattr(original, "__wrapped__", original)
+    monkeypatch.setattr(VllmConfig, "_validate_adaptive_verification", original)
+    config = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            method=method, enable_adaptive_verification=True
+        ),
+        parallel_config=SimpleNamespace(worker_cls=worker, pipeline_parallel_size=1),
+        lora_config=None,
+        compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode.NONE),
+    )
+    with pytest.raises(ValueError, match="full CUDA graphs"):
+        original(config)
+    enable_dspark_for_metal_runner()
+    installed = VllmConfig._validate_adaptive_verification
+    enable_dspark_for_metal_runner()
+    assert VllmConfig._validate_adaptive_verification is installed
+    if method == "dspark" and worker == "vllm_metal.v1.worker.MetalWorker":
+        installed(config)
+        config.lora_config = object()
+        with pytest.raises(ValueError, match="LoRA"):
+            installed(config)
+        config.lora_config = None
+        config.parallel_config.pipeline_parallel_size = 2
+        with pytest.raises(ValueError, match="pipeline parallelism"):
+            installed(config)
+    else:
+        with pytest.raises(ValueError, match="full CUDA graphs"):
+            installed(config)
+
+
 def test_adaptive_proposer_returns_prefix_of_full_block_at_short_output_budget():
     model, cache = make_cache()
     model.confidence_head.proj.weight = mx.zeros_like(model.confidence_head.proj.weight)
@@ -416,6 +453,56 @@ def test_adaptive_proposer_returns_prefix_of_full_block_at_short_output_budget()
     assert actual.draft_token_ids == [expected[:1]]
     assert proposer._valid_ends == {"r": 4}
     assert torch.all(cache.storage.tensors["target"] == 7)
+
+
+def test_zero_admission_commits_target_context_before_drafting_resumes():
+    model, cache = make_cache()
+    expensive = VerificationCosts(0, (1.0,), ((1.0,) + (100.0,) * 7,))
+    proposer = DSparkProposer(
+        model,
+        num_draft_tokens=7,
+        controller=SpeculativeDecodeController(),
+        adaptive_profile=AdaptiveVerificationProfile((1.0,) * 7, (expensive,)),
+    )
+    proposer.bind_cache(cache.storage, group_index=1, max_model_len=64)
+    state = RequestState(
+        token_ids=[1] * 4 + [4],
+        prompt_len=4,
+        sampling_params=SamplingParams(temperature=0),
+        block_ids=[[0], [3]],
+    )
+    prefix = _features(4)
+    ctx = _prefill(state, prefix, 0, True)
+    assert proposer.propose(ctx).draft_token_ids == [[]]
+    state.token_ids.append(5)
+    next_features = _features(1)
+    ctx = replace(
+        ctx,
+        target_aux_hidden_states=next_features,
+        decode_reqs=[("r", state)],
+        decode_segments=[PagedDecodeSegment("r", (4,), 0, 1, (), 4, ((0,), (3,)))],
+        decode_token_ids=[[5]],
+        prefill_reqs=[],
+        prefill_token_ids=[],
+        prefill_result_modes=[],
+        cu_seqlens=[0, 1],
+        num_decode_segments=1,
+    )
+    # The next cost decision can admit drafts again after a target-only step.
+    proposer.adaptive_profile = AdaptiveVerificationProfile(
+        (1.0,) * 7, (VerificationCosts(0, (1.0,), ((1.0,) * 8,)),)
+    )
+    actual = proposer.propose(ctx)
+    all_features = [
+        mx.concatenate([old, new])
+        for old, new in zip(prefix, next_features, strict=True)
+    ]
+    expected = model.draft(
+        mx.array([5]), [f[None] for f in all_features], num_draft_tokens=7
+    )[0].tolist()[0]
+    assert actual.draft_token_ids == [expected[:3]]
+    assert proposer._valid_ends == {"r": 5}
+    _assert_committed(proposer, state.block_ids[1], all_features)
 
 
 def test_dspark_width_rejection_does_not_write_shared_storage():
