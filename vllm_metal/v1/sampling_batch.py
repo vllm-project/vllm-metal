@@ -232,7 +232,7 @@ class SamplingBatch:
         *,
         allow_seed: bool = False,
     ) -> bool:
-        """Whether MLX categorical sampling matches *sampling_params_list*.
+        """Whether the native MLX sampler supports *sampling_params_list*.
 
         Requests must use plain temperature/top-k/top-p/min-p sampling; the
         mask is built per row, so rows may mix greedy (temperature 0) with
@@ -299,12 +299,11 @@ class SamplingBatch:
         instead of the shared step key; without it, seeded rows are rejected
         as a gate desync.
 
-        Uses greedy argmax when the batch allows it, otherwise the temperature/
-        top-k/top-p categorical graph over the vocab-sliced logits (unlike
-        argmax, categorical can select a padded lm_head column). The caller
-        owns evaluation and RNG state; ``next_native_rng_key`` is consumed only
-        when an unseeded random row draws from it, so all-seeded batches leave
-        the engine's native sampling counter untouched.
+        Uses greedy argmax when the batch allows it. Otherwise the shared Metal
+        sampler draws from the first ``vocab_size`` logits to exclude padded
+        LM-head columns. The caller owns evaluation and RNG state.
+        ``next_native_rng_key`` advances the engine counter only when an unseeded
+        random row needs a draw.
         Raises on batches neither native path admits — the caller must not
         let those reach here.
         """

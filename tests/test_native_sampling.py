@@ -245,10 +245,7 @@ class TestTopKTopPMaskParity:
 
 class TestMlxRandomTokens:
     def test_greedy_row_with_tied_maximum_stays_on_the_argmax(self) -> None:
-        """A greedy row must resolve to the argmax even when the top logits
-        tie. Masking it by value keeps every tied token, and the categorical
-        draw then picks between them; vLLM's greedy path takes the argmax.
-        """
+        """A greedy row in a mixed batch picks the lowest token ID on an exact tie."""
         logits = mx.array([[1.0, 5.0, 5.0, 0.0], [1.0, 2.0, 3.0, 4.0]])
         params = [
             _random_params(temperature=0.0),
