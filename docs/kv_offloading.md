@@ -45,7 +45,7 @@ activations), or one host chunk if that is larger, and leaves room for one
 reserved. The startup log says when the pool is changed. Pass the flag to size
 it yourself.
 
-The host pool comes out of `--gpu-memory-utilization` (see
+By default the host pool comes out of `--gpu-memory-utilization` (see
 [Configuration](configuration.md#kv-cache-memory-settings)), which is the total
 Metal budget including weights. A larger pool means a smaller KV cache, not
 extra memory. The startup memory breakdown shows it as `kv_offload_pool=`. A
@@ -54,8 +54,10 @@ startup, after the weights load, with the breakdown and the fix. 8 GiB was
 enough for the Qwen3-32B benchmark in #737.
 
 With `--kv-cache-memory-bytes` the KV cache keeps that size and the pool is
-extra memory on top of it. The default pool is still capped at a quarter of
-that size.
+extra memory on top of it. The default pool is at most a quarter of the KV
+cache, or one host chunk if that is larger. For example, an 8 GiB KV cache with
+the default chunk size gets a pool of up to 2 GiB, so the two need up to 10 GiB
+plus weights and activations.
 
 The pool takes memory only as chunks are stored. Level 1 sleep frees it (see
 [Sleep mode](configuration.md#sleep-mode)). MLA models do not support sleep
