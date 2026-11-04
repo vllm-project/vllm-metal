@@ -196,6 +196,8 @@ def validate_args(args, parser):
             "dflash": "z-lab/Qwen3-4B-DFlash-b16",
             "dspark": "deepseek-ai/dspark_qwen3_4b_block7",
             "draft_model": "Qwen/Qwen3-0.6B",
+            # Qwen3.5 MTP drafts with the target's own mtp.* layer.
+            "mtp": args.target,
         }[args.method]
     if args.worker not in (None, "native", "target", args.method, "replay"):
         parser.error("Draft worker must match --method")
