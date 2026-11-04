@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """DSpark serving alignment, admission and vLLM runner compatibility."""
 
+import itertools
+import json
+import math
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -17,6 +20,7 @@ from tests.test_dspark_paged import make_cache
 from tests.test_dspark_quantization import make_model
 from vllm_metal.patches.dspark_config import enable_dspark_for_metal_runner
 from vllm_metal.v1 import dspark_proposer
+from vllm_metal.v1.dspark_adaptive import AdaptiveVerificationProfile, VerificationCosts
 from vllm_metal.v1.dspark_proposer import DSparkProposer
 from vllm_metal.v1.model_runner import RequestState
 from vllm_metal.v1.spec_decode import SpeculativeDecodeController
@@ -75,7 +79,6 @@ def test_dspark_rejects_width_outside_its_trained_block(width):
 @pytest.mark.parametrize(
     "option,value",
     [
-        ("enable_adaptive_verification", True),
         ("draft_sample_method", "probabilistic"),
         ("rejection_sample_method", "block"),
         ("rejection_sample_method", "synthetic"),
@@ -296,13 +299,123 @@ def test_config_bridge_preserves_other_runner_rejections(monkeypatch, method, wo
         if not (
             worker == "vllm_metal.v1.worker.MetalWorker"
             and method == "dspark"
-            and item == "dspark speculative decoding"
+            and item in ("dspark speculative decoding", "adaptive draft verification")
         )
     ]
     assert after == expected
     assert "prefill context parallel" in after
-    if method is not None:
+    if method is not None and not (
+        method == "dspark" and worker == "vllm_metal.v1.worker.MetalWorker"
+    ):
         assert "adaptive draft verification" in after
+
+
+def test_adaptive_prefix_budget_matches_exhaustive_expected_throughput():
+    """Search past local rate dips, enforce capacities, and preserve prefixes."""
+    costs = VerificationCosts(
+        128, (1.0, 2.0), ((8.0, 8.1, 8.2, 8.3), (6.0, 20.0, 20.0, 6.5, 6.6, 8.0, 20.0))
+    )
+    profile = AdaptiveVerificationProfile((1.0, 1.0, 1.0), (costs,))
+    logits = [[2.0, 0.0, -1.0], [1.0, 3.0, -2.0]]
+    for capacities in itertools.product(range(4), repeat=2):
+        admitted = profile.admit(logits, capacities, 128)
+
+        def score(lengths):
+            expected = 2.0
+            for row, length in zip(logits, lengths, strict=True):
+                survival = 1.0
+                for value in row[:length]:
+                    survival *= 1 / (1 + math.exp(-value))
+                    expected += survival
+            return expected / (2 + costs.verify_ms[1][sum(lengths)])
+
+        exhaustive = max(
+            score(lengths)
+            for lengths in itertools.product(*(range(c + 1) for c in capacities))
+        )
+        assert score(admitted) == pytest.approx(exhaustive)
+        assert all(
+            0 <= value <= cap for value, cap in zip(admitted, capacities, strict=True)
+        )
+
+
+def test_adaptive_budget_uses_calibration_and_interpolated_context_cost():
+    cheap = VerificationCosts(0, (1.0,), ((1.0, 1.0, 1.0),))
+    costly = VerificationCosts(100, (1.0,), ((1.0, 5.0, 5.0),))
+    profile = AdaptiveVerificationProfile((1.0, 1.0), (cheap, costly))
+    assert profile.admit([[0.0, 0.0]], [2], 0) == [2]
+    assert profile.admit([[0.0, 0.0]], [2], 100) == [0]
+    assert profile.admit([[0.0, 0.0]], [2], 50) == [0]
+    costs = VerificationCosts(0, (1.0,), ((1.0, 1.5, 3.0),))
+    confident = AdaptiveVerificationProfile((1.0, 1.0), (costs,))
+    calibrated = replace(confident, temperatures=(0.1, 0.1))
+    assert confident.admit([[-1.0, -1.0]], [2], 0) == [1]
+    assert calibrated.admit([[-1.0, -1.0]], [2], 0) == [0]
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), -float("inf")])
+def test_adaptive_rejects_nonfinite_confidence(bad):
+    profile = AdaptiveVerificationProfile(
+        (1.0,), (VerificationCosts(0, (1.0,), ((1.0, 1.0),)),)
+    )
+    with pytest.raises(ValueError, match="finite"):
+        profile.admit([[bad]], [1], 0)
+
+
+def test_adaptive_profile_rejects_stale_identity_and_incomplete_costs(tmp_path):
+    data = {
+        "version": 1,
+        "identity": {"target": "revision-1"},
+        "temperatures": [1.0, 2.0],
+        "costs": [{"context": 0, "draft_ms": [1.0], "verify_ms": [[1.0, 2.0, 3.0]]}],
+    }
+    path = tmp_path / "profile.json"
+    path.write_text(json.dumps(data))
+
+    def load(identity):
+        return AdaptiveVerificationProfile.load(
+            str(path), identity=identity, width=2, max_num_seqs=1
+        )
+
+    assert load(data["identity"]).temperatures == (1.0, 2.0)
+    with pytest.raises(ValueError, match="does not match"):
+        load({"target": "revision-2"})
+    data["costs"][0]["verify_ms"][0].pop()
+    path.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="finite positive"):
+        load(data["identity"])
+
+
+def test_adaptive_proposer_returns_prefix_of_full_block_at_short_output_budget():
+    model, cache = make_cache()
+    model.confidence_head.proj.weight = mx.zeros_like(model.confidence_head.proj.weight)
+    model.confidence_head.proj.bias = mx.zeros_like(model.confidence_head.proj.bias)
+    costs = VerificationCosts(
+        0, (1.0,), ((1.0, 1.0, 1.0, 1.0, 100.0, 100.0, 100.0, 100.0),)
+    )
+    profile = AdaptiveVerificationProfile((1.0,) * 7, (costs,))
+    proposer = DSparkProposer(
+        model,
+        num_draft_tokens=7,
+        controller=SpeculativeDecodeController(),
+        adaptive_profile=profile,
+    )
+    proposer.bind_cache(cache.storage, group_index=1, max_model_len=64)
+    features = _features(4)
+    state = RequestState(
+        token_ids=[1] * 4 + [4],
+        prompt_len=4,
+        sampling_params=SamplingParams(temperature=0, max_tokens=3),
+        generated_tokens=1,
+        block_ids=[[0], [3]],
+    )
+    actual = proposer.propose(_prefill(state, features, 0, True))
+    expected = model.draft(
+        mx.array([4]), [f[None] for f in features], num_draft_tokens=7
+    )[0].tolist()[0]
+    assert actual.draft_token_ids == [expected[:1]]
+    assert proposer._valid_ends == {"r": 4}
+    assert torch.all(cache.storage.tensors["target"] == 7)
 
 
 def test_dspark_width_rejection_does_not_write_shared_storage():

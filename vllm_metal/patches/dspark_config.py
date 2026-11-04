@@ -23,3 +23,4 @@ def enable_dspark_for_metal_runner() -> None:
     Install from platform config validation, after VllmConfig is fully imported.
     """
     allow_v1_runner_feature("dspark speculative decoding", _serves_dspark)
+    allow_v1_runner_feature("adaptive draft verification", _serves_dspark)

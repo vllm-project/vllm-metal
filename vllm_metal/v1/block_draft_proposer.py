@@ -26,7 +26,10 @@ if TYPE_CHECKING:
     from vllm_metal.v1.model_runner import MetalModelRunner
 
 
-DraftForward = Callable[[mx.array, Sequence[tuple[Sequence[int], int]]], mx.array]
+DraftForward = Callable[
+    [mx.array, Sequence[tuple[Sequence[int], int]]],
+    tuple[mx.array, mx.array | None],
+]
 
 
 class BlockDraftProposer(ABC):
@@ -182,6 +185,17 @@ class BlockDraftProposer(ABC):
         self, anchors: mx.array, features: Sequence[mx.array]
     ) -> None: ...
 
+    def _draft_width(self, limit: int) -> int:
+        return limit
+
+    def _admit_drafts(
+        self,
+        confidence: mx.array | None,
+        rows: Sequence[tuple[Sequence[int], int]],
+        limits: list[int],
+    ) -> list[int]:
+        return limits
+
     def propose(self, ctx: ProposeContext) -> DraftTokenIds | None:
         cache = self.cache
         if cache is None:
@@ -278,7 +292,10 @@ class BlockDraftProposer(ABC):
                 # limit and have no local coverage entry. It remains a
                 # target-only request without reading unwritten draft KV.
                 end = len(state.token_ids) - 1
-                if end + width + self.extra_slots > cache.max_model_len:
+                if (
+                    end + self._draft_width(width) + self.extra_slots
+                    > cache.max_model_len
+                ):
                     continue
                 if end != self._valid_ends.get(req_id, 0):
                     raise RuntimeError(
@@ -293,11 +310,18 @@ class BlockDraftProposer(ABC):
             return None
         # Keep one rectangular draft batch, bounded by its largest remaining
         # budget. Shorter requests return only the prefix they can verify.
-        width = max(limits)
+        width = self._draft_width(max(limits))
         if width not in self._drafts:
             self._drafts[width] = self._compile_draft(width)
-        tokens = self._drafts[width](mx.array(anchors, dtype=mx.int32), rows)
-        mx.eval(tokens, *cache.storage.buffers)
+        tokens, confidence = self._drafts[width](
+            mx.array(anchors, dtype=mx.int32), rows
+        )
+        mx.eval(
+            tokens,
+            *([] if confidence is None else [confidence]),
+            *cache.storage.buffers,
+        )
+        limits = self._admit_drafts(confidence, rows, limits)
         return DraftTokenIds(
             req_ids=req_ids,
             draft_token_ids=[
