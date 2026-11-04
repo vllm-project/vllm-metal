@@ -32,6 +32,8 @@ GREEDY_TEMPERATURE_EPS = 1e-5
 _EMPTY_LOGITSPROCS = LogitsProcessors()
 # Logits per chunk when native top-k picks candidates by chunk maxima.
 TOP_K_CHUNK_SIZE = 64
+# Below this many logits in a batch the full sort is about as fast.
+TOP_K_MIN_BATCH_LOGITS = 100_000
 
 
 @dataclass(frozen=True)
@@ -386,6 +388,8 @@ class SamplingBatch:
     @staticmethod
     def _uses_top_k_candidates(top_k: Sequence[int], vocab_size: int) -> bool:
         """Whether every row has a top-k small enough for chunked candidates."""
+        if len(top_k) * vocab_size < TOP_K_MIN_BATCH_LOGITS:
+            return False
         if any(k <= 0 or k >= vocab_size for k in top_k):
             return False
         return max(top_k) * TOP_K_CHUNK_SIZE * 4 <= vocab_size
@@ -407,13 +411,13 @@ class SamplingBatch:
         Logits equal to the k-th value can also sit in other chunks, so they
         are counted over the whole row and drawn as one group.
 
-        Returns ``(logits, token_ids, tie_value, tie_count)``. ``logits`` has
+        Returns ``(logits, token_ids, is_tied, tie_count)``. ``logits`` has
         one column per sorted candidate above the row's k-th largest value
         (``-inf`` where masked), labelled by ``token_ids``, plus a last
         column for the group: the first ``tie_count`` tokens in vocab order
-        whose logit equals ``tie_value``. Top-p keeps sorted positions, and
-        the group comes last among the surviving positions, so it keeps a
-        count of tied tokens just as the full sort does.
+        where ``is_tied`` holds. Top-p keeps sorted positions, and the group
+        comes last among the surviving positions, so it keeps a count of tied
+        tokens just as the full sort does.
         """
         num_rows, vocab_size = scaled_logits.shape
         num_chunks = -(-vocab_size // TOP_K_CHUNK_SIZE)
@@ -446,7 +450,8 @@ class SamplingBatch:
             weights = mx.where(weights >= min_p_col, weights, 0.0)
             tie_weight = mx.where(tie_weight >= min_p_col, tie_weight, 0.0)
         keep = (sorted_desc > tie_value) & (weights > 0.0)
-        tie_count = (scaled_logits == tie_value).sum(axis=-1, keepdims=True)
+        is_tied = scaled_logits == tie_value
+        tie_count = is_tied.sum(axis=-1, keepdims=True)
         tie_count = mx.where(tie_weight > 0.0, tie_count, 0).astype(mx.float32)
         if any(p < 1.0 for p in top_p):
             top_p_col = mx.array(top_p, dtype=mx.float32)[:, None]
@@ -469,7 +474,7 @@ class SamplingBatch:
         logits = mx.concatenate(
             [mx.where(keep, sorted_desc, -mx.inf), group_logit], axis=-1
         )
-        return logits, token_ids, tie_value, tie_count
+        return logits, token_ids, is_tied, tie_count
 
     @classmethod
     def _top_k_candidate_tokens(
@@ -482,7 +487,7 @@ class SamplingBatch:
     ) -> mx.array:
         """Draw from :meth:`_top_k_candidates`; a group draw picks one of its
         tied tokens uniformly."""
-        logits, token_ids, tie_value, tie_count = cls._top_k_candidates(
+        logits, token_ids, is_tied, tie_count = cls._top_k_candidates(
             scaled_logits, top_k, top_p, min_p
         )
         candidate_key, tie_key = mx.random.split(key)
@@ -492,7 +497,6 @@ class SamplingBatch:
             token_ids, mx.minimum(position, num_candidates - 1)[:, None], axis=-1
         )[:, 0]
 
-        is_tied = scaled_logits == tie_value
         tie_rank = mx.cumsum(is_tied.astype(mx.int32), axis=-1)
         pick = mx.floor(
             mx.random.uniform(shape=tie_count.shape, key=tie_key) * tie_count

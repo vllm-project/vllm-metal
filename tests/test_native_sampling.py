@@ -8,6 +8,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 
 from tests.stub_runner import make_stub_runner
+from vllm_metal.v1 import sampling_batch
 from vllm_metal.v1.sampling_batch import (
     TOP_K_CHUNK_SIZE,
     SamplingBatch,
@@ -60,15 +61,17 @@ def _chunked_probs(
     """Vocab-order probabilities of the chunked top-k candidates; the tied
     group's mass is spread over its first ``tie_count`` tokens."""
     assert SamplingBatch._uses_top_k_candidates(top_k, logits.shape[-1])
-    cand_logits, token_ids, tie_value, tie_count = SamplingBatch._top_k_candidates(
+    cand_logits, token_ids, is_tied, tie_count = SamplingBatch._top_k_candidates(
         logits, top_k, top_p, min_p
     )
     probs = mx.softmax(cand_logits, axis=-1)
     num_ids = token_ids.shape[-1]
+    num_rows, vocab_size = logits.shape
+    # Ids past the vocab label the padded end of the last chunk; never drawn.
+    padded_size = -(-vocab_size // TOP_K_CHUNK_SIZE) * TOP_K_CHUNK_SIZE
     out = mx.put_along_axis(
-        mx.zeros(logits.shape), token_ids, probs[:, :num_ids], axis=-1
-    )
-    is_tied = logits == tie_value
+        mx.zeros((num_rows, padded_size)), token_ids, probs[:, :num_ids], axis=-1
+    )[:, :vocab_size]
     in_group = is_tied & (mx.cumsum(is_tied.astype(mx.int32), axis=-1) <= tie_count)
     group_share = probs[:, num_ids:] / mx.maximum(tie_count, 1.0)
     return out + mx.where(in_group, group_share, 0.0)
@@ -290,6 +293,24 @@ class TestTopKTopPMaskParity:
         assert kept == kept_ref == {0, 1, 2, 3}
 
 
+@pytest.mark.parametrize(
+    ("rows", "vocab_size", "expected"),
+    [(1, 32000, False), (3, 32000, False), (4, 32000, True), (1, 151936, True)],
+)
+def test_small_batches_keep_the_full_sort(
+    rows: int, vocab_size: int, expected: bool
+) -> None:
+    top_k = [20] * rows
+    assert SamplingBatch._uses_top_k_candidates(top_k, vocab_size) is expected
+
+
+@pytest.fixture
+def chunked_small_batches(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Let small test batches take the chunked path."""
+    monkeypatch.setattr(sampling_batch, "TOP_K_MIN_BATCH_LOGITS", 0)
+
+
+@pytest.mark.usefixtures("chunked_small_batches")
 class TestTopKCandidates:
     @pytest.mark.parametrize(
         ("top_k", "top_p", "min_p"),
@@ -308,6 +329,30 @@ class TestTopKCandidates:
         mx.eval(chunked, reference)
 
         assert mx.allclose(chunked, reference, atol=1e-6).item()
+
+    def test_vocab_past_a_chunk_boundary_matches_the_full_sort(self) -> None:
+        vocab_size = CHUNKED_VOCAB_SIZE + 17
+        logits = mx.random.normal((4, vocab_size), key=mx.random.key(23)) * 3
+        chunked = _chunked_probs(logits, [16] * 4, [0.95] * 4, [0.0] * 4)
+        reference = _sorted_probs(logits, [16] * 4, [0.95] * 4, [0.0] * 4)
+        mx.eval(chunked, reference)
+
+        assert mx.allclose(chunked, reference, atol=1e-6).item()
+
+    @pytest.mark.parametrize("top_p", [1.0, 0.9])
+    def test_fewer_finite_logits_than_top_k_match_the_full_sort(
+        self, top_p: float
+    ) -> None:
+        """Bad words and allowed-token masks can leave fewer than k tokens."""
+        logits = mx.random.normal((2, CHUNKED_VOCAB_SIZE), key=mx.random.key(29))
+        finite = (mx.arange(CHUNKED_VOCAB_SIZE) % 1000) == 3
+        logits = mx.where(mx.stack([finite, mx.ones_like(finite)]), logits, -mx.inf)
+        chunked = _chunked_probs(logits, [16, 16], [top_p] * 2, [0.0] * 2)
+        reference = _sorted_probs(logits, [16, 16], [top_p] * 2, [0.0] * 2)
+        mx.eval(chunked, reference)
+
+        assert mx.allclose(chunked, reference, atol=1e-6).item()
+        assert mx.all(mx.where(finite, 0.0, chunked[0]) == 0.0).item()
 
     @pytest.mark.parametrize(("top_k", "top_p"), [(16, 1.0), (16, 0.9), (4, 0.5)])
     def test_kept_tokens_match_vllm_reference(self, top_k: int, top_p: float) -> None:
@@ -684,6 +729,7 @@ class TestSeededNativeSampling:
             assert mixed[2] == alone
             assert mixed[0] == int(mx.argmax(logits[0]).item())
 
+    @pytest.mark.usefixtures("chunked_small_batches")
     def test_seeded_row_keeps_its_draw_next_to_a_top_k_neighbor(self) -> None:
         """The candidate width follows the batch, so seeded rows stay off it."""
         logits = mx.random.normal((2, CHUNKED_VOCAB_SIZE), key=mx.random.key(21))
