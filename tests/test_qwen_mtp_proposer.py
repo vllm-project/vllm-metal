@@ -13,8 +13,13 @@ from mlx_vlm.speculative.drafters.qwen3_5_mtp.qwen3_5_mtp import (
     Qwen3_5MTPDraftModel,
 )
 
+from vllm_metal.config import QWEN_MTP_DRAFTER_KEY
 from vllm_metal.v1.proposer import ProposeContext
-from vllm_metal.v1.qwen_mtp_proposer import QwenMTPProposer, is_qwen_mtp
+from vllm_metal.v1.qwen_mtp_proposer import (
+    QwenMTPProposer,
+    drafter_source,
+    is_qwen_mtp,
+)
 from vllm_metal.v1.spec_decode import PagedDecodeSegment
 
 HIDDEN = 32
@@ -276,3 +281,19 @@ def test_is_qwen_mtp_matches_draft_model_type() -> None:
     assert not is_qwen_mtp(config("mtp", "gemma4_assistant"))
     assert not is_qwen_mtp(config("ngram", "qwen3_5_mtp"))
     assert not is_qwen_mtp(None)
+
+
+def test_drafter_source_prefers_split_drafter() -> None:
+    def vllm_config(additional):
+        return SimpleNamespace(
+            additional_config=additional,
+            speculative_config=SimpleNamespace(
+                draft_model_config=SimpleNamespace(model="org/target")
+            ),
+        )
+
+    assert drafter_source(vllm_config({})) == "org/target"
+    assert (
+        drafter_source(vllm_config({QWEN_MTP_DRAFTER_KEY: "org/target-MTP-4bit"}))
+        == "org/target-MTP-4bit"
+    )

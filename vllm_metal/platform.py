@@ -14,6 +14,7 @@ import vllm_metal.envs as envs
 from vllm_metal.config import (
     DSPARK_DRAFT_QUANTIZATION_KEY,
     DSPARK_DRAFT_QUANTIZATION_Q4,
+    QWEN_MTP_DRAFTER_KEY,
     get_config,
 )
 
@@ -595,6 +596,20 @@ class MetalPlatform(Platform):
             ):
                 raise ValueError(
                     f"{DSPARK_DRAFT_QUANTIZATION_KEY} requires method='dspark'"
+                )
+
+        if isinstance(add, dict) and QWEN_MTP_DRAFTER_KEY in add:
+            from vllm_metal.v1.qwen_mtp_proposer import is_qwen_mtp
+
+            drafter = add[QWEN_MTP_DRAFTER_KEY]
+            if not isinstance(drafter, str) or not drafter:
+                raise ValueError(
+                    f"{QWEN_MTP_DRAFTER_KEY} must be a repo id or path, got {drafter!r}"
+                )
+            if not is_qwen_mtp(vllm_config.speculative_config):
+                raise ValueError(
+                    f"{QWEN_MTP_DRAFTER_KEY} requires method='mtp' on a Qwen3.5 "
+                    "family target"
                 )
 
         # Apply TurboQuant config from --additional-config

@@ -2,10 +2,11 @@
 """Native MTP drafting for Qwen3.5-family hybrid GDN targets (vLLM ``method="mtp"``).
 
 The drafter is the checkpoint's own MTP layer, loaded through mlx-vlm's
-``Qwen3_5MTPDraftModel``: either from a split drafter repo whose ``model_type``
-is ``qwen3_5_mtp`` (``--speculative-config '{"model": "<drafter>", ...}'``) or
-from a target checkpoint that still carries its ``mtp.*`` tensors
-(``{"method": "mtp", ...}``). It shares the target's embedding and LM head.
+``Qwen3_5MTPDraftModel`` with ``--speculative-config '{"method": "mtp", ...}'``:
+from the target checkpoint when it still carries its ``mtp.*`` tensors, or from
+a split drafter (``model_type`` ``qwen3_5_mtp``, e.g. for MLX conversions that
+dropped them) named by ``--additional-config '{"qwen_mtp_drafter": "<repo>"}'``.
+It shares the target's embedding and LM head.
 
 The MTP layer has one attention layer of its own. Each request keeps a small
 request-local KV cache for it; nothing is scheduler-owned. An entry pairs token
@@ -35,12 +36,13 @@ import mlx.core as mx
 from vllm.logger import init_logger
 from vllm.v1.outputs import DraftTokenIds
 
+from vllm_metal.config import QWEN_MTP_DRAFTER_KEY
 from vllm_metal.v1.proposer import NoOwnKVProposer
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from vllm.config import SpeculativeConfig
+    from vllm.config import SpeculativeConfig, VllmConfig
 
     from vllm_metal.v1.model_runner import MetalModelRunner
     from vllm_metal.v1.proposer import ProposeContext
@@ -63,6 +65,16 @@ def is_qwen_mtp(speculative_config: SpeculativeConfig | None) -> bool:
         return False
     model_type = getattr(draft_model_config.hf_config, "model_type", None)
     return model_type == QWEN_MTP_DRAFT_MODEL_TYPE
+
+
+def drafter_source(vllm_config: VllmConfig) -> str:
+    """The split drafter from additional_config, else the target checkpoint."""
+    additional = vllm_config.additional_config
+    if isinstance(additional, dict) and QWEN_MTP_DRAFTER_KEY in additional:
+        return str(additional[QWEN_MTP_DRAFTER_KEY])
+    spec = vllm_config.speculative_config
+    assert spec is not None and spec.draft_model_config is not None
+    return str(spec.draft_model_config.model)
 
 
 @dataclass
@@ -96,9 +108,7 @@ class QwenMTPProposer(NoOwnKVProposer):
             validate_drafter_compatibility,
         )
 
-        spec = runner.vllm_config.speculative_config
-        assert spec is not None and spec.draft_model_config is not None
-        source = str(spec.draft_model_config.model)
+        source = drafter_source(runner.vllm_config)
         drafter, kind = load_drafter(source, kind="mtp")
         validate_drafter_compatibility(runner.model, drafter, kind)
         drafter.bind(runner.model)
