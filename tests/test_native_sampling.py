@@ -570,8 +570,10 @@ class TestSeededNativeSampling:
 
 
 @pytest.mark.skipif(not torch.backends.mps.is_available(), reason="requires MPS")
-def test_shared_sampler_matches_mps_after_candidate_reordering(run_in_spawn_process):
-    """Both adapters preserve RNG identity and token-ID ties across blocks."""
+def test_shared_sampler_matches_upstream_after_candidate_reordering(
+    run_in_spawn_process,
+):
+    """Check upstream token IDs in vocabulary order on MPS and score order on MLX."""
     run_in_spawn_process(_check_shared_sampler_after_reordering)
 
 
@@ -582,8 +584,14 @@ def _check_shared_sampler_after_reordering():
     from vllm_metal.pytorch_backend.bindings import register_kernel_overrides
 
     register_kernel_overrides()
-    for vocab_size in (3, 1025, 6562):
-        logits = torch.randn(5, vocab_size, generator=torch.Generator().manual_seed(9))
+    # The two sampled IDs per case come from the pinned vLLM FP32 Triton sampler:
+    # https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/worker/gpu/sample/gumbel.py#L165-L205
+    for vocab_size, sampled_ids in (
+        (3, (1, 1)),
+        (1025, (524, 991)),
+        (6562, (3619, 3169)),
+    ):
+        logits = ((torch.arange(vocab_size) % 17).float() / 8).repeat(5, 1)
         logits[0].zero_()
         logits[:, 2::5] = -float("inf")
         # An invalid row must still return a real ID, even across reordered tiles.
@@ -594,7 +602,7 @@ def _check_shared_sampler_after_reordering():
             [0, 2, 17, 0, 0],
             [0.0, 0.8, 1.5, 1.0, 1.0],
         )
-        expected = (
+        mps_ids = (
             gumbel_sample(
                 logits.to("mps"),
                 torch.arange(len(seeds), dtype=torch.int32, device="mps"),
@@ -609,13 +617,13 @@ def _check_shared_sampler_after_reordering():
         )
         values = mx.array(logits.numpy())
         order = mx.argsort(values, axis=-1)[:, ::-1]
-        actual = get_ops().gumbel_sample(
+        mlx_ids = get_ops().gumbel_sample(
             mx.take_along_axis(values, order, axis=-1),
             mx.array(seeds, dtype=mx.int64),
             mx.array(positions, dtype=mx.int64),
             mx.array(temperatures, dtype=mx.float32),
             order,
         )
-        assert actual.tolist() == expected, vocab_size
-        assert expected[0] == 0
-        assert expected[3:] == [0, vocab_size - 1]
+        expected = [0, *sampled_ids, 0, vocab_size - 1]
+        assert mps_ids == expected, vocab_size
+        assert mlx_ids.tolist() == expected, vocab_size
