@@ -8,7 +8,12 @@ buffers use explicit CPU-to-MPS copies.
 import numpy as np
 import torch
 from vllm.utils.torch_utils import async_tensor_h2d
+from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.worker.gpu.buffer_utils import NonUvaBuffer
+
+# Upstream's Triton kernels score prompt rows without full-vocab fp32 copies;
+# bound those copies here (128 x 248k fp32 is 127 MB).
+_PROMPT_SCORE_ROWS = 128
 
 
 class MPSStagingBuffer(NonUvaBuffer):
@@ -85,7 +90,7 @@ def compute_topk_scores(
 ):
     from vllm.v1.sample.sampler import Sampler
 
-    # Explicit-token and prompt logprobs remain rejected by validate_request.
+    # Explicit-token logprobs remain rejected by validate_request.
     assert max_per_req_token_ids == 0
     scores = logits.float() if logits_mode else Sampler.compute_logprobs(logits)
     # Keep upstream's compiled rank helper eager on MPS.
@@ -94,3 +99,17 @@ def compute_topk_scores(
     if isinstance(cu_num_logits, torch.Tensor):
         return result._replace(cu_num_generated_tokens_tensor=cu_num_logits)
     return result._replace(cu_num_generated_tokens=cu_num_logits)
+
+
+def compute_prompt_topk_scores(logits, num_logprobs, token_ids, logits_mode=False):
+    return LogprobsTensors.cat(
+        [
+            compute_topk_scores(
+                logits[i : i + _PROMPT_SCORE_ROWS],
+                num_logprobs,
+                token_ids[i : i + _PROMPT_SCORE_ROWS],
+                logits_mode=logits_mode,
+            )
+            for i in range(0, logits.shape[0], _PROMPT_SCORE_ROWS)
+        ]
+    )
