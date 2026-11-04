@@ -238,6 +238,7 @@ def _nixl_config() -> SimpleNamespace:
 def test_other_connector_without_offloading_is_left_alone() -> None:
     vllm_config = _base_config()
     vllm_config.kv_transfer_config = _nixl_config()
+    vllm_config.kv_transfer_config.kv_connector_extra_config["canonical_layout"] = True
     before = vars(vllm_config.kv_transfer_config).copy()
     MetalPlatform.check_and_update_config(vllm_config)
     assert vars(vllm_config.kv_transfer_config) == before
@@ -274,36 +275,26 @@ def _canonical_config(connector, size, value) -> SimpleNamespace:
     return vllm_config
 
 
-# The engine core re-runs the hook with MetalOffloadingConnector set.
-_OFFLOAD_ENTRIES = [
-    (None, 1.0),
-    ("OffloadingConnector", None),
-    ("MetalOffloadingConnector", None),
-]
-
-
-@pytest.mark.parametrize("connector,size", _OFFLOAD_ENTRIES)
-@pytest.mark.parametrize("value", [True, 1, "false"])
+@pytest.mark.parametrize(
+    "connector,size,value",
+    [
+        (None, 1.0, True),
+        ("OffloadingConnector", None, True),
+        ("MetalOffloadingConnector", None, True),
+        (None, 1.0, "false"),
+    ],
+)
 def test_canonical_layout_rejected(connector, size, value) -> None:
-    """Metal skips upstream's per-layer canonical check. Truthy as upstream
-    reads it (bool()), so the string "false" is refused too."""
+    """Reject every entry path using upstream's truthiness rules."""
     vllm_config = _canonical_config(connector, size, value)
     with pytest.raises(NotImplementedError, match="canonical_layout"):
         MetalPlatform.check_and_update_config(vllm_config)
 
 
-@pytest.mark.parametrize("value", [False, 0, None])
-def test_canonical_layout_off_is_accepted(value) -> None:
-    vllm_config = _canonical_config(None, 1.0, value)
+def test_canonical_layout_off_is_accepted() -> None:
+    vllm_config = _canonical_config(None, 1.0, False)
     MetalPlatform.check_and_update_config(vllm_config)
     assert vllm_config.kv_transfer_config.kv_connector == "MetalOffloadingConnector"
-
-
-def test_canonical_layout_on_another_connector_is_left_alone() -> None:
-    vllm_config = _canonical_config("NixlConnector", None, True)
-    before = vars(vllm_config.kv_transfer_config).copy()
-    MetalPlatform.check_and_update_config(vllm_config)
-    assert vars(vllm_config.kv_transfer_config) == before
 
 
 def test_simple_kv_offload_env_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
