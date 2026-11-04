@@ -247,6 +247,60 @@ def test_draft_length_respects_caps(
     assert len(_drafts(out).get("r", [])) == expected
 
 
+def test_batched_drafts_match_single_request_drafts(drafter) -> None:
+    """Several requests drafted together (shared LM head call per step) give
+    the same drafts as each drafted alone, whatever their draft caps."""
+    mx.random.seed(2)
+    prompts = {"a": [3, 8, 1, 22], "b": [40, 5], "c": [9, 9, 14]}
+    sampled = {"a": 6, "b": 13, "c": 50}
+    caps = {"a": K, "b": 1, "c": 2}
+    hidden = {r: mx.random.normal((len(p), HIDDEN)) for r, p in prompts.items()}
+
+    expected = {}
+    for req_id, prompt in prompts.items():
+        alone = QwenMTPProposer(drafter=drafter, controller=_Controller())
+        expected |= _drafts(
+            alone.propose(
+                _prefill_ctx(
+                    req_id,
+                    prompt,
+                    0,
+                    hidden[req_id],
+                    sampled[req_id],
+                    draft_caps={req_id: caps[req_id]},
+                )
+            )
+        )
+
+    req_ids = list(prompts)
+    cu = [0]
+    for req_id in req_ids:
+        cu.append(cu[-1] + len(prompts[req_id]))
+    together = QwenMTPProposer(drafter=drafter, controller=_Controller())
+    out = together.propose(
+        ProposeContext(
+            target_hidden_states=mx.concatenate([hidden[r] for r in req_ids]),
+            decode_reqs=[],
+            decode_segments=[],
+            decode_token_ids=[],
+            prefill_reqs=[
+                SimpleNamespace(req_id=r, token_ids=prompts[r], start_pos=0)
+                for r in req_ids
+            ],
+            prefill_token_ids=[sampled[r] for r in req_ids],
+            prefill_result_modes=["final"] * len(req_ids),
+            request_states={r: _request_state() for r in req_ids},
+            cu_seqlens=cu,
+            num_decode_segments=0,
+            num_speculative_tokens=K,
+            finished_req_ids=set(),
+            draft_caps=caps,
+        )
+    )
+    assert _drafts(out) == expected
+    assert {r: len(d) for r, d in expected.items()} == caps
+
+
 def test_ineligible_request_keeps_no_drafter_cache(drafter) -> None:
     proposer = QwenMTPProposer(drafter=drafter, controller=_Controller({"r"}))
     out = proposer.propose(_prefill_ctx("r", [1, 2, 3], 0, mx.zeros((3, HIDDEN)), 4))

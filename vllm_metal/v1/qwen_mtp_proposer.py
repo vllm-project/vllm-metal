@@ -309,23 +309,41 @@ class QwenMTPProposer(NoOwnKVProposer):
                 ctx.request_states,
             )
         }
-        drafts: dict[str, mx.array] = {}
+        rows: list[tuple[str, _RequestDraftState, int]] = []
+        hidden: list[mx.array] = []
         for req_id, state, seed_hidden in seeds:
             if req_id not in eligible:
                 continue
             k = self._draft_length(req_id, ctx)
-            if k <= 0:
-                continue
-            h = seed_hidden
-            token = self._greedy(h)
-            tokens = [token]
-            for _ in range(k - 1):
-                h = self._forward(state, token, h)
+            if k > 0:
+                rows.append((req_id, state, k))
+                hidden.append(seed_hidden)
+        if not rows:
+            return {}
+
+        # The MTP layer runs per request (each has its own KV cache); the LM
+        # head, the costliest part of a draft step, runs once per step over
+        # every request still drafting.
+        tokens: dict[str, list[mx.array]] = {req_id: [] for req_id, _, _ in rows}
+        active = list(range(len(rows)))
+        step_tokens = self._greedy(mx.concatenate(hidden, axis=0))
+        for step in range(max(k for _, _, k in rows)):
+            for j, i in enumerate(active):
+                tokens[rows[i][0]].append(step_tokens[j : j + 1])
+            next_active = [
+                (j, i) for j, i in enumerate(active) if rows[i][2] > step + 1
+            ]
+            if not next_active:
+                break
+            for j, i in next_active:
+                state = rows[i][1]
+                hidden[i] = self._forward(state, step_tokens[j : j + 1], hidden[i])
                 state.round_appended += 1
-                token = self._greedy(h)
-                tokens.append(token)
-            drafts[req_id] = mx.concatenate(tokens)
-        return drafts
+            active = [i for _, i in next_active]
+            step_tokens = self._greedy(
+                mx.concatenate([hidden[i] for i in active], axis=0)
+            )
+        return {req_id: mx.concatenate(t) for req_id, t in tokens.items()}
 
     def _draft_length(self, req_id: str, ctx: ProposeContext) -> int:
         request_state = ctx.request_states[req_id]
