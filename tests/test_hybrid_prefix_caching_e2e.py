@@ -1,13 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """End-to-end correctness of align-mode prefix caching on hybrid GDN models.
 
-Thin wrapper around ``tools/hybrid_apc_parity_matrix.py --quick`` — the
-single cache-on/off parity harness.  The tool spawns cache-off and cache-on
-children (Metal is not fork-safe), asserts config reach (the cached run
-really resolved to align with ``mamba_block_size == block_size``), hit reach
-(an admission with a block-aligned ``num_computed_tokens > 0`` — a genuine
-restore), and token identity across a block-edge/divergent-suffix/repeat/
-batch matrix.  Run the tool directly for the full two-arm gate.
+``tools/hybrid_apc_parity_matrix.py --quick`` compares cache-off/on greedy
+tokens across block edges, divergent suffixes, repeats, and a batch.
+It asserts align mode, matching block sizes, and a real block-aligned prefix hit.
+Both modes use a 544-token prefill cap to control shape-dependent rounding;
+run the tool directly for the full diagnostic matrix.
 
 Not in CI — requires local Qwen3.5-0.8B weights.
 """
