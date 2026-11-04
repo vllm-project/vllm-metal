@@ -16,8 +16,8 @@ VLLM_METAL_BACKEND=mps PYTORCH_ENABLE_MPS_FALLBACK=0 \
 Release wheels include both native launchers and the shared Metal shaders;
 no compiler is needed. Source checkouts use the [development setup](CONTRIBUTING.md#development-setup).
 Selecting MPS defaults to MRv2. Use unquantized FP16/BF16 checkpoints and greedy
-requests (`temperature=0`). Output-token logprobs are supported; prompt logprobs
-and explicit token-ID scoring are not yet supported.
+requests (`temperature=0`). Output-token and prompt logprobs are supported;
+explicit token-ID scoring is not yet supported.
 
 For speech generation, see [Qwen3-TTS on Apple Silicon](qwen3-tts-mps.md).
 

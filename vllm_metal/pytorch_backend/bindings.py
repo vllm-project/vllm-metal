@@ -8,13 +8,17 @@ import torch
 def register_kernel_overrides():
     from vllm.triton_utils.dispatcher import register_kernels
 
-    from vllm_metal.pytorch_backend import speculative_ops
+    from vllm_metal.pytorch_backend import input_ops, speculative_ops
 
     module = "vllm.v1.worker.gpu.spec_decode.rejection_sampler"
+    prompt_module = "vllm.v1.worker.gpu.sample.prompt_logprob"
     register_kernels(
         {
             f"{module}._gather_draft_sampled_kernel": speculative_ops.gather_draft_sampled,
             f"{module}._flatten_sampled_kernel": speculative_ops.flatten_sampled,
+            f"{prompt_module}._prompt_logprobs_token_ids_kernel": (
+                input_ops.prompt_logprobs_token_ids
+            ),
         }
     )
 
@@ -82,7 +86,7 @@ def install():
     from vllm.model_executor.layers.mamba.short_conv import ShortConv
     from vllm.v1.attention.ops import vit_attn_wrappers
     from vllm.v1.worker.gpu import buffer_utils, model_runner
-    from vllm.v1.worker.gpu.sample import sampler
+    from vllm.v1.worker.gpu.sample import prompt_logprob, sampler
 
     from vllm_metal.pytorch_backend import runtime
     from vllm_metal.pytorch_backend.models.qwen3_5 import install as install_qwen3_5
@@ -120,4 +124,8 @@ def install():
     # validate_request limits sampling to greedy; scoring uses upstream Torch ops.
     sampler.gumbel_sample = lambda logits, *args, **kwargs: logits.argmax(dim=-1)
     sampler.compute_topk_scores = runtime.compute_topk_scores
+    prompt_logprob.compute_topk_scores = runtime.compute_topk_scores
+    # Unlike upstream's Triton kernels, this scorer materializes fp32 logprobs:
+    # 1024 rows of a 248k vocab is 1 GB.
+    prompt_logprob.CHUNK_SIZE = 128
     buffer_utils._metal_installed = True

@@ -502,6 +502,86 @@ def test_mps_logprobs(num_logprobs):
     )
 
 
+def test_prompt_logprobs_match_cpu_reference(run_in_spawn_process, monkeypatch):
+    monkeypatch.setenv("VLLM_METAL_BACKEND", "mps")
+    monkeypatch.setenv("PYTORCH_ENABLE_MPS_FALLBACK", "0")
+    run_in_spawn_process(_check_prompt_logprobs)
+
+
+def _check_prompt_logprobs():
+    from vllm.sampling_params import SamplingParams
+    from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
+
+    from vllm_metal.platform import MetalPlatform
+
+    MetalPlatform.register_triton_kernel_overrides()
+    install()
+    device = torch.device("mps")
+    worker = PromptLogprobsWorker(4, device)
+    prompt_lens = np.array([8, 4, 150, 4])
+    for req_id, slot, k in (("b", 0, 0), ("c", 1, None), ("a", 2, 2), ("d", 3, 1)):
+        worker.add_request(req_id, slot, SamplingParams(prompt_logprobs=k))
+    torch.manual_seed(0)
+    all_ids = torch.randint(0, 32, (4, 160), dtype=torch.int32, device=device)
+    computed = torch.zeros(4, dtype=torch.int32, device=device)
+    chunk_rows = []
+
+    def logits_fn(hidden_states):
+        chunk_rows.append(hidden_states.shape[0])
+        return hidden_states
+
+    def step(req_ids, slots, done, scheduled):
+        slots_np = np.array(slots)
+        cu_np = np.concatenate([[0], np.cumsum(scheduled)]).astype(np.int32)
+        logits = torch.randn(int(cu_np[-1]), 32, device=device)
+        batch = SimpleNamespace(
+            req_ids=req_ids,
+            idx_mapping=torch.tensor(slots_np, dtype=torch.int32, device=device),
+            idx_mapping_np=slots_np,
+            num_tokens=int(cu_np[-1]),
+            query_start_loc=torch.tensor(cu_np, device=device),
+            query_start_loc_np=cu_np,
+            num_computed_prefill_tokens_np=np.array(done),
+            num_scheduled_tokens=np.array(scheduled),
+            prefill_len_np=prompt_lens[slots_np],
+        )
+        computed[batch.idx_mapping.long()] = torch.tensor(
+            done, dtype=torch.int32, device=device
+        )
+        out = worker.compute_prompt_logprobs(
+            logits_fn, logits, batch, all_ids, computed, prompt_lens
+        )
+        return out, logits.cpu().log_softmax(-1), cu_np
+
+    # Slots out of batch order; "b" spans both steps and "d" is decoding.
+    first, first_expected, first_cu = step(
+        ["a", "b", "c", "d"], [2, 0, 1, 3], [0, 0, 0, 9], [150, 5, 4, 1]
+    )
+    second, second_expected, _ = step(["b"], [0], [5], [3])
+    assert sorted(first) == ["a"] and sorted(second) == ["b"]
+    assert chunk_rows == [128, 32, 3]
+    ids = all_ids.cpu().long()
+    cases = (
+        (first["a"], first_expected[:149], ids[2, 1:150], 2),
+        (
+            second["b"],
+            torch.cat([first_expected[first_cu[1] : first_cu[2]], second_expected[:2]]),
+            ids[0, 1:8],
+            0,
+        ),
+    )
+    for actual, expected, targets, k in cases:
+        expected_target = expected.gather(-1, targets[:, None])
+        assert actual.logprob_token_ids.shape == (len(targets), k + 1)
+        assert actual.logprob_token_ids[:, 0].tolist() == targets.tolist()
+        torch.testing.assert_close(actual.logprobs[:, 0].cpu(), expected_target[:, 0])
+        torch.testing.assert_close(
+            actual.logprobs[:, 1:].cpu(), expected.topk(k, -1).values
+        )
+        ranks = (expected >= expected_target).sum(-1)
+        assert actual.selected_token_ranks.tolist() == ranks.tolist()
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize(
     "rows,heads,kv_heads,head_size,gapped_heads",
