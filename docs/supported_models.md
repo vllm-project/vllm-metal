@@ -169,10 +169,10 @@ and TurboQuant are not validated.
 | GPT-OSS | 🔵 | | Sink attention (paged) | ✅ | `openai/gpt-oss-20b` |
 | Flint | 🔵 | | GQA + per-layer sliding window + learned sinks, no RoPE on full-attention layers (paged) | ✅ | `RecursiveSI/flint-int4` |
 | Ling-3.0 Tiny | 🔵 | | Hybrid MLA + KDA (paged latent + recurrent state) | 🔵 | `inclusionAI/Ling-3.0-tiny` (BF16 or converted MXFP8) |
-| GLM-4.5 | Not verified | | MLA (paged latent cache, MLX SDPA — no Metal kernel) | Not verified | — |
+| GLM-4.5 | Not verified | | GQA (paged) | Not verified | — |
 | MiniCPM3-4B | ✅ | | MLA (paged latent cache) | ✅ | `mlx-community/MiniCPM3-4B-4bit` |
 | MiniCPM4 | ✅ | | GQA (paged) | ✅ | `openbmb/MiniCPM4-0.5B-mlx` (needs `--trust-remote-code`) |
-| GLM-4.7-Flash | 🔵 | | GQA (paged) | ✅ | `mlx-community/GLM-4.7-Flash-4bit` |
+| GLM-4.7-Flash | 🔵 | | MLA (paged latent cache) | ✅ | `mlx-community/GLM-4.7-Flash-4bit` |
 | DeepSeek-R1-Distill-Qwen | ✅ | | GQA (paged) | ✅ | `mlx-community/DeepSeek-R1-Distill-Qwen-7B-3bit` |
 | Phi-4-mini | ✅ | | GQA packed qkv (paged) | ✅ | `microsoft/Phi-4-mini-instruct` |
 | Phi-3.5-mini | ✅ | | MHA packed qkv (paged) | ✅ | `mlx-community/Phi-3.5-mini-instruct-4bit` |
