@@ -22,6 +22,7 @@ class VllmMetal < Formula
   # The macOS CPU wheel supplies vLLM; this plugin provides Metal execution.
   resource "vllm" do
     url "https://github.com/vllm-project/vllm/releases/download/v0.33.0rc3/vllm-0.33.0%2Bcpu-cp38-abi3-macosx_11_0_arm64.whl"
+    version "0.33.0"
     sha256 "74840d3eec2ec097de26c331f803e276b5c7eb235709e624cd9b58ee3cc5b5c8"
   end
 
