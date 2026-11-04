@@ -229,6 +229,34 @@ class TestMetalPlatform:
         assert config.additional_config == additional
         assert config.speculative_config.method == "dspark"
 
+    @pytest.mark.parametrize(
+        ("method", "drafter", "match"),
+        [
+            ("mtp", "", "must be a repo id or path"),
+            ("mtp", 4, "must be a repo id or path"),
+            ("ngram", "org/Qwen3.8-27B-MTP-4bit", "requires method='mtp'"),
+            (None, "org/Qwen3.8-27B-MTP-4bit", "requires method='mtp'"),
+        ],
+    )
+    def test_qwen_mtp_drafter_rejects_invalid_configuration(
+        self, method, drafter, match
+    ):
+        config = self._platform_config(
+            speculative_config=(
+                SimpleNamespace(
+                    method=method,
+                    draft_model_config=SimpleNamespace(
+                        hf_config=SimpleNamespace(model_type="qwen3_5_mtp")
+                    ),
+                )
+                if method
+                else None
+            )
+        )
+        config.additional_config = {"qwen_mtp_drafter": drafter}
+        with pytest.raises(ValueError, match=match):
+            MetalPlatform.check_and_update_config(config)
+
     def test_set_device_valid(self) -> None:
         """Test setting valid device."""
         MetalPlatform.set_device(0)  # Should not raise
@@ -1576,16 +1604,21 @@ class TestMetalPlatform:
 
         assert vllm_config.scheduler_config.async_scheduling is False
 
+    @pytest.mark.parametrize(
+        ("method", "draft_model_type"),
+        [("draft_model", None), ("mtp", "gemma4_assistant")],
+    )
     def test_check_and_update_config_rejects_non_ngram_hybrid_speculation(
         self,
         monkeypatch: pytest.MonkeyPatch,
+        method: str,
+        draft_model_type: str | None,
     ) -> None:
-        """Hybrid targets reject non-ngram speculators at config time.
+        """Hybrid targets reject unvalidated speculators at config time.
 
-        Verify-span staging and acceptance rollback exist only for the ngram
-        method on GDN-family targets; any other pairing must fail fast here
-        rather than at the first verify forward. Rejecting (not downgrading)
-        is safe: no hybrid+speculative configuration ran before.
+        Only ngram and Qwen3.5 MTP drafts are validated against the GDN
+        verify-span staging and acceptance rollback; any other pairing must
+        fail fast here rather than at the first verify forward.
         """
         self._patch_stt_resolution(monkeypatch, is_stt=False)
         reset_config()
@@ -1599,15 +1632,18 @@ class TestMetalPlatform:
                     mamba_ssm_cache_dtype="float32",
                 ),
                 speculative_config=SimpleNamespace(
-                    method="draft_model",
+                    method=method,
                     use_heterogeneous_vocab=False,
                     num_speculative_tokens=2,
+                    draft_model_config=SimpleNamespace(
+                        hf_config=SimpleNamespace(model_type=draft_model_type)
+                    ),
                 ),
             )
             vllm_config.cache_config.mamba_block_size = 16
             with pytest.raises(
                 NotImplementedError,
-                match="ngram method on GDN-family targets only",
+                match="ngram method and Qwen3.5 MTP on GDN-family targets only",
             ):
                 MetalPlatform.check_and_update_config(vllm_config)
         finally:
@@ -1642,7 +1678,7 @@ class TestMetalPlatform:
             )
             with pytest.raises(
                 NotImplementedError,
-                match="ngram method on GDN-family targets only",
+                match="ngram method and Qwen3.5 MTP on GDN-family targets only",
             ):
                 MetalPlatform.check_and_update_config(vllm_config)
         finally:
@@ -1679,11 +1715,29 @@ class TestMetalPlatform:
         finally:
             reset_config()
 
+    @pytest.mark.parametrize(
+        "speculative_config",
+        [
+            SimpleNamespace(
+                method="ngram", use_heterogeneous_vocab=False, num_speculative_tokens=3
+            ),
+            SimpleNamespace(
+                method="mtp",
+                use_heterogeneous_vocab=False,
+                num_speculative_tokens=3,
+                draft_model_config=SimpleNamespace(
+                    hf_config=SimpleNamespace(model_type="qwen3_5_mtp")
+                ),
+            ),
+        ],
+        ids=["ngram", "qwen_mtp"],
+    )
     def test_check_and_update_config_accepts_hybrid_ngram_align_prefix_caching(
         self,
         monkeypatch: pytest.MonkeyPatch,
+        speculative_config: SimpleNamespace,
     ) -> None:
-        """ngram on a GDN hybrid keeps align-mode prefix caching enabled.
+        """ngram and Qwen3.5 MTP on a GDN hybrid keep align-mode prefix caching.
 
         Verification stages GDN state per verify span and caps drafts at the
         state-block boundary (gdn_spec), keeping align checkpoints exact.
@@ -1699,11 +1753,7 @@ class TestMetalPlatform:
                     mamba_cache_mode="align",
                     mamba_ssm_cache_dtype="float32",
                 ),
-                speculative_config=SimpleNamespace(
-                    method="ngram",
-                    use_heterogeneous_vocab=False,
-                    num_speculative_tokens=3,
-                ),
+                speculative_config=speculative_config,
             )
             vllm_config.cache_config.mamba_block_size = 16
             MetalPlatform.check_and_update_config(vllm_config)
