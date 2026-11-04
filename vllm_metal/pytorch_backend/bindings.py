@@ -124,5 +124,8 @@ def install():
     # validate_request limits sampling to greedy; scoring uses upstream Torch ops.
     sampler.gumbel_sample = lambda logits, *args, **kwargs: logits.argmax(dim=-1)
     sampler.compute_topk_scores = runtime.compute_topk_scores
-    prompt_logprob.compute_topk_scores = runtime.compute_prompt_topk_scores
+    prompt_logprob.compute_topk_scores = runtime.compute_topk_scores
+    # Unlike upstream's Triton kernels, this scorer materializes fp32 logprobs:
+    # 1024 rows of a 248k vocab is 1 GB.
+    prompt_logprob.CHUNK_SIZE = 128
     buffer_utils._metal_installed = True
