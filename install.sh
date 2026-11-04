@@ -113,7 +113,13 @@ fetch_release_vllm_tag() {
 install_vllm() {
   local vllm_release_tag="$1"
   local vllm_version="${vllm_release_tag#v}"
-  local download_url="https://github.com/vllm-project/vllm/releases/download/${vllm_release_tag}"
+  local download_tag="$vllm_release_tag"
+  # SCAFFOLDING: remove when .github/vllm-release-tag.commit moves past v0.33.0.
+  # vLLM published v0.33.0 on tag v0.33.0rc3 (same commit); the wheel is 0.33.0.
+  if [[ "$vllm_release_tag" == "v0.33.0" ]]; then
+    download_tag="v0.33.0rc3"
+  fi
+  local download_url="https://github.com/vllm-project/vllm/releases/download/${download_tag}"
   # vLLM's prebuilt macOS arm64 wheel is tagged cp38-abi3.
   local vllm_wheel_url="${download_url}/vllm-${vllm_version}%2Bcpu-cp38-abi3-macosx_11_0_arm64.whl"
 

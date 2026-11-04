@@ -28,35 +28,6 @@ _QWEN3_BACKBONE_ROOTS = frozenset({"embed_tokens", "layers", "norm", "lm_head"})
 _EXAONE4_LAYER_TYPE = {"L": "sliding_attention", "G": "full_attention"}
 
 
-# TODO: Remove Flint fallbacks once the pinned Transformers and vLLM know it.
-def _flint_config_class() -> type[Any]:
-    """Parse Flint checkpoint metadata on older Transformers releases."""
-    from transformers.configuration_utils import PretrainedConfig
-
-    class FlintCompatConfig(PretrainedConfig):
-        model_type = "flint"
-        keys_to_ignore_at_inference = ["past_key_values"]
-
-        def __init__(
-            self,
-            use_cache: bool = True,
-            initializer_range: float = 0.02,
-            **kwargs: Any,
-        ) -> None:
-            layer_types = kwargs.get("layer_types")
-            num_layers = kwargs.get("num_hidden_layers")
-            if layer_types is not None and len(layer_types) != num_layers:
-                raise ValueError(
-                    f"layer_types has {len(layer_types)} entries but "
-                    f"num_hidden_layers is {num_layers}"
-                )
-            self.use_cache = use_cache
-            self.initializer_range = initializer_range
-            super().__init__(**kwargs)
-
-    return FlintCompatConfig
-
-
 def register_model_compat() -> None:
     """Register missing model metadata for the Metal MLX runner.
 
@@ -74,21 +45,7 @@ def register_model_compat() -> None:
     if not isinstance(current_platform, MetalPlatform):
         return
 
-    from transformers import AutoConfig
     from vllm.model_executor.models import ModelRegistry
-
-    try:
-        AutoConfig.for_model("flint")
-    except ValueError:
-        AutoConfig.register("flint", _flint_config_class(), exist_ok=True)
-        logger.debug("Registered Flint config compatibility")
-
-    if "FlintForCausalLM" not in ModelRegistry.get_supported_archs():
-        ModelRegistry.register_model(
-            "FlintForCausalLM",
-            "vllm.model_executor.models.transformers:TransformersMoEForCausalLM",
-        )
-        logger.debug("Registered Flint architecture compatibility")
 
     supported = ModelRegistry.get_supported_archs()
     for arch in ("Lfm3ForCausalLM", "Lfm3VlForConditionalGeneration"):
@@ -105,7 +62,6 @@ def apply_compat_patches() -> None:
         return
     _APPLIED = True
     _patch_torch_mps_empty_host_cache()
-    _patch_vllm_gemma4_mtp_config_loading()
     _apply_bytelevel_patch_during_registration()
     _patch_mlx_lm_qwen35_fp8_sanitize()
     _patch_mlx_lm_qwen3_flat_weight_prefix()
@@ -327,79 +283,6 @@ def _patch_ray_distributed() -> None:
     from vllm.v1.executor.ray_executor_v2 import RayWorkerProc
 
     _install_metal_override(RayWorkerProc)
-
-
-def _gemma4_assistant_config_class() -> type[Any]:
-    """Return a minimal Transformers config for raw Gemma4 assistant metadata."""
-    from transformers.configuration_utils import PretrainedConfig
-    from transformers.models.gemma4.configuration_gemma4 import Gemma4TextConfig
-
-    class Gemma4AssistantCompatConfig(PretrainedConfig):
-        model_type = "gemma4_assistant"
-        sub_configs = {"text_config": Gemma4TextConfig}
-
-        def __init__(self, text_config: Any | None = None, **kwargs: Any) -> None:
-            if text_config is None:
-                self.text_config = Gemma4TextConfig()
-            elif isinstance(text_config, Gemma4TextConfig):
-                self.text_config = text_config
-            elif isinstance(text_config, Mapping):
-                self.text_config = Gemma4TextConfig(**text_config)
-            else:
-                self.text_config = text_config
-            super().__init__(**kwargs)
-
-        def get_text_config(self, decoder: bool = False) -> Any:
-            # Match Transformers' ``PretrainedConfig.get_text_config`` API.
-            return self.text_config
-
-    return Gemma4AssistantCompatConfig
-
-
-def _transformers_knows_gemma4_assistant(auto_config: Any) -> bool:
-    try:
-        auto_config.for_model("gemma4_assistant")
-    except ValueError:
-        return False
-    return True
-
-
-def _patch_vllm_gemma4_mtp_config_loading() -> None:
-    """Register raw Gemma4 assistant config parsing for the pinned stack.
-
-    vLLM 0.21 already knows how to normalize ``gemma4_assistant`` into the
-    ``gemma4_mtp`` draft wrapper, but the pinned Transformers release cannot
-    parse the raw assistant checkpoint's ``model_type`` before that override
-    runs. Keep the shim to config loading only; model construction remains owned
-    by vLLM/vllm-metal Gemma4 MTP modules.
-    """
-    try:
-        from transformers import AutoConfig
-    except ImportError as exc:
-        logger.warning(
-            "Could not install Gemma4 MTP config compatibility patch: %s",
-            exc,
-        )
-        return
-
-    if _transformers_knows_gemma4_assistant(AutoConfig):
-        return
-
-    try:
-        config_cls = _gemma4_assistant_config_class()
-    except ImportError as exc:
-        logger.warning(
-            "Could not install Gemma4 MTP config compatibility patch because "
-            "Gemma4 config classes are unavailable: %s",
-            exc,
-        )
-        return
-
-    # TODO: remove once the supported dependency stack parses raw
-    # ``model_type=gemma4_assistant`` configs before vLLM's Gemma4 MTP
-    # override runs.
-    AutoConfig.register("gemma4_assistant", config_cls, exist_ok=True)
-    logger.debug("Registered Gemma4 assistant config compatibility")
 
 
 def _decoder_tree_contains_type(value: Any, decoder_type: str) -> bool:

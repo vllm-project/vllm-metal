@@ -552,14 +552,6 @@ class MetalPlatform(Platform):
 
         import vllm.envs as vllm_envs
 
-        # vLLM 0.32 calls this hook before runner validation, with VllmConfig
-        # fully imported; importing it during platform discovery is circular.
-        from vllm_metal.patches.model_runner_validation import (
-            patch_metal_model_runner_validation,
-        )
-
-        patch_metal_model_runner_validation()
-
         # vLLM leaves AuxOutput validation to out-of-tree platforms, and
         # MetalModelRunner produces no auxiliary outputs.
         if vllm_config.aux_output_config.enabled:

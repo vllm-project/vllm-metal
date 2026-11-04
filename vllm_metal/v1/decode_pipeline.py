@@ -180,12 +180,21 @@ class PendingSampleStep:
 class MetalAsyncModelRunnerOutput(AsyncModelRunnerOutput):
     """Deferred step output; ``get_output()`` blocks until tokens resolve."""
 
-    def __init__(self, pipeline: DecodePipeline, serial: int) -> None:
+    def __init__(
+        self,
+        pipeline: DecodePipeline,
+        serial: int,
+        kv_connector_output: KVConnectorOutput | None,
+    ) -> None:
         self._pipeline = pipeline
         self._serial = serial
+        self._kv_connector_output = kv_connector_output
 
     def get_output(self) -> ModelRunnerOutput:
         return self._pipeline.resolve(self._serial)
+
+    def get_kv_connector_output(self) -> KVConnectorOutput | None:
+        return self._kv_connector_output
 
 
 class DecodePipeline:
@@ -282,7 +291,9 @@ class DecodePipeline:
         self._pending = step
         self._pending_serial += 1
         self._rows = {entry.req_id: entry.row for entry in step.entries}
-        return MetalAsyncModelRunnerOutput(self, self._pending_serial)
+        return MetalAsyncModelRunnerOutput(
+            self, self._pending_serial, step.kv_connector_output
+        )
 
     def assemble_decode_input_ids(
         self, decode_segments: Sequence[PagedDecodeSegment]

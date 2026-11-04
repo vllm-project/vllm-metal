@@ -189,7 +189,7 @@ def test_block_stride_spans_the_upstream_page():
 def test_budget_above_buffer_limit_uses_shared_regions(monkeypatch):
     from types import SimpleNamespace
 
-    from vllm.v1.core.kv_cache_utils import get_kv_cache_config_from_groups
+    from vllm.v1.core.kv_cache_planning import get_kv_cache_config_from_groups
 
     from tests.stub_runner import make_cache_config
     from vllm_metal.tensor_bridge import torch_to_mlx

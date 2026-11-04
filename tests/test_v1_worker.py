@@ -17,7 +17,7 @@ pytest.importorskip("vllm", reason="vllm not installed")
 import vllm.v1.worker.worker_base as worker_base  # noqa: E402
 from vllm.config import AttentionConfig, CacheConfig, VllmConfig  # noqa: E402
 from vllm.v1.attention.backends.utils import resolve_kv_cache_layout  # noqa: E402
-from vllm.v1.core.kv_cache_utils import (  # noqa: E402
+from vllm.v1.core.kv_cache_planning import (  # noqa: E402
     get_kv_cache_config_from_groups,
     get_kv_cache_groups,
 )

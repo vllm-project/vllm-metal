@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import mlx.core as mx
 import torch
 from vllm.utils.math_utils import cdiv
-from vllm.v1.core.kv_cache_utils import get_uniform_page_size
+from vllm.v1.core.kv_cache_planning import get_uniform_page_size
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec, MLAAttentionSpec
 
 from tests.stub_runner import (
