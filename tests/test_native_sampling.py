@@ -567,10 +567,10 @@ class TestSeededNativeSampling:
 
 
 @pytest.mark.skipif(not torch.backends.mps.is_available(), reason="requires MPS")
-def test_shared_sampler_matches_upstream_after_candidate_reordering(
+def test_shared_sampler_matches_upstream_with_padding_and_reordering(
     run_in_spawn_process,
 ):
-    """Check upstream token IDs in vocabulary order on MPS and score order on MLX."""
+    """Padded rows preserve the upstream RNG stream and original token-ID ties."""
     run_in_spawn_process(_check_shared_sampler_after_reordering)
 
 
@@ -599,9 +599,10 @@ def _check_shared_sampler_after_reordering():
             [0, 2, 17, 0, 0],
             [0.0, 0.8, 1.5, 1.0, 1.0],
         )
+        mps_logits = torch.nn.functional.pad(logits.to("mps"), (1, 2), value=1000.0)
         mps_ids = (
             gumbel_sample(
-                logits.to("mps"),
+                mps_logits[:, 1:-2],
                 torch.arange(len(seeds), dtype=torch.int32, device="mps"),
                 torch.tensor(temperatures, device="mps"),
                 torch.tensor(seeds, device="mps"),
@@ -614,8 +615,13 @@ def _check_shared_sampler_after_reordering():
         )
         values = mx.array(logits.numpy())
         order = mx.argsort(values, axis=-1)[:, ::-1]
-        mlx_ids = get_ops().gumbel_sample(
+        values = mx.pad(
             mx.take_along_axis(values, order, axis=-1),
+            ((0, 0), (1, 2)),
+            constant_values=1000.0,
+        )[:, 1:-2]
+        mlx_ids = get_ops().gumbel_sample(
+            values,
             mx.array(seeds, dtype=mx.int64),
             mx.array(positions, dtype=mx.int64),
             mx.array(temperatures, dtype=mx.float32),
@@ -624,3 +630,18 @@ def _check_shared_sampler_after_reordering():
         expected = [0, *sampled_ids, 0, vocab_size - 1]
         assert mps_ids == expected, vocab_size
         assert mlx_ids.tolist() == expected, vocab_size
+
+
+def test_broadcast_logits_use_per_row_candidate_ids():
+    from vllm_metal.metal import get_ops
+
+    # The same strided scores select different token IDs in the two rows.
+    scores = mx.array([[-9.0, 1.0, -9.0, 5.0, -9.0, 2.0]])[:, 1::2]
+    tokens = get_ops().gumbel_sample(
+        mx.broadcast_to(scores, (2, 3)),
+        mx.zeros(2, mx.int64),
+        mx.zeros(2, mx.int64),
+        mx.zeros(2, mx.float32),
+        mx.array([[1, 0, 2], [0, 2, 1]], dtype=mx.uint32),
+    )
+    assert tokens.tolist() == [0, 2]

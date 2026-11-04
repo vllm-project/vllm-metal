@@ -814,9 +814,9 @@ def _check_seeded_sampling():
     rows = 8192
     # Cross a reduction-block boundary, including a partial final block.
     token_ids = torch.tensor([0, 1023, 1024])
-    logits = torch.full((rows, 1025), -float("inf"))
+    logits = torch.full((1, 1025), -float("inf"))
     logits[:, token_ids] = torch.tensor([0.2, 0.3, 0.5]).log()
-    logits = logits.to("mps")
+    logits = logits.to("mps").expand(rows, -1)
     mapping = torch.zeros(rows, dtype=torch.int32, device="mps")
     positions = torch.arange(rows, device="mps")
     seed = torch.tensor([42], device="mps")

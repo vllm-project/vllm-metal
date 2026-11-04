@@ -66,16 +66,21 @@ def gumbel_sample(
     if IS_DRAFTING or logits_cache is not None:
         raise NotImplementedError("MPS does not support probabilistic draft sampling")
     rows = logits.shape[0]
+    # Cast a broadcast source row once, even when there are many draws.
+    if logits_stride == 0:
+        logits = logits[:1].float().expand_as(logits)
+    else:
+        logits = logits.float()
     _, kernel, unused_ids = _gumbel_kernel()
     kernel(
-        logits.float().contiguous(),
+        logits,
         mapping.long().contiguous(),
         seeds,
         positions.long().contiguous(),
         temperatures,
         argmax,
         maximum,
-        vocab_size,
+        (vocab_size, *logits.stride()),
         BLOCK_SIZE,
         argmax.shape[1],
         int(APPLY_TEMPERATURE),

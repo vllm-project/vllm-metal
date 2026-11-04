@@ -34,7 +34,7 @@ kernel void gumbel_sample(
     const device float* temperatures [[buffer(4)]],
     device long* argmax [[buffer(5)]],
     device float* maximum [[buffer(6)]],
-    constant long& vocab [[buffer(7)]],
+    constant long* logits_layout [[buffer(7)]],
     constant long& block_size [[buffer(8)]],
     constant long& blocks [[buffer(9)]],
     constant long& apply_temperature [[buffer(10)]],
@@ -48,11 +48,14 @@ kernel void gumbel_sample(
     float temp = slot < 0 ? 0.0f : temperatures[slot];
     long seed = slot < 0 ? 0 : seeds[slot];
     long position = positions[group.y];
+    // Read padded or broadcast logits directly, without packing the rows.
+    const long vocab = logits_layout[0];
+    const device float* row = logits + long(group.y) * logits_layout[1];
     float best = -INFINITY;
     uint index = UINT_MAX;
     for (long col = long(group.x) * block_size + tid;
          col < min(vocab, (long(group.x) + 1) * block_size); col += 256) {
-        float value = logits[long(group.y) * vocab + col];
+        float value = row[col * logits_layout[2]];
         uint token = indexed ? token_ids[long(group.y) * vocab + col] : uint(col);
         if (temp != 0.0f && value != -INFINITY) {
             if (apply_temperature && temp != 1.0f) value /= temp;

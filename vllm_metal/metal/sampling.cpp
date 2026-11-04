@@ -24,9 +24,11 @@ class GumbelSamplePrimitive : public Primitive {
     for (int i = 0; i < 5; ++i) enc.set_input_array(inputs[i], i);
     enc.set_output_array(outputs[0], 5);
     enc.set_output_array(outputs[1], 6);
-    int64_t vocab = inputs[0].shape(1), blocks = outputs[0].shape(1);
+    const auto& logits = inputs[0];
+    int64_t layout[] = {logits.shape(1), logits.strides()[0], logits.strides()[1]};
+    int64_t blocks = outputs[0].shape(1);
     int64_t apply_temperature = 1, indexed = indexed_;
-    enc.set_bytes(vocab, 7);
+    enc.set_bytes(layout, 3, 7);
     enc.set_bytes(kSamplingBlockSize, 8);
     enc.set_bytes(blocks, 9);
     enc.set_bytes(apply_temperature, 10);
@@ -64,7 +66,7 @@ array gumbel_sample_primitive_fn(
   auto primitive = std::make_shared<GumbelSamplePrimitive>(s, token_ids.has_value());
   auto outputs = array::make_arrays(
       {{rows, blocks}, {rows, blocks}}, {int64, float32}, primitive,
-      {contiguous(logits), arange(rows, int64), contiguous(seeds),
+      {logits, arange(rows, int64), contiguous(seeds),
        contiguous(positions), contiguous(temperatures),
        token_ids ? contiguous(*token_ids) : zeros({1}, uint32)});
   auto& ids = outputs[0];
