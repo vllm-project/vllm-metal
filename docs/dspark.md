@@ -80,3 +80,15 @@ records serving throughput, latency,
 acceptance and memory. Keep model revisions, input token IDs, thinking mode,
 output limits and cache settings matched across comparisons, and retain
 regressions as well as gains.
+
+Each phase's `acceptance.json` records accepted draft tokens in zero-based
+position order, using the difference between settled server counters. Timed
+results exclude warmup; `summary.json` retains acceptance data for every repeat. Missing or
+inconsistent position counters fail validation.
+
+The per-position yield divides accepted tokens by all verified draft blocks,
+including shorter blocks near output limits. It measures how often the accepted
+prefix reaches each position, not the conditional acceptance probability of a
+proposed token. Mean accepted draft tokens excludes the correction or bonus token.
+Use these values alongside latency to identify costly, low-yield suffixes;
+acceptance alone does not establish a speedup or justify a confidence threshold.
