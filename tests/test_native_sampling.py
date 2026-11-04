@@ -332,7 +332,9 @@ class TestTopKCandidates:
 
     def test_vocab_past_a_chunk_boundary_matches_the_full_sort(self) -> None:
         vocab_size = CHUNKED_VOCAB_SIZE + 17
-        logits = mx.random.normal((4, vocab_size), key=mx.random.key(23)) * 3
+        logits = mx.random.normal((4, vocab_size), key=mx.random.key(23)) - 20.0
+        # The last, padded chunk must be among the sorted ones.
+        logits[:, -1] = 0.0
         chunked = _chunked_probs(logits, [16] * 4, [0.95] * 4, [0.0] * 4)
         reference = _sorted_probs(logits, [16] * 4, [0.95] * 4, [0.0] * 4)
         mx.eval(chunked, reference)
