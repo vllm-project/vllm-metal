@@ -219,32 +219,40 @@ def test_bailing_hybrid_emits_mla_and_kda_specs() -> None:
             {"speculative_config": SimpleNamespace(num_speculative_tokens=1)},
             "speculative",
         ),
+        ({"prefix_match_unit": 2}, "multiple of index_kpool"),
     ],
     ids=[
         "rope",
         "shared_indexer",
         "split_pool",
         "speculative",
+        "hit_splits_pool",
     ],
 )
 def test_glm5_next_specs_refuse_unsupported_configs(overrides, error) -> None:
     """What the paged sparse layout cannot serve fails loudly instead of being
     laid out: a RoPE latent, a layer reusing another layer's top-k, a block
-    that splits a pool, and speculative decoding (rejected drafts would stay
-    in the pooled keys and tails)."""
+    or prefix-hit unit that splits a pool, and speculative decoding (rejected
+    drafts would stay in the pooled keys and tails)."""
     runner = make_glm5_next_stub_runner(**overrides)
 
     with pytest.raises((ValueError, NotImplementedError), match=error):
         runner._cache_policy.get_kv_cache_spec()
 
 
-def test_glm5_next_block_bytes_match_vllms_layout() -> None:
-    """The planner sizes a block as vLLM lays out GLM-5-Next's specs: the
-    pooled keys are a KV group of their own, so a block costs the latent pages
-    alone."""
+def test_glm5_next_pooled_keys_share_the_latent_block() -> None:
+    """The pooled keys sit in the latent pages, so vLLM keeps the sparse
+    layers' KV groups at the latent block (prefix hits land on every block),
+    and the planner sizes a block as vLLM lays it out."""
     runner = make_glm5_next_stub_runner()
     runtime = initialize_glm5_next_runtime(runner, 12)
 
+    groups = runtime.storage.config.kv_cache_groups
+    assert {
+        group.kv_cache_spec.block_size
+        for group in groups
+        if isinstance(group.kv_cache_spec, MLAAttentionSpec)
+    } == {32}
     assert runtime.storage.nbytes == (
         12 * runner._cache_policy.get_cache_block_size_bytes()
     )

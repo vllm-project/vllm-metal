@@ -1466,7 +1466,7 @@ class TestResolveModelDims:
             ),
             (
                 # GLM-5-Next: the NoPE latent alone; the pooled indexer keys
-                # have specs of their own.
+                # sit in the page padding.
                 {
                     "num_hidden_layers": 45,
                     "num_attention_heads": 64,

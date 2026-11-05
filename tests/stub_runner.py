@@ -137,7 +137,11 @@ def _grouping_config(block_size: int, num_blocks: int) -> SimpleNamespace:
 
 
 def make_glm5_next_stub_runner(
-    *, block_size: int = 32, speculative_config: Any = None, **model_args: Any
+    *,
+    block_size: int = 32,
+    speculative_config: Any = None,
+    prefix_match_unit: int | None = None,
+    **model_args: Any,
 ) -> mr.MetalModelRunner:
     """A bf16 GLM-5-Next stage: three KDA layers, then one sparse MLA layer."""
     from vllm_metal.attention.runtime.families.glm5_next import (
@@ -170,6 +174,7 @@ def make_glm5_next_stub_runner(
             mamba_block_size=4096,
             mamba_page_size_padded=None,
             mamba_cache_mode="none",
+            prefix_match_unit=prefix_match_unit,
         ),
     )
     runner.vllm_config.speculative_config = speculative_config
@@ -200,7 +205,12 @@ def initialize_glm5_next_runtime(runner: mr.MetalModelRunner, num_blocks: int) -
     cache = get_kv_cache_config_from_groups(config, groups, 0)
     cache.kv_cache_layout = "LBNHC"
     runtime = HybridPagedAttentionRuntime(
-        hybrid_plan=runner.hybrid_runtime_plan, dtype=mx.bfloat16
+        hybrid_plan=runner.hybrid_runtime_plan,
+        dtype=mx.bfloat16,
+        pooled_keys=(
+            runner.model_args["index_kpool"],
+            runner.model_args["index_head_dim"],
+        ),
     )
     runtime.initialize_from_config(cache)
     return runtime

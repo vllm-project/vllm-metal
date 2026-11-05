@@ -31,10 +31,10 @@ from vllm_metal.attention.caches.turboquant import (
     prefill_workspace_bytes,
 )
 from vllm_metal.attention.impls.dsa import (
-    INDEXER_CACHE_SUFFIX,
-    indexer_cache_spec,
     is_sparse_mla,
+    latent_page_rows,
     max_latent_blocks,
+    sparse_latent_spec,
     sparse_mla_reserve_bytes,
 )
 from vllm_metal.attention.impls.turboquant_prefill import (
@@ -464,20 +464,26 @@ class ModelCachePolicy:
     def _is_sparse_mla(self) -> bool:
         return self._runner.is_mla and is_sparse_mla(self._runner.model_args)
 
-    def _sparse_indexer_spec(
-        self, *, block_size: int, torch_dtype: torch.dtype
-    ) -> MLAAttentionSpec | None:
-        """vLLM's pooled-key spec for each sparse MLA layer."""
+    def _sparse_latent_spec(self, spec: KVCacheSpec) -> KVCacheSpec:
+        """A sparse MLA layer's spec, its pooled keys in the latent page."""
         if not self._is_sparse_mla():
-            return None
+            return spec
         if self._runner.vllm_config.speculative_config is not None:
             raise NotImplementedError(
                 "GLM-5-Next sparse MLA: speculative decoding is not supported; "
                 "rejected drafts would stay in the pooled keys and tails."
             )
-        return indexer_cache_spec(
-            self._runner.model_args, block_size=block_size, dtype=torch_dtype
-        )
+        kpool = int(self._runner.model_args["index_kpool"])
+        unit = self._runner.cache_config.prefix_match_unit
+        # vLLM checked this against the pooled-key spec's tokens_per_state.
+        if unit is not None and unit % kpool:
+            raise ValueError(
+                f"GLM-5-Next sparse MLA: --prefix-match-unit {unit} must be a "
+                f"multiple of index_kpool {kpool}, so prefix hits end on whole "
+                "pools."
+            )
+        assert isinstance(spec, MLAAttentionSpec)
+        return sparse_latent_spec(spec, self._runner.model_args)
 
     def validate_paged_attention_support(self) -> None:
         """Validate that the loaded model can run on the paged-attention path."""
@@ -591,17 +597,14 @@ class ModelCachePolicy:
         if self._runner.is_hybrid:
             hybrid_plan = self._hybrid_plan()
             state_spec = self._state_layer_spec(hybrid_plan)
-            pooled = self._sparse_indexer_spec(
-                block_size=block_size, torch_dtype=torch_dtype
-            )
             for layer_idx in range(num_spec_layers):
                 name = f"layers.{layer_idx}"
                 if hybrid_plan.layers.is_state_layer(layer_idx):
                     specs[f"{name}.{hybrid_plan.family.layer_name}"] = state_spec
                 elif hybrid_plan.layers.is_attention_layer(layer_idx):
-                    specs[f"{name}.self_attn"] = attention_spec(layer_idx)
-                    if pooled is not None:
-                        specs[f"{name}.self_attn{INDEXER_CACHE_SUFFIX}"] = pooled
+                    specs[f"{name}.self_attn"] = self._sparse_latent_spec(
+                        attention_spec(layer_idx)
+                    )
         else:
             for layer_idx in range(num_spec_layers):
                 specs[f"layers.{layer_idx}.self_attn"] = attention_spec(layer_idx)
@@ -932,6 +935,14 @@ class ModelCachePolicy:
                 + self._draft_cache_block_size_bytes()
             )
 
+        if self._is_sparse_mla() and self._runner.is_hybrid:
+            # The latent pages, the pooled keys in their padding; the KDA
+            # pages alias them.
+            return sum(
+                spec.page_size_bytes
+                for spec in self.get_kv_cache_spec().values()
+                if type(spec) is MLAAttentionSpec
+            )
         return (
             self._kv_factor() * block_size * dtype_size * self._kv_layer_size_sum()
             + self._draft_cache_block_size_bytes()
@@ -989,10 +1000,16 @@ class ModelCachePolicy:
 
     def _build_hybrid_backend(self) -> HybridPagedAttentionRuntime:
         self._reject_turboquant_for_mla()
+        model_args = self._runner.model_args
         return HybridPagedAttentionRuntime(
             hybrid_plan=self._hybrid_plan(),
             dtype=self._require_kv_cache_dtype(),
             mamba_cache_mode=self._runner.cache_config.mamba_cache_mode,
+            pooled_keys=(
+                (int(model_args["index_kpool"]), int(model_args["index_head_dim"]))
+                if self._is_sparse_mla()
+                else None
+            ),
         )
 
     def _build_mla_backend(self, block_size: int) -> MLAPagedAttentionRuntime:
@@ -1338,7 +1355,9 @@ class WorkerCachePlanner:
             if explicit is None:
                 kv_budget -= sparse_reserve
             sparse_max_blocks = max_latent_blocks(
-                block_size=block_size,
+                rows_per_block=latent_page_rows(
+                    self._worker.model_runner.model_args, block_size=block_size
+                ),
                 latent_dim=self._worker.model_runner.mla_latent_dim,
             )
         kv_offload_pool = self._resolve_kv_offload_pool(kv_budget, per_block_bytes)

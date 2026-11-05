@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""GLM-5-Next sparse MLA on vLLM's paged latent and pooled-key caches."""
+"""GLM-5-Next sparse MLA on vLLM's paged latent cache."""
 
 from __future__ import annotations
 
 import itertools
 import math
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import mlx.core as mx
@@ -15,15 +15,13 @@ import torch
 from mlx_vlm.models.cache import KVCache, PoolingCache
 from mlx_vlm.models.linear import linear
 from mlx_vlm.models.sparse_attention import indexed_sparse_attention
-from vllm.v1.kv_cache_interface import MLAAttentionSpec, SparseCacheRole
+from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
 from vllm_metal.attention.caches.mla_cache import MLAPagedLatentCache
-from vllm_metal.attention.caches.storage import KVCacheStorage
+from vllm_metal.attention.caches.storage import CacheViews, KVCacheStorage
 from vllm_metal.attention.context import PagedAttentionContext, get_context
 from vllm_metal.attention.impls.mla import _block_table_rows, _mla_metadata
 
-# vLLM's name for this cache, built inline by its GLM-5-Next Indexer.
-INDEXER_CACHE_SUFFIX = ".indexer.k_cache"
 # The most per-head float32 indexer scores one prefill query part may hold:
 # the default of vLLM's VLLM_SPARSE_INDEXER_MAX_LOGITS_MB, which bounds the
 # logits summed over the heads.
@@ -41,13 +39,25 @@ def is_dsa_attention(module: nn.Module) -> bool:
     return hasattr(indexer, "index_kpool") and hasattr(module, "kv_lora_rank")
 
 
-def indexer_cache_spec(
-    model_args: Mapping[str, Any], *, block_size: int, dtype: torch.dtype
-) -> MLAAttentionSpec:
-    """vLLM's pooled-key spec for one sparse layer.
+def latent_page_rows(model_args: Mapping[str, Any], *, block_size: int) -> int:
+    """A sparse layer's latent rows per block, its pooled keys' rows included."""
+    pooled = block_size // int(model_args["index_kpool"])
+    return block_size + pooled * int(model_args["index_head_dim"]) // int(
+        model_args["kv_lora_rank"]
+    )
 
-    It is in the model dtype; vLLM's ``Glm5NextIndexerCache`` builds an fp8 one
-    inline.
+
+def sparse_latent_spec(
+    spec: MLAAttentionSpec, model_args: Mapping[str, Any]
+) -> MLAAttentionSpec:
+    """A sparse layer's latent spec, with the pooled keys in its page padding.
+
+    vLLM's GLM-5-Next cache keeps the pooled keys in the latent's block, which
+    its block-outer layout packs. A pooled-key spec of its own would, on Metal's
+    layer-outer layout, become a KV group whose block vLLM grows to the latent
+    page (16 times at GLM-5.3-Flash's sizes), and prefix-cache hits would land
+    only on that block's multiples. In the padding they share the latent's
+    block table. They are in the model dtype; vLLM's are fp8.
     """
     if model_args.get("qk_rope_head_dim") != 0:
         raise ValueError(
@@ -60,21 +70,15 @@ def indexer_cache_spec(
             "(indexer_types 'shared') are not supported."
         )
     kpool = int(model_args["index_kpool"])
-    head_dim = int(model_args["index_head_dim"])
-    # vLLM asserts this in Glm5NextIndexerCache.__init__.
-    if block_size % kpool:
+    pooled_size = spec.block_size // kpool * int(model_args["index_head_dim"])
+    if spec.block_size % kpool or pooled_size % spec.head_size:
         raise ValueError(
-            f"GLM-5-Next sparse MLA: KV cache block_size {block_size} must be a "
-            f"multiple of index_kpool {kpool}, so pools never straddle blocks."
+            f"GLM-5-Next sparse MLA: KV cache block_size {spec.block_size} must "
+            f"be a multiple of index_kpool {kpool}, so pools never straddle "
+            "blocks, and its pooled keys must fill whole latent rows."
         )
-    return MLAAttentionSpec(
-        block_size=block_size,
-        num_kv_heads=1,
-        head_size=head_dim,
-        dtype=dtype,
-        cache_role=SparseCacheRole.INDEXER,
-        tokens_per_state=kpool,
-    )
+    rows = latent_page_rows(model_args, block_size=spec.block_size)
+    return replace(spec, page_size_padded=rows * spec.state_content_size_bytes)
 
 
 def sparse_mla_reserve_bytes(
@@ -102,23 +106,24 @@ def sparse_mla_reserve_bytes(
     return part + max_model_len // kpool * per_pool + decode_rows
 
 
-def max_latent_blocks(*, block_size: int, latent_dim: int) -> int:
+def max_latent_blocks(*, rows_per_block: int, latent_dim: int) -> int:
     """The most latent blocks mlx-vlm's kernel can address with 32-bit offsets."""
-    return (2**31 - 1) // (block_size * latent_dim)
+    return (2**31 - 1) // (rows_per_block * latent_dim)
 
 
 @dataclass(frozen=True)
 class SparseIndexerCaches:
-    """The sparse layers' pooled-key pages and their unfinished pools' rows."""
+    """The sparse layers' latent rows, pooled keys and unfinished pools' rows."""
 
-    # [num_blocks, pools per block, index_head_dim]: vLLM's pages, in a KV
-    # group of their own
+    # [num_blocks * rows_per_block, latent_dim]: each latent page as rows, its
+    # pooled keys after the block's latent rows
+    rows: CacheViews
+    rows_per_block: int
+    # [num_blocks, block_size // index_kpool, index_head_dim], in the padding
     pooled: MLAPagedLatentCache
     # [num_blocks, index_kpool, 2 * index_head_dim]: raw key | gate of the
     # unfinished pool in that latent block, at its position % index_kpool
     tail: MLAPagedLatentCache
-    # The pooled keys' group among the step context's KV groups.
-    kv_group: int
 
     @classmethod
     def from_upstream(
@@ -127,16 +132,20 @@ class SparseIndexerCaches:
         attention_names: Sequence[str],
         *,
         latent: MLAPagedLatentCache,
-        kv_group: int,
+        kpool: int,
+        head_dim: int,
     ) -> SparseIndexerCaches:
-        """Bind vLLM's pooled keys and allocate the tail rows.
+        """View the pooled keys in the latent pages and allocate the tail rows.
 
-        The pooled keys are vLLM's KV group of their own; the tail rows sit
-        beside each latent block, in a table of their own.
+        The tail rows sit beside each latent block, in a table of their own.
         """
-        limit = max_latent_blocks(
-            block_size=latent.block_size, latent_dim=latent.latent_dim
-        )
+        block_size, latent_dim = latent.block_size, latent.latent_dim
+        page = storage.specs[attention_names[0]].page_size_bytes
+        rows_per_block = page // (latent_dim * latent.dtype.size)
+        assert (rows_per_block - block_size) * latent_dim >= (
+            block_size // kpool * head_dim
+        ), "GLM-5-Next sparse MLA: the latent pages have no room for the pooled keys"
+        limit = max_latent_blocks(rows_per_block=rows_per_block, latent_dim=latent_dim)
         if latent.num_blocks > limit:
             raise ValueError(
                 f"GLM-5-Next sparse MLA: {latent.num_blocks} KV blocks exceed "
@@ -144,21 +153,38 @@ class SparseIndexerCaches:
                 "address with its 32-bit offsets; lower "
                 "--num-gpu-blocks-override."
             )
-        if not latent.has_dense_pages:
-            raise ValueError("GLM-5-Next sparse MLA: requires dense latent pages.")
-        names = [name + INDEXER_CACHE_SUFFIX for name in attention_names]
-        pooled = MLAPagedLatentCache.from_upstream(storage, names)
-        kpool = storage.specs[names[0]].tokens_per_state
+        tensors = [storage.tensors[name] for name in attention_names]
+        num_blocks = latent.num_blocks
+        rows = [
+            torch.as_strided(
+                t, (num_blocks * rows_per_block, latent_dim), (latent_dim, 1)
+            )
+            for t in tensors
+        ]
+        pooled = [
+            torch.as_strided(
+                t,
+                (num_blocks, block_size // kpool, head_dim),
+                (rows_per_block * latent_dim, head_dim, 1),
+                t.storage_offset() + block_size * latent_dim,
+            )
+            for t in tensors
+        ]
         # vLLM's ring is a KV group of its own, for KV transfer and speculative
         # tokens; neither runs here, so the rows sit beside their latent block.
         tail = MLAPagedLatentCache(
             num_layers=len(attention_names),
-            latent_dim=2 * pooled.latent_dim,
-            num_blocks=latent.num_blocks,
+            latent_dim=2 * head_dim,
+            num_blocks=num_blocks,
             block_size=kpool,
             dtype=latent.dtype,
         )
-        return cls(pooled=pooled, tail=tail, kv_group=kv_group)
+        return cls(
+            rows=storage.views(rows),
+            rows_per_block=rows_per_block,
+            pooled=MLAPagedLatentCache.from_views(storage, pooled),
+            tail=tail,
+        )
 
 
 def _restore_pooling_cache(
@@ -216,14 +242,12 @@ class _PageWrites:
         *,
         past: int,
         latent_slots: Sequence[int],
-        pooled_slots: Sequence[int],
         block_size: int,
     ) -> None:
         """Queue one request's new pools and tail after mlx-vlm's indexer ran.
 
-        A pool's slot is its last token's slot in the pooled keys' group divided
-        by ``kpool``, as vLLM maps pools in ``get_compressed_slot_mapping``, a
-        Triton kernel.
+        A pool's slot is its last token's latent slot divided by ``kpool``, as
+        vLLM maps pools in ``get_compressed_slot_mapping``, a Triton kernel.
         """
         kpool, length = pool.ratio, len(latent_slots)
         new_pools = (past + length) // kpool - past // kpool
@@ -231,7 +255,7 @@ class _PageWrites:
             self.pool_rows.append(pool.pooled[0, -new_pools:])
             self.pool_slots += [
                 slot // kpool
-                for j, slot in enumerate(pooled_slots)
+                for j, slot in enumerate(latent_slots)
                 if (past + j + 1) % kpool == 0
             ]
         if remainder := (past + length) % kpool:
@@ -276,17 +300,17 @@ def query_parts(length: int, heads: int, pools: int) -> list[int]:
 
 
 def _global_slots(
-    topk: mx.array, block_table: mx.array, block_size: int
+    topk: mx.array, block_table: mx.array, block_size: int, rows_per_block: int
 ) -> tuple[mx.array, mx.array]:
-    """Top-k positions to latent slots and their mask.
+    """Top-k positions to latent rows and their mask.
 
     vLLM's ``triton_convert_req_index_to_global_index`` is Triton-only. An
-    unselected entry (-1) reads the request's first latent slot, as mlx-vlm
+    unselected entry (-1) reads the request's first latent row, as mlx-vlm
     clips it.
     """
     safe = mx.maximum(topk, 0)
-    slots = mx.take(block_table, safe // block_size) * block_size + safe % block_size
-    return slots, topk >= 0
+    blocks = mx.take(block_table, safe // block_size)
+    return blocks * rows_per_block + safe % block_size, topk >= 0
 
 
 class DSAPagedAttentionWrapper(nn.Module):
@@ -365,8 +389,7 @@ class DSAPagedAttentionWrapper(nn.Module):
             )
         # Written first: the always-selected tail includes this step's rows.
         latent_cache.write_slots(layer, _mla_metadata(ctx).slot_mapping, new_latent[0])
-        latent = latent_cache.latent_caches[layer]
-        latent = latent.reshape(1, 1, -1, latent.shape[-1])
+        latent = self._dsa_indexer_caches.rows[layer][None, None]
 
         rows, slots, selected = self._select(ctx, x, q_resid)
         # One-token requests take mlx-vlm's decode attention, which gathers
@@ -399,7 +422,7 @@ class DSAPagedAttentionWrapper(nn.Module):
     def _select(
         self, ctx: PagedAttentionContext, x: mx.array, q_resid: mx.array
     ) -> tuple[list[list[int]], list[mx.array], list[mx.array]]:
-        """Each request's top-k as latent slots and a mask, writing back its pages."""
+        """Each request's top-k as latent rows and a mask, writing back its pages."""
         kpool = self._inner.indexer.index_kpool
         layer = self._dsa_layer_idx
         caches = self._dsa_indexer_caches
@@ -408,8 +431,7 @@ class DSAPagedAttentionWrapper(nn.Module):
         tail_pages = caches.tail.latent_caches[layer]
         block_tables = _block_table_rows(ctx)
         cu = ctx.cu_seqlens
-        assert cu is not None and ctx.kv_groups is not None
-        pooled_group = ctx.kv_groups[caches.kv_group]
+        assert cu is not None
         rows: list[list[int]] = []
         slots: list[mx.array] = []
         selected: list[mx.array] = []
@@ -420,16 +442,15 @@ class DSAPagedAttentionWrapper(nn.Module):
             tail_rows = None
             if past % kpool:
                 tail_rows = tail_pages[ctx.block_tables[i][(past - 1) // block_size]]
-            pooled_table = mx.array(pooled_group.block_tables[i], dtype=mx.int32)
             pool = _restore_pooling_cache(
-                tail_rows, pooled_pages, pooled_table, past, kpool
+                tail_rows, pooled_pages, block_tables[i], past, kpool
             )
             topk = self._request_topk(
                 x[:, start:end], q_resid[:, start:end], pool, past
             )
             rows.append(list(range(start, end)))
             request_slots, request_selected = _global_slots(
-                topk[0], block_tables[i], block_size
+                topk[0], block_tables[i], block_size, caches.rows_per_block
             )
             slots.append(request_slots)
             selected.append(request_selected)
@@ -437,7 +458,6 @@ class DSAPagedAttentionWrapper(nn.Module):
                 pool,
                 past=past,
                 latent_slots=ctx.slot_mapping[start:end],
-                pooled_slots=pooled_group.slot_mapping[start:end],
                 block_size=block_size,
             )
         writes.write(caches, layer)

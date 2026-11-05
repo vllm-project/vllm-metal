@@ -21,7 +21,6 @@ from vllm_metal.attention.caches.state_cache import PagedStateCache
 from vllm_metal.attention.caches.storage import KVCacheStorage
 from vllm_metal.attention.context import PagedAttentionContext
 from vllm_metal.attention.impls.dsa import (
-    INDEXER_CACHE_SUFFIX,
     DSAPagedAttentionWrapper,
     SparseIndexerCaches,
     is_dsa_attention,
@@ -52,9 +51,13 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
         dtype: mx.Dtype,
         # Scheduler-side mamba caching strategy.
         mamba_cache_mode: str = "none",
+        # GLM-5-Next: (index_kpool, index_head_dim) of the pooled keys that
+        # the sparse layers keep in their latent pages.
+        pooled_keys: tuple[int, int] | None = None,
     ) -> None:
         self._hybrid_plan = hybrid_plan
         self._dtype = dtype
+        self._pooled_keys = pooled_keys
         state_family = self._hybrid_plan.family
         if mamba_cache_mode not in state_family.supported_cache_modes:
             raise NotImplementedError(
@@ -99,22 +102,14 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
             for i, group in enumerate(config.kv_cache_groups)
             if any(name in attention_names for name in group.layer_names)
         )
-        if isinstance(self._cache, MLAPagedLatentCache) and (
-            attention_names[0] + INDEXER_CACHE_SUFFIX in self.storage.specs
-        ):
-            # GLM-5-Next: the pooled keys are a KV group of their own, after the
-            # latent's in the step context.
+        if isinstance(self._cache, MLAPagedLatentCache) and self._pooled_keys:
+            kpool, head_dim = self._pooled_keys
             self._indexer_caches = SparseIndexerCaches.from_upstream(
                 self.storage,
                 attention_names,
                 latent=self._cache,
-                kv_group=len(self._scheduler_group_indices),
-            )
-            pooled_names = [name + INDEXER_CACHE_SUFFIX for name in attention_names]
-            self._scheduler_group_indices += tuple(
-                i
-                for i, group in enumerate(config.kv_cache_groups)
-                if any(name in pooled_names for name in group.layer_names)
+                kpool=kpool,
+                head_dim=head_dim,
             )
         self._group_block_sizes = tuple(
             config.kv_cache_groups[i].kv_cache_spec.block_size
@@ -236,8 +231,7 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
         """The sparse indexer's caches (GLM-5-Next)."""
         if self._indexer_caches is None:
             raise RuntimeError(
-                "GLM-5-Next sparse MLA: the KV cache config has no pooled-key "
-                "specs for the sparse layers"
+                "GLM-5-Next sparse MLA: the runtime was built without pooled keys"
             )
         return self._indexer_caches
 
