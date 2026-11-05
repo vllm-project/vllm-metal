@@ -249,11 +249,20 @@ def test_replay_rejects_broken_generation_and_closes_stream(monkeypatch, problem
 
 
 @pytest.mark.parametrize(
-    "audit_passed,legacy_passed", [(False, True), (True, False), (True, True)]
+    "audit_passed,token_status",
+    [
+        (None, "exact"),
+        (None, "top_k"),
+        (False, "exact"),
+        (True, "fail"),
+        (True, "top_k"),
+        (True, "exact"),
+    ],
 )
 @pytest.mark.parametrize("hub_models", [False, True])
+@pytest.mark.parametrize("method", ["dspark", "suffix"])
 def test_cli_requires_both_audits_and_preserves_the_report(
-    monkeypatch, tmp_path, audit_passed, legacy_passed, hub_models
+    monkeypatch, tmp_path, audit_passed, token_status, hub_models, method
 ):
     import tools.speculative_parity as tool
     from tools import check_parity as cli
@@ -274,12 +283,15 @@ def test_cli_requires_both_audits_and_preserves_the_report(
         [
             "parity",
             "--method",
-            "dspark",
+            method,
             "--model",
             "test/target" if hub_models else str(target),
-            "--draft",
-            "test/draft" if hub_models else str(draft),
-            "--audit-continuations",
+            *(
+                ["--draft", "test/draft" if hub_models else str(draft)]
+                if method != "suffix"
+                else []
+            ),
+            *(["--audit-continuations"] if audit_passed is not None else []),
             "--output-dir",
             str(output),
         ],
@@ -288,7 +300,7 @@ def test_cli_requires_both_audits_and_preserves_the_report(
     report = {
         "passed": audit_passed,
         "reports": {
-            "dspark-b1": {
+            f"{method}-b1": {
                 "tokens": 32,
                 "native_argmax_mismatches": int(not audit_passed),
                 "serving_argmax_mismatches": 0,
@@ -343,7 +355,12 @@ def test_cli_requires_both_audits_and_preserves_the_report(
                                     "input_ids": [0],
                                     "tokens": [1] * 10
                                     if worker == "target"
-                                    else [2 if legacy_passed else 9] + [1] * 9,
+                                    else [
+                                        {"exact": 1, "top_k": 2, "fail": 9}[
+                                            token_status
+                                        ]
+                                    ]
+                                    + [1] * 9,
                                     "text": "test",
                                     "top_logprobs": [
                                         [
@@ -354,7 +371,12 @@ def test_cli_requires_both_audits_and_preserves_the_report(
                                                 "logprob": -rank,
                                             }
                                             for rank, token in enumerate(
-                                                [2, 1] if legacy_passed else [9, 8], 1
+                                                {
+                                                    "exact": [1, 2],
+                                                    "top_k": [2, 1],
+                                                    "fail": [9, 8],
+                                                }[token_status],
+                                                1,
                                             )
                                         ]
                                     ]
@@ -370,25 +392,43 @@ def test_cli_requires_both_audits_and_preserves_the_report(
     # A TOP_K_MATCH success must not override the strict audit result.
     with pytest.raises(SystemExit) as caught:
         cli.main()
-    assert caught.value.code == (0 if audit_passed and legacy_passed else 1)
+    expected = (
+        audit_passed is not False
+        and token_status != "fail"
+        and (method != "suffix" or token_status == "exact")
+    )
+    assert caught.value.code == (0 if expected else 1)
     summary = json.loads((output / "summary.json").read_text())
-    assert summary["passed"] == (audit_passed and legacy_passed)
-    assert summary["continuation_audit_passed"] == audit_passed
-    assert json.loads((output / "continuation-audit.json").read_text()) == report
+    assert summary["passed"] == expected
+    if method == "suffix":
+        assert summary["target_suffix_exact_passed"] == (token_status == "exact")
+    if audit_passed is not None:
+        assert summary["continuation_audit_passed"] == audit_passed
+        assert json.loads((output / "continuation-audit.json").read_text()) == report
+    else:
+        assert "continuation_audit_passed" not in summary
+        assert not (output / "continuation-audit.json").exists()
     assert [command[-1] for command in commands] == [
         "native",
         "target",
-        "dspark",
-        "replay",
+        method,
+        *(["replay"] if audit_passed is not None else []),
     ]
-    assert all(
-        command[-8:-4] == ["--model", str(target), "--draft", str(draft)]
-        for command in commands
-    )
-    assert resolved == (["test/target", "test/draft"] if hub_models else [])
+    if method == "suffix":
+        assert all("--draft" not in command for command in commands)
+        assert all(command[-6:-4] == ["--model", str(target)] for command in commands)
+    else:
+        assert all(
+            command[-8:-4] == ["--model", str(target), "--draft", str(draft)]
+            for command in commands
+        )
+    expected_models = ["test/target"]
+    if method != "suffix":
+        expected_models.append("test/draft")
+    assert resolved == (expected_models if hub_models else [])
     metadata = json.loads((output / "metadata.json").read_text())
     assert metadata["target"] == str(target)
-    assert metadata["draft"] == str(draft)
+    assert metadata["draft"] == (None if method == "suffix" else str(draft))
 
 
 def test_cli_rejects_duplicate_batch_sizes_before_starting_workers(
@@ -435,6 +475,38 @@ def test_cli_rejects_q4_for_other_drafting_methods(monkeypatch, tmp_path):
     with pytest.raises(SystemExit) as caught:
         cli.main()
     assert caught.value.code == 2
+    assert not (tmp_path / "results").exists()
+
+
+@pytest.mark.parametrize("worker", [None, "suffix"])
+def test_cli_rejects_draft_checkpoint_for_suffix(monkeypatch, tmp_path, capsys, worker):
+    from tools import check_parity as cli
+    from tools import speculative_parity as tool
+
+    monkeypatch.setattr(
+        tool,
+        "run",
+        lambda *_: pytest.fail("Invalid arguments reached model resolution"),
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "parity",
+            "--model",
+            "test/target",
+            "--method",
+            "suffix",
+            "--draft",
+            "test/unused-draft",
+            "--output-dir",
+            str(tmp_path / "results"),
+            *(["--worker", worker] if worker is not None else []),
+        ],
+    )
+    with pytest.raises(SystemExit) as caught:
+        cli.main()
+    assert caught.value.code == 2
+    assert "--draft cannot be used with --method suffix" in capsys.readouterr().err
     assert not (tmp_path / "results").exists()
 
 

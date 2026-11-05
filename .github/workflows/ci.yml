@@ -114,7 +114,17 @@ jobs:
         restore-keys: |
           native-${{ matrix.os }}-${{ runner.arch }}-${{ steps.native-toolchain.outputs.hash }}-
 
+    - name: Cache Arctic wheel
+      uses: actions/cache@v4
+      with:
+        path: ${{ runner.temp }}/arctic-wheels
+        # Native wheels require an exact toolchain match; do not restore a
+        # wheel built for a different Python, architecture, or SDK.
+        key: arctic-${{ matrix.os }}-${{ runner.arch }}-${{ steps.native-toolchain.outputs.hash }}-${{ hashFiles('scripts/lib.sh', '.github/vllm-release-tag.commit') }}
+
     - name: Test
+      env:
+        VLLM_METAL_ARCTIC_WHEEL_DIR: ${{ runner.temp }}/arctic-wheels
       run: |
         scripts/test.sh
 
