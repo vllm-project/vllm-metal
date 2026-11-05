@@ -285,6 +285,7 @@ def make_stub_runner(
         "_intermediate_forward_supported": True,
         "_draft_token_ids": None,
         "_execute_model_state": None,
+        "_pp_verify_drafts": {},
         "_sample_failure": None,
         "_diffusion": None,
         "_selective_logits_supported": False,

@@ -294,12 +294,15 @@ class PipelinedModel:
         cache: Any = None,
         inputs_embeds: mx.array | None = None,
         recv_first: bool = False,
-    ) -> mx.array:
+        return_hidden: bool = False,
+    ) -> Any:
         """Build this stage's forward; a later stage's receive stays pending.
 
         The caller calls :meth:`wait_for_recv` before it submits the forward.
         ``recv_first`` waits before the build instead, for a forward that may
-        submit GPU work itself, as prefill attention does.
+        submit GPU work itself, as prefill attention does. ``return_hidden``
+        makes GLM-5-Next's last stage return ``(logits, final hidden states)``
+        for its MTP drafter.
         """
         h_in = inputs_embeds
         if not self._pp.is_first:
@@ -309,6 +312,10 @@ class PipelinedModel:
             h_in = self._pending_recv[None]
             if recv_first:
                 self.wait_for_recv()
+        if return_hidden:
+            return self._glm5_next_stage_forward(
+                input_ids, h_in, cache, return_hidden=True
+            )
         return self._stage_forward(input_ids, h_in, cache=cache)
 
     def wait_for_recv(self) -> None:
@@ -354,8 +361,13 @@ class PipelinedModel:
         )
 
     def _glm5_next_stage_forward(
-        self, input_ids: mx.array, h_in: mx.array | None, cache: Any
-    ) -> mx.array:
+        self,
+        input_ids: mx.array,
+        h_in: mx.array | None,
+        cache: Any,
+        *,
+        return_hidden: bool = False,
+    ) -> Any:
         """Run this stage's GLM-5-Next layers on all residual streams.
 
         The backbone expands the embedding into ``hc_mult`` streams before its
@@ -376,7 +388,9 @@ class PipelinedModel:
         for layer, layer_cache in zip(backbone.layers, layer_caches, strict=True):
             h, topk = layer(h, None, layer_cache, topk)
         if self._pp.is_last:
-            return linear(self._model.lm_head, backbone.norm(h.mean(axis=2)))
+            hidden = backbone.norm(h.mean(axis=2))
+            logits = linear(self._model.lm_head, hidden)
+            return (logits, hidden) if return_hidden else logits
         return self._check_wire_dtype(h.reshape(*h.shape[:2], -1))
 
     def _check_wire_dtype(self, h_out: mx.array) -> mx.array:

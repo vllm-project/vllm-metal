@@ -2066,7 +2066,9 @@ class TestV1MetalModelRunnerGDNSubmit:
         send_handle = mx.array([2.0], dtype=mx.float32)
 
         class _Stage:
-            def __call__(self, input_ids, *, cache, inputs_embeds, recv_first):
+            def __call__(
+                self, input_ids, *, cache, inputs_embeds, recv_first, return_hidden
+            ):
                 events.append(("forward", recv_first))
                 return stage_output
 
@@ -4924,6 +4926,54 @@ class TestPreemptedReadmission:
         assert entry.prefill.token_ids == [7, 8, 9, 10]
         assert entry.prefill.prompt_len == 4
         assert entry.result_mode == "new_final"
+
+    @pytest.mark.parametrize("skipped_steps", [0, 1])
+    @pytest.mark.parametrize("accepted", [0, 2])
+    def test_non_last_pp_stage_commits_the_accepted_drafts(
+        self, accepted, skipped_steps
+    ) -> None:
+        """After a verify step, a non-last stage learns the kept drafts from
+        the request's next scheduler output, also after steps without it: it
+        appends them before the sampled token and rolls its verify spans back
+        to that depth."""
+        runner = make_stub_runner()
+        runner._request_states["r"] = mr.RequestState(
+            token_ids=[1, 2, 3, 4, 5],
+            prompt_len=4,
+            sampling_params=SamplingParams(),
+            generated_tokens=1,
+        )
+        runner._pp_verify_drafts = {"r": (7, 8)}
+        runner._paged_attention_runtime = Mock(spec=HybridPagedAttentionRuntime)
+        cached = CachedRequestData(
+            req_ids=["r"],
+            resumed_req_ids=set(),
+            new_token_ids=[[9]],
+            all_token_ids={},
+            new_block_ids=[None],
+            num_computed_tokens=[5 + accepted],
+            num_output_tokens=[2 + accepted],
+        )
+        output = self._scheduler_output(self._new_req([1], num_computed_tokens=0), 1)
+        output.scheduled_new_reqs = []
+        for _ in range(skipped_steps):
+            runner._update_pp_stage_states(output)
+        output.scheduled_cached_reqs = cached
+
+        runner._update_pp_stage_states(output)
+
+        assert runner._request_states["r"].token_ids == [
+            1,
+            2,
+            3,
+            4,
+            5,
+            *(7, 8)[:accepted],
+            9,
+        ]
+        runner._paged_attention_runtime.accept_spec_verify.assert_called_with(
+            {"r": accepted + 1}
+        )
 
     def test_non_last_pp_stage_keeps_the_prefill_tokens(self) -> None:
         runner = make_stub_runner()

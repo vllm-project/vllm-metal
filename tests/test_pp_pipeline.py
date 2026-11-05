@@ -576,3 +576,32 @@ class TestHyperConnectionStages:
 
         assert wire.shape == (1, 6, stages[1]._wire_hidden)
         assert bool(mx.allclose(logits, expected, rtol=1e-5, atol=1e-5))
+
+
+def test_drafting_under_pipeline_parallelism_keeps_one_batch_in_flight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """vLLM takes a step's drafts before it processes that step's sampled
+    tokens, so drafting under synchronous PP keeps one batch in flight."""
+    from vllm.config import VllmConfig
+
+    from vllm_metal.patches.pp_speculative_batches import (
+        run_one_batch_when_drafting_under_pp,
+    )
+
+    monkeypatch.setattr(
+        VllmConfig, "max_concurrent_batches", VllmConfig.max_concurrent_batches
+    )
+    run_one_batch_when_drafting_under_pp()
+    config = object.__new__(VllmConfig)
+    object.__setattr__(
+        config, "parallel_config", SimpleNamespace(pipeline_parallel_size=2)
+    )
+    object.__setattr__(
+        config, "scheduler_config", SimpleNamespace(async_scheduling=False)
+    )
+    object.__setattr__(config, "speculative_config", None)
+    assert config.max_concurrent_batches == 2
+
+    object.__setattr__(config, "speculative_config", SimpleNamespace())
+    assert config.max_concurrent_batches == 1

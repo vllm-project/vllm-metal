@@ -468,11 +468,6 @@ class ModelCachePolicy:
         """A sparse MLA layer's spec, its pooled keys in the latent page."""
         if not self._is_sparse_mla():
             return spec
-        if self._runner.vllm_config.speculative_config is not None:
-            raise NotImplementedError(
-                "GLM-5-Next sparse MLA: speculative decoding is not supported; "
-                "rejected drafts would stay in the pooled keys and tails."
-            )
         kpool = int(self._runner.model_args["index_kpool"])
         unit = self._runner.cache_config.prefix_match_unit
         # vLLM checked this against the pooled-key spec's tokens_per_state.

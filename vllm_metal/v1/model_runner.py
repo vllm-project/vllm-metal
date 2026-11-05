@@ -101,6 +101,10 @@ from vllm_metal.v1.gemma4_mtp import (
     Gemma4MTPAssistantRuntime,
     Gemma4MTPAssistantSource,
 )
+from vllm_metal.v1.glm5_next_mtp_proposer import (
+    Glm5NextMTPProposer,
+    is_glm5_next_mtp,
+)
 from vllm_metal.v1.lora import EncoderLoRATarget, MetalLoRARuntime
 from vllm_metal.v1.mm import EncoderCache
 from vllm_metal.v1.model_adapter import (
@@ -495,6 +499,9 @@ class MetalModelRunner:
         # Async forward state: stashed by execute_model, consumed by
         # sample_tokens (mirrors upstream's execute_model_state pattern).
         self._execute_model_state: _PagedForwardState | None = None
+        # A non-last pipeline stage's verify drafts per request, until the
+        # request's next step says how many were kept.
+        self._pp_verify_drafts: dict[str, tuple[int, ...]] = {}
         # What a failed sample_tokens call raised (type and message); the next
         # execute_model raises on it.
         self._sample_failure: str | None = None
@@ -598,6 +605,10 @@ class MetalModelRunner:
                 if self.hybrid_runtime_plan is not None
                 else None
             )
+            if family == "kda":
+                # GLM-5-Next's sparse layers attend a window like a prefill
+                # segment, without the window kernel and its head bound.
+                return None
             if family != "gdn":
                 return (
                     "window mode does not support non-GDN hybrid state "
@@ -771,6 +782,10 @@ class MetalModelRunner:
             proposer = DFlashProposer if spec.method == "dflash" else DSparkProposer
             self._drafter = proposer.build(self)
             self._aux_capture = self._drafter.target_capture(self._forward_model)
+        elif is_glm5_next_mtp(spec) and not is_non_last_stage(self.pp):
+            # Loaded before memory profiling, like the block drafters; under
+            # pipeline parallelism the last stage, which samples, drafts.
+            self._drafter = Glm5NextMTPProposer.build(self)
         elif spec is not None and spec.uses_draft_model():
             self._drafter = DraftModelProposer.build(
                 speculative_config=spec,
@@ -1409,6 +1424,9 @@ class MetalModelRunner:
             return
         if Gemma4MTPAssistantSource.is_gemma4_mtp(spec):
             self._drafter = Gemma4MTPProposer(self)
+        elif is_glm5_next_mtp(spec):
+            # Loaded with the model; its MTP layer keeps request-local caches.
+            pass
         elif spec.method in ("dflash", "dspark"):
             from vllm_metal.v1.block_draft_proposer import BlockDraftProposer
 
@@ -1522,6 +1540,11 @@ class MetalModelRunner:
             self._spec_decode_controller.active_spec_decode_tokens(scheduler_output),
             self._paged_request_seq_lens,
         )
+        if is_non_last_stage(self.pp):
+            # The request's next step says which drafts were kept.
+            self._pp_verify_drafts.update(
+                (segment.req_id, segment.draft_token_ids) for segment in decode_segments
+            )
         # Any GDN verify-span stash left from a prior step is stale (consumed
         # or dropped when that step's verification resolved); start clean.
         hybrid_runtime = self._paged_attention_runtime
@@ -1741,13 +1764,17 @@ class MetalModelRunner:
                     cache=offset_caches,
                     inputs_embeds=inputs_embeds,
                     recv_first=bool(prefill_reqs),
+                    return_hidden=collect_target_hidden_states,
                 )
+                target_hidden_states = None
+                if collect_target_hidden_states:
+                    # Only the last stage loads a drafter.
+                    stage_output, target_hidden_states = stage_output
                 if self.pp.is_last:
                     logits = self._extract_logits(stage_output)
                 else:
                     logits = None
                     pp_send_handle = pipeline_send(stage_output, self.pp)
-                target_hidden_states = None
             else:
                 # Intermediate-only prefill steps sample nothing: no chunk of
                 # theirs contributes a token, so the lm_head projection over
@@ -2443,9 +2470,19 @@ class MetalModelRunner:
             return ()
 
         decode_reqs: list[tuple[str, RequestState]] = []
-        for req_id in scheduler_output.scheduled_cached_reqs.req_ids:
+        cached = scheduler_output.scheduled_cached_reqs
+        for i, req_id in enumerate(cached.req_ids):
             state = self._request_states.get(req_id)
-            if state is not None and state.generated_tokens > 0:
+            # A non-last pipeline stage appends this step's sampled tokens
+            # later (_update_pp_stage_states); the scheduler counts them.
+            generated = (
+                cached.num_output_tokens[i]
+                if is_non_last_stage(self.pp)
+                else state.generated_tokens
+                if state is not None
+                else 0
+            )
+            if state is not None and generated > 0:
                 decode_reqs.append((req_id, state))
         return tuple(decode_reqs)
 
@@ -2607,7 +2644,9 @@ class MetalModelRunner:
         int-offset arange path on text segments.
 
         Any speculative-decode segment in the batch is rejected up
-        front: ``prepare_grouped`` may keep a ``num_query_tokens > 1``
+        front unless verify windows stay one segment per request and the
+        adapter supplies no segment positions:
+        ``prepare_grouped`` may keep a ``num_query_tokens > 1``
         verification window as one ``cu_seqlens`` segment, but this
         method's M-RoPE position handling has only been exercised with
         single-token decode segments. Supplying and validating per-row
@@ -2623,7 +2662,10 @@ class MetalModelRunner:
         assert encoder_cache is not None
 
         for segment in decode_segments:
-            if segment.num_query_tokens > 1:
+            if segment.num_query_tokens > 1 and (
+                getattr(adapter, "supplies_segment_positions", True)
+                or not self.merge_verify_windows
+            ):
                 raise NotImplementedError(
                     "Speculative decode is not supported on the multimodal "
                     "paged path yet: M-RoPE positions for a multi-token "
@@ -2997,11 +3039,17 @@ class MetalModelRunner:
                 )
 
         cached = scheduler_output.scheduled_cached_reqs
-        if not cached.new_token_ids:
-            return
-        for i, req_id in enumerate(cached.req_ids):
+        drafts = self._pp_verify_drafts
+        for req_id in scheduler_output.finished_req_ids | (
+            scheduler_output.preempted_req_ids or set()
+        ):
+            drafts.pop(req_id, None)
+        # The verify rows each continuing request committed in its last step.
+        committed: dict[str, int] = {}
+        for i, (req_id, new_token_ids) in enumerate(
+            zip(cached.req_ids, cached.new_token_ids, strict=True)
+        ):
             state = self._request_states[req_id]
-            new_token_ids = cached.new_token_ids[i]
             # Append only the tokens not already reflected in token_ids (mirrors
             # upstream's num_new_tokens; tolerates >1 sampled token per step).
             num_new = (
@@ -3010,8 +3058,16 @@ class MetalModelRunner:
                 - len(state.token_ids)
             )
             if num_new > 0:
-                state.token_ids.extend(new_token_ids[-num_new:])
+                # A verify step's accepted drafts precede its sampled token.
+                accepted = drafts.pop(req_id, ())[
+                    : max(0, num_new - len(new_token_ids))
+                ]
+                state.token_ids.extend([*accepted, *new_token_ids][-num_new:])
                 state.generated_tokens = len(state.token_ids) - state.prompt_len
+                committed[req_id] = num_new
+        runtime = self._paged_attention_runtime
+        if isinstance(runtime, HybridPagedAttentionRuntime):
+            runtime.accept_spec_verify(committed)
 
     def _update_cached_request_blocks(
         self,

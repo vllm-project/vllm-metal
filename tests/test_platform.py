@@ -1790,6 +1790,64 @@ class TestMetalPlatform:
         assert cache_config.mamba_cache_mode == "none"
         assert cache_config.mamba_block_size == 32768
 
+    def _glm5_next_mtp_config(self, additional_config: dict) -> VllmConfig:
+        vllm_config = self._hybrid_vllm_config(
+            SimpleNamespace(
+                block_size=16,
+                kv_cache_dtype_skip_layers=[],
+                enable_prefix_caching=True,
+                mamba_cache_mode="align",
+                mamba_ssm_cache_dtype="float32",
+            ),
+            speculative_config=SimpleNamespace(
+                method="mtp",
+                use_heterogeneous_vocab=False,
+                num_speculative_tokens=1,
+                draft_model_config=SimpleNamespace(
+                    hf_config=SimpleNamespace(model_type="glm5_next_mtp")
+                ),
+            ),
+            model_type="glm5_next",
+            text_model_type="glm5_next_text",
+        )
+        vllm_config.cache_config.mamba_block_size = 16
+        vllm_config.model_config.quantization = None
+        vllm_config.additional_config = additional_config
+        return vllm_config
+
+    @pytest.mark.parametrize("pipeline_parallel_size", [1, 2])
+    def test_check_and_update_config_accepts_glm5_next_mtp(
+        self, monkeypatch: pytest.MonkeyPatch, pipeline_parallel_size: int
+    ) -> None:
+        """GLM-5-Next MTP passes on its KDA hybrid target, alone or under
+        pipeline parallelism, and keeps align-mode prefix caching."""
+        self._patch_stt_resolution(monkeypatch, is_stt=False)
+        reset_config()
+        try:
+            vllm_config = self._glm5_next_mtp_config(
+                {vm_config.GLM5_NEXT_MTP_DRAFTER_KEY: "drafter"}
+            )
+            vllm_config.parallel_config.pipeline_parallel_size = pipeline_parallel_size
+            MetalPlatform.check_and_update_config(vllm_config)
+        finally:
+            reset_config()
+
+        assert vllm_config.cache_config.enable_prefix_caching is True
+        assert vllm_config.cache_config.mamba_cache_mode == "align"
+
+    def test_check_and_update_config_glm5_next_mtp_needs_its_drafter(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """MLX conversions drop the MTP layer, so its split drafter is named."""
+        self._patch_stt_resolution(monkeypatch, is_stt=False)
+        reset_config()
+        try:
+            vllm_config = self._glm5_next_mtp_config({})
+            with pytest.raises(ValueError, match="mlx_vlm.split_mtp"):
+                MetalPlatform.check_and_update_config(vllm_config)
+        finally:
+            reset_config()
+
     def test_hybrid_family_lookup_uses_the_text_model_type(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

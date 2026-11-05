@@ -172,8 +172,9 @@ its latent block, and each step reads only the latent rows the indexer selects.
 Long prefill chunks are scored in query parts of at most 512 MiB of indexer
 scores. mlx-vlm's indexed attention kernel
 addresses at most 907 blocks of 4352 tokens per stage: a larger automatic pool
-is capped, and a larger `--num-gpu-blocks-override` is refused. Speculative
-decoding and RoPE latents are refused at startup.
+is capped, and a larger `--num-gpu-blocks-override` is refused. RoPE latents
+are refused at startup. Speculative decoding takes the checkpoint's MTP layer
+([GLM-5.3-Flash MTP](speculative_decoding.md#glm-53-flash-mtp)).
 
 | Model | MLX | PyTorch MPS | Attention Kernel | Automatic Prefix Cache | Example checkpoint |
 | --- | --- | --- | --- | --- | --- |

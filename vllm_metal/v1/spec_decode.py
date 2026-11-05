@@ -146,27 +146,26 @@ class SpeculativeDecodeController:
         # Hybrid GDN targets verify n-gram drafts through packed decode spans:
         # full-attention layers take the extra query rows, the GDN layers run
         # their state scan over the span, and the acceptance fixup in gdn_spec
-        # rolls partial accepts back to the accepted depth. The staging and
-        # fixup live in the GDN state wrapper only — other hybrid state
-        # families (mamba2, KDA, shortconv) have no rollback, so a partial
-        # accept would silently corrupt their recurrent state — and the other
-        # speculators are not validated on hybrid targets yet.
+        # rolls partial accepts back to the accepted depth. KDA targets
+        # (GLM-5-Next MTP) keep each span row's state until acceptance. Other
+        # hybrid state families (mamba2, shortconv) have no rollback, so a
+        # partial accept would silently corrupt their recurrent state, and the
+        # other speculators are not validated on hybrid targets yet.
         if (active_spec_tokens or has_invalid_spec_tokens) and is_hybrid:
-            if hybrid_family is not None and hybrid_family != "gdn":
+            if hybrid_family not in (None, "gdn", "kda"):
                 raise NotImplementedError(
                     "Speculative decode verification for hybrid models on "
-                    f"Metal is implemented for the GDN state family only; "
-                    f"this target's state family is {hybrid_family!r}."
+                    "Metal is implemented for the GDN and KDA state families "
+                    f"only; this target's state family is {hybrid_family!r}."
                 )
             method = (
                 speculative_config.method if speculative_config is not None else None
             )
-            if method != "ngram":
+            if method != ("mtp" if hybrid_family == "kda" else "ngram"):
                 raise NotImplementedError(
                     "Speculative decode verification for hybrid models on "
-                    "Metal supports the ngram method only (draft-model, MTP, "
-                    "and block drafts are not validated on hybrid GDN "
-                    "targets yet)."
+                    "Metal supports the ngram method only on GDN targets and "
+                    f"MTP only on KDA targets; got {method!r}."
                 )
 
         decode_req_ids = {req_id for req_id, _ in decode_reqs}

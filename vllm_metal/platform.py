@@ -14,6 +14,7 @@ import vllm_metal.envs as envs
 from vllm_metal.config import (
     DSPARK_DRAFT_QUANTIZATION_KEY,
     DSPARK_DRAFT_QUANTIZATION_Q4,
+    GLM5_NEXT_MTP_DRAFTER_KEY,
     get_config,
 )
 
@@ -604,6 +605,19 @@ class MetalPlatform(Platform):
                     f"{DSPARK_DRAFT_QUANTIZATION_KEY} requires method='dspark'"
                 )
 
+        from vllm_metal.v1.glm5_next_mtp_proposer import is_glm5_next_mtp
+
+        glm5_next_mtp = is_glm5_next_mtp(vllm_config.speculative_config)
+        if glm5_next_mtp != (
+            isinstance(add, dict) and GLM5_NEXT_MTP_DRAFTER_KEY in add
+        ):
+            raise ValueError(
+                f"{GLM5_NEXT_MTP_DRAFTER_KEY} names the drafter of method='mtp' "
+                "on a GLM-5-Next target, and that method needs it: MLX "
+                "conversions drop the MTP layer, which mlx_vlm.split_mtp "
+                "extracts."
+            )
+
         # Apply TurboQuant config from --additional-config
         # Example: --additional-config '{"turboquant": true, "k_quant": "q4_0"}'
         if isinstance(add, dict) and add.get("turboquant"):
@@ -788,22 +802,23 @@ class MetalPlatform(Platform):
             )
             if vllm_config.speculative_config is not None:
                 spec_method = vllm_config.speculative_config.method
-                if spec_method != "ngram" or state_family.label != "gdn":
+                gdn_ngram = spec_method == "ngram" and state_family.label == "gdn"
+                if not gdn_ngram and not glm5_next_mtp:
                     # The verify-span staging and acceptance rollback live in
-                    # the GDN state wrapper only; other hybrid state families
-                    # (mamba2, KDA, shortconv) would silently corrupt their
+                    # the GDN and KDA state wrappers only; other hybrid state
+                    # families (mamba2, shortconv) would silently corrupt their
                     # recurrent state on a partial accept, and the other
                     # speculators are not validated on any hybrid target.
                     # Reject at config time rather than at the first verify
                     # forward.
                     raise NotImplementedError(
                         "Speculative decoding on hybrid models on Metal is "
-                        "implemented for the ngram method on GDN-family "
-                        "targets only; this configuration pairs method "
-                        f"{spec_method!r} with the {state_family.label!r} "
-                        "state family."
+                        "implemented for GLM-5-Next MTP and the ngram method "
+                        "on GDN-family targets only; this configuration pairs "
+                        f"method {spec_method!r} with the "
+                        f"{state_family.label!r} state family."
                     )
-                if not envs.VLLM_METAL_GDN_LAZY_KERNELS:
+                if gdn_ngram and not envs.VLLM_METAL_GDN_LAZY_KERNELS:
                     # Hybrid GDN verification runs multi-token spans through
                     # the variable-length lazy scan kernels; the eager path
                     # only implements single-row decode.
@@ -823,12 +838,12 @@ class MetalPlatform(Platform):
                         f"mamba_cache_mode {state_family.supported_cache_modes}, "
                         f"not {cache_config.mamba_cache_mode!r}",
                     )
-                # ngram+GDN is the one hybrid speculative configuration that
-                # keeps align-mode prefix caching: verification stages GDN
-                # state per verify span and caps drafts at the state-block
-                # boundary (gdn_spec), keeping align-mode checkpoints exact.
-                # Every other hybrid+speculative combination was rejected
-                # above, so no APC downgrade for speculators remains here.
+                # ngram+GDN and GLM-5-Next MTP keep align-mode prefix caching:
+                # verification stages the state per verify span and both
+                # proposers cap drafts at the state-block boundary, keeping
+                # align-mode checkpoints exact. Every other hybrid+speculative
+                # combination was rejected above, so no APC downgrade for
+                # speculators remains here.
 
         # Pipeline parallelism is supported on Metal/MLX: each stage runs in its
         # own worker process and the inter-stage activations cross the
@@ -968,18 +983,20 @@ class MetalPlatform(Platform):
             )
             scheduler_config.async_scheduling = False
 
-        # Speculative decoding is not implemented under pipeline parallelism:
-        # the PP forward path produces no target hidden states and draft
-        # proposal runs only on the sampling (last) stage; no method has been
-        # validated. Reject loudly rather than run an untested combination.
+        # Under pipeline parallelism only GLM-5-Next MTP drafts: its last stage
+        # returns target hidden states and drafts, and earlier stages learn the
+        # accepted drafts from the next step's scheduler output. No other
+        # method has been validated. Reject loudly rather than run an untested
+        # combination.
         if (
             parallel_config.pipeline_parallel_size > 1
             and vllm_config.speculative_config is not None
+            and not glm5_next_mtp
         ):
             raise NotImplementedError(
-                "Pipeline parallelism on Metal does not support speculative "
-                "decoding; remove --speculative-config or run with "
-                "pipeline_parallel_size=1."
+                "Pipeline parallelism on Metal supports speculative decoding "
+                "with GLM-5-Next MTP only; remove --speculative-config or run "
+                "with pipeline_parallel_size=1."
             )
 
         # LoRA is not supported under pipeline parallelism: non-last stages

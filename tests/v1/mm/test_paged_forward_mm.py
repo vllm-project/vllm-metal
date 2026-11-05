@@ -657,6 +657,43 @@ class TestMmDecodeSegmentPositions:
             )
         assert adapter.call_lm_calls == []
 
+    def test_spec_decode_runs_where_the_runner_supplies_no_positions(
+        self, monkeypatch
+    ) -> None:
+        # GLM-5.3-Flash's language model reads no positions, so a verify
+        # window kept as one segment needs none from the runner.
+        monkeypatch.setattr(mr.MetalModelRunner, "merge_verify_windows", True)
+        adapter = _SequentialPositionsAdapter()
+        runner = _runner(adapter)
+        state = RequestState(
+            token_ids=[1, 2, 3, 4, 5, 6],
+            prompt_len=5,
+            sampling_params=SamplingParams(),
+            mrope_position_delta=0,
+        )
+        runner._request_states["req-mm"] = state
+        segment = PagedDecodeSegment(
+            req_id="req-mm",
+            input_token_ids=(6, 100, 101, 102),
+            start_row=0,
+            num_query_tokens=4,
+            draft_token_ids=(100, 101, 102),
+            cache_start_pos=5,
+            block_ids=((0,),),
+        )
+        runner._spec_decode_controller.build_decode_segments = MagicMock(
+            return_value=(segment,)
+        )
+
+        runner._start_paged_forward(
+            batch=MagicMock(),
+            prefill_reqs=[],
+            decode_reqs=[("req-mm", state)],
+            scheduler_output=_scheduler_output(),
+        )
+
+        assert adapter.call_lm_calls[0]["position_ids"].shape == (3, 1, 4)
+
     def test_text_spec_decode_alongside_mm_prefill_is_rejected(self) -> None:
         # Mixed batch: an mm prefill forces the runner onto
         # ``_run_mm_paged_forward``, and a text-only request with

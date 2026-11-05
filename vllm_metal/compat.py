@@ -34,7 +34,9 @@ def register_model_compat() -> None:
     MLX executes the model, while vLLM still queries registered model classes
     for hybrid capabilities and state-cache metadata. The general-plugin hook
     runs before ModelConfig inspection, after vllm.config is importable;
-    registering in apply_compat_patches would create an import cycle.
+    registering in apply_compat_patches would create an import cycle. It runs
+    in every vLLM process, so it also installs the engine-side patch for
+    speculative decoding under pipeline parallelism.
     """
     if os.environ.get("VLLM_METAL_BACKEND", "mlx") != "mlx":
         return
@@ -53,6 +55,12 @@ def register_model_compat() -> None:
             ModelRegistry.register_model(
                 arch, f"vllm_metal.patches.lfm3_registry:{arch}"
             )
+
+    from vllm_metal.patches.pp_speculative_batches import (
+        run_one_batch_when_drafting_under_pp,
+    )
+
+    run_one_batch_when_drafting_under_pp()
 
 
 def apply_compat_patches() -> None:
