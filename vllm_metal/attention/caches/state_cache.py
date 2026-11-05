@@ -13,6 +13,7 @@ import mlx.core as mx
 if TYPE_CHECKING:
     from vllm_metal.attention.context import PagedAttentionContext
     from vllm_metal.attention.impls.gdn_spec import GDNSpecVerifyStep
+    from vllm_metal.attention.impls.kda import KDAVerifySpan
 
 
 @functools.cache
@@ -54,6 +55,8 @@ class PagedStateCache:
         # fixup (speculative decode on hybrid GDN models); None off the
         # speculative path. Owned by gdn_spec, cleared every step.
         self.spec_verify_stash: GDNSpecVerifyStep | None = None
+        # KDA's verify spans, until acceptance (kda.accept_kda_verify_spans).
+        self.kda_verify_spans: list[KDAVerifySpan] = []
 
     def store_conv_state(self, layer_idx: int, array: mx.array) -> None:
         """Store a layer's updated conv pool, keeping pool siblings aliased."""

@@ -1333,6 +1333,41 @@ class TestGlm5NextSparseAttention:
             _assert_output_matches(actual, expected, num_tokens, second.alone)
             _assert_pages_match(runtime, second)
 
+    @pytest.mark.parametrize("committed", [1, 2, 3, 4])
+    def test_verify_span_keeps_the_committed_rows(self, committed) -> None:
+        """A verify span from mid-pool past the next pool, then acceptance: the
+        pages hold bitwise what mlx-vlm's cache transaction keeps, although the
+        span wrote a later pool's tail over the committed pool's rows, and the
+        next decode row is bitwise mlx-vlm's."""
+        from mlx_vlm.speculative.cache_state import start_speculative_cache
+
+        inner = _glm5_next_layer()
+        runtime, wrapper = _glm5_next_paged(inner)
+        request = _GlmRequest([5, 2])
+        _glm_step(inner, runtime, wrapper, [(request, 6)])
+
+        x = mx.random.normal((1, 4, _GLM_HIDDEN)).astype(mx.bfloat16)
+        pac.prepare_grouped(
+            [([request.blocks], request.offset, 4)],
+            [],
+            runtime.kv_group_block_sizes(),
+            merge_verify_windows=True,
+        )
+        pac.get_context().req_ids = ["r"]
+        try:
+            wrapper(x)
+        finally:
+            pac.clear_context()
+        runtime.accept_spec_verify({"r": committed})
+        rollback = start_speculative_cache([request.reference], 4)
+        inner(x, cache=request.reference)
+        rollback.commit([committed])
+        request.offset += committed
+
+        _assert_pages_match(runtime, request)
+        ((actual, expected, _, _),) = _glm_step(inner, runtime, wrapper, [(request, 1)])
+        _assert_output_matches(actual, expected, 1, request.alone)
+
     @pytest.mark.parametrize(
         ("cap_mib", "ties", "block_size", "history", "chunk"),
         [

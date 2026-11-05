@@ -3,10 +3,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx_vlm.models.cache import ArraysCache
 
 from vllm_metal.attention.caches.state_cache import (
     PagedStateCache,
@@ -66,11 +68,50 @@ def is_kda_attention(module: nn.Module) -> bool:
 
 
 @dataclass(frozen=True, slots=True)
+class KDAVerifySpan:
+    """One request's speculative verify span in one KDA layer, kept until
+    acceptance.
+
+    ``cache`` is mlx-vlm's ``ArraysCache`` over the request's state row, which
+    recorded the state after every span row.
+    """
+
+    cache_idx: int
+    req_id: str
+    slot_ids: mx.array
+    cache: ArraysCache
+
+
+def accept_kda_verify_spans(
+    state_cache: PagedStateCache, committed_rows: Mapping[str, int]
+) -> None:
+    """Roll spans that rejected a draft back to their committed depth.
+
+    A verify step writes the span-final state, as if every draft were accepted.
+    ``committed_rows`` maps a request to its committed rows (accepted drafts
+    plus the bonus row); a request without an entry keeps its spans.
+    """
+    kept = []
+    for span in state_cache.kda_verify_spans:
+        committed = committed_rows.get(span.req_id)
+        if committed is None:
+            kept.append(span)
+        elif committed < span.cache.history_capacity:
+            span.cache.commit_speculation([committed])
+            state_cache.write_conv_rows(span.cache_idx, span.cache[0], span.slot_ids)
+            state_cache.write_recurrent_rows(
+                span.cache_idx, span.cache[1], span.slot_ids
+            )
+    state_cache.kda_verify_spans = kept
+
+
+@dataclass(frozen=True, slots=True)
 class _KDAStep:
     cu_seqlens: list[int]
     slot_ids: list[int]
     num_requests: int
     num_decode_requests: int
+    req_ids: list[str]
 
 
 class KDAPagedAttentionWrapper(nn.Module):
@@ -139,7 +180,7 @@ class KDAPagedAttentionWrapper(nn.Module):
         step = self._prepare_step(ctx)
         self._kda_state_cache.apply_pending_conv_state(self._kda_cache_idx)
         self._kda_state_cache.apply_pending_recurrent_state(self._kda_cache_idx)
-        if step.num_decode_requests == step.num_requests:
+        if step.num_decode_requests == step.num_requests == step.cu_seqlens[-1]:
             return self._run_decode(x, step)
         return self._run_requests(x, step)
 
@@ -155,6 +196,7 @@ class KDAPagedAttentionWrapper(nn.Module):
             ),
             num_requests=num_requests,
             num_decode_requests=ctx.num_decode_requests,
+            req_ids=ctx.req_ids,
         )
 
     def _run_decode(self, x: mx.array, step: _KDAStep) -> mx.array:
@@ -169,10 +211,36 @@ class KDAPagedAttentionWrapper(nn.Module):
         for req_idx, slot in enumerate(step.slot_ids):
             start = step.cu_seqlens[req_idx]
             end = step.cu_seqlens[req_idx + 1]
+            if req_idx < step.num_decode_requests and end - start > 1:
+                outputs.append(
+                    self._run_verify(x[:, start:end, :], slot, step.req_ids[req_idx])
+                )
+                continue
             cache = self._slot_cache(mx.array([slot], dtype=mx.int32))
             outputs.append(self._inner(x[:, start:end, :], mask=None, cache=cache))
             cache.flush()
         return mx.concatenate(outputs, axis=1)
+
+    def _run_verify(self, x: mx.array, slot: int, req_id: str) -> mx.array:
+        """Run a speculative verify span on mlx-vlm's ``ArraysCache``.
+
+        The span-final state is written now; the cache keeps the state after
+        every row for :func:`accept_kda_verify_spans`.
+        """
+        state_cache = self._kda_state_cache
+        cache_idx = self._kda_cache_idx
+        slot_ids = mx.array([slot], dtype=mx.int32)
+        cache = ArraysCache(2)
+        cache[0] = state_cache.gather_conv_rows(cache_idx, slot_ids)
+        cache[1] = state_cache.gather_recurrent_rows(cache_idx, slot_ids)
+        cache.start_speculation(x.shape[1])
+        output = self._inner(x, mask=None, cache=cache)
+        state_cache.write_conv_rows(cache_idx, cache[0], slot_ids)
+        state_cache.write_recurrent_rows(cache_idx, cache[1], slot_ids)
+        state_cache.kda_verify_spans.append(
+            KDAVerifySpan(cache_idx, req_id, slot_ids, cache)
+        )
+        return output
 
     def _slot_cache(self, slot_ids: mx.array) -> StateSlotArraysCache:
         return StateSlotArraysCache(

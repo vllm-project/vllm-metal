@@ -7,7 +7,7 @@ physical allocation and scheduler-owned block IDs for both state and KV.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import mlx.core as mx
@@ -23,8 +23,10 @@ from vllm_metal.attention.context import PagedAttentionContext
 from vllm_metal.attention.impls.dsa import (
     DSAPagedAttentionWrapper,
     SparseIndexerCaches,
+    accept_verify_pools,
     is_dsa_attention,
 )
+from vllm_metal.attention.impls.kda import accept_kda_verify_spans
 from vllm_metal.attention.impls.mla import (
     MLAPagedAttentionWrapper,
     is_mla_attention,
@@ -284,12 +286,24 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
         state_block_ids: list[list[list[int]]] | None = None,
         step_positions: list[tuple[int, int]] | None = None,
     ) -> None:
+        ctx.req_ids = req_ids
         self.state_manager.populate_step_context(
             req_ids=req_ids,
             ctx=ctx,
             state_block_ids=state_block_ids,
             step_positions=step_positions,
         )
+
+    def accept_spec_verify(self, committed_rows: Mapping[str, int]) -> None:
+        """Keep the KDA states and pooled keys of verify spans at the depth each
+        request committed (accepted drafts plus the bonus row)."""
+        accept_kda_verify_spans(self.state_cache, committed_rows)
+        if self._indexer_caches is not None:
+            accept_verify_pools(
+                self._indexer_caches,
+                committed_rows,
+                block_size=self.kv_cache.block_size,
+            )
 
     def extend_forward_eval_outputs(self, outputs: list[mx.array]) -> None:
         self.storage.depend(outputs)
@@ -300,6 +314,17 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
         self.state_manager.extend_forward_eval_outputs(outputs)
 
     def release_requests(self, req_ids: set[str]) -> None:
+        # Verify spans a request never confirms stay as written.
+        state_cache = self.state_cache
+        state_cache.kda_verify_spans = [
+            span for span in state_cache.kda_verify_spans if span.req_id not in req_ids
+        ]
+        if self._indexer_caches is not None:
+            self._indexer_caches.verify_pools[:] = [
+                entry
+                for entry in self._indexer_caches.verify_pools
+                if entry.req_id not in req_ids
+            ]
         self.state_manager.release_requests(req_ids)
 
     def materialize_pending_state(self) -> None:

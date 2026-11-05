@@ -128,6 +128,8 @@ class SparseIndexerCaches:
     # [num_blocks, index_kpool, 2 * index_head_dim]: raw key | gate of the
     # unfinished pool in that latent block, at its position % index_kpool
     tail: MLAPagedLatentCache
+    # Verify spans' pools, kept until acceptance (accept_verify_pools).
+    verify_pools: list[_VerifyPool] = field(default_factory=list)
 
     @classmethod
     def from_upstream(
@@ -175,7 +177,8 @@ class SparseIndexerCaches:
             for t in tensors
         ]
         # vLLM's ring is a KV group of its own, for KV transfer and speculative
-        # tokens; neither runs here, so the rows sit beside their latent block.
+        # tokens. Here the rows sit beside their latent block: no KV transfer
+        # runs, and a partial accept rewrites them (accept_verify_pools).
         tail = MLAPagedLatentCache(
             num_layers=len(attention_names),
             latent_dim=2 * head_dim,
@@ -229,6 +232,54 @@ def _key_validity(past: int) -> KVCache:
             mx.zeros((1, 1, past, 0), dtype=mx.bool_),
         )
     return valid
+
+
+@dataclass(frozen=True)
+class _VerifyPool:
+    """One verify span's ``PoolingCache``, speculating over the span's rows."""
+
+    layer: int
+    req_id: str
+    pool: PoolingCache
+    latent_slots: Sequence[int]
+
+
+def accept_verify_pools(
+    caches: SparseIndexerCaches,
+    committed_rows: Mapping[str, int],
+    *,
+    block_size: int,
+) -> None:
+    """Restore the unfinished pool's tail rows of spans that rejected a draft.
+
+    A verify step writes its pages as if every draft were accepted. After a
+    partial accept, the committed unfinished pool's rows are partly unwritten
+    (the span completed that pool) or overwritten by a later pool's rows in the
+    same block; mlx-vlm's committed ``PoolingCache`` holds them all. Pools past
+    the committed depth are not read before they are rewritten. A request
+    without an entry in ``committed_rows`` keeps its spans.
+    """
+    kept = []
+    for entry in caches.verify_pools:
+        committed = committed_rows.get(entry.req_id)
+        if committed is None:
+            kept.append(entry)
+            continue
+        if committed == len(entry.latent_slots):
+            continue
+        entry.pool.commit_speculation([committed])
+        keys, gates, _ = entry.pool.state
+        if keys is None:
+            continue
+        # The unfinished pool lies in the committed end's latent block, at its
+        # positions % kpool.
+        first = entry.latent_slots[committed - 1] // block_size * entry.pool.ratio
+        caches.tail.write_slots(
+            entry.layer,
+            mx.arange(first, first + keys.shape[1], dtype=mx.int32),
+            mx.concatenate([keys[0], gates[0]], axis=-1).astype(caches.tail.dtype),
+        )
+    caches.verify_pools[:] = kept
 
 
 @dataclass
@@ -449,6 +500,9 @@ class DSAPagedAttentionWrapper(nn.Module):
             pool = _restore_pooling_cache(
                 tail_rows, pooled_pages, block_tables[i], past, kpool
             )
+            verify = i < ctx.num_decode_requests and end - start > 1
+            if verify:
+                pool.start_speculation(end - start)
             topk = self._request_topk(
                 x[:, start:end], q_resid[:, start:end], pool, past
             )
@@ -464,6 +518,12 @@ class DSAPagedAttentionWrapper(nn.Module):
                 latent_slots=ctx.slot_mapping[start:end],
                 block_size=block_size,
             )
+            if verify:
+                caches.verify_pools.append(
+                    _VerifyPool(
+                        layer, ctx.req_ids[i], pool, ctx.slot_mapping[start:end]
+                    )
+                )
         writes.write(caches, layer)
         return rows, slots, selected
 

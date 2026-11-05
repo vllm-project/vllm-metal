@@ -2173,6 +2173,14 @@ class MetalModelRunner:
                 apply_spec_decode_acceptance(
                     state_cache, GDNLazyKernels.shared(), committed_rows
                 )
+            hybrid_runtime.accept_spec_verify(
+                {
+                    req_id: len(ids)
+                    for (req_id, _), ids in zip(
+                        decode_reqs, decode_token_ids, strict=True
+                    )
+                }
+            )
 
         # ---- prompt logprobs for requests that asked for them ----
         self._gather_prefill_prompt_logprobs(

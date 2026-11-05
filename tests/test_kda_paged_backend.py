@@ -19,7 +19,10 @@ from vllm_metal.attention.context import (
     clear_context,
     set_context,
 )
-from vllm_metal.attention.impls.kda import KDAPagedAttentionWrapper
+from vllm_metal.attention.impls.kda import (
+    KDAPagedAttentionWrapper,
+    accept_kda_verify_spans,
+)
 
 _HIDDEN_SIZE = 16
 _NUM_HEADS = 2
@@ -129,4 +132,72 @@ def test_kda_paged_state_matches_reference_with_reordering_and_mixed_steps(
         np.array(expected_recurrent),
         rtol=1e-6,
         atol=1e-6,
+    )
+
+
+def test_kda_verify_spans_keep_the_committed_rows() -> None:
+    """A verify step's state equals one pass over each request's committed
+    rows after acceptance; a request acceptance does not name keeps its span."""
+    mx.random.seed(23)
+    inner, make_reference, reference_state = _glm5_next_kda()
+    projection_size = _NUM_HEADS * _HEAD_DIM
+    state_cache = make_state_cache(
+        num_layers=1,
+        max_seqs=3,
+        conv_kernel_dim=_CONV_KERNEL,
+        conv_dim=3 * projection_size,
+        num_v_heads=_NUM_HEADS,
+        value_head_dim=_HEAD_DIM,
+        key_head_dim=_HEAD_DIM,
+        dtype=mx.float32,
+        recurrent_dtype=mx.float32,
+    )
+    wrapper = KDAPagedAttentionWrapper(inner, 0, 0, state_cache)
+    cu_seqlens, committed = [0, 3, 6, 8], [1, 3, 2]
+    x = mx.random.normal((1, cu_seqlens[-1], _HIDDEN_SIZE)).astype(mx.float32)
+
+    set_context(
+        PagedAttentionContext(
+            slot_mapping=[],
+            cu_seqlens=cu_seqlens,
+            state_slot_mapping=[0, 1, 2],
+            num_decode_requests=3,
+            req_ids=["a", "b", "c"],
+        )
+    )
+    try:
+        actual = wrapper(x)
+    finally:
+        clear_context()
+    accept_kda_verify_spans(state_cache, {"a": committed[0], "b": committed[1]})
+    assert [span.req_id for span in state_cache.kda_verify_spans] == ["c"]
+    accept_kda_verify_spans(state_cache, {"c": committed[2]})
+
+    spans = list(zip(cu_seqlens[:-1], cu_seqlens[1:], strict=True))
+    expected = mx.concatenate(
+        [inner(x[:, start:end], cache=make_reference()) for start, end in spans],
+        axis=1,
+    )
+    kept = [make_reference() for _ in spans]
+    for (start, _), rows, reference in zip(spans, committed, kept, strict=True):
+        inner(x[:, start : start + rows], cache=reference)
+    expected_conv, expected_recurrent = (
+        mx.concatenate(states)
+        for states in zip(*map(reference_state, kept), strict=True)
+    )
+    mx.eval(actual, expected)
+    np.testing.assert_allclose(
+        np.array(actual), np.array(expected), rtol=1e-5, atol=1e-5
+    )
+    np.testing.assert_allclose(
+        np.array(state_cache.conv_states[0]),
+        np.array(expected_conv),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        np.array(state_cache.recurrent_states[0]),
+        np.array(expected_recurrent),
+        rtol=1e-5,
+        atol=1e-5,
     )
