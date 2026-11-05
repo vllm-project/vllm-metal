@@ -119,8 +119,6 @@ reply still costs a full canvas, so compare the `long` prompt across runs, not
 
 ## DSpark adaptive profile
 
-Use `benchmark/dspark_adaptive_profile.py` to collect local target/draft costs
-and calibrate the trained confidence head for greedy prefix admission. See the
-[adaptive verification guide](../docs/dspark.md#adaptive-verification) for input
-format, matching server settings and held-out validation. The utility preserves
-raw observations and does not replace an end-to-end serving comparison.
+Use `benchmark/dspark_adaptive_profile.py` to measure target/draft costs and
+calibrate DSpark's confidence head. The [adaptive verification guide](../docs/dspark.md#adaptive-verification)
+covers profile collection, server configuration and serving evaluation.

@@ -70,26 +70,23 @@ establish a speedup.
 
 ## Adaptive verification
 
-An optional policy uses the draft's trained confidence head and a local timing
-profile to admit promising prefixes for target verification. DSpark generates
-the full configured draft block, then chooses how many tokens from each row to
-submit. The target verifier still decides which tokens to accept. A batch-size
-draft schedule remains an upper bound; zero pauses drafting at that batch size.
+Adaptive verification uses the draft's trained confidence head and a local
+timing profile to choose how many draft tokens to send to the target. DSpark
+generates the full configured block, then selects a prefix for each request.
+The target verifier decides which tokens to accept. A batch-size draft schedule
+sets the maximum prefix length; zero pauses drafting at that batch size.
 
-The policy estimates expected emitted tokens per measured draft-plus-target
-time. It searches every feasible total budget, including zero, because Metal
-costs need not increase smoothly with width. Costs are interpolated by mean
-context length and clamped at the profile's endpoints. The cost model is an
-approximation: heterogeneous contexts, unequal row lengths and HTTP overhead
-can change the benefit. Validate end-to-end serving on separate workloads.
+The policy maximizes expected output tokens per measured draft-plus-target
+time. Costs are interpolated by mean context length and clamped at the profile's
+endpoints. Mixed contexts, unequal request lengths and HTTP overhead can affect
+the benefit, so evaluate it on your serving workload.
 
 ### Collect a profile
 
-Use the same Mac, checkpoints, activation precision, draft settings, verification
-layout and context limit as the intended server. Include every batch size up
-to its `max_num_seqs`. Profiles are local calibration artifacts; startup rejects
-a mismatched identity or incomplete cost table. Regenerate a profile after
-changing model files, hardware, runtime versions or execution settings.
+Use the server's Mac, checkpoints, activation precision, draft settings,
+verification layout and context limit. The collector covers batch sizes 1
+through `max_num_seqs`; startup checks that the profile matches. Regenerate it
+after changing model files, hardware, runtime versions or execution settings.
 
 Save the arguments for the fixed-width engine as `llm-arguments.json`:
 
@@ -111,15 +108,15 @@ Save the arguments for the fixed-width engine as `llm-arguments.json`:
 }
 ```
 
-Set the memory allocation for your machine. Use checkpoints with a trained
-confidence head. If you use draft Q4 conversion or a candidate limit, include
-the same settings here and when serving.
+Choose a cache allocation that fits your Mac and a draft with a trained
+confidence head. Match any draft Q4 conversion and candidate-limit settings
+to the server.
 
-Prepare `calibration-inputs.json` as a JSON list. Each row contains `input_ids`
-(the target tokenizer's integer token IDs, including the intended chat template)
-and `split` (`"fit"` or `"holdout"`). Use nonempty, disjoint sets of representative
-natural prompts. Keep this corpus separate from the later serving evaluation.
-Each prompt plus `--output-cap` must fit the context limit.
+Prepare `calibration-inputs.json` as a list of objects with `input_ids` and
+`split` (`"fit"` or `"holdout"`). Tokenize representative prompts with the target
+tokenizer and intended chat template. Both splits must be nonempty and disjoint
+from each other and the serving evaluation. Each prompt plus `--output-cap`
+must fit the context limit.
 
 ```bash
 python tools/benchmark/dspark_adaptive_profile.py \
@@ -130,18 +127,16 @@ python tools/benchmark/dspark_adaptive_profile.py \
     --output dspark-profile
 ```
 
-Run profiling alone on AC power with enough available memory. The collector
-uses an in-process engine to observe conditional confidence and requires exact
-control/observer outputs. Both use full-width draft generation, including near
-the output cap. It measures the target and full-width draft at each context,
-batch size and total admission budget, retaining all samples and warmups.
-Context points must leave room for the draft block and correction token.
+Run on AC power with enough available memory and no competing GPU job. Each
+context point must leave room for the draft block and correction token.
+The collector measures full-width drafting and target verification at each
+context, batch size and total draft-token budget. It also checks that
+observing confidence leaves generated outputs unchanged.
 
-Temperatures are fitted sequentially to prefix-survival Brier error on the
-fitting split, using a fixed grid. Held-out scores are reported without affecting
-the fit. Review those scores even when calibration makes them worse. The output
-directory includes raw observations, controls, timing samples, settings and
-`profile.json`; an existing directory is never replaced.
+Confidence temperatures are fitted on the `fit` split. Compare raw and
+calibrated Brier scores on `holdout` to assess calibration quality. Choose a new
+output directory; it will contain `profile.json`, settings, raw observations,
+controls, and all timing samples and warmups.
 
 ### Serve with the profile
 
@@ -159,15 +154,13 @@ configurations:
 }
 ```
 
-Merge these entries with the model, method and width settings above. Restart the
-server after changing the profile; it is loaded once at startup. Greedy-only
-restrictions still apply. This native Metal policy does not need CUDA graphs.
+Merge these entries with the model, method and width settings above. The profile
+is loaded at startup, so restart after changing it. Adaptive verification
+supports greedy decoding.
 
-Compare fixed-width DSpark and adaptive DSpark with identical tokenized inputs,
-server settings and repeated warmups. Also keep target-only controls. Report
-latency, throughput, emitted token counts and per-position acceptance together:
-a higher accepted/drafted ratio by itself does not establish a speedup.
-
+Compare adaptive DSpark, fixed-width DSpark and target-only serving with the
+same tokenized inputs, settings and repeated warmups. Measure latency,
+throughput, output-token counts and per-position acceptance together.
 
 ## Validate your setup
 
