@@ -1020,22 +1020,23 @@ class MetalModelRunner:
         """Hand the runtime's KV storage to the KV connector, and build its driver.
 
         Called by the worker after ``initialize_kv_cache`` when a KV connector
-        is configured. Only the SDPA runtime's ``KVCacheStorage`` is registered.
-        Hybrid and count-based (draft model) caches have no layout the connector
-        can address, and KV offloading does not support MLA models yet.
+        is configured. Only the SDPA and MLA runtimes' ``KVCacheStorage`` is
+        registered. Hybrid and count-based (draft model) caches have no layout
+        the connector can address.
         """
+        from vllm_metal.attention.runtime.mla import MLAPagedAttentionRuntime
         from vllm_metal.attention.runtime.sdpa import SDPAPagedAttentionRuntime
 
         runtime = self._paged_attention_runtime
         storage = None
-        if isinstance(runtime, SDPAPagedAttentionRuntime):
+        if isinstance(runtime, (SDPAPagedAttentionRuntime, MLAPagedAttentionRuntime)):
             try:
                 storage = runtime.storage
             except RuntimeError:
                 storage = None
         if storage is None:
             raise NotImplementedError(
-                "KV offloading on Metal requires the SDPA paged attention "
+                "KV offloading on Metal requires the SDPA or MLA paged attention "
                 "runtime with storage bound from the KV cache config; "
                 f"{type(runtime).__name__} provides none."
             )
