@@ -395,6 +395,19 @@ class TestMetalPlatform:
     ) -> None:
         MetalPlatform.validate_request({}, pooling_params)
 
+    @pytest.mark.parametrize("speculative", [False, True])
+    def test_mps_sampling_requires_greedy_only_for_speculation(
+        self, monkeypatch, speculative
+    ):
+        monkeypatch.setattr("vllm_metal.envs.VLLM_METAL_BACKEND", "mps")
+        monkeypatch.setattr(MetalPlatform, "_mps_speculative", speculative)
+        params = SamplingParams(temperature=0.8, top_k=25, top_p=0.85)
+        if speculative:
+            with pytest.raises(VLLMValidationError, match="temperature"):
+                MetalPlatform.validate_request({}, params)
+        else:
+            MetalPlatform.validate_request({}, params)
+
     def test_sleep_mode_is_available(self) -> None:
         assert MetalPlatform.is_sleep_mode_available()
 

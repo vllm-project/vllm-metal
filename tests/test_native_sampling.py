@@ -245,10 +245,7 @@ class TestTopKTopPMaskParity:
 
 class TestMlxRandomTokens:
     def test_greedy_row_with_tied_maximum_stays_on_the_argmax(self) -> None:
-        """A greedy row must resolve to the argmax even when the top logits
-        tie. Masking it by value keeps every tied token, and the categorical
-        draw then picks between them; vLLM's greedy path takes the argmax.
-        """
+        """A greedy row in a mixed batch picks the lowest token ID on an exact tie."""
         logits = mx.array([[1.0, 5.0, 5.0, 0.0], [1.0, 2.0, 3.0, 4.0]])
         params = [
             _random_params(temperature=0.0),
@@ -567,3 +564,89 @@ class TestSeededNativeSampling:
                 next_native_rng_key=lambda: mx.random.key(0),
                 output_lengths=[0],
             )
+
+
+def _sampling_golden_cases():
+    # The two sampled IDs per case come from the pinned vLLM FP32 Triton sampler:
+    # https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/worker/gpu/sample/gumbel.py#L165-L205
+    for vocab_size, sampled_ids in (
+        (3, (1, 1)),
+        (1025, (524, 991)),
+        (6562, (3619, 3169)),
+    ):
+        logits = ((torch.arange(vocab_size) % 17).float() / 8).repeat(5, 1)
+        logits[0].zero_()
+        logits[:, 2::5] = -float("inf")
+        # An invalid row must still return a real ID, even across reordered tiles.
+        logits[3:].fill_(float("nan"))
+        logits[4, -1] = -20.0
+        seeds, positions, temperatures = (
+            [42, -1, (1 << 62) + 31, 42, 42],
+            [0, 2, 17, 0, 0],
+            [0.0, 0.8, 1.5, 1.0, 1.0],
+        )
+        expected = [0, *sampled_ids, 0, vocab_size - 1]
+        yield logits, seeds, positions, temperatures, expected
+
+
+def test_mlx_sampler_matches_upstream_with_padding_and_reordering():
+    """Padded MLX rows preserve upstream draws and original token-ID ties."""
+    from vllm_metal.metal import get_ops
+
+    for logits, seeds, positions, temperatures, expected in _sampling_golden_cases():
+        values = mx.array(logits.numpy())
+        order = mx.argsort(values, axis=-1)[:, ::-1]
+        values = mx.pad(
+            mx.take_along_axis(values, order, axis=-1),
+            ((0, 0), (1, 2)),
+            constant_values=1000.0,
+        )[:, 1:-2]
+        mlx_ids = get_ops().gumbel_sample(
+            values,
+            mx.array(seeds, dtype=mx.int64),
+            mx.array(positions, dtype=mx.int64),
+            mx.array(temperatures, dtype=mx.float32),
+            order,
+        )
+        assert mlx_ids.tolist() == expected, logits.shape[-1]
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="requires MPS")
+def test_mps_sampler_matches_upstream_with_padding(run_in_spawn_process):
+    """Padded MPS rows preserve upstream draws and token-ID ties."""
+    run_in_spawn_process(_check_mps_sampler_against_upstream)
+
+
+def _check_mps_sampler_against_upstream():
+    from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+
+    from vllm_metal.pytorch_backend.bindings import register_kernel_overrides
+
+    register_kernel_overrides()
+    for logits, seeds, positions, temperatures, expected in _sampling_golden_cases():
+        mps_logits = torch.nn.functional.pad(logits.to("mps"), (1, 2), value=1000.0)
+        mps_ids = gumbel_sample(
+            mps_logits[:, 1:-2],
+            torch.arange(len(seeds), dtype=torch.int32, device="mps"),
+            torch.tensor(temperatures, device="mps"),
+            torch.tensor(seeds, device="mps"),
+            torch.tensor(positions, device="mps"),
+            True,
+            False,
+        )
+        assert mps_ids.cpu().tolist() == expected, logits.shape[-1]
+
+
+def test_broadcast_logits_use_per_row_candidate_ids():
+    from vllm_metal.metal import get_ops
+
+    # The same strided scores select different token IDs in the two rows.
+    scores = mx.array([[-9.0, 1.0, -9.0, 5.0, -9.0, 2.0]])[:, 1::2]
+    tokens = get_ops().gumbel_sample(
+        mx.broadcast_to(scores, (2, 3)),
+        mx.zeros(2, mx.int64),
+        mx.zeros(2, mx.int64),
+        mx.zeros(2, mx.float32),
+        mx.array([[1, 0, 2], [0, 2, 1]], dtype=mx.uint32),
+    )
+    assert tokens.tolist() == [0, 2]

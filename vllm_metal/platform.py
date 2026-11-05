@@ -115,6 +115,7 @@ class MetalPlatform(Platform):
     # Its served canvas_length, recorded by _check_diffusion_config.
     _diffusion_canvas_length: ClassVar[int | None] = None
     _serves_omni: ClassVar[bool] = False
+    _mps_speculative: ClassVar[bool] = False
 
     # --- Ray distributed executor support (Phase 1) ---
     # Advertise the Apple GPU as a custom Ray resource named "mlx".  Because this
@@ -365,13 +366,10 @@ class MetalPlatform(Platform):
             if enabled
         ]
         if envs.VLLM_METAL_BACKEND == "mps":
-            # The MPS sampler is greedy argmax. logit_bias and min_tokens
-            # change that choice, and this backend does not run the MLX
-            # torch-sampler bridge that applies them.
             unsupported_controls += [
                 name
                 for name, enabled in (
-                    ("temperature", params.temperature != 0),
+                    ("temperature", params.temperature != 0 and cls._mps_speculative),
                     ("presence_penalty", params.presence_penalty != 0),
                     ("frequency_penalty", params.frequency_penalty != 0),
                     (
@@ -380,6 +378,8 @@ class MetalPlatform(Platform):
                     ),
                     ("allowed_token_ids", bool(params.allowed_token_ids)),
                     ("bad_words", bool(params.bad_words)),
+                    # Both controls need an MPS override for MRv2's logit-bias kernel.
+                    # https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/worker/gpu/sample/logit_bias.py#L225-L246
                     ("logit_bias", bool(params.logit_bias)),
                     ("min_tokens", params.min_tokens > 0),
                 )
@@ -630,6 +630,7 @@ class MetalPlatform(Platform):
             from vllm_metal.pytorch_backend.worker import configure_mps
 
             cls._serves_omni = getattr(model_config, "model_stage", None) is not None
+            cls._mps_speculative = vllm_config.speculative_config is not None
             configure_mps(vllm_config, omni=cls._serves_omni)
         if parallel_config.worker_cls == "auto":
             parallel_config.worker_cls = (
