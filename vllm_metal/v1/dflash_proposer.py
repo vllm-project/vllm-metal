@@ -85,7 +85,7 @@ class DFlashProposer(BlockDraftProposer):
         draft = self.cache.compile_draft(
             num_draft_tokens=width, embed=self.embed, project=self.project
         )
-        return lambda anchors, rows: mx.argmax(draft(anchors, rows), axis=-1)
+        return lambda anchors, rows: (mx.argmax(draft(anchors, rows), axis=-1), None)
 
     def _profile_draft(self, anchors: mx.array, features: Sequence[mx.array]) -> None:
         mx.eval(

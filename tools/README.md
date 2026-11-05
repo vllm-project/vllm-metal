@@ -116,3 +116,9 @@ python tools/diffusion_bench.py --concurrency 1 4 --repeats 3 --json bench.json
 Tokens/s depends on how much of each 32-token canvas the answer uses: a short
 reply still costs a full canvas, so compare the `long` prompt across runs, not
 `short`.
+
+## DSpark adaptive profile
+
+Use `benchmark/dspark_adaptive_profile.py` to measure target/draft costs and
+calibrate DSpark's confidence head. The [adaptive verification guide](../docs/dspark.md#adaptive-verification)
+covers profile collection, server configuration and serving evaluation.

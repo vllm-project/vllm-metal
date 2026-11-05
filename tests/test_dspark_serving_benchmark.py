@@ -12,6 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from tools.benchmark.dspark_adaptive_profile import fit_confidence, load_inputs
 from tools.benchmark.dspark_serving_benchmark import (
     COUNTERS,
     machine_state,
@@ -343,3 +344,58 @@ def test_machine_state_survives_stalled_system_tools(monkeypatch):
     assert state["power"]["returncode"] is None
     assert "TimeoutExpired" in state["thermal"]["stderr"]
     assert state["gpu_device_utilization_percent"] is None
+
+
+def test_calibration_does_not_fit_held_out_acceptance():
+    rows = [
+        {
+            "split": split,
+            "confidence": [1.2, -0.7],
+            "verified": 2,
+            "generated_width": 2,
+            "accepted": accepted,
+        }
+        for split in ("fit", "holdout")
+        for accepted in (0, 1, 2)
+    ]
+    before = fit_confidence(rows, 2)
+    changed = deepcopy(rows)
+    for row in changed:
+        if row["split"] == "holdout":
+            row["accepted"] = 0
+    after = fit_confidence(changed, 2)
+    assert before["temperatures"] == after["temperatures"]
+    assert before["reports"]["fit"] == after["reports"]["fit"]
+    assert before["reports"]["holdout"] != after["reports"]["holdout"]
+
+
+def test_calibration_rejects_confidence_from_a_shorter_generated_block():
+    # DSpark's bidirectional predictions depend on generation width, even
+    # when only a prefix is returned to satisfy the request's output limit.
+    rows = [
+        {
+            "split": "fit",
+            "confidence": [1.2],
+            "verified": 1,
+            "generated_width": 1,
+            "accepted": 1,
+        }
+    ]
+    with pytest.raises(ValueError, match="full configured draft block"):
+        fit_confidence(rows, 2)
+
+
+@pytest.mark.parametrize("split", ("fit", "holdout"))
+def test_calibration_inputs_reject_reused_token_sequences(tmp_path, split):
+    path = tmp_path / "inputs.json"
+    path.write_text(
+        json.dumps(
+            [
+                {"split": "fit", "input_ids": [7, 8]},
+                {"split": "holdout", "input_ids": [9, 10]},
+                {"split": split, "input_ids": [7, 8]},
+            ]
+        )
+    )
+    with pytest.raises(ValueError, match="Duplicate|disjoint"):
+        load_inputs(path, 128, 64)
