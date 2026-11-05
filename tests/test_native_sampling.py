@@ -566,21 +566,7 @@ class TestSeededNativeSampling:
             )
 
 
-@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="requires MPS")
-def test_shared_sampler_matches_upstream_with_padding_and_reordering(
-    run_in_spawn_process,
-):
-    """Padded rows preserve the upstream RNG stream and original token-ID ties."""
-    run_in_spawn_process(_check_shared_sampler_after_reordering)
-
-
-def _check_shared_sampler_after_reordering():
-    from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
-
-    from vllm_metal.metal import get_ops
-    from vllm_metal.pytorch_backend.bindings import register_kernel_overrides
-
-    register_kernel_overrides()
+def _sampling_golden_cases():
     # The two sampled IDs per case come from the pinned vLLM FP32 Triton sampler:
     # https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/worker/gpu/sample/gumbel.py#L165-L205
     for vocab_size, sampled_ids in (
@@ -599,20 +585,15 @@ def _check_shared_sampler_after_reordering():
             [0, 2, 17, 0, 0],
             [0.0, 0.8, 1.5, 1.0, 1.0],
         )
-        mps_logits = torch.nn.functional.pad(logits.to("mps"), (1, 2), value=1000.0)
-        mps_ids = (
-            gumbel_sample(
-                mps_logits[:, 1:-2],
-                torch.arange(len(seeds), dtype=torch.int32, device="mps"),
-                torch.tensor(temperatures, device="mps"),
-                torch.tensor(seeds, device="mps"),
-                torch.tensor(positions, device="mps"),
-                True,
-                False,
-            )
-            .cpu()
-            .tolist()
-        )
+        expected = [0, *sampled_ids, 0, vocab_size - 1]
+        yield logits, seeds, positions, temperatures, expected
+
+
+def test_mlx_sampler_matches_upstream_with_padding_and_reordering():
+    """Padded MLX rows preserve upstream draws and original token-ID ties."""
+    from vllm_metal.metal import get_ops
+
+    for logits, seeds, positions, temperatures, expected in _sampling_golden_cases():
         values = mx.array(logits.numpy())
         order = mx.argsort(values, axis=-1)[:, ::-1]
         values = mx.pad(
@@ -627,9 +608,33 @@ def _check_shared_sampler_after_reordering():
             mx.array(temperatures, dtype=mx.float32),
             order,
         )
-        expected = [0, *sampled_ids, 0, vocab_size - 1]
-        assert mps_ids == expected, vocab_size
-        assert mlx_ids.tolist() == expected, vocab_size
+        assert mlx_ids.tolist() == expected, logits.shape[-1]
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="requires MPS")
+def test_mps_sampler_matches_upstream_with_padding(run_in_spawn_process):
+    """Padded MPS rows preserve upstream draws and token-ID ties."""
+    run_in_spawn_process(_check_mps_sampler_against_upstream)
+
+
+def _check_mps_sampler_against_upstream():
+    from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+
+    from vllm_metal.pytorch_backend.bindings import register_kernel_overrides
+
+    register_kernel_overrides()
+    for logits, seeds, positions, temperatures, expected in _sampling_golden_cases():
+        mps_logits = torch.nn.functional.pad(logits.to("mps"), (1, 2), value=1000.0)
+        mps_ids = gumbel_sample(
+            mps_logits[:, 1:-2],
+            torch.arange(len(seeds), dtype=torch.int32, device="mps"),
+            torch.tensor(temperatures, device="mps"),
+            torch.tensor(seeds, device="mps"),
+            torch.tensor(positions, device="mps"),
+            True,
+            False,
+        )
+        assert mps_ids.cpu().tolist() == expected, logits.shape[-1]
 
 
 def test_broadcast_logits_use_per_row_candidate_ids():
