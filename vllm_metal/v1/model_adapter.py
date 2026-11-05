@@ -141,6 +141,7 @@ class IntermediateForwardOutput:
     """Projection-free forward output for a no-sample intermediate step."""
 
     hidden_states: mx.array
+    aux_hidden_states: tuple[mx.array, ...] = ()
 
 
 class MultimodalEncodeResult(Protocol):
@@ -312,8 +313,9 @@ class ModelAdapter(Protocol):
         input_ids: mx.array,
         *,
         cache: Any | None = None,
+        aux_capture: AuxHiddenStateCapture | None = None,
     ) -> IntermediateForwardOutput:
-        """Run *model* without the output projection (cache writes only)."""
+        """Run without logits, retaining cache writes and optional draft features."""
 
     def target_forward(
         self,
@@ -721,6 +723,7 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
         input_ids: mx.array,
         *,
         cache: Any | None = None,
+        aux_capture: AuxHiddenStateCapture | None = None,
     ) -> IntermediateForwardOutput:
         """Run *model*'s transformer body without the output projection.
 
@@ -734,7 +737,13 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
                 f"{type(model).__name__} has no resolvable transformer body; "
                 "callers must gate on supports_intermediate_forward()."
             )
-        return IntermediateForwardOutput(hidden_states=body(input_ids, cache=cache))
+        if aux_capture is None:
+            return IntermediateForwardOutput(hidden_states=body(input_ids, cache=cache))
+        hidden_states, auxiliary = aux_capture.run(body, input_ids, cache=cache)
+        auxiliary = tuple(self._flatten_target_hidden_states(h) for h in auxiliary)
+        if any(h.shape[0] != input_ids.size for h in auxiliary):
+            raise ValueError("Intermediate capture requires one state per input token")
+        return IntermediateForwardOutput(hidden_states, auxiliary)
 
     def _transformer_body(self, model: Any) -> Any | None:
         backbone = self._target_backbone(model)

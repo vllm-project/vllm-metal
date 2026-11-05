@@ -4237,8 +4237,9 @@ class TestIntermediateBodyOnlyForward:
             num_spec_tokens_to_schedule=0,
         )
 
+    @pytest.mark.parametrize("block_draft", [False, True])
     def test_intermediate_only_step_runs_body_and_skips_lm_head(
-        self, monkeypatch
+        self, monkeypatch, block_draft
     ) -> None:
         # Arrange
         captured: dict[str, object] = {}
@@ -4251,6 +4252,21 @@ class TestIntermediateBodyOnlyForward:
         runner = make_stub_runner(model=SimpleNamespace(model=body))
         runner.num_layers = 0
         runner._paged_block_size = 4
+        if block_draft:
+            features = hidden + 1
+
+            def capture(forward, *args, **kwargs):
+                return forward(*args, **kwargs), (features,)
+
+            def propose(ctx):
+                captured["draft_ctx"] = ctx
+                return None
+
+            runner._aux_capture = SimpleNamespace(run=capture)
+            runner._drafter = SimpleNamespace(
+                needs_target_hidden_states=lambda *a, **k: False,
+                propose=propose,
+            )
 
         def unexpected_target_forward(*args, **kwargs):
             raise AssertionError("intermediate-only step must not run lm_head")
@@ -4263,9 +4279,15 @@ class TestIntermediateBodyOnlyForward:
         monkeypatch.setattr(runner, "_submit_paged_forward_outputs", record_submit)
 
         # Act
+        request = self._intermediate_prefill_request()
+        batch = mr._ExecutionBatch()
+        output_idx = batch.add_output(request.req_id, [])
+        batch.paged_prefill_entries.append(
+            mr._PendingPrefillEntry(output_idx, request, "intermediate")
+        )
         runner._start_paged_forward(
-            mr._ExecutionBatch(),
-            prefill_reqs=[self._intermediate_prefill_request()],
+            batch,
+            prefill_reqs=[request],
             decode_reqs=[],
             scheduler_output=self._make_scheduler_output(),
         )
@@ -4281,6 +4303,14 @@ class TestIntermediateBodyOnlyForward:
         assert state.target_hidden_states is None
         assert state.intermediate_only is True
         assert state.cu_seqlens == [0, 2]
+        result, _ = runner._sample_paged_batch()
+        assert result.sampled_tokens == [[]]
+        assert runner._paged_request_seq_lens[request.req_id] == 2
+        if block_draft:
+            ctx = captured["draft_ctx"]
+            assert ctx.prefill_reqs == [request]
+            assert ctx.prefill_result_modes == ["intermediate"]
+            assert ctx.target_aux_hidden_states[0].tolist() == features[0].tolist()
 
     @pytest.mark.parametrize("case", ["final_prefill", "with_decode", "drafter"])
     def test_non_intermediate_only_steps_run_full_forward(
