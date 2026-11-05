@@ -214,6 +214,7 @@ def test_bailing_hybrid_emits_mla_and_kda_specs() -> None:
     [
         ({"qk_rope_head_dim": 64}, "qk_rope_head_dim 0"),
         ({"indexer_types": ["full"] * 3 + ["shared"]}, "shared"),
+        ({"index_kpool_always_select_tail": False}, "always_select_tail"),
         ({"block_size": 34}, "multiple of index_kpool"),
         (
             {"speculative_config": SimpleNamespace(num_speculative_tokens=1)},
@@ -224,6 +225,7 @@ def test_bailing_hybrid_emits_mla_and_kda_specs() -> None:
     ids=[
         "rope",
         "shared_indexer",
+        "no_tail",
         "split_pool",
         "speculative",
         "hit_splits_pool",
@@ -231,9 +233,10 @@ def test_bailing_hybrid_emits_mla_and_kda_specs() -> None:
 )
 def test_glm5_next_specs_refuse_unsupported_configs(overrides, error) -> None:
     """What the paged sparse layout cannot serve fails loudly instead of being
-    laid out: a RoPE latent, a layer reusing another layer's top-k, a block
-    or prefix-hit unit that splits a pool, and speculative decoding (rejected
-    drafts would stay in the pooled keys and tails)."""
+    laid out: a RoPE latent, a layer reusing another layer's top-k, a
+    checkpoint that drops the incomplete tail pool, a block or prefix-hit
+    unit that splits a pool, and speculative decoding (rejected drafts would
+    stay in the pooled keys and tails)."""
     runner = make_glm5_next_stub_runner(**overrides)
 
     with pytest.raises((ValueError, NotImplementedError), match=error):

@@ -69,6 +69,10 @@ def sparse_latent_spec(
             "GLM-5-Next sparse MLA: layers that reuse another layer's top-k "
             "(indexer_types 'shared') are not supported."
         )
+    if not model_args.get("index_kpool_always_select_tail", True):
+        raise NotImplementedError(
+            "GLM-5-Next sparse MLA: requires index_kpool_always_select_tail=True."
+        )
     kpool = int(model_args["index_kpool"])
     pooled_size = spec.block_size // kpool * int(model_args["index_head_dim"])
     if spec.block_size % kpool or pooled_size % spec.head_size:
@@ -538,7 +542,7 @@ class DSAPagedAttentionWrapper(nn.Module):
             pad = [(0, 0), (0, 0), (0, width - topk.shape[-1])]
             topk = mx.pad(topk, pad, constant_values=-1)
         topk = topk[..., :width]
-        # vLLM's config refuses index_kpool_always_select_tail other than True.
+        # sparse_latent_spec refuses index_kpool_always_select_tail other than True.
         if kpool > 1:
             visible = positions + 1
             tail_count = visible % kpool
