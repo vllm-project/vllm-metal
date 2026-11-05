@@ -370,6 +370,64 @@ class TestPackedRoPE:
             self.calls.append((x.shape, offset))
             return super().__call__(x, offset=offset)
 
+    @pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+    @pytest.mark.parametrize("factor,base", [(0.5, 1e6), (1.0, 1e4)])
+    @pytest.mark.parametrize("apply_keys", [True, False])
+    def test_lfm3_batches_decode_without_changing_rotations(
+        self, monkeypatch, dtype, factor, base, apply_keys
+    ):
+        from mlx_vlm.models.lfm3.language import RotaryEmbedding
+
+        from vllm_metal.attention.impls.varlen_rope_compat import apply_packed_rope
+
+        rope = RotaryEmbedding(
+            128, {"partial_rotary_factor": factor, "rope_theta": base}
+        )
+        q = mx.random.normal((1, 16, 4, 128), key=mx.random.key(42)).astype(dtype)
+        k = mx.random.normal((1, 4, 4, 128), key=mx.random.key(43)).astype(dtype)
+        offsets = [0, 37, 4096, 8191]
+        expected_q = mx.concatenate(
+            [rope(q[:, :, i : i + 1, :], offset=off) for i, off in enumerate(offsets)],
+            axis=2,
+        )
+        expected_k = (
+            mx.concatenate(
+                [
+                    rope(k[:, :, i : i + 1, :], offset=off)
+                    for i, off in enumerate(offsets)
+                ],
+                axis=2,
+            )
+            if apply_keys
+            else k
+        )
+        calls = []
+        original = RotaryEmbedding.__call__
+
+        def record(self, x, offset=0, position_ids=None):
+            calls.append(
+                (x.shape, offset.tolist() if isinstance(offset, mx.array) else offset)
+            )
+            return original(self, x, offset=offset, position_ids=position_ids)
+
+        monkeypatch.setattr(RotaryEmbedding, "__call__", record)
+        out_q, out_k = apply_packed_rope(
+            SimpleNamespace(rope=rope),
+            q,
+            k,
+            [0, 1, 2, 3, 4],
+            offsets=offsets,
+            apply_keys=apply_keys,
+        )
+        expected_calls = [((4, 16, 1, 128), offsets)]
+        if apply_keys:
+            expected_calls.append(((4, 4, 1, 128), offsets))
+        assert calls == expected_calls
+        assert mx.array_equal(out_q, expected_q).item()
+        assert mx.array_equal(out_k, expected_k).item()
+        if not apply_keys:
+            assert out_k is k
+
     def test_native_rope_batches_single_token_segments(self):
         from vllm_metal.attention.impls.varlen_rope_compat import (
             apply_packed_rope,
