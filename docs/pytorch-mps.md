@@ -15,9 +15,12 @@ VLLM_METAL_BACKEND=mps PYTORCH_ENABLE_MPS_FALLBACK=0 \
 
 Release wheels include both native launchers and the shared Metal shaders;
 no compiler is needed. Source checkouts use the [development setup](CONTRIBUTING.md#development-setup).
-Selecting MPS defaults to MRv2. Use unquantized FP16/BF16 checkpoints and greedy
-requests (`temperature=0`). Output-token logprobs are supported; prompt logprobs
-and explicit token-ID scoring are not yet supported.
+Selecting MPS defaults to MRv2. Use unquantized FP16/BF16 checkpoints.
+Greedy decoding and seeded sampling with temperature, top-k, top-p, and min-p
+are supported. Output-token logprobs are supported; prompt logprobs and explicit
+token-ID scoring are not yet supported.
+
+For speech generation, see [Qwen3-TTS on Apple Silicon](qwen3-tts-mps.md).
 
 ## EAGLE3 speculative decoding
 
@@ -45,6 +48,18 @@ more draft tokens do not always improve throughput.
 - Extend upstream scheduler, cache, speculative-decoding and omni contracts.
   Continuous batching and duplex are requirements for the corresponding serving
   features, not optional follow-ups to a single-request implementation.
+
+## Adding Omni models
+
+- Keep model definitions, weight loading, audio processing, and cache algorithms
+  in vllm-omni. Reuse its worker and runner interfaces through `omni.py`.
+- Put MPS deployment defaults in `pytorch_backend/deploy/`; keep
+  `omni_platform.py` limited to platform capabilities.
+- Put model-family operator registrations in `pytorch_backend/models/`.
+  Follow `qwen3_code_predictor.py`: a small `install()` function, upstream
+  `register_oot` hooks, and shared MPS operations. Register before model loading.
+- Add a shared helper only when another model needs the same behavior. Validate
+  matching-checkpoint parity and real serving at batch sizes 1, 4, and 8.
 
 ## Kernels: choose the existing integration point
 

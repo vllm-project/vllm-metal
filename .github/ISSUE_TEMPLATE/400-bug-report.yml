@@ -1,0 +1,59 @@
+name: 🐛 Bug report
+description: Raise an issue here if you find a bug.
+title: "[Bug]: "
+labels: ["bug"]
+
+body:
+- type: markdown
+  attributes:
+    value: >
+      #### Before submitting an issue, please make sure the issue hasn't been already addressed by searching through [the existing and past issues](https://github.com/vllm-project/vllm-metal/issues?q=is%3Aissue+sort%3Acreated-desc+).
+- type: input
+  attributes:
+    label: vllm-metal version
+    description: >
+      `brew list --versions vllm-metal` for Homebrew, `pip show vllm-metal` otherwise.
+      If you built from source, give the commit.
+  validations:
+    required: true
+- type: textarea
+  attributes:
+    label: Your Mac
+    description: |
+      Please run the following and paste the output below.
+      ```sh
+      sw_vers
+      sysctl -n machdep.cpu.brand_string hw.memsize
+      ```
+    render: text
+  validations:
+    required: true
+- type: dropdown
+  attributes:
+    label: Backend
+    options:
+      - MLX (default)
+      - PyTorch MPS (VLLM_METAL_BACKEND=mps)
+  validations:
+    required: true
+- type: textarea
+  attributes:
+    label: 🐛 Describe the bug
+    description: |
+      A clear and concise description of what the bug is, with the exact command or a minimal script that reproduces it, the model, and the full traceback or log.
+    placeholder: |
+      ```sh
+      vllm serve <model> ...
+      ```
+
+      ```
+      The error message you got, with the full traceback.
+      ```
+  validations:
+    required: true
+- type: checkboxes
+  attributes:
+    label: Before submitting a new issue...
+    options:
+      - label: I have searched for relevant issues.
+        required: true

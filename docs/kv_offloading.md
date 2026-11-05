@@ -60,8 +60,7 @@ the default chunk size gets a pool of up to 2 GiB, so the two need up to 10 GiB
 plus weights and activations.
 
 The pool takes memory only as chunks are stored. Level 1 sleep frees it (see
-[Sleep mode](configuration.md#sleep-mode)). MLA models do not support sleep
-yet, with or without offloading.
+[Sleep mode](configuration.md#sleep-mode)).
 
 ## Limits
 
@@ -74,6 +73,8 @@ for example Qwen3 dense models or MiniCPM3. Refused at startup:
 - Pooling and speech-to-text models.
 - Pipeline and data parallelism, and any executor other than `uni`.
 - `--kv-offloading-size` combined with a different KV connector.
+- `canonical_layout` in `kv_connector_extra_config`. Metal does not write the
+  canonical layout.
 
 ## Reuse across restarts
 

@@ -927,6 +927,27 @@ class TestSharedStorageRuntime:
         for layer in range(2):
             assert bool(mx.array_equal(rebound.latent_caches[layer][4], rows + layer))
 
+    def test_sleep_frees_the_backing_and_wake_rebinds_the_views(self) -> None:
+        backend = self._make_backend()
+        cache = backend._cache
+        before = mx.get_active_memory()
+
+        backend.release_kv_memory()
+
+        assert backend.storage.released
+        assert before - mx.get_active_memory() >= backend.storage.nbytes
+
+        backend.restore_kv_memory()
+        rows = mx.random.normal((16, _LATENT_DIM)).astype(mx.float16)
+        cache.write_slots(1, mx.arange(16, 32), rows)  # block 1
+        outputs: list[mx.array] = []
+        backend.extend_forward_eval_outputs(outputs)
+        mx.eval(*outputs)
+
+        names = ["layers.0.self_attn", "layers.1.self_attn"]
+        rebound = MLAPagedLatentCache.from_upstream(backend.storage, names)
+        assert bool(mx.array_equal(rebound.latent_caches[1][1], rows))
+
 
 class TestMLAPerForwardMetadata:
     """The typed ``ctx.mla_metadata`` memo converts each per-forward input

@@ -3,7 +3,9 @@
 #include "ops_internal.h"
 
 #include <unordered_map>
+#include <chrono>
 #include <cstdlib>
+#include <mutex>
 
 // ---------------------------------------------------------------------------
 // Library caching
@@ -29,6 +31,74 @@ inline void record_paged_dispatch(PagedDispatch family, int gqa_partition = 0,
   // The mixed wrapper records its family after NAX records the executed width.
   if (family != PagedDispatch::MixedNaxPrefillDecode)
     g_last_nax_heads_per_tg.store(nax_heads_per_tg, std::memory_order_relaxed);
+}
+
+constexpr size_t kNaxPrefillTraceCapacity = 8192;
+static std::array<NaxPrefillDispatchEvent, kNaxPrefillTraceCapacity>
+    g_nax_prefill_trace;
+static std::atomic<bool> g_nax_prefill_trace_enabled{false};
+static std::mutex g_nax_prefill_trace_mutex;
+static size_t g_nax_prefill_trace_size = 0;
+static uint64_t g_nax_prefill_trace_dropped = 0;
+static uint64_t g_nax_prefill_trace_append_ns = 0;
+
+void start_nax_prefill_dispatch_trace() {
+  std::lock_guard<std::mutex> lock(g_nax_prefill_trace_mutex);
+  g_nax_prefill_trace_size = 0;
+  g_nax_prefill_trace_dropped = 0;
+  g_nax_prefill_trace_append_ns = 0;
+  g_nax_prefill_trace_enabled.store(true, std::memory_order_relaxed);
+}
+
+static void record_nax_prefill_dispatch(
+    const array& query, const array& key_cache, int num_kv_heads,
+    int block_size, int num_seqs, int total_q_blocks, kernels::NaxConfig cfg,
+    int sliding_window, float softcap, bool use_sinks,
+    const std::string& function, bool split_full, int max_seq_len, int q_block_offset,
+    int value_slices, int grouped_skip_bounds) {
+  if (!g_nax_prefill_trace_enabled.load(std::memory_order_relaxed)) return;
+  const auto started = std::chrono::steady_clock::now();
+  std::lock_guard<std::mutex> lock(g_nax_prefill_trace_mutex);
+  if (!g_nax_prefill_trace_enabled.load(std::memory_order_relaxed)) return;
+  if (g_nax_prefill_trace_size < kNaxPrefillTraceCapacity) {
+    int32_t key_block_stride = static_cast<int32_t>(key_cache.strides()[0]);
+    if (static_cast<int>(key_cache.shape(1)) > block_size) {
+      key_block_stride = static_cast<int32_t>(block_size * key_cache.strides()[1]);
+    }
+    g_nax_prefill_trace[g_nax_prefill_trace_size++] = {
+        cfg.HEADS_PER_TG > 1 ? "nax_gqa6_prefill" : "nax_prefill",
+        query.dtype() == bfloat16 ? "bfloat16" : "float16",
+        static_cast<int>(query.shape(0)), static_cast<int>(query.shape(1)),
+        num_kv_heads, static_cast<int>(query.shape(2)), block_size, num_seqs,
+        static_cast<int>(query.shape(1)) / cfg.HEADS_PER_TG, total_q_blocks,
+        cfg.NUM_THREADS, cfg.BQ, cfg.HEADS_PER_TG,
+        static_cast<int32_t>(query.shape(1) * query.shape(2)), key_block_stride,
+        static_cast<int32_t>(key_cache.strides()[2]),
+        static_cast<int64_t>(key_cache.strides()[0]),
+        static_cast<int64_t>(key_cache.strides()[1]),
+        static_cast<int64_t>(key_cache.strides()[2]),
+        static_cast<int>(key_cache.shape(1)), sliding_window, softcap, use_sinks,
+        value_slices, grouped_skip_bounds, function, split_full, max_seq_len, q_block_offset};
+  } else {
+    ++g_nax_prefill_trace_dropped;
+  }
+  // Includes lock acquisition, metadata reads and append/drop accounting.
+  // Excludes flag check, final clock read/accounting, unlock and start/take.
+  g_nax_prefill_trace_append_ns += static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - started).count());
+}
+
+NaxPrefillTraceResult take_nax_prefill_dispatch_trace() {
+  std::lock_guard<std::mutex> lock(g_nax_prefill_trace_mutex);
+  g_nax_prefill_trace_enabled.store(false, std::memory_order_relaxed);
+  NaxPrefillTraceResult result{
+      {g_nax_prefill_trace.begin(), g_nax_prefill_trace.begin() + g_nax_prefill_trace_size},
+      kNaxPrefillTraceCapacity, g_nax_prefill_trace_dropped, g_nax_prefill_trace_append_ns};
+  g_nax_prefill_trace_size = 0;
+  g_nax_prefill_trace_dropped = 0;
+  g_nax_prefill_trace_append_ns = 0;
+  return result;
 }
 
 // Split a mixed batch's decode rows only when they carry at least this much
@@ -419,7 +489,12 @@ static void dispatch_paged_attention_nax(
   enc.dispatch_threadgroups(
       MTL::Size::Make(num_heads / cfg.HEADS_PER_TG, plan.q_blocks, plan.value_slices),
       MTL::Size::Make(plan.num_threads, 1, 1));
-
+  // The trace lock orders appends, not dispatches from concurrent encoders.
+  record_nax_prefill_dispatch(
+      query, key_cache, num_kv_heads, block_size, num_seqs, plan.q_blocks,
+      cfg, sliding_window, softcap, plan.use_sinks, plan.base_kname,
+      plan.split_full, max_seq_len, q_block_offset, plan.value_slices,
+      cfg.HEADS_PER_TG > 1 ? 1 : -1);
 }
 
 struct TiledAttentionPlan {

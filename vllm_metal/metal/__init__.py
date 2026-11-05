@@ -122,6 +122,10 @@ def _build_rope_source() -> str:
     return _read_v2_metal_source("rope.metal")
 
 
+def _build_sampling_source() -> str:
+    return _read_v2_metal_source("sampling.metal")
+
+
 def _build_normalization_source() -> str:
     return _read_v2_metal_source("normalization.metal")
 

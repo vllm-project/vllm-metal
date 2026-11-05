@@ -69,6 +69,80 @@ def test_request_slots_and_dummy_padding(num_groups):
     assert dummy.tolist() == expected_slots[:num_groups]
 
 
+def test_gather_nulls_blocks_below_sliding_window():
+    # Oracle from vLLM v0.33.0, tests/v1/worker/test_gpu_block_table.py
+    # (test_gather_block_tables_nulls_blocks_below_sliding_window).
+    install()
+    tables = BlockTables(
+        [16, 16], 4, 64, [16, 16], torch.device("mps"), sliding_window_reach=[0, 31]
+    )
+    full_ids = [list(range(1, 13)), list(range(41, 53))]
+    swa_ids = [list(range(21, 33)), list(range(61, 73))]
+    for req, slot in enumerate([0, 2]):
+        tables.append_block_ids(slot, (full_ids[req], swa_ids[req]), True)
+    tables.apply_staged_writes()
+    mapping = torch.tensor([0, 2], dtype=torch.int32, device="mps")
+    computed = torch.tensor([145, 0, 120, 0], dtype=torch.int32, device="mps")
+
+    full, swa = tables.gather_block_tables(
+        mapping, num_reqs_padded=3, num_computed_tokens=computed
+    )
+    full_rows, swa_rows = full[:, :12].tolist(), swa[:, :12].tolist()
+    _, unmasked = tables.gather_block_tables(mapping, num_reqs_padded=2)
+
+    assert full_rows[:2] == full_ids
+    assert swa_rows == [
+        [0] * 7 + swa_ids[0][7:],
+        [0] * 5 + swa_ids[1][5:],
+        [0] * 12,
+    ]
+    assert tables.block_tables[1].gpu[0, :12].tolist() == swa_ids[0]
+    assert unmasked[0, :12].tolist() == swa_ids[0]
+
+
+def test_gather_clears_rows_left_by_larger_batch():
+    # Oracle from vLLM v0.33.0, tests/v1/worker/test_gpu_block_table.py
+    # (test_shared_block_tables_clear_rows_from_larger_batch).
+    install()
+    tables = BlockTables([16], 4, 64, [3], torch.device("mps"))
+    for slot in range(4):
+        tables.append_block_ids(slot, ([slot + 1] * 3,), True)
+    tables.apply_staged_writes()
+    tables.gather_block_tables(
+        torch.arange(4, dtype=torch.int32, device="mps"), num_reqs_padded=4
+    )
+
+    (view,) = tables.gather_block_tables(
+        torch.tensor([2], dtype=torch.int32, device="mps"), num_reqs_padded=1
+    )
+
+    assert view.tolist() == [[3, 3, 3]]
+    assert tables.input_block_tables[0][1:].count_nonzero().item() == 0
+
+
+def test_post_update_stores_drafts_by_request_slot(state):
+    # The last PP rank's drafts land in the request-slot rows, as in vLLM
+    # v0.33.0's _post_update_kernel; a removed (-1) row writes nothing.
+    drafts_out = torch.zeros((4, 2), dtype=torch.int64, device="mps")
+
+    post_update(
+        torch.tensor([2, -1, 0], dtype=torch.int32, device="mps"),
+        state.num_computed_tokens.gpu,
+        state.last_sampled_tokens,
+        None,
+        torch.zeros((3, 1), dtype=torch.int64, device="mps"),
+        torch.zeros(3, dtype=torch.int32, device="mps"),
+        torch.zeros(3, dtype=torch.int32, device="mps"),
+        None,
+        state.all_token_ids.gpu,
+        state.total_len.gpu,
+        draft_tokens=torch.tensor([[5, 6], [7, 8], [9, 10]], device="mps"),
+        draft_tokens_out=drafts_out,
+    )
+
+    assert drafts_out.tolist() == [[9, 10], [0, 0], [5, 6], [0, 0]]
+
+
 @pytest.mark.parametrize("num_sampled", [0, 1, 3])
 def test_removed_request_writeback_at_capacity(state, num_sampled):
     # The second request disappears before writeback. Its -1 slot must not
@@ -455,6 +529,20 @@ def test_rope_matches_upstream(dtype, rows, heads, kv_heads, head_size, gapped_h
         torch.testing.assert_close(got, want, atol=0, rtol=0)
 
 
+def test_vision_encoder_attention_runs_on_mps():
+    # Upstream registers this op for the platform's CPU key only.
+    from vllm.v1.attention.ops.vit_attn_wrappers import vit_torch_sdpa_wrapper
+
+    install()
+    q, k, v = torch.randn(3, 1, 9, 4, 64).unbind(0)
+    cu_seqlens = torch.tensor([0, 2, 9], dtype=torch.int32)
+    expected = vit_torch_sdpa_wrapper(q, k, v, cu_seqlens=cu_seqlens)
+    actual = vit_torch_sdpa_wrapper(
+        q.to("mps"), k.to("mps"), v.to("mps"), cu_seqlens=cu_seqlens.to("mps")
+    )
+    torch.testing.assert_close(actual.cpu(), expected, atol=1e-5, rtol=1e-5)
+
+
 @pytest.mark.parametrize("logprobs", [None, 5])
 def test_chunked_verification_matches_full_batch(
     run_in_spawn_process, monkeypatch, logprobs
@@ -489,6 +577,8 @@ def _check_chunked_verification(logprobs):
             num_speculative_tokens=3,
             enable_adaptive_verification=False,
             rejection_sample_method="standard",
+            fly_entropy_threshold=0.3,
+            fly_entropy_top_k=3,
         ),
         torch.device("mps"),
     )
@@ -553,3 +643,349 @@ def _check_chunked_verification(logprobs):
             chunked_scores.selected_token_ranks, scores.selected_token_ranks
         )
         assert chunked_scores.cu_num_generated_tokens == scores.cu_num_generated_tokens
+
+
+def test_mrope_positions_preserve_ragged_prefill_and_decode():
+    from vllm_metal.pytorch_backend.input_ops import prepare_rope_positions
+
+    state = SimpleNamespace(
+        num_dims=3,
+        max_model_len=8,
+        positions=torch.full((3, 7), -1, device="mps", dtype=torch.int64),
+        prefill_positions=SimpleNamespace(
+            gpu=torch.arange(4 * 3 * 8, device="mps").reshape(12, 8)
+        ),
+        prefill_delta=SimpleNamespace(gpu=torch.tensor([0, 7, 0, 0], device="mps")),
+    )
+    prepare_rope_positions(
+        state,
+        torch.tensor([3, 1], device="mps"),
+        torch.tensor([0, 2, 5], device="mps"),
+        torch.tensor([0, 4, 0, 3], device="mps"),
+        torch.tensor([0, 4, 0, 1], device="mps"),
+    )
+    assert state.positions.cpu().tolist() == [
+        [73, 74, 11, 12, 13, 0, -1],
+        [81, 82, 11, 12, 13, 0, -1],
+        [89, 90, 11, 12, 13, 0, -1],
+    ]
+
+
+def test_omni_repetition_penalty_matches_upstream_torch():
+    """Sampler row order may differ from request-slot order."""
+    from vllm.model_executor.layers.utils import apply_penalties as reference
+
+    from vllm_metal.pytorch_backend.omni_logits import apply_penalties, bincount
+
+    logits = torch.tensor([[2.0, -3.0, 4.0, -5.0], [-1.0, 2.0, -3.0, 4.0]])
+    prompts = torch.tensor([[0, 1], [2, 3]])
+    outputs = torch.tensor([[1, 1], [0, 3]])
+    rep, freq, pres = (
+        torch.tensor([1.2, 1.5]),
+        torch.zeros(2),
+        torch.zeros(2),
+    )
+    with torch.compiler.set_stance("force_eager"):
+        expected = reference(
+            logits.clone(), prompts.flip(0), outputs.flip(0), pres, freq, rep.flip(0)
+        )
+    ids = torch.cat([prompts, outputs], dim=1).to("mps")
+    mask = torch.zeros(2, 1, dtype=torch.int32, device="mps")
+    counts = torch.zeros(2, 4, dtype=torch.int32, device="mps")
+    mapping = torch.tensor([1, 0], device="mps")
+    bincount(mapping, ids, torch.tensor([2, 2]), torch.tensor([4, 4]), mask, counts, 4)
+    actual = logits.to("mps")
+    apply_penalties(
+        actual,
+        mapping,
+        None,
+        None,
+        rep.to("mps"),
+        freq.to("mps"),
+        pres.to("mps"),
+        mask,
+        counts,
+    )
+    torch.testing.assert_close(actual.cpu(), expected)
+
+
+@pytest.mark.parametrize("with_metadata", [False, True])
+def test_omni_macos_transport_handles_long_names_and_page_padding(with_metadata):
+    pytest.importorskip("vllm_omni")
+    from vllm_metal.pytorch_backend.omni_connector import MetalSharedMemoryConnector
+
+    connector = MetalSharedMemoryConnector({})
+    key = "speech-" + "long-request-id-" * 8
+    try:
+        ok, size, metadata = connector.put("0", "1", key, {"frame": 7})
+        assert ok
+        connector.reap_consumed()
+        result = connector.get("0", "1", key, metadata if with_metadata else None)
+        assert result == ({"frame": 7}, size)
+        assert connector.get("0", "1", key) is None
+    finally:
+        connector.close()
+
+
+@pytest.mark.parametrize(
+    "length", [1, 5, 64, 65, 200], ids=["one", "short", "chunk", "chunk+1", "multi"]
+)
+def test_gdn_chunked_prefill_matches_transformers_recurrence(length):
+    from transformers.models.qwen3_5.modeling_qwen3_5 import (
+        torch_recurrent_gated_delta_rule,
+    )
+
+    from vllm_metal.pytorch_backend.models.qwen3_5 import delta_rule_chunked
+
+    heads, k_dim, v_dim = 3, 32, 16
+    q, k = (
+        torch.nn.functional.normalize(torch.randn(length, heads, k_dim), dim=-1)
+        for _ in range(2)
+    )
+    v = torch.randn(length, heads, v_dim)
+    g = -torch.rand(length, heads)
+    beta = torch.rand(length, heads)
+    state = torch.randn(heads, k_dim, v_dim) * 0.1
+    expected, expected_state = torch_recurrent_gated_delta_rule(
+        q[None], k[None], v[None], g[None], beta[None], state[None], True
+    )
+    out, final = delta_rule_chunked(
+        *(x.to("mps") for x in (q * k_dim**-0.5, k, v, g, beta, state))
+    )
+    # The chunked form reorders the recurrence's fp32 sums.
+    torch.testing.assert_close(out.cpu(), expected[0], atol=1e-5, rtol=1e-4)
+    torch.testing.assert_close(final.cpu(), expected_state[0], atol=1e-5, rtol=1e-4)
+
+
+@pytest.mark.parametrize(
+    "pooled",
+    [
+        pytest.param(False, id="dense"),
+        pytest.param(True, id="pooled", marks=pytest.mark.slow),
+    ],
+)
+def test_gdn_state_carries_across_chunked_prefill_and_decode(pooled):
+    """``pooled`` puts the caches at the start of one buffer holding more than
+    INT_MAX fp32 elements, like the shared KV buffer on a large Mac. MPSGraph
+    matmuls reject a view into it at a non-zero offset, so resumed prefill must
+    copy its slot. Metal wires that whole buffer on first use, hence slow."""
+    from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+
+    from vllm_metal.pytorch_backend.models.qwen3_5 import _gdn_core
+    from vllm_metal.pytorch_backend.mps_ops import _load_mps_module
+
+    pool_bytes = (2**31 + (1 << 20)) * 4
+    if pooled and (
+        _load_mps_module().max_buffer_length() <= pool_bytes
+        or torch.mps.recommended_max_memory() < 2 * pool_bytes
+    ):
+        pytest.skip("Needs a Metal buffer past INT_MAX fp32 elements, with headroom")
+    k_heads, v_heads, k_dim, v_dim, width = 2, 4, 16, 8, 4
+    channels = 2 * k_heads * k_dim + v_heads * v_dim
+    layer = SimpleNamespace(
+        key_dim=k_heads * k_dim,
+        value_dim=v_heads * v_dim,
+        tp_size=1,
+        head_k_dim=k_dim,
+        head_v_dim=v_dim,
+        activation="silu",
+        conv1d=SimpleNamespace(
+            weight=torch.randn(channels, 1, width, device="mps"), bias=None
+        ),
+        A_log=torch.randn(v_heads, device="mps"),
+        dt_bias=torch.randn(v_heads, device="mps"),
+        kv_cache=[
+            torch.randn(4, width - 1, channels, device="mps"),
+            torch.randn(4, v_heads, v_dim, k_dim, device="mps"),
+        ],
+    )
+    if pooled:
+        pool = torch.empty(pool_bytes // 4, device="mps")
+        start = 0
+        for i, t in enumerate(layer.kv_cache):
+            layer.kv_cache[i] = pool[start : start + t.numel()].view_as(t).copy_(t)
+            start += t.numel()
+    untouched = [t[2].clone() for t in layer.kv_cache]
+    qkv = torch.randn(76, channels, device="mps")
+    b, a = torch.randn(2, 76, v_heads, device="mps")
+
+    def step(lo, hi, decode, resumed):
+        # A padded decode row rides along with every prefill; it must stay zero.
+        x = torch.cat([qkv[:1] * 0, qkv[lo:hi]])
+        md = SimpleNamespace(
+            num_decodes=2 if decode else 1,
+            num_decode_tokens=2 if decode else 1,
+            num_prefills=0 if decode else 1,
+            num_prefill_tokens=0 if decode else hi - lo,
+            non_spec_state_indices_tensor=torch.tensor([PAD_SLOT_ID, 1], device="mps"),
+            non_spec_query_start_loc=torch.tensor([0, 1, 1 + hi - lo], device="mps"),
+            has_initial_state=torch.tensor([False, resumed], device="mps"),
+        )
+        out = torch.zeros(len(x), v_heads, v_dim, device="mps")
+        _gdn_core(
+            layer,
+            x,
+            torch.cat([b[:1], b[lo:hi]]),
+            torch.cat([a[:1], a[lo:hi]]),
+            out,
+            md,
+        )
+        assert torch.equal(out[0], torch.zeros_like(out[0]))
+        return out[1:].cpu()
+
+    got = torch.cat(
+        [step(0, 70, False, False), step(70, 75, False, True), step(75, 76, True, True)]
+    )
+
+    weight = layer.conv1d.weight[:, 0].cpu()
+    tail, state = torch.zeros(width - 1, channels), torch.zeros(v_heads, k_dim, v_dim)
+    for t in range(76):
+        hist = torch.cat([tail, qkv[t : t + 1].cpu()])
+        x, tail = torch.nn.functional.silu((hist.T * weight).sum(-1)), hist[1:]
+        q, k, v = x.split([k_heads * k_dim, k_heads * k_dim, v_heads * v_dim])
+        q, k = (
+            torch.nn.functional.normalize(
+                y.view(k_heads, k_dim), dim=-1
+            ).repeat_interleave(2, 0)
+            for y in (q, k)
+        )
+        g = -torch.exp(layer.A_log.cpu()) * torch.nn.functional.softplus(
+            a[t].cpu() + layer.dt_bias.cpu()
+        )
+        state = state * torch.exp(g)[:, None, None]
+        delta = (
+            v.view(v_heads, v_dim) - torch.einsum("hk,hkv->hv", k, state)
+        ) * torch.sigmoid(b[t].cpu())[:, None]
+        state = state + k[:, :, None] * delta[:, None, :]
+        torch.testing.assert_close(
+            got[t],
+            torch.einsum("hk,hkv->hv", q * k_dim**-0.5, state),
+            atol=1e-4,
+            rtol=1e-4,
+        )
+    torch.testing.assert_close(
+        layer.kv_cache[1][1].cpu().view(v_heads, k_dim, v_dim),
+        state,
+        atol=1e-4,
+        rtol=1e-4,
+    )
+    assert all(
+        torch.equal(t[2], u) for t, u in zip(layer.kv_cache, untouched, strict=True)
+    )
+
+
+def test_seeded_sampling_preserves_distribution_and_batch_isolation(
+    run_in_spawn_process,
+):
+    # vLLM registers overrides at worker startup, before optional libraries load.
+    run_in_spawn_process(_check_seeded_sampling)
+
+
+def _check_seeded_sampling():
+    from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+
+    from vllm_metal.pytorch_backend.bindings import register_kernel_overrides
+
+    register_kernel_overrides()
+    rows = 8192
+    # Cross a reduction-block boundary, including a partial final block.
+    token_ids = torch.tensor([0, 1023, 1024])
+    logits = torch.full((1, 1025), -float("inf"))
+    logits[:, token_ids] = torch.tensor([0.2, 0.3, 0.5]).log()
+    logits = logits.to("mps").expand(rows, -1)
+    mapping = torch.zeros(rows, dtype=torch.int32, device="mps")
+    positions = torch.arange(rows, device="mps")
+    seed = torch.tensor([42], device="mps")
+    temperature = torch.ones(1, device="mps")
+    actual = gumbel_sample(logits, mapping, temperature, seed, positions, False, False)
+    frequencies = torch.bincount(actual.cpu(), minlength=1025)[token_ids] / rows
+    torch.testing.assert_close(
+        frequencies, torch.tensor([0.2, 0.3, 0.5]), atol=0.02, rtol=0
+    )
+    # Request scheduling must not change the random stream for a given position.
+    order = torch.arange(rows - 1, -1, -1, device="mps")
+    reordered = gumbel_sample(
+        logits, mapping, temperature, seed, positions[order], False, False
+    )
+    assert torch.equal(actual[order], reordered)
+    greedy = gumbel_sample(
+        logits, mapping, temperature * 0, seed, positions, False, False
+    )
+    assert greedy.eq(1024).all()
+    with pytest.raises(NotImplementedError, match="probabilistic draft sampling"):
+        gumbel_sample(
+            logits[:1],
+            mapping[:1],
+            temperature,
+            seed,
+            positions[:1],
+            apply_temperature=True,
+            is_drafting=True,
+            logits_cache=logits[:1, None, :],
+            logits_cache_col=positions[:1],
+        )
+
+
+def test_mrv2_sampling_filters_preserve_request_mapping(run_in_spawn_process):
+    run_in_spawn_process(_check_mrv2_sampling_filters)
+
+
+def _check_mrv2_sampling_filters():
+    from vllm.sampling_params import SamplingParams
+    from vllm.v1.worker.gpu.sample.sampler import Sampler
+
+    from vllm_metal.pytorch_backend.bindings import register_kernel_overrides
+
+    register_kernel_overrides()
+    install()
+    state = RequestState(4, 64, 16, 0, 64, torch.device("mps"))
+    state.prompt_len.np[:] = 10
+    state.prompt_len.copy_to_uva()
+    sampler = Sampler(
+        SimpleNamespace(reasoning_config=None), 4, 5, torch.device("mps"), state
+    )
+    params = [
+        SamplingParams(temperature=0),
+        SamplingParams(temperature=0.5, top_k=2, top_p=0.95, seed=17),
+        SamplingParams(
+            temperature=1,
+            top_k=3,
+            top_p=0.7,
+            min_p=0.2,
+            seed=42,
+        ),
+    ]
+    for slot, param in enumerate(params):
+        sampler.add_request(slot, param)
+    sampler.apply_staged_writes()
+    slots = np.array([2, 0, 1])
+    mapping = torch.tensor(slots, device="mps", dtype=torch.int32)
+    logits = torch.tensor(
+        [
+            [2.0, 3.0, 4.0, 5.0, 1.0],
+            [0.0, 1.0, 2.0, 3.0, 4.0],
+            [0.0, 4.0, 4.0, 0.0, 0.0],
+        ],
+        device="mps",
+    )
+    zeros = torch.zeros(3, device="mps", dtype=torch.int32)
+
+    def sample(position):
+        return sampler.sample(
+            logits,
+            mapping,
+            mapping,
+            slots,
+            torch.full((3,), position, device="mps"),
+            zeros,
+            zeros,
+            np.full(3, position + 1),
+        )
+
+    first, processed = sample(10)
+    assert first[:2].tolist() == [3, 4]
+    assert first[2].item() in (1, 2)
+    assert processed[0].isfinite().tolist() == [False, False, False, True, False]
+    assert processed[2, 1:3].tolist() == [8.0, 8.0]
+    assert processed[2].isfinite().tolist() == [False, True, True, False, False]
+    assert torch.equal(sample(10)[0], first)

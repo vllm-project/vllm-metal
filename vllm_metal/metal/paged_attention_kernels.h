@@ -90,13 +90,19 @@ inline NaxPrefillWork nax_prefill_work(int q, int prefix, int heads, int kv_head
       std::max(int64_t(0), full_end - prefix) / bq);
   const int64_t fast_visits = split ? visits - edge_blocks : 0;
   const int slices = bq / 16;
-  const double issued = double(heads) * slices * (visits + end);
-  const double active = double(heads) * (slices * visits + ((tail + 15) / 16) * end);
-  const double fast = double(heads) * slices * fast_visits;
-  return {issued, active, issued - fast, double(heads) * slices * end,
-          double(heads) * slices * edge_blocks, fast,
-          double(visits + end) / (full + (tail != 0)), double(end),
-          (bq == 64 ? heads : kv_heads) * (full + (tail != 0)), full};
+  const int64_t q_blocks = full + (tail != 0);
+  NaxPrefillWork work;
+  work.issued = double(heads) * slices * (visits + end);
+  work.active = double(heads) * (slices * visits + ((tail + 15) / 16) * end);
+  work.fast = double(heads) * slices * fast_visits;
+  work.guarded = work.issued - work.fast;
+  work.guarded_q = double(heads) * slices * end;
+  work.kv_edge = double(heads) * slices * edge_blocks;
+  work.stream = double(visits + end) / q_blocks;
+  work.tail_stream = double(end);
+  work.groups = (bq == 64 ? heads : kv_heads) * q_blocks;
+  work.full_blocks = full;
+  return work;
 }
 
 struct NaxGqaScore {

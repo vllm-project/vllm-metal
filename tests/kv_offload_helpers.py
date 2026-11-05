@@ -15,7 +15,7 @@ import numpy as np
 import torch
 from vllm.config import VllmConfig
 from vllm.v1.attention.backends.utils import record_kv_cache_layout
-from vllm.v1.core.kv_cache_utils import get_kv_cache_config_from_groups
+from vllm.v1.core.kv_cache_planning import get_kv_cache_config_from_groups
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheGroupSpec,

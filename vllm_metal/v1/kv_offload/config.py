@@ -182,6 +182,16 @@ def configure_kv_offloading(vllm_config: VllmConfig) -> None:
             "--kv-offloading-size and any offloading connector from "
             "--kv-transfer-config."
         )
+    # Read as upstream's build_offloading_config does. Metal skips the
+    # per-layer canonical check, so the disk tier would file uncertified
+    # pages under a canonical namespace.
+    if kv_transfer_config is not None and bool(
+        kv_transfer_config.kv_connector_extra_config.get("canonical_layout", False)
+    ):
+        raise NotImplementedError(
+            "KV offloading on Metal does not support canonical_layout; remove "
+            "it from kv_connector_extra_config."
+        )
 
     if kv_transfer_config is None:
         from vllm.config import KVTransferConfig

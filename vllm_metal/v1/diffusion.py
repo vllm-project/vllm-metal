@@ -507,14 +507,9 @@ class DiffusionGemmaRuntime:
         runner._reconcile_request_lifecycle(
             evicted,
             preempted_req_ids=scheduler_output.preempted_req_ids,
-            resumed_req_ids=cached_reqs.resumed_req_ids,
         )
         # A preempted request re-prefills its prompt and committed tokens.
-        for req_id in (
-            evicted
-            | (scheduler_output.preempted_req_ids or set())
-            | cached_reqs.resumed_req_ids
-        ):
+        for req_id in evicted | (scheduler_output.preempted_req_ids or set()):
             self._requests.pop(req_id, None)
 
         from vllm_metal.v1.model_runner import RequestState

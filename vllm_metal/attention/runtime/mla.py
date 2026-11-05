@@ -89,6 +89,15 @@ class MLAPagedAttentionRuntime(PagedAttentionRuntimeBase):
             self._storage.depend(outputs)
             outputs.extend(self._storage.buffers)
 
+    def release_kv_memory(self) -> None:
+        if self._storage is None:
+            # Count-initialized caches (draft-model speculation) own their arrays.
+            super().release_kv_memory()
+        self.storage.release()
+
+    def restore_kv_memory(self) -> None:
+        self.storage.reallocate()
+
     @property
     def storage(self) -> KVCacheStorage:
         if self._storage is None:

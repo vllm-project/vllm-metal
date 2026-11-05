@@ -34,6 +34,8 @@ class Lfm2VlMultimodalAdapter:
     per view and this adapter concatenates them in prompt order.
     """
 
+    family: str = "LFM2-VL"
+
     forward_ready: bool = True
 
     requires_explicit_positions: bool = False
@@ -68,13 +70,14 @@ class Lfm2VlMultimodalAdapter:
         language_model = model.language_model
         if not hasattr(model, "encode_images"):
             raise RuntimeError(
-                "Lfm2Vl model.encode_images missing; mlx_vlm version drift detected."
+                f"{cls.family} model.encode_images missing; mlx_vlm version drift "
+                "detected."
             )
         backbone = resolve_text_backbone(language_model, owner="mlx_vlm")
         if not callable(backbone):
             raise RuntimeError(
                 "language_model.model is not callable; mlx_vlm version drift "
-                "detected. Expected the LFM2 text backbone."
+                f"detected. Expected the {cls.family} text backbone."
             )
         embed_tokens_fn = resolve_backbone_embed_tokens(backbone, owner="mlx_vlm")
         return cls(
@@ -99,7 +102,7 @@ class Lfm2VlMultimodalAdapter:
         for feature in features:
             if feature.modality == "video":
                 raise NotImplementedError(
-                    f"Feature {feature.identifier!r}: LFM2-VL video input is "
+                    f"Feature {feature.identifier!r}: {self.family} video input is "
                     "not yet supported."
                 )
             if feature.modality != "image":
@@ -113,32 +116,7 @@ class Lfm2VlMultimodalAdapter:
                     "for vision encoding."
                 )
 
-            pixel_values = self._as_mlx(
-                self._feature_value(feature.data, "pixel_values")
-            )
-            spatial_shapes = self._as_mlx(
-                self._feature_value(feature.data, "spatial_shapes")
-            )
-            lengths = self._tile_lengths(
-                feature.identifier, pixel_values, spatial_shapes
-            )
-
-            # vLLM hands the tiles already padded to a common patch count, and
-            # the tower recovers each tile's real length from the mask rather
-            # than from spatial_shapes, so synthesise it here instead of
-            # repacking the pixels.
-            padded = int(pixel_values.shape[1])
-            mask = (
-                mx.arange(padded, dtype=mx.int32)[None, :]
-                < mx.array(lengths, dtype=mx.int32)[:, None]
-            )
-
-            views = self._model.encode_images(
-                pixel_values,
-                spatial_shapes=spatial_shapes,
-                pixel_attention_mask=mask,
-            )
-            hidden_states = mx.concatenate(views, axis=0)
+            hidden_states = self._encode_image(feature.identifier, feature.data)
 
             expected = feature.mm_position.get_num_embeds()
             if int(hidden_states.shape[0]) != expected:
@@ -151,6 +129,28 @@ class Lfm2VlMultimodalAdapter:
             outputs.append(Lfm2VlVisionEncodeResult(hidden_states=hidden_states))
 
         return outputs
+
+    def _encode_image(self, identifier: str, data: MultiModalKwargsItem) -> mx.array:
+        pixel_values = self._as_mlx(self._feature_value(data, "pixel_values"))
+        spatial_shapes = self._as_mlx(self._feature_value(data, "spatial_shapes"))
+        lengths = self._tile_lengths(identifier, pixel_values, spatial_shapes)
+
+        # vLLM hands the tiles already padded to a common patch count, and
+        # the tower recovers each tile's real length from the mask rather
+        # than from spatial_shapes, so synthesise it here instead of
+        # repacking the pixels.
+        padded = int(pixel_values.shape[1])
+        mask = (
+            mx.arange(padded, dtype=mx.int32)[None, :]
+            < mx.array(lengths, dtype=mx.int32)[:, None]
+        )
+
+        views = self._model.encode_images(
+            pixel_values,
+            spatial_shapes=spatial_shapes,
+            pixel_attention_mask=mask,
+        )
+        return mx.concatenate(views, axis=0)
 
     def get_mrope_input_positions(
         self,
@@ -165,7 +165,7 @@ class Lfm2VlMultimodalAdapter:
         for feature in mm_features:
             if feature.modality == "video":
                 raise NotImplementedError(
-                    f"Feature {feature.identifier!r}: LFM2-VL video input is "
+                    f"Feature {feature.identifier!r}: {self.family} video input is "
                     "not yet supported."
                 )
         seq_len = len(input_tokens)
@@ -215,10 +215,11 @@ class Lfm2VlMultimodalAdapter:
             input_embeddings=inputs_embeds,
         )
 
-    @staticmethod
-    def _check_deepstack(deepstack_visual_embeds: Any | None) -> None:
+    def _check_deepstack(self, deepstack_visual_embeds: Any | None) -> None:
         if deepstack_visual_embeds is not None:
-            raise RuntimeError("LFM2-VL does not expose deepstack visual residuals.")
+            raise RuntimeError(
+                f"{self.family} does not expose deepstack visual residuals."
+            )
 
     @staticmethod
     def _tile_lengths(

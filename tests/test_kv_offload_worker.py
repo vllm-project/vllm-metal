@@ -128,6 +128,24 @@ def test_transfers_are_sliced() -> None:
     )
 
 
+def test_expedited_load_is_finished_when_waited_on() -> None:
+    # vLLM 0.33's synchronous loads submit with expedited=True, then wait.
+    storage = make_storage()
+    worker = make_worker(storage, blocks_per_chunk=1, num_cpu_chunks=16)
+    randomize(storage)
+    original = snapshot_blocks(storage, [5, 2])
+    spec = gpu_spec([5, 2])
+    assert worker.submit_store(1, spec, CPULoadStoreSpec([0, 1]))
+    zero_blocks(storage, [5, 2])
+
+    assert worker.submit_load(2, CPULoadStoreSpec([0, 1]), spec, expedited=True)
+    worker.wait({2})
+
+    assert [r.job_id for r in worker.get_finished()] == [1, 2]
+    for a, b in zip(original, snapshot_blocks(storage, [5, 2]), strict=True):
+        np.testing.assert_array_equal(a, b)
+
+
 def test_load_peak_memory_is_bounded() -> None:
     """A load holds one slice at a time, not the whole job."""
     storage = make_storage(
