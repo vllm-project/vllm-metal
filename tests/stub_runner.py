@@ -500,3 +500,70 @@ def make_state_cache(
             )
         )
     return PagedStateCache(states)
+
+
+def make_sdpa_runtime(
+    *,
+    num_layers,
+    num_kv_heads,
+    head_dim,
+    num_blocks,
+    block_size,
+    dtype,
+    cache_idx_map=None,
+    kv_heads_per_layer=None,
+    head_dim_per_layer=None,
+    sliding_window_per_layer=None,
+):
+    """SDPA runtime over a count-allocated cache.
+
+    Serving binds runtimes from vLLM's ``KVCacheConfig``
+    (``initialize_from_config``); unit fixtures size a pool directly.
+    """
+    from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
+    from vllm_metal.attention.runtime.sdpa import SDPAPagedAttentionRuntime
+
+    runtime = SDPAPagedAttentionRuntime(
+        block_size=block_size,
+        dtype=dtype,
+        cache_idx_map=cache_idx_map,
+        sliding_window_per_layer=sliding_window_per_layer,
+    )
+    runtime._cache = MetalPagedKVCache(
+        num_layers=num_layers,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        num_blocks=num_blocks,
+        block_size=block_size,
+        dtype=dtype,
+        kv_heads_per_layer=kv_heads_per_layer,
+        head_dim_per_layer=head_dim_per_layer,
+        sliding_window_per_layer=sliding_window_per_layer,
+    )
+    return runtime
+
+
+def make_mla_runtime(*, num_layers, latent_dim, num_blocks, block_size, dtype):
+    """MLA runtime over a count-allocated latent cache (unit fixtures only)."""
+    from vllm_metal.attention.caches.mla_cache import MLAPagedLatentCache
+    from vllm_metal.attention.runtime.mla import MLAPagedAttentionRuntime
+
+    runtime = MLAPagedAttentionRuntime()
+    runtime._cache = MLAPagedLatentCache(
+        num_layers=num_layers,
+        latent_dim=latent_dim,
+        num_blocks=num_blocks,
+        block_size=block_size,
+        dtype=dtype,
+    )
+    return runtime
+
+
+def adopt_draft_group(proposer, group_index, target_max_model_len):
+    """Hand a draft proposer its scheduler group without a storage bind.
+
+    Serving resolves both inside ``bind_paged_cache``; proposer unit fixtures
+    wire their own caches and only need the group and context limit.
+    """
+    proposer._scheduler_group_index = group_index
+    proposer._max_model_len = min(proposer._max_model_len, target_max_model_len)

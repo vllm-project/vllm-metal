@@ -263,15 +263,12 @@ def test_release_frees_backing_and_reallocate_rebinds_existing_views():
     np.testing.assert_array_equal(np.array(views[0]), 3)
 
 
-def test_count_initialized_runtime_refuses_sleep_release():
+def test_unbound_runtime_refuses_sleep_release():
     from vllm_metal.attention.runtime.sdpa import SDPAPagedAttentionRuntime
 
-    runtime = SDPAPagedAttentionRuntime(
-        num_layers=1, num_kv_heads=1, head_dim=64, block_size=16, dtype=mx.float32
-    )
-    runtime.initialize(4)
+    runtime = SDPAPagedAttentionRuntime(block_size=16, dtype=mx.float32)
 
-    with pytest.raises(NotImplementedError, match="Sleep mode does not support"):
+    with pytest.raises(RuntimeError, match="Shared KV storage"):
         runtime.release_kv_memory()
 
 

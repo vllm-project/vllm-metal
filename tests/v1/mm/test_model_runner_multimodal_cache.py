@@ -96,11 +96,7 @@ def _paged_runner_with_encoder_cache():
     runner = make_stub_runner(
         encoder_cache=EncoderCache(),
         _paged_attention_runtime=SDPAPagedAttentionRuntime(
-            num_layers=1,
-            num_kv_heads=1,
-            head_dim=4,
-            block_size=16,
-            dtype=mx.float32,
+            block_size=16, dtype=mx.float32
         ),
         _paged_block_size=16,
     )

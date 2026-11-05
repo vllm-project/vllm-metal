@@ -26,34 +26,11 @@ class MLAPagedAttentionRuntime(PagedAttentionRuntimeBase):
     layout.
     """
 
-    def __init__(
-        self,
-        *,
-        num_layers: int,
-        latent_dim: int,
-        block_size: int,
-        dtype: mx.Dtype,
-    ) -> None:
-        self._num_layers = num_layers
-        self._latent_dim = latent_dim
-        self._block_size = block_size
-        self._dtype = dtype
+    def __init__(self) -> None:
         self._cache = None
         self._storage: KVCacheStorage | None = None
         self._scheduler_group_indices = (0,)
         self._wrappers: list[MLAPagedAttentionWrapper] = []
-
-    def initialize(self, num_blocks: int) -> None:
-        # TODO: Move draft-model speculation's target KV to initialize_from_config.
-        # Then remove this initializer and MLAPagedLatentCache's count-based
-        # allocation.
-        self._cache = MLAPagedLatentCache(
-            num_layers=self._num_layers,
-            latent_dim=self._latent_dim,
-            num_blocks=num_blocks,
-            block_size=self._block_size,
-            dtype=self._dtype,
-        )
 
     def initialize_from_config(
         self, config: KVCacheConfig, layer_names: tuple[str, ...]
