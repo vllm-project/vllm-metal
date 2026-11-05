@@ -399,6 +399,14 @@ class TestMetalPlatform:
     def test_sleep_mode_is_available(self) -> None:
         assert MetalPlatform.is_sleep_mode_available()
 
+    @pytest.mark.parametrize("method", ["ngram", "dflash", "dspark"])
+    def test_sleep_mode_accepts_shared_cache_drafters(self, method) -> None:
+        config = self._platform_config(
+            model_config=SimpleNamespace(enable_sleep_mode=True),
+            speculative_config=SimpleNamespace(method=method),
+        )
+        MetalPlatform._check_sleep_mode_config(config, "mlx")
+
     def test_check_and_update_config_rejects_sleep_mode_with_model_drafting(
         self,
     ) -> None:
@@ -406,7 +414,9 @@ class TestMetalPlatform:
             model_config=SimpleNamespace(enable_sleep_mode=True),
             speculative_config=SimpleNamespace(method="draft_model"),
         )
-        with pytest.raises(NotImplementedError, match="only n-gram"):
+        with pytest.raises(
+            NotImplementedError, match="supports ngram, dflash and dspark"
+        ):
             MetalPlatform.check_and_update_config(vllm_config)
 
     def test_check_and_update_config_rejects_sleep_mode_on_mps(

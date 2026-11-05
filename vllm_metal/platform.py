@@ -1182,9 +1182,13 @@ class MetalPlatform(Platform):
                 f"(VLLM_METAL_BACKEND={backend!r})."
             )
         speculative_config = vllm_config.speculative_config
-        if speculative_config is not None and speculative_config.method != "ngram":
+        if speculative_config is not None and speculative_config.method not in (
+            "ngram",
+            "dflash",
+            "dspark",
+        ):
             raise NotImplementedError(
-                "Sleep mode on Metal supports only n-gram speculative decoding, "
+                "Sleep mode on Metal supports ngram, dflash and dspark speculation, "
                 f"got method={speculative_config.method!r}."
             )
 
