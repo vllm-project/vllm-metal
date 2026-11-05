@@ -47,7 +47,7 @@ def initialize_hybrid_runtime(
     """Build the test runtime from vLLM's real grouping and placement functions."""
     from dataclasses import replace
 
-    from vllm.v1.core.kv_cache_utils import (
+    from vllm.v1.core.kv_cache_planning import (
         get_kv_cache_config_from_groups,
         get_kv_cache_groups,
     )
@@ -96,7 +96,7 @@ def initialize_mla_runtime(
 ):
     """Build a standalone MLA runtime through the cache policy, from vLLM's real
     grouping and placement of the policy's specs."""
-    from vllm.v1.core.kv_cache_utils import (
+    from vllm.v1.core.kv_cache_planning import (
         get_kv_cache_config_from_groups,
         get_kv_cache_groups,
     )
@@ -219,7 +219,7 @@ def make_stub_runner(
         "_sampler": None,
         "_native_sampling_enabled": False,
         "_native_sampling_step": 0,
-        "_structured_output_applier": MetalStructuredOutputApplier(),
+        "_structured_output_applier": MetalStructuredOutputApplier(mask_stride=1),
         "_prompt_logprobs_tracker": PromptLogprobsTracker(),
         "_lora": MetalLoRARuntime(),
         "_yoco_cache_mapping": None,
@@ -322,6 +322,7 @@ def make_gemma4_mixed_attention_runner(
         model_config=SimpleNamespace(
             max_model_len=max_model_len,
             original_max_model_len=original_max_model_len,
+            supports_kv_cache_grouping=False,
         ),
         parallel_config=SimpleNamespace(
             tensor_parallel_size=1,
@@ -460,6 +461,14 @@ def make_nemotron_hybrid_plan(
     )
 
 
+class DenseStateViews(list[mx.array]):
+    """Dense test storage with the same row-read contract as CacheViews."""
+
+    def gather_rows(self, layer_idx: int, ids: mx.array) -> mx.array:
+        """Read selected rows from one layer."""
+        return self[layer_idx][ids]
+
+
 def make_state_cache(
     *,
     num_layers,
@@ -475,19 +484,19 @@ def make_state_cache(
     from vllm_metal.attention.caches.state_cache import PagedStateCache
 
     states = [
-        [
+        DenseStateViews(
             mx.zeros((max_seqs, conv_kernel_dim - 1, conv_dim), dtype=dtype)
             for _ in range(num_layers)
-        ]
+        )
     ]
     if num_v_heads is not None:
         states.append(
-            [
+            DenseStateViews(
                 mx.zeros(
                     (max_seqs, num_v_heads, value_head_dim, key_head_dim),
                     dtype=recurrent_dtype,
                 )
                 for _ in range(num_layers)
-            ]
+            )
         )
     return PagedStateCache(states)

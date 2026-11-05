@@ -66,6 +66,8 @@ Qwen3 dense models. Refused at startup:
 - Pooling and speech-to-text models.
 - Pipeline and data parallelism, and any executor other than `uni`.
 - `--kv-offloading-size` combined with a different KV connector.
+- `canonical_layout` in `kv_connector_extra_config`. Metal does not write the
+  canonical layout.
 
 ## Reuse across restarts
 

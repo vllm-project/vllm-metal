@@ -238,6 +238,7 @@ def _nixl_config() -> SimpleNamespace:
 def test_other_connector_without_offloading_is_left_alone() -> None:
     vllm_config = _base_config()
     vllm_config.kv_transfer_config = _nixl_config()
+    vllm_config.kv_transfer_config.kv_connector_extra_config["canonical_layout"] = True
     before = vars(vllm_config.kv_transfer_config).copy()
     MetalPlatform.check_and_update_config(vllm_config)
     assert vars(vllm_config.kv_transfer_config) == before
@@ -261,6 +262,39 @@ def test_unknown_spec_name_rejected() -> None:
     )
     with pytest.raises(NotImplementedError, match="ARCOffloadingSpec"):
         MetalPlatform.check_and_update_config(vllm_config)
+
+
+def _canonical_config(connector, size, value) -> SimpleNamespace:
+    vllm_config = _base_config(kv_offloading_size=size)
+    vllm_config.kv_transfer_config = SimpleNamespace(
+        kv_connector=connector,
+        kv_connector_module_path=None,
+        kv_role=None,
+        kv_connector_extra_config={"canonical_layout": value},
+    )
+    return vllm_config
+
+
+@pytest.mark.parametrize(
+    "connector,size,value",
+    [
+        (None, 1.0, True),
+        ("OffloadingConnector", None, True),
+        ("MetalOffloadingConnector", None, True),
+        (None, 1.0, "false"),
+    ],
+)
+def test_canonical_layout_rejected(connector, size, value) -> None:
+    """Reject every entry path using upstream's truthiness rules."""
+    vllm_config = _canonical_config(connector, size, value)
+    with pytest.raises(NotImplementedError, match="canonical_layout"):
+        MetalPlatform.check_and_update_config(vllm_config)
+
+
+def test_canonical_layout_off_is_accepted() -> None:
+    vllm_config = _canonical_config(None, 1.0, False)
+    MetalPlatform.check_and_update_config(vllm_config)
+    assert vllm_config.kv_transfer_config.kv_connector == "MetalOffloadingConnector"
 
 
 def test_simple_kv_offload_env_rejected(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -69,6 +69,80 @@ def test_request_slots_and_dummy_padding(num_groups):
     assert dummy.tolist() == expected_slots[:num_groups]
 
 
+def test_gather_nulls_blocks_below_sliding_window():
+    # Oracle from vLLM v0.33.0, tests/v1/worker/test_gpu_block_table.py
+    # (test_gather_block_tables_nulls_blocks_below_sliding_window).
+    install()
+    tables = BlockTables(
+        [16, 16], 4, 64, [16, 16], torch.device("mps"), sliding_window_reach=[0, 31]
+    )
+    full_ids = [list(range(1, 13)), list(range(41, 53))]
+    swa_ids = [list(range(21, 33)), list(range(61, 73))]
+    for req, slot in enumerate([0, 2]):
+        tables.append_block_ids(slot, (full_ids[req], swa_ids[req]), True)
+    tables.apply_staged_writes()
+    mapping = torch.tensor([0, 2], dtype=torch.int32, device="mps")
+    computed = torch.tensor([145, 0, 120, 0], dtype=torch.int32, device="mps")
+
+    full, swa = tables.gather_block_tables(
+        mapping, num_reqs_padded=3, num_computed_tokens=computed
+    )
+    full_rows, swa_rows = full[:, :12].tolist(), swa[:, :12].tolist()
+    _, unmasked = tables.gather_block_tables(mapping, num_reqs_padded=2)
+
+    assert full_rows[:2] == full_ids
+    assert swa_rows == [
+        [0] * 7 + swa_ids[0][7:],
+        [0] * 5 + swa_ids[1][5:],
+        [0] * 12,
+    ]
+    assert tables.block_tables[1].gpu[0, :12].tolist() == swa_ids[0]
+    assert unmasked[0, :12].tolist() == swa_ids[0]
+
+
+def test_gather_clears_rows_left_by_larger_batch():
+    # Oracle from vLLM v0.33.0, tests/v1/worker/test_gpu_block_table.py
+    # (test_shared_block_tables_clear_rows_from_larger_batch).
+    install()
+    tables = BlockTables([16], 4, 64, [3], torch.device("mps"))
+    for slot in range(4):
+        tables.append_block_ids(slot, ([slot + 1] * 3,), True)
+    tables.apply_staged_writes()
+    tables.gather_block_tables(
+        torch.arange(4, dtype=torch.int32, device="mps"), num_reqs_padded=4
+    )
+
+    (view,) = tables.gather_block_tables(
+        torch.tensor([2], dtype=torch.int32, device="mps"), num_reqs_padded=1
+    )
+
+    assert view.tolist() == [[3, 3, 3]]
+    assert tables.input_block_tables[0][1:].count_nonzero().item() == 0
+
+
+def test_post_update_stores_drafts_by_request_slot(state):
+    # The last PP rank's drafts land in the request-slot rows, as in vLLM
+    # v0.33.0's _post_update_kernel; a removed (-1) row writes nothing.
+    drafts_out = torch.zeros((4, 2), dtype=torch.int64, device="mps")
+
+    post_update(
+        torch.tensor([2, -1, 0], dtype=torch.int32, device="mps"),
+        state.num_computed_tokens.gpu,
+        state.last_sampled_tokens,
+        None,
+        torch.zeros((3, 1), dtype=torch.int64, device="mps"),
+        torch.zeros(3, dtype=torch.int32, device="mps"),
+        torch.zeros(3, dtype=torch.int32, device="mps"),
+        None,
+        state.all_token_ids.gpu,
+        state.total_len.gpu,
+        draft_tokens=torch.tensor([[5, 6], [7, 8], [9, 10]], device="mps"),
+        draft_tokens_out=drafts_out,
+    )
+
+    assert drafts_out.tolist() == [[9, 10], [0, 0], [5, 6], [0, 0]]
+
+
 @pytest.mark.parametrize("num_sampled", [0, 1, 3])
 def test_removed_request_writeback_at_capacity(state, num_sampled):
     # The second request disappears before writeback. Its -1 slot must not
@@ -503,6 +577,8 @@ def _check_chunked_verification(logprobs):
             num_speculative_tokens=3,
             enable_adaptive_verification=False,
             rejection_sample_method="standard",
+            fly_entropy_threshold=0.3,
+            fly_entropy_top_k=3,
         ),
         torch.device("mps"),
     )

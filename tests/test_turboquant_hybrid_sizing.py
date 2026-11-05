@@ -11,10 +11,8 @@ import torch
 from vllm.config import AttentionConfig, CacheConfig, CompilationConfig
 from vllm.model_executor.models import ModelRegistry
 from vllm.v1.attention.backends.utils import record_kv_cache_layout
-from vllm.v1.core.kv_cache_utils import (
-    get_kv_cache_groups,
-    resolve_kv_cache_block_sizes,
-)
+from vllm.v1.core.kv_cache_planning import get_kv_cache_groups
+from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 
 from tests.stub_runner import (
@@ -122,7 +120,7 @@ class TestHybridTurboQuantCachePolicy:
         assert per_block == len(SDPA_LAYERS) * TQ_PAGE
 
     def test_upstream_uniformity_probe_handles_mixed_hybrid_specs(self) -> None:
-        from vllm.v1.core.kv_cache_utils import is_kv_cache_spec_uniform
+        from vllm.v1.core.kv_cache_planning import is_kv_cache_spec_uniform
 
         for sdpa_layers in ([3, 7], [0, 4]):
             runner = make_stub_runner(
@@ -387,7 +385,7 @@ class TestTurboQuantHybridAlignment:
             if any(name.endswith(".self_attn") for name in group.layer_names)
         )
         from vllm.v1.attention.backends.utils import record_kv_cache_layout
-        from vllm.v1.core.kv_cache_utils import get_kv_cache_config_from_groups
+        from vllm.v1.core.kv_cache_planning import get_kv_cache_config_from_groups
 
         from vllm_metal.attention.runtime.hybrid import HybridPagedAttentionRuntime
 

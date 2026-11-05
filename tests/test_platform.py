@@ -26,10 +26,11 @@ from vllm.pooling_params import LateInteractionParams, PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.selector import AttentionSelectorConfig
-from vllm.v1.core.kv_cache_utils import (
-    get_kv_cache_capacity,
+from vllm.v1.core.kv_cache_planning import (
+    get_global_kv_cache_groups,
     get_kv_cache_configs,
 )
+from vllm.v1.core.kv_cache_utils import get_kv_cache_capacity
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheSpec,
@@ -42,9 +43,6 @@ import vllm_metal.platform as platform_module
 from tests.stub_runner import make_gemma4_mixed_attention_runner
 from vllm_metal import _apply_model_runner_default
 from vllm_metal.config import reset_config
-from vllm_metal.patches.model_runner_validation import (
-    patch_metal_model_runner_validation,
-)
 from vllm_metal.platform import MetalPlatform
 from vllm_metal.v1.cache_policy import WorkerCachePlanner
 from vllm_metal.v1.model_adapter import DefaultModelAdapter
@@ -797,111 +795,6 @@ class TestMetalPlatform:
                     distributed_executor_backend="mp",
                 )
             )
-
-    @pytest.mark.parametrize("backend", ["mlx", "mps"])
-    def test_v2_validation_preserves_unsupported_features(
-        self, monkeypatch: pytest.MonkeyPatch, backend: str
-    ) -> None:
-        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
-        config = self._platform_config()
-        MetalPlatform.check_and_update_config(config)
-        monkeypatch.setenv("VLLM_METAL_BACKEND", backend)
-        config.speculative_config = SimpleNamespace(
-            method="suffix", parallel_drafting=False
-        )
-
-        with pytest.raises(
-            ValueError,
-            match="Model Runner V2 on Metal does not support: speculative method 'suffix'",
-        ):
-            config._validate_v2_model_runner()
-
-    @pytest.mark.parametrize(
-        ("validator_name", "features_name"),
-        [
-            ("_validate_v2_model_runner", "_get_v2_model_runner_unsupported_features"),
-            ("_validate_model_runner", "_get_model_runner_unsupported_features"),
-        ],
-    )
-    def test_mrv2_validation_patch_supports_method_names(
-        self, monkeypatch: pytest.MonkeyPatch, validator_name: str, features_name: str
-    ) -> None:
-        for name in (
-            "_validate_v2_model_runner",
-            "_get_v2_model_runner_unsupported_features",
-            "_validate_model_runner",
-            "_get_model_runner_unsupported_features",
-        ):
-            monkeypatch.delattr(VllmConfig, name, raising=False)
-        unsupported = ["x"]
-        monkeypatch.setattr(
-            VllmConfig, validator_name, lambda config: None, raising=False
-        )
-        monkeypatch.setattr(
-            VllmConfig, features_name, lambda config: unsupported, raising=False
-        )
-        monkeypatch.setattr("vllm.platforms.current_platform", MetalPlatform())
-        config = object.__new__(VllmConfig)
-
-        patch_metal_model_runner_validation()
-        patched = getattr(VllmConfig, validator_name)
-
-        assert patched._metal_mrv2
-        assert not hasattr(
-            VllmConfig,
-            "_validate_model_runner"
-            if validator_name == "_validate_v2_model_runner"
-            else "_validate_v2_model_runner",
-        )
-        with pytest.raises(ValueError, match="x"):
-            patched(config)
-        unsupported.clear()
-        assert patched(config) is None
-
-    def test_mrv2_validation_patch_requires_validator(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        for name in ("_validate_v2_model_runner", "_validate_model_runner"):
-            monkeypatch.delattr(VllmConfig, name, raising=False)
-
-        with pytest.raises(
-            RuntimeError,
-            match="_validate_v2_model_runner.*_validate_model_runner.*"
-            "vllm-metal needs updating for this vLLM version",
-        ):
-            patch_metal_model_runner_validation()
-
-    def test_mrv2_validation_patch_delegates_on_non_metal(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        config = self._platform_config()
-        calls = []
-
-        def original(config):
-            calls.append(config)
-
-        monkeypatch.setattr(VllmConfig, "_validate_v2_model_runner", original)
-        monkeypatch.setattr("vllm.platforms.current_platform", object())
-
-        patch_metal_model_runner_validation()
-        config._validate_v2_model_runner()
-
-        assert calls == [config]
-
-    def test_mrv2_validation_patch_is_idempotent(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        def original(config):
-            pass
-
-        monkeypatch.setattr(VllmConfig, "_validate_v2_model_runner", original)
-        patch_metal_model_runner_validation()
-        patched = VllmConfig._validate_v2_model_runner
-
-        patch_metal_model_runner_validation()
-
-        assert VllmConfig._validate_v2_model_runner is patched
-        assert patched.__wrapped__ is original
 
     def test_check_and_update_config_rejects_routed_experts(self) -> None:
         """vLLM leaves AuxOutput validation to out-of-tree platforms."""
@@ -2513,7 +2406,12 @@ class TestAutoFitMaxModelLenChain:
         available = num_pool_blocks * self._PACKED_BLOCK_BYTES
         vllm_config, specs = self.gemma4_config_and_specs(original_max_model_len=-1)
 
-        config = get_kv_cache_configs(vllm_config, [specs], [available])[0]
+        config = get_kv_cache_configs(
+            vllm_config,
+            [specs],
+            [available],
+            get_global_kv_cache_groups(vllm_config, [specs]),
+        )[0]
 
         capacity, _ = get_kv_cache_capacity(vllm_config, config)
         assert vllm_config.model_config.max_model_len < self._DERIVED_MAX_LEN
@@ -2525,7 +2423,12 @@ class TestAutoFitMaxModelLenChain:
             original_max_model_len=self._DERIVED_MAX_LEN
         )
 
-        config = get_kv_cache_configs(vllm_config, [specs], [available])[0]
+        config = get_kv_cache_configs(
+            vllm_config,
+            [specs],
+            [available],
+            get_global_kv_cache_groups(vllm_config, [specs]),
+        )[0]
 
         full_groups = [
             group
@@ -2553,5 +2456,7 @@ class TestAutoFitMaxModelLenChain:
         available = self._PACKED_BLOCK_BYTES - 1
         vllm_config, specs = self.gemma4_config_and_specs(original_max_model_len=-1)
 
+        groups = get_global_kv_cache_groups(vllm_config, [specs])
+
         with pytest.raises(ValueError, match="Cannot auto-fit max_model_len"):
-            get_kv_cache_configs(vllm_config, [specs], [available])
+            get_kv_cache_configs(vllm_config, [specs], [available], groups)
