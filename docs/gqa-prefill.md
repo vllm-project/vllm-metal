@@ -1,17 +1,19 @@
 # Grouped NAX prefill
 
-The MLX NAX dispatcher can process three or six query heads from one six-head
-KV group in a BQ16 threadgroup. `VLLM_METAL_NAX_GQA_PREFILL` defaults to `1`;
+The MLX NAX dispatcher uses BQ16 threadgroups for three or six query heads
+within a six-head KV group, or four query heads within an eight-head KV group.
+`VLLM_METAL_NAX_GQA_PREFILL` defaults to `1`;
 set it to `0` and restart workers to retain upstream NAX.
 
 Eligibility is based on tensor geometry and attention features, not a model
-name: BF16, head dimension 256, Q/KV head ratio 6, kernel page 16, one ordinary
+name: BF16, head dimension 256, one ordinary
 causal sequence, no mixed suffix offset, sliding window, softcap or sinks.
+Supported layouts are GQA6 with kernel page16 and GQA8 with kernel page32.
 Kernel pages may be translated from larger physical cache pages. Other shapes
 retain their established route. Each dispatch executes one selected kernel.
 
-Both layouts preserve the per-head calculation. h3 uses 96 threads and h6 uses
-192; neither is always fastest. Complete query/KV tiles omit bounds checks,
+All layouts preserve the per-head calculation. h3 uses 96 threads, h4 uses 128
+and h6 uses 192; none is always fastest. Complete query/KV tiles omit bounds checks,
 while partial tiles and causal masking remain guarded. Whole-request alignment
 is not required.
 
@@ -70,8 +72,7 @@ regressions and serving measurements belong in the accompanying PR evidence.
 
 Known limitations remain: some odd-K selections trail historical experimental
 layouts even while beating upstream; D128/D512 and other ratios need their own
-compiled layouts and resource validation. The separate GQA8 implementation is
-not part of this change. Other models with matching geometry have operator
+compiled layouts and resource validation. Other models with matching geometry have operator
 coverage, not a blanket whole-model performance guarantee.
 
 ## Context length
@@ -83,6 +84,30 @@ no admitted path showed a repeated significant loss above 2% against actual
 upstream or h3 in that matrix. This is operator evidence, not 128K model E2E
 or a speedup guarantee at arbitrary lengths. Complete-work density, tail cost
 and core capacity still gate admission.
+
+## GQA8 admission
+
+GQA8 adds the page32/h4 instance to the same grouped shader. The ratio names
+the model's Q/KV-head ratio; the threadgroup handles four of those query heads.
+It reuses the existing work counter and guarded-pipeline score with no extra
+group-state growth. The GQA6 h3/h6 policy remains unchanged.
+
+Only the guarded upstream pipeline is eligible. A candidate is rejected if
+it reduces the useful group count available to the detected GPU cores:
+`min(cores, grouped.groups) < min(cores, baseline.groups)`. The remaining score
+must exceed `0.5 + 32 * cores * grouped.tail_stream / baseline.issued`.
+Upstream split/optimized requests retain their existing pipeline. Thus long
+cold prompts need not use GQA8 grouping, while cached short queries can qualify.
+Head counts, Q/prefix work and GPU capacity drive this decision; there is no
+model-name or chip-name allowlist and no fixed total-KV length limit.
+
+The guarded score weights were calibrated with the earlier GQA8 implementation
+(base `2a2a2d0`) on 10/20/40-core M5 devices. They are empirical work weights,
+not predicted milliseconds or a guarantee for unseen shapes. Earlier h8
+experiments retained some wins over h4; this bounded implementation does not
+claim to be the fastest of every experimental layout. There is no 80-core GPU
+measurement. Current-source results must be reported separately from that
+earlier calibration and from the GQA6 serving measurements below.
 
 ## Serving measurements
 

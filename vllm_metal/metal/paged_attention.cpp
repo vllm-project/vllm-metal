@@ -66,7 +66,7 @@ static void record_nax_prefill_dispatch(
       key_block_stride = static_cast<int32_t>(block_size * key_cache.strides()[1]);
     }
     g_nax_prefill_trace[g_nax_prefill_trace_size++] = {
-        cfg.HEADS_PER_TG > 1 ? "nax_gqa6_prefill" : "nax_prefill",
+        paged_dispatch_name(nax_prefill_dispatch_family(cfg)),
         query.dtype() == bfloat16 ? "bfloat16" : "float16",
         static_cast<int>(query.shape(0)), static_cast<int>(query.shape(1)),
         num_kv_heads, static_cast<int>(query.shape(2)), block_size, num_seqs,
@@ -477,7 +477,7 @@ static void dispatch_paged_attention_nax(
     kernel = load_kernel();
   }
   if (cfg.HEADS_PER_TG > 1) {
-    record_paged_dispatch(PagedDispatch::NaxGqa6Prefill, 0, 0, cfg.HEADS_PER_TG);
+    record_paged_dispatch(nax_prefill_dispatch_family(cfg), 0, 0, cfg.HEADS_PER_TG);
   } else if (g_dispatch_diagnostics_enabled.load(std::memory_order_relaxed)) {
     g_last_nax_split.store(plan.split_full ? 1 : 0, std::memory_order_relaxed);
     g_last_nax_heads_per_tg.store(cfg.HEADS_PER_TG, std::memory_order_relaxed);

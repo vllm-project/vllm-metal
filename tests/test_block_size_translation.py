@@ -435,7 +435,7 @@ def test_nax_work_counts_match_independent_causal_loop(nax_policy_binary):
     cases = [
         (q, prefix, heads, kv, bq, split)
         for q, prefix in lengths
-        for heads, kv in ((24, 4), (54, 9))
+        for heads, kv in ((24, 4), (54, 9), (16, 2), (16, 4))
         for bq in (16, 64)
         for split in (0, 1)
     ]
@@ -463,7 +463,7 @@ def test_nax_work_counts_match_independent_causal_loop(nax_policy_binary):
         {"offset": 1},
         {"head_dim": 512},
         {"page": 8},
-        {"page": 32},
+        {"page": 0},
         {"cores": 0},
         {"q": 0},
         {"q": 1},
@@ -473,10 +473,14 @@ def test_nax_work_counts_match_independent_causal_loop(nax_policy_binary):
         {"heads": 25},
     ],
 )
+@pytest.mark.parametrize("geometry", [(24, 4, 16), (16, 2, 32)])
 def test_nax_grouped_preserves_unsupported_and_unknown_fallbacks(
-    nax_config_runner, changes
+    nax_config_runner, changes, geometry
 ):
-    cfg, name = nax_config_runner(**changes)
+    heads, kv_heads, page = geometry
+    cfg, name = nax_config_runner(
+        **({"heads": heads, "kv_heads": kv_heads, "page": page} | changes)
+    )
     assert cfg == (64, 1, 128)
     assert "_gqa" not in name
 
@@ -600,7 +604,8 @@ def test_nax_grouped_preserves_unsupported_and_unknown_fallbacks(
             6,
             "_gqa6_full",
         ),
-        ({"heads": 16, "kv_heads": 2, "page": 32, "q": 128}, 1, ""),
+        ({"q": 144, "page": 32}, 1, ""),
+        ({"heads": 16, "kv_heads": 2, "page": 32, "q": 128}, 4, "_gqa8_full"),
         ({"q": 2048, "prefix": 0, "upstream_split": 1}, 1, ""),
     ],
 )
@@ -630,6 +635,50 @@ def test_nax_grouped_capacity_falls_back_at_the_pipeline_limit(
     cfg, name = nax_config_runner(**changes, capacity=capacity)
     assert cfg == expected
     assert ("_gqa" in name) == (expected[1] > 1)
+
+
+@pytest.mark.parametrize("cores", [10, 20, 40, 80])
+@pytest.mark.parametrize(
+    ("changes", "width"),
+    [
+        ({"q": 64}, 4),
+        ({"q": 128}, 4),
+        ({"q": 64, "prefix": 4097}, 4),
+        ({"q": 64, "prefix": 65537}, 4),
+        ({"q": 63}, 1),
+        ({"q": 65}, 1),
+        ({"q": 64, "upstream_split": 1}, 1),
+        ({"q": 128, "upstream_split": 1}, 1),
+        ({"q": 64, "page": 16}, 1),
+        ({"q": 64, "capacity": 127}, 1),
+        ({"q": 64, "capacity": 128}, 4),
+    ],
+)
+def test_nax_gqa8_preserves_capacity_pipeline_and_tail_guards(
+    nax_config_runner, cores, changes, width
+):
+    """GQA8 h4 must earn admission against the actual guarded upstream path."""
+    cfg, name = nax_config_runner(
+        **(
+            {"heads": 16, "kv_heads": 2, "page": 32, "prefix": 31680, "cores": cores}
+            | changes
+        )
+    )
+    assert cfg == ((16, 4, 128) if width == 4 else (64, 1, 128))
+    assert name.endswith("_gqa8_full") == (width == 4)
+
+
+@pytest.mark.parametrize(
+    ("heads", "kv_heads", "cores", "width"),
+    [(16, 2, 20, 4), (16, 2, 40, 1), (16, 2, 80, 1), (32, 4, 40, 4)],
+)
+def test_nax_gqa8_rejects_reduced_parallel_capacity(
+    nax_config_runner, heads, kv_heads, cores, width
+):
+    cfg, _ = nax_config_runner(
+        heads=heads, kv_heads=kv_heads, page=32, q=144, prefix=31680, cores=cores
+    )
+    assert cfg[1] == width
 
 
 class TestNaxKernelInstantiations:

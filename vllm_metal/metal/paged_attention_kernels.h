@@ -175,6 +175,40 @@ inline double nax_gqa_guarded_score(
   return (benefit - cost) / baseline.issued;
 }
 
+inline double nax_gqa_critical_savings(
+    int q, int heads, int cores, int heads_per_group,
+    const NaxPrefillWork& baseline, const NaxPrefillWork& grouped) {
+  constexpr int kGroupedQueryTile = 16;
+  return std::min(int64_t(cores), int64_t(heads))
+      * ((q % kNaxBQ + kGroupedQueryTile - 1) / kGroupedQueryTile)
+      * baseline.tail_stream
+      - std::min(int64_t(cores), baseline.groups)
+      * heads_per_group * grouped.tail_stream;
+}
+
+inline NaxGqaScore nax_gqa8_work_score(
+    int q, int prefix, int heads, int cores, bool upstream_split) {
+  constexpr int kHeadsPerGroup = 4;
+  constexpr double kAdmissionMargin = .5;
+  constexpr double kTailReserveWeight = 8;
+  // The four-head layout was calibrated against the guarded upstream loop.
+  if (upstream_split) return {true, false, 0, kHeadsPerGroup};
+  const auto baseline = nax_prefill_work(q, prefix, heads, heads / 8, kNaxBQ, false);
+  const auto grouped = nax_prefill_work(q, prefix, heads, heads / kHeadsPerGroup, 16, true);
+  // Keep at least as many useful groups available to fill this GPU.
+  if (std::min(int64_t(cores), grouped.groups) <
+      std::min(int64_t(cores), baseline.groups))
+    return {true, false, 0, kHeadsPerGroup};
+  const double critical_savings = nax_gqa_critical_savings(
+      q, heads, cores, kHeadsPerGroup, baseline, grouped);
+  // h4 has no extra group state; the capacity veto above makes lost-grid cost zero.
+  const double value = nax_gqa_guarded_score(
+      baseline, grouped, heads, cores, 0, critical_savings, 0);
+  const double threshold = kAdmissionMargin + kTailReserveWeight * cores
+      * kHeadsPerGroup * grouped.tail_stream / baseline.issued;
+  return {true, value > threshold, value, kHeadsPerGroup};
+}
+
 inline NaxGqaScore nax_gqa_work_score(
     int q, int prefix, int heads, int kv_heads, int page,
     int cores, bool upstream_split) {
@@ -195,6 +229,8 @@ inline NaxGqaScore nax_gqa_work_score(
   if (q <= 1 || prefix < 0 || heads <= 0 || kv_heads <= 0 ||
       heads % kv_heads || cores <= 0) return {false, false, 0, 0};
   const int ratio = heads / kv_heads;
+  if (ratio == 8 && page == 32)
+    return nax_gqa8_work_score(q, prefix, heads, cores, upstream_split);
   if (ratio != kSupportedRatio || page != kSupportedPageSize)
     return {false, false, 0, 0};
   const auto baseline = nax_prefill_work(
@@ -236,11 +272,8 @@ inline NaxGqaScore nax_gqa_work_score(
     const double head_growth = double(heads_per_group) / kNarrowHeadLimit - 1;
     const double padding_savings =
         baseline.issued - baseline.active - grouped.issued + grouped.active;
-    const double critical_savings = std::min(int64_t(cores), int64_t(heads))
-        * ((q % kNaxBQ + kGroupedQueryTile - 1) / kGroupedQueryTile)
-        * baseline.tail_stream
-        - std::min(int64_t(cores), baseline.groups)
-        * heads_per_group * grouped.tail_stream;
+    const double critical_savings = nax_gqa_critical_savings(
+        q, heads, cores, heads_per_group, baseline, grouped);
     const double value = upstream_split
         ? nax_gqa_split_score(baseline, grouped, heads_per_group, head_growth,
                              padding_savings, critical_savings)
@@ -306,7 +339,9 @@ inline std::string nax_name(
   std::string name = "paged_attention_nax_" + dtype +
       "_hs" + std::to_string(head_size) +
       "_bs" + std::to_string(block_size);
-  if (cfg.HEADS_PER_TG > 1)
+  if (cfg.HEADS_PER_TG == 4)
+    name += "_gqa8_full";
+  else if (cfg.HEADS_PER_TG > 1)
     name += cfg.HEADS_PER_TG == 6 ? "_gqa6_full" : "_gqa6_sub_full";
   return name;
 }

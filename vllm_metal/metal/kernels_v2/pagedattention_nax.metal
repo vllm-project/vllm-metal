@@ -761,10 +761,10 @@ void paged_attention_nax_grouped_full(
   constexpr int BQ = 16;
   constexpr int TILE_KV = 32;
   constexpr int TD = HEAD_SIZE / 16;
-  static_assert(GROUP_SIZE == 6,
-                "unsupported grouped NAX head ratio");
-  static_assert(BLOCK_SIZE == 16,
-                "unsupported grouped NAX block size");
+  static_assert((GROUP_SIZE == 6 && BLOCK_SIZE == 16 &&
+                 (HEADS_PER_TG == 3 || HEADS_PER_TG == 6)) ||
+                (GROUP_SIZE == 8 && BLOCK_SIZE == 32 && HEADS_PER_TG == 4),
+                "unsupported grouped NAX layout");
 
   static_assert(HEADS_PER_TG > 0 && GROUP_SIZE % HEADS_PER_TG == 0,
                 "threadgroups must partition the original KV-head group");
@@ -899,11 +899,11 @@ void paged_attention_nax_grouped_full(
 }
 
 #define instantiate_paged_attention_nax_grouped_full(                             \
-    type, block_size, width, suffix)                                           \
+    type, block_size, ratio, width, suffix)                                    \
   template [[host_name("paged_attention_nax_" #type                          \
-                       "_hs256_bs" #block_size "_gqa6" #suffix)]]         \
+                       "_hs256_bs" #block_size "_gqa" #ratio #suffix)]]    \
   [[kernel]] void paged_attention_nax_grouped_full<                               \
-      type, block_size, 6, width>(                                        \
+      type, block_size, ratio, width>(                                    \
       device type *out [[buffer(2)]],                                        \
       device const type *q [[buffer(3)]],                                    \
       device const type *k_cache [[buffer(4)]],                              \
@@ -926,5 +926,6 @@ void paged_attention_nax_grouped_full(
       uint3 tgpg [[threadgroups_per_grid]],                                  \
       uint sg_idx [[simdgroup_index_in_threadgroup]]);
 
-instantiate_paged_attention_nax_grouped_full(bfloat16_t, 16, 6, _full);
-instantiate_paged_attention_nax_grouped_full(bfloat16_t, 16, 3, _sub_full);
+instantiate_paged_attention_nax_grouped_full(bfloat16_t, 16, 6, 6, _full);
+instantiate_paged_attention_nax_grouped_full(bfloat16_t, 16, 6, 3, _sub_full);
+instantiate_paged_attention_nax_grouped_full(bfloat16_t, 32, 8, 4, _full);

@@ -31,8 +31,23 @@ constexpr int kPartitionSize = VLLM_METAL_PARTITION_SIZE;
 enum class PagedDispatch {
   None, GqaDecode, PerToken, SplitKv, Window, WindowSplitKv, NaxPrefill,
   TiledPrefill, MixedPrefillDecode, MixedNaxPrefillDecode,
-  NaxGqa6Prefill, Count
+  NaxGqa6Prefill, NaxGqa8Prefill, Count
 };
+
+inline const char* paged_dispatch_name(PagedDispatch family) {
+  static constexpr const char* names[] = {
+      "", "gqa_decode", "per_token_ps0", "per_token_ps512", "window_ps0",
+      "window_ps512", "nax_prefill", "tiled_prefill", "mixed_prefill_decode",
+      "mixed_nax_prefill_decode", "nax_gqa6_prefill", "nax_gqa8_prefill"};
+  static_assert(std::size(names) == static_cast<size_t>(PagedDispatch::Count),
+                "PagedDispatch and its diagnostic names must stay in sync");
+  return names[static_cast<size_t>(family)];
+}
+
+inline PagedDispatch nax_prefill_dispatch_family(kernels::NaxConfig cfg) {
+  if (cfg.HEADS_PER_TG == 4) return PagedDispatch::NaxGqa8Prefill;
+  return cfg.HEADS_PER_TG > 1 ? PagedDispatch::NaxGqa6Prefill : PagedDispatch::NaxPrefill;
+}
 using hardware::detected_gpu_core_count;
 using hardware::gpu_core_count;
 // One measured dispatch table, also exposed read-only to numerical/routing
