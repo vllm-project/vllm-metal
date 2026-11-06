@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from types import SimpleNamespace
 from typing import Any
 
 import mlx.core as mx
@@ -11,7 +12,7 @@ from mlx_lm.models.bailing_moe_v3 import BailingKDA, ModelArgs
 from mlx_lm.models.cache import ArraysCache
 from mlx_vlm.models.cache import ArraysCache as VLMArraysCache
 from mlx_vlm.models.glm5_next.config import TextConfig as Glm5NextTextConfig
-from mlx_vlm.models.glm5_next.language import Glm5NextLinearAttention
+from mlx_vlm.models.glm5_next.language import Glm5NextLinearAttention, LanguageModel
 
 from tests.stub_runner import make_state_cache
 from vllm_metal.attention.context import (
@@ -59,7 +60,25 @@ def _glm5_next_kda() -> tuple[Any, ...]:
     )
 
 
-@pytest.mark.parametrize("make_kda", [_bailing_kda, _glm5_next_kda])
+def _glm5_next_kda_rank() -> tuple[Any, ...]:
+    """Rank 1's share of mlx-vlm's two-rank shard(), without the cross-rank sum."""
+    config = Glm5NextTextConfig(
+        hidden_size=_HIDDEN_SIZE,
+        linear_num_heads=2 * _NUM_HEADS,
+        linear_head_dim=_HEAD_DIM,
+        linear_conv_kernel_dim=_CONV_KERNEL,
+        num_hidden_layers=1,
+    )
+    model = LanguageModel(config)
+    model.shard(SimpleNamespace(size=lambda: 2, rank=lambda: 1))
+    inner = model.layers[0].self_attn
+    inner.sharding_group = None
+    return (inner, lambda: VLMArraysCache(size=2), lambda ref: (ref[0], ref[1]))
+
+
+@pytest.mark.parametrize(
+    "make_kda", [_bailing_kda, _glm5_next_kda, _glm5_next_kda_rank]
+)
 def test_kda_paged_state_matches_reference_with_reordering_and_mixed_steps(
     make_kda: Callable[[], tuple[Any, ...]],
 ) -> None:

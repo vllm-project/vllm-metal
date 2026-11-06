@@ -1120,13 +1120,16 @@ _GLM_LATENT = 32
 _GLM_INDEX_DIM = 16
 
 
-def _glm5_next_layer(*, kpool: int = 4, ties: bool = False) -> nn.Module:
+def _glm5_next_layer(
+    *, kpool: int = 4, ties: bool = False, tp_rank: int | None = None
+) -> nn.Module:
     """A tiny bf16 GLM-5-Next sparse attention layer, in inference mode as
     mlx-vlm's loader returns it. Its widths are multiples of 32, so mlx-vlm's
     prefill takes its indexed kernel. ``ties`` zeroes the head weights, so
-    every pool scores exactly 0."""
+    every pool scores exactly 0. ``tp_rank`` takes that rank's share of
+    mlx-vlm's two-rank ``shard()``."""
     from mlx_vlm.models.glm5_next.config import TextConfig
-    from mlx_vlm.models.glm5_next.language import Glm5NextAttention
+    from mlx_vlm.models.glm5_next.language import Glm5NextAttention, LanguageModel
 
     mx.random.seed(0)
     config = TextConfig(
@@ -1144,8 +1147,14 @@ def _glm5_next_layer(*, kpool: int = 4, ties: bool = False) -> nn.Module:
         index_kpool=kpool,
         num_hidden_layers=4,
     )
+    if tp_rank is None:
+        inner = Glm5NextAttention(config, layer_idx=3)
+    else:
+        model = LanguageModel(config)
+        model.shard(SimpleNamespace(size=lambda: 2, rank=lambda: tp_rank))
+        inner = model.layers[3].self_attn
     # In training mode, mlx-vlm sends decode steps through its prefill path.
-    inner = Glm5NextAttention(config, layer_idx=3).eval()
+    inner = inner.eval()
     inner.set_dtype(mx.bfloat16)
     # Set after set_dtype: the checkpoint keeps the pool compression float32.
     inner.indexer.index_kpool_compress_ape = mx.random.normal((kpool, _GLM_INDEX_DIM))
@@ -1367,6 +1376,25 @@ class TestGlm5NextSparseAttention:
         _assert_pages_match(runtime, request)
         ((actual, expected, _, _),) = _glm_step(inner, runtime, wrapper, [(request, 1)])
         _assert_output_matches(actual, expected, 1, request.alone)
+
+    def test_tensor_parallel_rank_matches_mlx_vlm(self, monkeypatch) -> None:
+        """One rank of mlx-vlm's two-rank shard: the paged layer runs the local
+        heads and all-sums its output on the layer's group, as mlx-vlm does.
+        The stand-in sum doubles, as two equal partial outputs would."""
+        inner = _glm5_next_layer(tp_rank=1)
+
+        def all_sum(x: mx.array, *, group: object) -> mx.array:
+            assert group is inner.sharding_group
+            return 2 * x
+
+        monkeypatch.setattr(mx.distributed, "all_sum", all_sum)
+        runtime, wrapper = _glm5_next_paged(inner)
+        request = _GlmRequest([5, 2])
+        for num_tokens in (9, 1):
+            ((actual, expected, _, _),) = _glm_step(
+                inner, runtime, wrapper, [(request, num_tokens)]
+            )
+            _assert_output_matches(actual, expected, num_tokens, request.alone)
 
     @pytest.mark.parametrize(
         ("cap_mib", "ties", "block_size", "history", "chunk"),

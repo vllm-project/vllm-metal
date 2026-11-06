@@ -472,7 +472,10 @@ class DSAPagedAttentionWrapper(nn.Module):
         out = mx.concatenate(outputs)
         if order != sorted(order):
             out = out[mx.argsort(mx.array(order))]
-        return linear(inner.o_proj, out.reshape(1, len(order), -1)), None
+        out = linear(inner.o_proj, out.reshape(1, len(order), -1))
+        if inner.sharding_group is not None:
+            out = mx.distributed.all_sum(out, group=inner.sharding_group)
+        return out, None
 
     def _select(
         self, ctx: PagedAttentionContext, x: mx.array, q_resid: mx.array
