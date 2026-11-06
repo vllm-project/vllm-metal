@@ -99,6 +99,9 @@ class Glm5NextMTPProposer(NoOwnKVProposer):
         drafter, kind = load_drafter(source, kind="mtp")
         validate_drafter_compatibility(runner.model, drafter, kind)
         drafter.bind(runner.model)
+        if runner.tp_group is not None:
+            drafter.shard(runner.tp_group)
+            mx.eval(drafter.parameters())
         logger.info("GLM-5-Next MTP drafter loaded from %s", source)
         return cls(drafter=drafter, controller=runner._spec_decode_controller)
 

@@ -985,7 +985,7 @@ class MetalPlatform(Platform):
         # Under pipeline parallelism only GLM-5-Next MTP drafts: its last stage
         # returns target hidden states and drafts, and earlier stages learn the
         # accepted drafts from the next step's scheduler output. Under TP every
-        # rank runs the unsharded drafter on identical inputs and only rank 0's
+        # rank runs its shard of the drafter on identical inputs and only rank 0's
         # drafts reach the scheduler. No other method has been validated.
         # Reject loudly rather than run an untested combination.
         if (
