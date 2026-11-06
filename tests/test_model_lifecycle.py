@@ -463,6 +463,48 @@ class TestModelLifecycle:
         lifecycle._load_mlx_lm_text_model("stub", lazy=False)
         assert captured["lazy"] is False
 
+    def test_load_mlx_lm_text_model_forwards_model_type_override(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Text-only Qwen3.5 checkpoints declare model_type "qwen3_5_text",
+        # which has no mlx-lm module; the override must reach the loader so
+        # _get_classes resolves the shared "qwen3_5" module.
+        captured: dict[str, object] = {}
+
+        def _fake_load(
+            path: str,
+            *,
+            lazy: bool,
+            revision: str | None = None,
+            model_config: dict | None = None,
+        ) -> tuple[object, object]:
+            captured["model_config"] = model_config
+            return object(), object()
+
+        monkeypatch.setattr(model_lifecycle, "mlx_lm_load_model", _fake_load)
+        monkeypatch.setattr(
+            model_lifecycle, "resolve_mlx_lm_model_path", lambda name, **_: Path(name)
+        )
+        monkeypatch.setattr(
+            model_lifecycle,
+            "_mlx_lm_compatible_model_path",
+            lambda name: contextlib.nullcontext(name),
+        )
+        lifecycle, _ = _make_lifecycle()
+
+        lifecycle._load_mlx_lm_text_model(
+            "stub", model_config={"model_type": "qwen3_5"}
+        )
+        assert captured["model_config"] == {"model_type": "qwen3_5"}
+
+    def test_mlx_lm_model_type_override_maps_text_only_qwen35(self) -> None:
+        override = model_lifecycle.mlx_lm_model_type_override
+        assert override(SimpleNamespace(model_type="qwen3_5_text")) == {
+            "model_type": "qwen3_5"
+        }
+        assert override(SimpleNamespace(model_type="qwen3_5")) is None
+        assert override(SimpleNamespace(model_type=None)) is None
+
     def test_load_uses_adapter_override_for_qwen35_fp8_conditional_generation(
         self,
         monkeypatch: pytest.MonkeyPatch,

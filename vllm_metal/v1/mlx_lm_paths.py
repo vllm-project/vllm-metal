@@ -80,3 +80,20 @@ def mlx_lm_compatible_model_path(model_name: str | Path) -> Iterator[Path]:
             total_shards,
         )
         yield compat_path
+
+
+_MLX_LM_MODEL_TYPE_REMAP = {
+    # Text-only Qwen3.5 checkpoints declare model_type "qwen3_5_text"; mlx-lm
+    # ships the shared "qwen3_5" module instead (the HF-side *_text split is
+    # newer than its MODEL_REMAPPING, e.g. "deepseek_v41_text").
+    "qwen3_5_text": "qwen3_5",
+}
+
+
+def mlx_lm_model_type_override(hf_config) -> dict | None:
+    """``model_config`` overrides routing ``hf_config``'s model_type at an
+    mlx-lm module that exists; None when the checkpoint's type resolves
+    directly."""
+    model_type = getattr(hf_config, "model_type", None)
+    remapped = _MLX_LM_MODEL_TYPE_REMAP.get(model_type)
+    return {"model_type": remapped} if remapped is not None else None
