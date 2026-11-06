@@ -352,17 +352,17 @@ class TestSamplerDevicePolicy:
         assert generator.device.type == "cpu"
 
     @pytest.mark.parametrize(
-        "overrides",
+        ("overrides", "native"),
         [
-            None,
-            {"repetition_penalty": 1.1},
-            {"logprobs": 1},
-            {"logprob_token_ids": [1, 2]},
-            {"presence_penalty": 0.5},
-            {"allowed_token_ids": [1, 2]},
+            (None, False),
+            ({"repetition_penalty": 1.1}, False),
+            ({"logprobs": 1}, False),
+            ({"logprob_token_ids": [1, 2]}, False),
+            ({"presence_penalty": 0.5}, False),
+            ({"allowed_token_ids": [1, 2]}, True),
         ],
     )
-    def test_bridged_logits_reach_sampler_on_cpu(self, overrides) -> None:
+    def test_sampling_routes_to_native_or_cpu(self, overrides, native) -> None:
         logits = mx.array([[0.0, 1.0, 4.0, 2.0]], dtype=mx.float32)
         batch = SamplingBatch(
             [SamplingParams(temperature=0.8, top_k=2, **(overrides or {}))],
@@ -383,9 +383,9 @@ class TestSamplerDevicePolicy:
             logits, batch, SpySampler(), next_native_rng_key=next_native_rng_key
         )
 
-        assert [d.type for d in seen_devices] == ["cpu"]
+        assert [d.type for d in seen_devices] == ([] if native else ["cpu"])
         assert 0 <= result.token_ids[0] < 4
-        assert runner._native_sampling_step == 0
+        assert runner._native_sampling_step == int(native)
 
 
 class TestV1SamplingBatch:
@@ -779,7 +779,7 @@ class TestV1SamplingBatch:
         assert sample([2, 2]) == 0
 
     def test_allowed_token_ids_constrains_greedy_sampling(self) -> None:
-        """Greedy with allowed_token_ids must fall back and the constraint works."""
+        """Greedy sampling must honor allowed_token_ids."""
         logits = mx.array([[10.0, 1.0, 5.0, 1.0]], dtype=mx.float32)
         batch = SamplingBatch(
             [SamplingParams(temperature=0.0, allowed_token_ids=[2, 3])],
@@ -884,7 +884,7 @@ class TestV1SamplingBatch:
         assert sampled == {0, 1}
 
     def test_bad_words_blocks_greedy_token(self) -> None:
-        """Greedy + bad_words_token_ids must fall back and block the banned token."""
+        """Greedy sampling must block the banned token."""
         logits = mx.array([[10.0, 1.0, 5.0, 1.0]], dtype=mx.float32)
         sp = SamplingParams(temperature=0.0)
         sp._bad_words_token_ids = [[0]]  # ban token 0 (the highest logit)

@@ -106,10 +106,12 @@ class TestNativeRandomEligibility:
             ("min tokens still pending", [_random_params(min_tokens=2)]),
         ],
     )
-    def test_ineligible_batches_fall_back(self, label, params_list) -> None:
+    def test_default_gate_rejects_extended_sampling_options(
+        self, label, params_list
+    ) -> None:
         assert not SamplingBatch.params_allow_native_random(params_list)
 
-    def test_bad_words_fall_back(self) -> None:
+    def test_bad_words_keep_deferred_decode_disabled(self) -> None:
         params = _random_params()
         params._bad_words_token_ids = [[99]]
 
@@ -650,3 +652,73 @@ def test_broadcast_logits_use_per_row_candidate_ids():
         mx.array([[1, 0, 2], [0, 2, 1]], dtype=mx.uint32),
     )
     assert tokens.tolist() == [0, 2]
+
+
+class TestNativeConstraints:
+    def test_masks_match_vllm_for_output_suffixes_and_mixed_rows(self):
+        from vllm.v1.sample.sampler import Sampler
+
+        from vllm_metal.v1.native_constraints import apply_native_constraints
+
+        params = [
+            SamplingParams(allowed_token_ids=[0, 1, 2, 3]),
+            SamplingParams(),
+            SamplingParams(),
+            SamplingParams(),
+        ]
+        for sp in params[:3]:
+            sp._bad_words_token_ids = [[4], [1, 2], [2, 1, 3], [1, 2, 1, 0]]
+        prompts = [[1, 2, 1]] * 4
+        for outputs in [
+            [[], [], [], []],
+            [[1], [2, 1], [1, 2, 1], []],
+            [[1, 2], [3], [2, 1, 2], []],
+        ]:
+            batch = SamplingBatch(params, prompts, outputs, vocab_size=5)
+            raw = [[0.0, 1.0, 2.0, 3.0, 4.0]] * 4
+            expected = Sampler().apply_logits_processors(
+                torch.tensor(raw), batch.make_sampling_metadata(), False
+            )
+            logits = mx.array(raw)
+            actual = apply_native_constraints(logits, params, outputs)
+            assert actual.tolist() == expected.tolist()
+            assert logits.tolist() == raw
+
+    @pytest.mark.parametrize("temperature", [0.0, 0.8])
+    def test_sync_constraints_use_native_draw_and_current_history(
+        self, monkeypatch, temperature
+    ):
+        from vllm.v1.sample.sampler import Sampler
+
+        from vllm_metal.v1.sampling_batch import sample_from_logits
+
+        sp = SamplingParams(
+            temperature=temperature, allowed_token_ids=[1, 2], top_k=1, seed=7
+        )
+        sp._bad_words_token_ids = [[0, 2]]
+        sampler = Sampler()
+        monkeypatch.setattr(
+            sampler, "forward", lambda *_: pytest.fail("torch fallback")
+        )
+        for history, expected in [([], 2), ([0], 1), ([0, 1], 2)]:
+            batch = SamplingBatch([sp], [[0]], [history], vocab_size=4)
+            result = sample_from_logits(
+                mx.array([[10.0, 1.0, 3.0, 4.0]]),
+                batch,
+                sampler,
+                next_native_rng_key=lambda: mx.random.key(0),
+            )
+            assert result.token_ids == [expected]
+        assert not SamplingBatch.params_allow_native_random([sp], [1], allow_seed=True)
+        assert not SamplingBatch.params_allow_native_greedy([sp], [1])
+
+    def test_lazy_constraints_require_resolved_history(self):
+        params = [SamplingParams(temperature=0, allowed_token_ids=[1])]
+        with pytest.raises(RuntimeError, match="gate desync"):
+            SamplingBatch.native_sample_tokens(
+                mx.array([[2.0, 1.0]]),
+                params,
+                vocab_size=2,
+                next_native_rng_key=None,
+                output_lengths=[0],
+            )
