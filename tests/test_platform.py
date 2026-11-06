@@ -1824,19 +1824,22 @@ class TestMetalPlatform:
         vllm_config.additional_config = additional_config
         return vllm_config
 
-    @pytest.mark.parametrize("pipeline_parallel_size", [1, 2])
+    @pytest.mark.parametrize(("pp", "tp"), [(1, 1), (2, 1), (1, 2)])
     def test_check_and_update_config_accepts_glm5_next_mtp(
-        self, monkeypatch: pytest.MonkeyPatch, pipeline_parallel_size: int
+        self, monkeypatch: pytest.MonkeyPatch, pp: int, tp: int
     ) -> None:
         """GLM-5-Next MTP passes on its KDA hybrid target, alone or under
-        pipeline parallelism, and keeps align-mode prefix caching."""
+        pipeline or tensor parallelism, and keeps align-mode prefix caching."""
         self._patch_stt_resolution(monkeypatch, is_stt=False)
         reset_config()
         try:
             vllm_config = self._glm5_next_mtp_config(
                 {vm_config.GLM5_NEXT_MTP_DRAFTER_KEY: "drafter"}
             )
-            vllm_config.parallel_config.pipeline_parallel_size = pipeline_parallel_size
+            parallel = vllm_config.parallel_config
+            parallel.pipeline_parallel_size = pp
+            parallel.tensor_parallel_size = tp
+            parallel.world_size = pp * tp
             MetalPlatform.check_and_update_config(vllm_config)
         finally:
             reset_config()

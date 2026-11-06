@@ -984,19 +984,19 @@ class MetalPlatform(Platform):
 
         # Under pipeline parallelism only GLM-5-Next MTP drafts: its last stage
         # returns target hidden states and drafts, and earlier stages learn the
-        # accepted drafts from the next step's scheduler output. Under TP the
-        # draft model is not sharded. No other method has been validated.
+        # accepted drafts from the next step's scheduler output. Under TP every
+        # rank runs the unsharded drafter on identical inputs and only rank 0's
+        # drafts reach the scheduler. No other method has been validated.
         # Reject loudly rather than run an untested combination.
         if (
             parallel_config.world_size > 1
             and vllm_config.speculative_config is not None
-            and not (glm5_next_mtp and parallel_config.tensor_parallel_size == 1)
+            and not glm5_next_mtp
         ):
             raise NotImplementedError(
                 "Pipeline and tensor parallelism on Metal support speculative "
-                "decoding with GLM-5-Next MTP under pipeline parallelism only; "
-                "remove --speculative-config or run without pipeline/tensor "
-                "parallelism."
+                "decoding with GLM-5-Next MTP only; remove --speculative-config "
+                "or run without pipeline/tensor parallelism."
             )
 
         # LoRA is not supported under pipeline parallelism: non-last stages
