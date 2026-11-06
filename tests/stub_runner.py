@@ -290,6 +290,7 @@ def make_stub_runner(
         "_selective_logits_supported": False,
         "pp": None,
         "_pp_model": None,
+        "tp_group": None,
         "_model_adapter": DefaultModelAdapter(),
         "_spec_decode_controller": SpeculativeDecodeController(),
         "kv_heads_per_layer": None,
