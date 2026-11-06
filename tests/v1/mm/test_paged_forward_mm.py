@@ -12,7 +12,7 @@ import pytest
 import torch
 from vllm.sampling_params import SamplingParams
 
-from tests.stub_runner import make_stub_runner
+from tests.stub_runner import admit_prefill_request, make_stub_runner
 from vllm_metal.attention.context import get_context
 from vllm_metal.attention.runtime.sdpa import SDPAPagedAttentionRuntime
 from vllm_metal.multimodal import MultiModalFeatureSpec, PlaceholderRange
@@ -816,7 +816,7 @@ class TestMmPrefillDeltaRoundTrip:
             lambda *a, **kw: _SamplingResult(decode_tokens, None),
         )
 
-    def test_new_final_mm_prefill_writes_delta_to_request_state(
+    def test_first_chunk_mm_prefill_writes_delta_to_request_state(
         self, monkeypatch
     ) -> None:
         adapter = _MmAdapter()
@@ -847,9 +847,11 @@ class TestMmPrefillDeltaRoundTrip:
         entry = _PendingPrefillEntry(
             output_idx=batch.add_output("req-0", []),
             prefill=prefill,
-            result_mode="new_final",
+            result_mode="final",
         )
         batch.paged_prefill_entries.append(entry)
+
+        admit_prefill_request(runner, prefill)
 
         runner._start_paged_forward(
             batch=batch,
@@ -873,7 +875,7 @@ class TestMmPrefillDeltaRoundTrip:
         # Sanity: token_ids = full_prompt + [next_token]
         assert new_state.token_ids == [99, 11, 42]
 
-    def test_cached_final_mm_prefill_updates_existing_state_delta(
+    def test_continuation_mm_prefill_updates_existing_state_delta(
         self, monkeypatch
     ) -> None:
         adapter = _MmAdapter()
@@ -910,7 +912,7 @@ class TestMmPrefillDeltaRoundTrip:
         entry = _PendingPrefillEntry(
             output_idx=batch.add_output("req-0", []),
             prefill=prefill,
-            result_mode="cached_final",
+            result_mode="final",
         )
         batch.paged_prefill_entries.append(entry)
 

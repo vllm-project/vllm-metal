@@ -10,10 +10,11 @@ import mlx.nn as nn
 import numpy as np
 import pytest
 from vllm.sampling_params import SamplingParams
-from vllm.v1.core.sched.output import NewRequestData
+from vllm.v1.core.sched.output import CachedRequestData, NewRequestData
 from vllm.v1.outputs import LogprobsLists
 
 import vllm_metal.v1.diffusion as diffusion
+from tests.stub_runner import make_stub_runner
 from vllm_metal.attention.context import get_context
 from vllm_metal.platform import MetalPlatform
 from vllm_metal.v1.diffusion import (
@@ -350,31 +351,22 @@ class _StubRuntime:
     def copy_blocks(self, copies) -> None:
         self.calls.append("copy")
 
+    def release_requests(self, req_ids) -> None:
+        self.calls.append("release")
+
     def materialize_pending_state(self) -> None:
         self.calls.append("materialize")
 
 
-def _stub_runner() -> SimpleNamespace:
-    runner = SimpleNamespace(
-        vllm_config=_vllm_config(),
+def _stub_runner():
+    config = _vllm_config()
+    return make_stub_runner(
+        vllm_config=config,
+        model_config=config.model_config,
         _paged_attention_runtime=_StubRuntime(),
-        _request_states={},
-        _draft_token_ids=None,
-        _paged_group_block_sizes=(16,),
-        tq_prefill_workspace_bytes=0,
+        _paged_block_size=16,
         model=None,
     )
-    runner.model_config = runner.vllm_config.model_config
-    runner._finished_req_ids = lambda so: so.finished_req_ids
-
-    def reconcile(evicted, **_kwargs):
-        for req_id in evicted:
-            runner._request_states.pop(req_id, None)
-
-    runner._reconcile_request_lifecycle = reconcile
-    runner._copy_paged_block_ids = lambda block_ids: [list(g) for g in block_ids]
-    runner._update_cached_request_blocks = lambda cached: None
-    return runner
 
 
 def _scheduler_output(
@@ -390,9 +382,14 @@ def _scheduler_output(
     return SimpleNamespace(
         scheduled_encoder_inputs={},
         scheduled_new_reqs=list(new_reqs),
-        scheduled_cached_reqs=SimpleNamespace(
+        scheduled_cached_reqs=CachedRequestData(
             req_ids=list(cached),
+            resumed_req_ids=set(),
+            new_token_ids=[],
+            all_token_ids={},
+            new_block_ids=[None] * len(cached),
             num_computed_tokens=list(cached.values()),
+            num_output_tokens=[0] * len(cached),
         ),
         finished_req_ids=finished or set(),
         preempted_req_ids=preempted or set(),
@@ -774,7 +771,10 @@ class TestRuntimeStepProtocol:
         assert rt._requests == {}
         assert "r" not in rt._runner._request_states
 
-    def test_readmitted_request_prefills_its_committed_tokens(self, runtime) -> None:
+    @pytest.mark.parametrize("num_computed_tokens", [0, 2])
+    def test_readmitted_request_prefills_its_committed_tokens(
+        self, runtime, num_computed_tokens
+    ) -> None:
         rt, forwards = runtime
         rt.execute_model(
             _scheduler_output(
@@ -789,14 +789,25 @@ class TestRuntimeStepProtocol:
         assert "r" not in rt._requests
         assert forwards == []
         new_req = _new_req("r", prompt=[1, 2], prefill_token_ids=[1, 2, 3, 1])
+        new_req.num_computed_tokens = num_computed_tokens
+        new_req.block_ids = ([5],)
 
-        rt.execute_model(_scheduler_output(new_reqs=[new_req], scheduled={"r": 4}))
+        rt.execute_model(
+            _scheduler_output(
+                new_reqs=[new_req], scheduled={"r": 4 - num_computed_tokens}
+            )
+        )
 
         state = rt._runner._request_states["r"]
-        assert forwards == [(False, [(0, [1, 2, 3, 1])])]
+        assert forwards == [
+            (False, [(num_computed_tokens, [1, 2, 3, 1][num_computed_tokens:])])
+        ]
         assert state.token_ids == [1, 2, 3, 1]
         assert state.prompt_len == 2
+        assert state.block_ids == [[5]]
+        assert state.num_computed_tokens == num_computed_tokens
         assert rt._requests["r"] is not old_canvas
+        assert "r" not in rt._runner._awaiting_readmission
 
 
 class TestEncoderHiddenStates:
