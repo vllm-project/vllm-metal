@@ -23,9 +23,7 @@ scheduler-owned prefix reuse and verifies greedy proposals on the target.
 
 These methods currently have these Metal-specific constraints:
 
-- Only plain greedy requests (`temperature=0`, without penalties, token
-  constraints, or sample logprobs) are drafted. Other requests run without
-  speculation.
+- Requests that ask for sample logprobs run without speculation.
 - Scheduling must be synchronous. The Metal platform disables async scheduling
   when speculative decoding is configured.
 - Pipeline parallelism is not supported with speculative decoding.

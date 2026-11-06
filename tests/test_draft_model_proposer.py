@@ -414,14 +414,16 @@ def test_no_cache_hit_ingests_the_whole_committed_range() -> None:
     assert model.input_lens[0] == PROMPT_LEN
 
 
-@pytest.mark.parametrize("temperature,max_tokens", [(1.0, 16), (0.0, 1)])
-def test_ineligible_request_ingests_but_never_drafts(temperature, max_tokens) -> None:
+@pytest.mark.parametrize("logprobs,max_tokens", [(1, 16), (None, 1)])
+def test_ineligible_request_ingests_but_never_drafts(logprobs, max_tokens) -> None:
     """Ineligible requests still ingest committed KV without running lookahead."""
     model = StubDraftModel()
     proposer = _proposer(model)
     state = _request_state(
         scheduler_block_ids=[0, 1],
-        sampling_params=SamplingParams(temperature=temperature, max_tokens=max_tokens),
+        sampling_params=SamplingParams(
+            temperature=0.0, logprobs=logprobs, max_tokens=max_tokens
+        ),
     )
     state.generated_tokens = 1
     drafts = proposer.propose(

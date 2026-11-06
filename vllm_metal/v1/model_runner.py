@@ -2000,13 +2000,18 @@ class MetalModelRunner:
 
         # ---- sample tokens ----
         vocab_size = self._vocab_size
-        next_native_rng_key = (
+        native_rng_key = (
             self._next_native_sample_key
             if self._native_sampling_enabled
-            and self.vllm_config.speculative_config is None
-            and self._drafter is None
             and grammar_output is None
             and not scheduler_output.has_structured_output_requests
+            else None
+        )
+        # Verify rows sample natively; other rows of speculative configs stay
+        # on torch.
+        next_native_rng_key = (
+            native_rng_key
+            if self.vllm_config.speculative_config is None and self._drafter is None
             else None
         )
         decode_token_ids: list[list[int]] = [[] for _ in decode_reqs]
@@ -2020,10 +2025,13 @@ class MetalModelRunner:
                 if segment.draft_token_ids
             ]
             if spec_items:
-                spec_token_ids = self._spec_decode_controller.verify_greedy(
+                spec_token_ids = self._spec_decode_controller.verify(
                     logits,
                     [req for _, req, _ in spec_items],
                     [segment for _, _, segment in spec_items],
+                    self._sampler,
+                    vocab_size=vocab_size,
+                    next_native_rng_key=native_rng_key,
                 )
                 for (decode_index, _, _), sampled_ids in zip(
                     spec_items,

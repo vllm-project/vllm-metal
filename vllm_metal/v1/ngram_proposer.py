@@ -29,7 +29,7 @@ target actually accepted) to score it as a real hit or a miss, rather than
 trusting the lookup kernel's own optimism.
 
 The verify half is unchanged: drafts are handed back via ``take_draft_token_ids``
-and verified next step by ``SpeculativeDecodeController.verify_greedy``.
+and verified next step by ``SpeculativeDecodeController.verify``.
 """
 
 from __future__ import annotations

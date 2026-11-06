@@ -173,7 +173,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Seeded requests use a per-request seed-derived MLX key (sync path only).
     # Penalties, sample logprobs,
     # allowed-token IDs, bad words, structured outputs, or any speculative
-    # decoding config keep random sampling on torch. Set to "0" as the kill
+    # decoding config (except draft-verification rows) keep random sampling
+    # on torch. Set to "0" as the kill
     # switch to sample every non-greedy step with the torch sampler.
     "VLLM_METAL_NATIVE_SAMPLING": _bool("VLLM_METAL_NATIVE_SAMPLING", True),
     # Experimental MLA Metal decode kernel (RFC #360). Off by default —

@@ -157,15 +157,17 @@ class TestDraftModelSpecDecode:
         """
         runner = sd_engine.llm_engine.model_executor.driver_worker.model_runner
         controller = runner._spec_decode_controller
-        original_verify = controller.verify_greedy
+        original_verify = controller.verify
         stats = {"drafted": 0, "accepted": 0}
         # Rejections that are not a numerical tie (a real mismatch).  Recorded
         # here and asserted after generate() so the check runs in test scope,
         # not the engine loop.
         real_mismatches: list[tuple[int, int, int, float]] = []
 
-        def tie_checking_verify(logits, decode_reqs, decode_segments):
-            result = original_verify(logits, decode_reqs, decode_segments)
+        def tie_checking_verify(logits, decode_reqs, decode_segments, *args, **kwargs):
+            result = original_verify(
+                logits, decode_reqs, decode_segments, *args, **kwargs
+            )
             # verify stops at the first per-segment mismatch, so accepted =
             # len(output) - 1 locates the one rejected draft (if any).
             for segment, output_ids in zip(decode_segments, result, strict=True):
@@ -188,7 +190,7 @@ class TestDraftModelSpecDecode:
             return result
 
         with pytest.MonkeyPatch.context() as mp:
-            mp.setattr(controller, "verify_greedy", tie_checking_verify)
+            mp.setattr(controller, "verify", tie_checking_verify)
             token_ids = _greedy(sd_engine, [prompt])[prompt]
 
         # (a) lossless vs greedy goldens (two prompts sit on a documented ULP tie)

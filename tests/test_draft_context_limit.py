@@ -130,13 +130,13 @@ def test_initial_prefill_fallback_is_per_request_and_keeps_other_rows_drafting(i
     assert proposer.get_stats()["num_context_limit_fallback_requests"] == 2
 
 
-@pytest.mark.parametrize("mode", ["non_greedy", "no_sample", "intermediate"])
+@pytest.mark.parametrize("mode", ["logprobs", "no_sample", "intermediate"])
 def test_other_eligibility_gates_do_not_log_context_fallback(mode, info):
     proposer = _proposer(StubDraftModel(), max_model_len=32, min_speculative_tokens=3)
     state = _request_state(scheduler_block_ids=[0, 1], token_ids=list(range(31)))
     ctx = _context("r", state, {"r": state}, num_speculative_tokens=3)
-    if mode == "non_greedy":
-        state.sampling_params = SamplingParams(temperature=1.0)
+    if mode == "logprobs":
+        state.sampling_params = SamplingParams(temperature=0.0, logprobs=1)
     elif mode == "no_sample":
         ctx = replace(ctx, decode_token_ids=[[]])
     else:

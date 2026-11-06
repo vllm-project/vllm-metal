@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -11,10 +11,12 @@ import mlx.core as mx
 from vllm.v1.core.sched.output import SchedulerOutput
 
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPDraftSeed
-from vllm_metal.v1.sampling_batch import GREEDY_TEMPERATURE_EPS
+from vllm_metal.v1.sampling_batch import SamplingBatch, sample_from_logits
 
 if TYPE_CHECKING:
+    import torch
     from vllm.config.speculative import SpeculativeConfig
+    from vllm.v1.sample.sampler import Sampler
 
     from vllm_metal.v1.model_runner import RequestState
 
@@ -25,7 +27,10 @@ class _PagedDecodeStateLike(Protocol):
 
 
 class _SpecDecodeRequestStateLike(Protocol):
+    token_ids: Sequence[int]
+    prompt_len: int
     sampling_params: Any
+    generator: torch.Generator | None
     generated_tokens: int
 
 
@@ -205,7 +210,7 @@ class SpeculativeDecodeController:
                 )
             draft_reqs.append((req_id, request_by_id[req_id]))
 
-        self._validate_greedy_sampling(draft_reqs)
+        self._validate_sampling(draft_reqs)
 
     def build_decode_segments(
         self,
@@ -253,13 +258,24 @@ class SpeculativeDecodeController:
 
         return tuple(segments)
 
-    def verify_greedy(
+    def verify(
         self,
         logits: mx.array,
         decode_reqs: Sequence[tuple[str, _SpecDecodeRequestStateLike]],
         decode_segments: Sequence[PagedDecodeSegment],
+        sampler: Sampler,
+        *,
+        vocab_size: int,
+        next_native_rng_key: Callable[[], mx.array] | None = None,
     ) -> list[list[int]]:
-        """Verify scheduled draft tokens with greedy target logits."""
+        """Verify scheduled draft tokens against tokens sampled from the target.
+
+        Each row is sampled as decode would sample it, after the request's
+        history plus the drafts before the row, and drafts are accepted while
+        they equal the sampled tokens. Every emitted token is the target's own
+        sample, so speculation keeps the output distribution; with
+        deterministic drafts this is vLLM's rejection sampling.
+        """
         if len(decode_reqs) != len(decode_segments):
             raise ValueError("decode_reqs and decode_segments must have equal length")
 
@@ -273,7 +289,7 @@ class SpeculativeDecodeController:
                     f"metadata: {req_id!r} != {segment.req_id!r}"
                 )
 
-        self._validate_greedy_sampling(decode_reqs)
+        self._validate_sampling(decode_reqs)
 
         num_decode_rows = max(
             segment.start_row + segment.num_query_tokens for segment in decode_segments
@@ -281,6 +297,38 @@ class SpeculativeDecodeController:
         target_tokens = mx.argmax(logits[0, :num_decode_rows, :], axis=-1)
         mx.eval(target_tokens)
         flat_target_tokens: list[int] = target_tokens.tolist()  # type: ignore[assignment]
+
+        rows: list[int] = []
+        params: list[Any] = []
+        prompts: list[list[int]] = []
+        outputs: list[list[int]] = []
+        generators: dict[int, torch.Generator] = {}
+        for (_, state), segment in zip(decode_reqs, decode_segments, strict=True):
+            if SamplingBatch.params_allow_native_greedy(
+                [state.sampling_params], [state.generated_tokens]
+            ):
+                continue
+            prompt = list(state.token_ids[: state.prompt_len])
+            output = list(state.token_ids[state.prompt_len :])
+            for offset in range(segment.num_query_tokens):
+                if state.generator is not None:
+                    generators[len(rows)] = state.generator
+                rows.append(segment.start_row + offset)
+                params.append(state.sampling_params)
+                prompts.append(prompt)
+                outputs.append(output + list(segment.draft_token_ids[:offset]))
+        if rows:
+            batch = SamplingBatch(
+                params, prompts, outputs, vocab_size=vocab_size, generators=generators
+            )
+            sampled = sample_from_logits(
+                logits[0, mx.array(rows), :],
+                batch,
+                sampler,
+                next_native_rng_key=next_native_rng_key,
+            )
+            for row, token_id in zip(rows, sampled.token_ids, strict=True):
+                flat_target_tokens[row] = token_id
 
         sampled_token_ids: list[list[int]] = []
         for segment in decode_segments:
@@ -327,7 +375,7 @@ class SpeculativeDecodeController:
             decode_token_ids,
             strict=True,
         ):
-            if not sampled_ids or not self.can_draft_greedy(req_id, state, sampled_ids):
+            if not sampled_ids or not self.can_draft(req_id, state, sampled_ids):
                 continue
             accepted_offset = len(sampled_ids) - 1
             seeds.append(
@@ -346,9 +394,7 @@ class SpeculativeDecodeController:
             if result_mode == "intermediate":
                 continue
             state = request_states.get(prefill.req_id)
-            if state is None or not self.can_draft_greedy(
-                prefill.req_id, state, (token_id,)
-            ):
+            if state is None or not self.can_draft(prefill.req_id, state, (token_id,)):
                 continue
             prefill_end = cu_seqlens[num_decode_segments + i + 1]
             seeds.append(
@@ -363,13 +409,13 @@ class SpeculativeDecodeController:
 
         return tuple(seeds)
 
-    def can_draft_greedy(
+    def can_draft(
         self,
         req_id: str,
         request_state: _SpecDecodeRequestStateLike,
         sampled_ids: Sequence[int],
     ) -> bool:
-        """Whether a request may be drafted under greedy-only spec decode."""
+        """Whether a request may be drafted this step."""
         # Sampling updates the output count before the scheduler retires a request.
         sampling_params = request_state.sampling_params
         max_tokens = sampling_params.max_tokens
@@ -384,7 +430,7 @@ class SpeculativeDecodeController:
         ):
             return False
         try:
-            self._validate_greedy_sampling([(req_id, request_state)])
+            self._validate_sampling([(req_id, request_state)])
         except NotImplementedError:
             return False
         return True
@@ -402,8 +448,8 @@ class SpeculativeDecodeController:
 
         Shared eligibility filter for block-draft, draft-model and n-gram
         proposers: skip decode rows that did not sample this step, skip
-        finished or non-greedy requests via :meth:`can_draft_greedy`, skip
-        intermediate prefill chunks, and de-duplicate prefill rows whose
+        requests that :meth:`can_draft` refuses, skip intermediate prefill
+        chunks, and de-duplicate prefill rows whose
         ``req_id`` was already admitted through decode.
 
         Callers post-process the returned pairs (e.g. the draft-model
@@ -419,7 +465,7 @@ class SpeculativeDecodeController:
         ):
             if not sampled_ids:
                 continue
-            if not self.can_draft_greedy(req_id, state, sampled_ids):
+            if not self.can_draft(req_id, state, sampled_ids):
                 continue
             eligible.append((req_id, state))  # type: ignore[arg-type]
             seen.add(req_id)
@@ -430,7 +476,7 @@ class SpeculativeDecodeController:
             if result_mode == "intermediate" or prefill.req_id in seen:
                 continue
             state = request_states.get(prefill.req_id)
-            if state is None or not self.can_draft_greedy(
+            if state is None or not self.can_draft(
                 prefill.req_id, state, (prefill_token_ids[i],)
             ):
                 continue
@@ -438,32 +484,18 @@ class SpeculativeDecodeController:
 
         return eligible
 
-    def _validate_greedy_sampling(
+    def _validate_sampling(
         self,
         decode_reqs: Sequence[tuple[str, _SpecDecodeRequestStateLike]],
     ) -> None:
-        for _, request_state in decode_reqs:
-            sampling_params = request_state.sampling_params
-            unsupported = (
-                sampling_params.temperature >= GREEDY_TEMPERATURE_EPS
-                or sampling_params.top_k > 0
-                or sampling_params.top_p != 1.0
-                or sampling_params.frequency_penalty != 0.0
-                or sampling_params.presence_penalty != 0.0
-                or sampling_params.repetition_penalty != 1.0
-                or sampling_params.num_logprobs is not None
-                or bool(sampling_params.allowed_token_ids)
-                or bool(sampling_params.bad_words_token_ids)
-                or bool(sampling_params.logit_bias)
-                or request_state.generated_tokens < sampling_params.min_tokens
+        if any(
+            request_state.sampling_params.num_logprobs is not None
+            for _, request_state in decode_reqs
+        ):
+            raise NotImplementedError(
+                "Speculative decode verification on Metal does not return "
+                "sample logprobs yet."
             )
-            if unsupported:
-                raise NotImplementedError(
-                    "Speculative decode verification on Metal currently "
-                    "supports greedy sampling only (temperature=0, no "
-                    "penalties, constraints, logprobs, or logit_bias, and "
-                    "not before a request reaches min_tokens)."
-                )
 
 
 __all__ = [

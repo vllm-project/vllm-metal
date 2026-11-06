@@ -175,7 +175,6 @@ def test_chunked_prefill_then_rejection_overwrites_temporary_kv(accepted, propos
 @pytest.mark.parametrize(
     "kind",
     [
-        "sampled",
         "logprobs",
         "grammar",
         "zero_k",
@@ -188,7 +187,7 @@ def test_chunked_prefill_then_rejection_overwrites_temporary_kv(accepted, propos
 )
 def test_non_drafting_rows_still_commit_features(kind, proposer):
     params = SamplingParams(
-        temperature=0.7 if kind == "sampled" else 0,
+        temperature=0,
         max_tokens={"output_budget": 1, "last_output": 2}.get(kind, 16),
         logprobs=1 if kind == "logprobs" else None,
         stop_token_ids=[2] if kind == "stop_token" else None,
@@ -714,13 +713,14 @@ def test_context_limit_uses_selected_width(width, proposer):
         assert result is None
 
 
-@pytest.mark.parametrize("producer", ["greedy", "sampled", "grammar", "zero_k"])
+@pytest.mark.parametrize("producer", ["greedy", "logprobs", "grammar", "zero_k"])
 def test_prefix_hit_reuses_committed_kv_without_writing_shared_blocks(
     proposer, producer
 ):
     proposer.enable_prefix_caching = True
     params = SamplingParams(
-        temperature=0.7 if producer == "sampled" else 0,
+        temperature=0,
+        logprobs=1 if producer == "logprobs" else None,
         structured_outputs=StructuredOutputsParams(choice=["yes", "no"])
         if producer == "grammar"
         else None,
