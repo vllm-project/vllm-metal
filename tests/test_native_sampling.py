@@ -106,10 +106,12 @@ class TestNativeRandomEligibility:
             ("min tokens still pending", [_random_params(min_tokens=2)]),
         ],
     )
-    def test_ineligible_batches_fall_back(self, label, params_list) -> None:
+    def test_default_gate_rejects_extended_sampling_options(
+        self, label, params_list
+    ) -> None:
         assert not SamplingBatch.params_allow_native_random(params_list)
 
-    def test_bad_words_fall_back(self) -> None:
+    def test_bad_words_keep_deferred_decode_disabled(self) -> None:
         params = _random_params()
         params._bad_words_token_ids = [[99]]
 
@@ -650,3 +652,76 @@ def test_broadcast_logits_use_per_row_candidate_ids():
         mx.array([[1, 0, 2], [0, 2, 1]], dtype=mx.uint32),
     )
     assert tokens.tolist() == [0, 2]
+
+
+class TestNativePenalties:
+    @pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+    def test_counts_signs_and_prompt_membership_match_vllm(self, dtype):
+        from vllm.v1.sample.sampler import Sampler
+
+        from vllm_metal.v1.native_penalties import apply_native_penalties
+
+        params = [
+            SamplingParams(
+                repetition_penalty=1.5, frequency_penalty=0.5, presence_penalty=-0.25
+            ),
+            SamplingParams(
+                repetition_penalty=0.5, frequency_penalty=-0.5, presence_penalty=0.75
+            ),
+            SamplingParams(),
+            SamplingParams(frequency_penalty=0.25),
+        ]
+        prompts = [[0, 0, 2], [1, 3], [], [0] * 20]
+        outputs = [[1, 1, 1, 2], [2, 2, 4], [], [4] * 257]
+        raw = [[4.0, 3.0, -2.0, 0.0, -1.0, float("-inf")]] * 4
+        batch = SamplingBatch(params, prompts, outputs, vocab_size=6)
+        expected = Sampler.apply_penalties(
+            torch.tensor(raw), batch.make_sampling_metadata(), outputs
+        )
+        logits = mx.array(raw, dtype=dtype)
+        actual = apply_native_penalties(logits, params, prompts, outputs)
+        torch.testing.assert_close(torch.tensor(actual.tolist()), expected)
+        assert logits.tolist() == raw  # Raw scores remain available to callers.
+
+    @pytest.mark.parametrize("random_row", [False, True])
+    def test_sync_sampling_uses_penalties_without_torch(self, monkeypatch, random_row):
+        from vllm.v1.sample.sampler import Sampler
+
+        from vllm_metal.v1.sampling_batch import sample_from_logits
+
+        params = [
+            SamplingParams(temperature=0, repetition_penalty=2),
+            SamplingParams(
+                temperature=0.8 if random_row else 0,
+                top_k=1,
+                frequency_penalty=1,
+                seed=17,
+            ),
+        ]
+        batch = SamplingBatch(params, [[0], [0]], [[], [0, 0]], vocab_size=3)
+        sampler = Sampler()
+        monkeypatch.setattr(
+            sampler, "forward", lambda *_: pytest.fail("torch fallback")
+        )
+        logits = mx.array([[4.0, 3.0, 0.0], [4.0, 3.0, 0.0]])
+        result = sample_from_logits(
+            logits, batch, sampler, next_native_rng_key=lambda: mx.random.key(2)
+        )
+        assert result.token_ids == [1, 1]
+        assert not SamplingBatch.params_allow_native_greedy(
+            params, batch.output_lengths
+        )
+        assert not SamplingBatch.params_allow_native_random(
+            params, batch.output_lengths, allow_seed=True
+        )
+
+    def test_penalty_history_is_required_by_lazy_sampler(self):
+        params = [SamplingParams(temperature=0, presence_penalty=1)]
+        with pytest.raises(RuntimeError, match="gate desync"):
+            SamplingBatch.native_sample_tokens(
+                mx.array([[1.0, 2.0]]),
+                params,
+                vocab_size=2,
+                next_native_rng_key=None,
+                output_lengths=[1],
+            )
