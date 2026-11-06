@@ -9,7 +9,8 @@ import pytest
 from vllm_metal.metal import paged_attention_capabilities
 
 
-def test_structured_capabilities_are_normalized():
+@pytest.mark.parametrize("grouped_reference_supported", [False, True])
+def test_structured_capabilities_are_normalized(grouped_reference_supported):
     query = MagicMock(
         return_value={
             "gqa_decode": False,
@@ -17,6 +18,8 @@ def test_structured_capabilities_are_normalized():
             "decode_routing_metadata": True,
         }
     )
+    if grouped_reference_supported:
+        query.return_value["nax_grouped_reference_hint"] = True
     ops = SimpleNamespace(paged_attention_capabilities=query)
     assert paged_attention_capabilities(ops) == {
         "gqa_decode": False,
@@ -26,6 +29,7 @@ def test_structured_capabilities_are_normalized():
         "gqa_mixed_decode_plan": False,
         "nax_split_hint": False,
         "nax_prefill_split_hint": False,
+        "nax_grouped_reference_hint": grouped_reference_supported,
     }
     query.assert_called_once_with()
 
