@@ -190,7 +190,7 @@ RAY_ADDRESS=auto VLLM_HOST_IP=10.0.0.1 \
 
 **Limitations.**
 
-- **Models.** The model's MLX class must implement `shard()`, as mlx-lm's Qwen3 and Qwen3.5 do. Multimodal Qwen3.5 checkpoints need `--language-model-only`, which loads them through mlx-lm. MLA, pooling and multimodal models are rejected at load.
+- **Models.** The model's MLX class must implement `shard()`, as mlx-lm's Qwen3 and Qwen3.5 do. Multimodal Qwen3.5 checkpoints need `--language-model-only`, which loads them through mlx-lm. MLA, pooling and multimodal models other than GLM-5.3-Flash are rejected at load.
 - **No PP+TP**, for the MLX reason above.
 - **Rejected at config time**, as for PP: speculative decoding, LoRA, AWQ/GGUF checkpoints, speech-to-text models, MoE expert offloading, KV offloading and data parallelism.
 - **Co-located ranks oversubscribe the KV budget**, as for PP stages on one Mac.
