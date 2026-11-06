@@ -257,7 +257,9 @@ class PipelinedModel:
     # own. Lazy: a singleton stage crosses no wire, so it never reads either half.
     @cached_property
     def _wire_hidden(self) -> int:
-        return self._model.args.hidden_size
+        # mlx_lm's multimodal wrappers (e.g. qwen3_5) keep the text args on
+        # ``language_model``.
+        return getattr(self._model, "language_model", self._model).args.hidden_size
 
     @cached_property
     def _wire_dtype(self) -> mx.Dtype:
