@@ -372,9 +372,8 @@ class TestPackedRoPE:
 
     @pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
     @pytest.mark.parametrize("factor,base", [(0.5, 1e6), (1.0, 1e4)])
-    @pytest.mark.parametrize("apply_keys", [True, False])
     def test_lfm3_batches_decode_without_changing_rotations(
-        self, monkeypatch, dtype, factor, base, apply_keys
+        self, monkeypatch, dtype, factor, base
     ):
         from mlx_vlm.models.lfm3.language import RotaryEmbedding
 
@@ -390,16 +389,9 @@ class TestPackedRoPE:
             [rope(q[:, :, i : i + 1, :], offset=off) for i, off in enumerate(offsets)],
             axis=2,
         )
-        expected_k = (
-            mx.concatenate(
-                [
-                    rope(k[:, :, i : i + 1, :], offset=off)
-                    for i, off in enumerate(offsets)
-                ],
-                axis=2,
-            )
-            if apply_keys
-            else k
+        expected_k = mx.concatenate(
+            [rope(k[:, :, i : i + 1, :], offset=off) for i, off in enumerate(offsets)],
+            axis=2,
         )
         calls = []
         original = RotaryEmbedding.__call__
@@ -417,16 +409,10 @@ class TestPackedRoPE:
             k,
             [0, 1, 2, 3, 4],
             offsets=offsets,
-            apply_keys=apply_keys,
         )
-        expected_calls = [((4, 16, 1, 128), offsets)]
-        if apply_keys:
-            expected_calls.append(((4, 4, 1, 128), offsets))
-        assert calls == expected_calls
+        assert calls == [((4, 16, 1, 128), offsets), ((4, 4, 1, 128), offsets)]
         assert mx.array_equal(out_q, expected_q).item()
         assert mx.array_equal(out_k, expected_k).item()
-        if not apply_keys:
-            assert out_k is k
 
     def test_native_rope_batches_single_token_segments(self):
         from vllm_metal.attention.impls.varlen_rope_compat import (
