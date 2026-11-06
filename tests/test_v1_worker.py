@@ -171,7 +171,7 @@ class TestWorkerRunnerBoundaryDelegation:
         )
         worker.vllm_config.model_config = worker.model_config
         worker.vllm_config.scheduler_config = SimpleNamespace()
-        worker.parallel_config = SimpleNamespace(pipeline_parallel_size=1)
+        worker.parallel_config = SimpleNamespace(world_size=1)
         worker.rank = worker.local_rank = 0
         worker.distributed_init_method = "unused"
         monkeypatch.setattr(worker_module, "set_wired_limit", lambda: None)

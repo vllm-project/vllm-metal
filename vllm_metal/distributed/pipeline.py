@@ -77,7 +77,7 @@ class PipelineGroup:
     def bootstrap_ring(cls, rank: int, peer_ips: list[str]) -> PipelineGroup:
         """Form the MLX ring across ``peer_ips`` (one per rank), then init.
 
-        The vLLM engine spawns one worker process per pipeline stage (the
+        The vLLM engine spawns one worker process per rank (the
         ``mp``/``ray`` executor), so — unlike the standalone ``mlx.launch``
         harness — no launcher injects the ring environment. The compiled ring
         backend reads two variables: ``MLX_RANK`` and ``MLX_HOSTFILE`` (a path
@@ -92,14 +92,20 @@ class PipelineGroup:
         synchronous ring initialization, after which the temporary hostfile is
         removed and the process environment is restored.
 
+        When MLX's own ``MLX_IBV_DEVICES`` device file is set, the group uses
+        JACCL (RDMA over Thunderbolt) instead, and ``MLX_JACCL_COORDINATOR``
+        defaults to rank 0's ring address.
+
         Fails loud if the formed group's size does not match ``len(peer_ips)``
         (e.g. ``MLX_RANK``/``MLX_HOSTFILE`` never reached the backend, or a node
         IP in the hostfile was unreachable).
         """
         world_size = len(peer_ips)
         hosts = _ring_hosts(peer_ips)
+        backend = "jaccl" if os.environ.get("MLX_IBV_DEVICES") else "ring"
         previous_env = {
-            name: os.environ.get(name) for name in ("MLX_RANK", "MLX_HOSTFILE")
+            name: os.environ.get(name)
+            for name in ("MLX_RANK", "MLX_HOSTFILE", "MLX_JACCL_COORDINATOR")
         }
         fd, path = tempfile.mkstemp(prefix=f"mlx_ring_rank{rank}_", suffix=".json")
         try:
@@ -107,23 +113,26 @@ class PipelineGroup:
                 json.dump(hosts, f)
             os.environ["MLX_RANK"] = str(rank)
             os.environ["MLX_HOSTFILE"] = path
+            if backend == "jaccl":
+                os.environ.setdefault("MLX_JACCL_COORDINATOR", hosts[0][0])
             logger.info(
-                "MLX ring bootstrap: rank=%d/%d hosts=%s hostfile=%s",
+                "MLX %s bootstrap: rank=%d/%d hosts=%s hostfile=%s",
+                backend,
                 rank,
                 world_size,
                 [h[0] for h in hosts],
                 path,
             )
 
-            # Form the real ring group from the MLX_RANK / MLX_HOSTFILE env set
-            # above. backend="ring" pins the transport: the default "any" takes
+            # Form the real group from the MLX_RANK / MLX_HOSTFILE env set
+            # above. backend= pins the transport: the default "any" takes
             # the first backend that initializes (e.g. a singleton MPI group
             # when libmpi is present), which would fail the size check below
             # with a misleading hint.
-            pp = cls(mx.distributed.init(backend="ring"))
+            pp = cls(mx.distributed.init(backend=backend))
             if pp.size != world_size:
                 raise RuntimeError(
-                    "MLX ring did not form the expected pipeline group: "
+                    f"MLX {backend} did not form the expected group: "
                     f"got size {pp.size}, expected {world_size}. Check that "
                     "MLX_RANK/MLX_HOSTFILE reached the ring backend and that every "
                     "node IP in the hostfile is reachable."

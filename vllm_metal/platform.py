@@ -577,6 +577,11 @@ class MetalPlatform(Platform):
                 "Prefill context parallelism (prefill_context_parallel_size > 1) "
                 "is not supported on Metal."
             )
+        if parallel_config.decode_context_parallel_size > 1:
+            raise NotImplementedError(
+                "Decode context parallelism (decode_context_parallel_size > 1) "
+                "is not supported on Metal."
+            )
         unsupported = [
             name
             for name in ("enable_trace_replay", "return_sampling_mask")
@@ -655,27 +660,27 @@ class MetalPlatform(Platform):
 
         # Resolve the executor backend. vLLM's ParallelConfig already defaults an
         # unset backend to "mp" when world_size > 1 on non-CUDA/Ray/TPU (see
-        # config/parallel.py), so for the common PP>1 case mp is selected upstream
+        # config/parallel.py), so for the common PP/TP>1 case mp is selected upstream
         # before this hook runs. This branch only covers what vLLM leaves unset:
-        # the PP==1 default of "uni" (a single in-process worker), and the
-        # explicit "auto" string ("uni" cannot host PP's per-stage processes).
+        # the world_size==1 default of "uni" (a single in-process worker), and the
+        # explicit "auto" string ("uni" cannot host per-rank processes).
         if parallel_config.distributed_executor_backend in ("auto", None):
-            if parallel_config.pipeline_parallel_size > 1:
+            if parallel_config.world_size > 1:
                 parallel_config.distributed_executor_backend = "mp"
             else:
                 parallel_config.distributed_executor_backend = "uni"
         elif (
             parallel_config.distributed_executor_backend == "uni"
-            and parallel_config.pipeline_parallel_size > 1
+            and parallel_config.world_size > 1
         ):
-            # uni builds only rank 0, but PP needs one worker per stage. vLLM's
+            # uni builds only rank 0, but PP/TP needs one worker per rank. vLLM's
             # UniProcExecutor does not reject this, so the lone worker would hang
-            # in gloo/ring rendezvous waiting for a stage that never spawns. Fail
+            # in gloo/ring rendezvous waiting for a rank that never spawns. Fail
             # loud rather than silently flip the user's explicit executor choice.
             raise NotImplementedError(
-                "Pipeline parallelism (pipeline_parallel_size > 1) requires the "
+                "Pipeline and tensor parallelism require the "
                 "'mp' or 'ray' executor; 'uni' runs a single process and cannot "
-                "place per-stage workers. Re-run with "
+                "place per-rank workers. Re-run with "
                 "--distributed-executor-backend mp (single node) or ray."
             )
         elif parallel_config.distributed_executor_backend == "ray":
@@ -850,32 +855,26 @@ class MetalPlatform(Platform):
         # mx.distributed data plane (point-to-point send/recv), wired in the
         # model runner (see MetalModelRunner._start_paged_forward). The control
         # plane stays on vLLM's gloo group; the two transports coexist.
-        if parallel_config.pipeline_parallel_size > 1:
+        if parallel_config.world_size > 1:
             base_port = envs.VLLM_METAL_RING_BASE_PORT
-            max_port = base_port + parallel_config.pipeline_parallel_size - 1
+            max_port = base_port + parallel_config.world_size - 1
             if max_port > 65535:
                 raise ValueError(
-                    "VLLM_METAL_RING_BASE_PORT is too high for "
-                    "pipeline_parallel_size: "
-                    f"base {base_port} with pipeline_parallel_size="
-                    f"{parallel_config.pipeline_parallel_size} would use port "
-                    f"{max_port}"
+                    "VLLM_METAL_RING_BASE_PORT is too high for world_size: "
+                    f"base {base_port} with world_size="
+                    f"{parallel_config.world_size} would use port {max_port}"
                 )
 
-        # Tensor parallelism is not supported on Metal/MLX yet: a single Apple
-        # GPU per node cannot shard a TP>1 model, and there is no cross-device
-        # collective wired in (mx.distributed). Only TP=1 is validated. Reject
-        # at config time rather than hang on Ray placement-group creation (one
-        # "mlx" resource per node) or silently misbehave. This is executor-
-        # agnostic: uni/mp are equally unable to run TP>1 on one device. This
-        # guard also rejects PP+TP — which must STAY rejected when TP support
-        # lands: PipelineGroup relies on global_rank == pipeline stage index,
-        # which only holds while world_size = PP * TP has TP == 1.
-        if parallel_config.tensor_parallel_size > 1:
+        # PP+TP stays rejected: MLX's ring and JACCL backends cannot split the
+        # world group into per-stage TP groups, and PipelineGroup relies on
+        # global_rank == pipeline stage index, which only holds while TP == 1.
+        if (
+            parallel_config.pipeline_parallel_size > 1
+            and parallel_config.tensor_parallel_size > 1
+        ):
             raise NotImplementedError(
-                "Metal/MLX does not support tensor parallelism yet "
-                "(tensor_parallel_size > 1), alone or combined with pipeline "
-                "parallelism; only TP=1 is validated."
+                "Metal/MLX does not support combining pipeline and tensor "
+                "parallelism: MLX's ring and JACCL backends cannot split a group."
             )
 
         # Data parallelism (dense models, one full replica per Mac via the Ray DP
@@ -930,14 +929,14 @@ class MetalPlatform(Platform):
                     "balancer; --data-parallel-external-lb / --data-parallel-hybrid-lb "
                     "are not supported."
                 )
-            # DP+PP (each replica its own PP group) needs the mx.distributed ring
+            # DP+PP/TP (each replica its own MLX group) needs the mx.distributed
             # bootstrap scoped per-replica and per-replica ring ports; never
-            # validated. (DP+TP is already rejected by the tensor-parallel guard.)
-            if parallel_config.pipeline_parallel_size > 1:
+            # validated.
+            if parallel_config.world_size > 1:
                 raise NotImplementedError(
                     "Metal does not support combining data parallelism with "
-                    "pipeline parallelism yet; use --data-parallel-size or "
-                    "--pipeline-parallel-size > 1, not both."
+                    "pipeline or tensor parallelism yet; use data parallelism or "
+                    "pipeline/tensor parallelism, not both."
                 )
             # DP + speculative decoding / LoRA were never validated under data
             # parallelism (each replica is an independent dense engine); mirror the
@@ -985,18 +984,19 @@ class MetalPlatform(Platform):
 
         # Under pipeline parallelism only GLM-5-Next MTP drafts: its last stage
         # returns target hidden states and drafts, and earlier stages learn the
-        # accepted drafts from the next step's scheduler output. No other
-        # method has been validated. Reject loudly rather than run an untested
-        # combination.
+        # accepted drafts from the next step's scheduler output. Under TP the
+        # draft model is not sharded. No other method has been validated.
+        # Reject loudly rather than run an untested combination.
         if (
-            parallel_config.pipeline_parallel_size > 1
+            parallel_config.world_size > 1
             and vllm_config.speculative_config is not None
-            and not glm5_next_mtp
+            and not (glm5_next_mtp and parallel_config.tensor_parallel_size == 1)
         ):
             raise NotImplementedError(
-                "Pipeline parallelism on Metal supports speculative decoding "
-                "with GLM-5-Next MTP only; remove --speculative-config or run "
-                "with pipeline_parallel_size=1."
+                "Pipeline and tensor parallelism on Metal support speculative "
+                "decoding with GLM-5-Next MTP under pipeline parallelism only; "
+                "remove --speculative-config or run without pipeline/tensor "
+                "parallelism."
             )
 
         # LoRA is not supported under pipeline parallelism: non-last stages
@@ -1004,14 +1004,12 @@ class MetalPlatform(Platform):
         # (see MetalModelRunner._update_pp_stage_states), so per-step LoRA
         # decode routing would silently run their layer slices without the
         # adapter while the last stage applies it. The LoRA runtime is also
-        # wired to the full model before the stage slice. Reject loudly.
-        if (
-            parallel_config.pipeline_parallel_size > 1
-            and vllm_config.lora_config is not None
-        ):
+        # wired to the full model before the stage slice. Under TP the adapters
+        # would wrap sharded projections they cannot split. Reject loudly.
+        if parallel_config.world_size > 1 and vllm_config.lora_config is not None:
             raise NotImplementedError(
-                "Pipeline parallelism on Metal does not support LoRA; "
-                "remove --enable-lora or run with pipeline_parallel_size=1."
+                "Pipeline and tensor parallelism on Metal do not support LoRA; "
+                "remove --enable-lora or run without pipeline/tensor parallelism."
             )
 
         if scheduler_config.enable_chunked_prefill:
@@ -1089,12 +1087,12 @@ class MetalPlatform(Platform):
         )
         if serves_stt_model:
             # STT checkpoints use a dedicated STTModelRunner with no pipeline-
-            # split path. Reject PP here, with the other config-time PP guards,
-            # before any worker spawns.
-            if parallel_config.pipeline_parallel_size > 1:
+            # split or shard path. Reject PP/TP here, with the other config-time
+            # PP/TP guards, before any worker spawns.
+            if parallel_config.world_size > 1:
                 raise NotImplementedError(
-                    "Pipeline parallelism (pipeline_parallel_size > 1) is not "
-                    "supported for speech-to-text models."
+                    "Pipeline and tensor parallelism are not supported for "
+                    "speech-to-text models."
                 )
             if parallel_config.data_parallel_size > 1:
                 raise NotImplementedError(
@@ -1112,18 +1110,19 @@ class MetalPlatform(Platform):
             logger.info("STT model detected")
 
         # The text AWQ and GGUF loaders materialize the full checkpoint before
-        # stage slicing. Multimodal and STT models take different loader paths.
+        # stage slicing or sharding. Multimodal and STT models take different
+        # loader paths.
         if (
-            parallel_config.pipeline_parallel_size > 1
+            parallel_config.world_size > 1
             and model_config is not None
             and model_config.multimodal_config is None
             and model_config.quantization in ("auto_awq", "gguf")
         ):
             raise NotImplementedError(
-                "Pipeline parallelism does not support AWQ or GGUF checkpoints "
-                "because their loaders materialize the complete model on every "
-                "stage before stage slicing. Use "
-                "pipeline_parallel_size=1 or an MLX-LM safetensors checkpoint."
+                "Pipeline and tensor parallelism do not support AWQ or GGUF "
+                "checkpoints because their loaders materialize the complete model "
+                "on every rank before slicing or sharding. Use an MLX-LM "
+                "safetensors checkpoint or run without pipeline/tensor parallelism."
             )
 
         # LoRA cannot wrap the GGUFLinear layers the GGUF loader installs.
@@ -1171,8 +1170,8 @@ class MetalPlatform(Platform):
         unsupported = None
         if vllm_config.model_config.runner_type != "generate":
             unsupported = f"runner type {vllm_config.model_config.runner_type!r}"
-        elif vllm_config.parallel_config.pipeline_parallel_size > 1:
-            unsupported = "pipeline parallelism"
+        elif vllm_config.parallel_config.world_size > 1:
+            unsupported = "pipeline or tensor parallelism"
         elif vllm_config.lora_config is not None:
             unsupported = "LoRA"
         elif vllm_config.speculative_config is not None:
