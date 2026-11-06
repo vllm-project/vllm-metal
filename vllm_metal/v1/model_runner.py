@@ -60,6 +60,7 @@ from vllm_metal.attention.context import (
     get_context,
     prepare_grouped,
 )
+from vllm_metal.attention.impls.dsa import is_sparse_mla
 from vllm_metal.attention.impls.gdn_lazy import GDNLazyKernels
 from vllm_metal.attention.impls.gdn_spec import apply_spec_decode_acceptance
 from vllm_metal.attention.impls.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
@@ -901,15 +902,14 @@ class MetalModelRunner:
         """
         if (
             not hasattr(self.model, "shard")
-            or self.is_mla
             or self._is_pooling
-            or self._is_vlm
+            or ((self.is_mla or self._is_vlm) and not is_sparse_mla(self.model_args))
         ):
             raise NotImplementedError(
                 "Tensor parallelism on Metal requires a text generation model "
                 "whose MLX class implements shard(); MLA / pooling / VLM "
-                "(multimodal) configs are not supported under TP yet (got "
-                f"{type(self.model).__name__})."
+                "(multimodal) configs other than GLM-5-Next are not supported "
+                f"under TP yet (got {type(self.model).__name__})."
             )
         self.model.shard(group)
         tp_size = group.size()

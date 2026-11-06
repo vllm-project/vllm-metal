@@ -301,3 +301,18 @@ def test_glm5_next_pooled_keys_share_the_latent_block() -> None:
     assert runtime.storage.nbytes == (
         12 * runner._cache_policy.get_cache_block_size_bytes()
     )
+
+
+def test_glm5_next_tensor_parallel_spec_splits_only_the_kda_state() -> None:
+    """GLM-5-Next shards under TP: a rank holds half of each KDA state, while
+    the replicated latent and its pooled keys keep their whole spec."""
+    whole = make_glm5_next_stub_runner(linear_num_heads=2)
+    runner = make_glm5_next_stub_runner(linear_num_heads=2)
+    runner.model = Mock(spec=["shard"])
+
+    runner.apply_tensor_parallel(SimpleNamespace(size=lambda: 2))
+
+    specs = runner._cache_policy.get_kv_cache_spec()
+    latent = whole._cache_policy.get_kv_cache_spec()["layers.3.self_attn"]
+    assert specs["layers.3.self_attn"] == latent
+    assert specs["layers.0.linear_attn"].shapes == ((1, 12), (1, 4, 4))
