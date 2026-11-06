@@ -852,17 +852,20 @@ class MetalModelRunner:
         (``_start_paged_forward``) and the KV-cache spec size only this stage's
         layers — not the full model.
 
-        Only the validated path (uniform SDPA attention, e.g. Qwen3) is supported under
-        pipeline parallelism: fail loud on YOCO / hybrid / MLA models whose
-        KV-cache layer accounting does not map cleanly onto a contiguous layer
-        slice yet.
+        Only the validated paths (uniform SDPA attention, e.g. Qwen3, and GDN
+        hybrids, e.g. Qwen3.5) are supported under pipeline parallelism: fail
+        loud on other YOCO / hybrid / MLA / pooling / VLM configs.
         """
         if pp.size == 1:
             return
 
+        gdn_hybrid = (
+            self.hybrid_runtime_plan is not None
+            and self.hybrid_runtime_plan.family.label == "gdn"
+        )
         unsupported = (
             self._yoco_cache_mapping is not None
-            or self.is_hybrid
+            or (self.is_hybrid and not gdn_hybrid)
             or self.is_mla
             or self._is_pooling
             or self._is_vlm
@@ -870,9 +873,9 @@ class MetalModelRunner:
         if unsupported:
             raise NotImplementedError(
                 "Pipeline parallelism on Metal is validated only for uniform-"
-                "attention generation on the paged path (e.g. Qwen3 with "
-                "paged attention); YOCO / hybrid / MLA / "
-                "pooling / VLM (multimodal) configs are not "
+                "attention and GDN hybrid generation on the paged path (e.g. "
+                "Qwen3, or Qwen3.5 with --language-model-only); other YOCO / "
+                "hybrid / MLA / pooling / VLM (multimodal) configs are not "
                 "supported under PP yet."
             )
 
