@@ -773,3 +773,45 @@ class TestNativeLogprobs:
         actual = gather_native_logprobs(logits, mx.array([0]), 0).tolists()
         expected = -math.log1p((vocab_size - 1) * math.exp(-18.0))
         assert actual.logprobs[0, 0] == pytest.approx(expected, abs=5e-6)
+
+    @pytest.mark.parametrize("logits_mode", [False, True])
+    @pytest.mark.parametrize("k", [1, 3, 17])
+    def test_large_topk_covers_tail_ties_and_few_finite_scores(self, logits_mode, k):
+        from vllm_metal.v1.native_logprobs import gather_native_logprobs
+
+        # A non-aligned vocabulary exercises the real tail. Maxima span chunks,
+        # while one row has fewer finite scores than the requested alternatives.
+        vocab = 4099
+        raw = torch.stack(
+            [
+                torch.arange(vocab, dtype=torch.float32),
+                torch.full((vocab,), -2.0),
+                torch.full((vocab,), float("-inf")),
+            ]
+        )
+        raw[1, [0, 513, 2049, vocab - 1]] = 7.0
+        raw[2, 511] = 2.0
+        targets = [vocab - 1, 0, vocab - 2]
+        reference = raw if logits_mode else raw.log_softmax(dim=-1)
+        result = gather_native_logprobs(
+            mx.array(raw.tolist()),
+            mx.array(targets),
+            k,
+            logits_mode=logits_mode,
+        ).tolists()
+        for row, target in enumerate(targets):
+            ids = result.logprob_token_ids[row].tolist()
+            assert ids[0] == target
+            assert len(set(ids[1:])) == k
+            assert all(0 <= token < vocab for token in ids)
+            torch.testing.assert_close(
+                torch.tensor(result.logprobs[row]),
+                reference[row, ids],
+            )
+            torch.testing.assert_close(
+                torch.tensor(result.logprobs[row, 1:]),
+                torch.topk(reference[row], k).values,
+            )
+            assert result.sampled_token_ranks[row] == int(
+                (reference[row] >= reference[row, target]).sum()
+            )
