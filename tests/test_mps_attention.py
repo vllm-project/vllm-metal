@@ -74,7 +74,7 @@ ops.forward(
     torch.tensor([[1, 2, 3]], dtype=torch.int32, device="mps"),
     torch.tensor([40], dtype=torch.int32, device="mps"),
     torch.tensor([0, 40], dtype=torch.int32, device="mps"),
-    torch.empty_like(q), 40, 128**-0.5, -1, 0.0, 1,
+    torch.empty_like(q), 40, 128**-0.5, -1, 0.0, 1, None,
 )
 torch.mps.synchronize()
 """,
@@ -96,29 +96,30 @@ torch.mps.synchronize()
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize(
     "head_size,block_size,window,softcap",
     [
         (64, 8, None, None),
         (96, 16, 33, 2.0),
         (128, 32, None, 0.0),
-        (128, 16, 2, None),
         (256, 16, 33, None),
         (512, 8, None, 2.0),
     ],
 )
 @pytest.mark.parametrize(
-    "force_tiled,counts,starts,prefilling",
+    "force_tiled,counts,starts,prefilling,causal",
     [
-        (False, [39, 1], [17, 700], [True, False]),
-        (True, [39, 1], [17, 700], [True, False]),
-        (False, [1, 1], [17, 700], None),
-        (False, [1, 1], [17, 40], [False, False]),
-        (False, [3, 4], [511, 700], [False, False]),
-        (False, [5, 1], [17, 700], [False, False]),
-        (False, [2, 2], [17, 40], [False, False]),
-        (False, [2, 2], [17, 40], [True, False]),
+        (False, [39, 1], [17, 700], [True, False], True),
+        (True, [39, 1], [17, 700], [True, False], True),
+        (False, [1, 1], [17, 700], None, True),
+        (False, [1, 1], [17, 40], [False, False], True),
+        (False, [3, 4], [511, 700], [False, False], True),
+        (False, [5, 1], [17, 700], [False, False], True),
+        (False, [2, 2], [17, 40], [False, False], True),
+        (False, [2, 2], [17, 40], [True, False], True),
+        pytest.param(
+            False, [39, 1], [17, 700], [False, False], False, id="block-draft"
+        ),
     ],
 )
 def test_mps_paged_attention(

@@ -66,8 +66,6 @@ class MPSAttentionMetadataBuilder(AttentionMetadataBuilder[MPSAttentionMetadata]
         # MRv2 supplies these flags on CPU. As on MLX, any true prefill keeps
         # the batch on the prefill route; only decode/verification uses windows.
         window_seqlen_q = 1
-        if not isinstance(m.causal, bool):
-            raise NotImplementedError("MPS requires a uniform attention mode per layer")
         block_ranges = None
         if not m.causal and m.max_query_len > 1:
             offsets, rows = token_rows(m.query_start_loc, m.num_actual_tokens)

@@ -47,8 +47,6 @@ ir.ops.rms_norm.register_impl("torch_mps", supports_args=_supports_rms_norm)(rms
 def rms_norm_out(out, x, weight, epsilon):
     """Adapt the direct vLLM op, including per-layer context K-norm weights."""
     if weight is not None and weight.ndim == 2:
-        if weight.shape != (x.shape[0], x.shape[-1]):
-            raise ValueError("Grouped RMSNorm weights must match the outer dimension")
         normalized = rms_norm(
             x.float(), torch.ones_like(weight[0], dtype=torch.float32), epsilon
         )

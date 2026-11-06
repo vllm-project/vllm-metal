@@ -58,7 +58,7 @@ class PagedAttention {
     if (it != pipelines_.end()) return it->second;
     auto constants = [[MTLFunctionConstantValues alloc] init];
     bool no = false;
-    for (NSUInteger i : {20, 30, 40, 50, 100, 120, 130})
+    for (NSUInteger i : {20, 30, 40, 50, 100, 130})
       [constants setConstantValue:&no type:MTLDataTypeBool atIndex:i];
     // NAX prefill: 41 (nax_split_full) = false keeps the original guarded
     // loop. The split pipeline is only chosen by the MLX launcher.
@@ -173,7 +173,7 @@ class PagedAttention {
                const Tensor& out, int max_seq_len, double scale,
                int sliding_window, double softcap, int window_seqlen_q,
                const std::optional<Tensor>& block_ranges) {
-    for (auto* t : {&q, &k, &v, &kc, &vc, &slots, &blocks, &lens, &cu, &out})
+    for (auto* t : {&q, &blocks, &lens, &cu, &out})
       TORCH_CHECK(t->is_mps(), "All paged attention buffers must be on MPS");
     TORCH_CHECK(q.dim() == 3 && q.is_contiguous() &&
                 (q.size(2) == 64 || q.size(2) == 96 || q.size(2) == 128 ||
@@ -183,14 +183,12 @@ class PagedAttention {
     check_cache(k, v, kc, vc, slots);
     TORCH_CHECK(kc.size(3) == head_size, "Query and cache head sizes must match");
     const int block_size = kc.size(1);
-    TORCH_CHECK(q.scalar_type() == at::kHalf || q.scalar_type() == at::kBFloat16,
-                "Experimental MPS attention requires fp16 or bf16");
-    for (auto* t : {&k, &v, &kc, &vc, &out})
-      TORCH_CHECK(t->scalar_type() == q.scalar_type(), "Q/K/V/cache/output dtype mismatch");
-    TORCH_CHECK(slots.scalar_type() == at::kLong && blocks.scalar_type() == at::kInt &&
+    TORCH_CHECK(q.scalar_type() == k.scalar_type() && out.scalar_type() == q.scalar_type(),
+                "Q/K/V/output dtype mismatch");
+    TORCH_CHECK(blocks.scalar_type() == at::kInt &&
                 lens.scalar_type() == at::kInt && cu.scalar_type() == at::kInt,
                 "Invalid attention metadata dtype");
-    TORCH_CHECK(slots.is_contiguous() && blocks.is_contiguous() &&
+    TORCH_CHECK(blocks.is_contiguous() &&
                 lens.is_contiguous() && cu.is_contiguous(),
                 "Attention metadata must be contiguous");
     const int tokens = q.size(0), heads = q.size(1), kv_heads = kc.size(2);
@@ -198,7 +196,7 @@ class PagedAttention {
     const int parts = (max_seq_len + kPartitionSize - 1) / kPartitionSize;
     TORCH_CHECK(k.size(0) == tokens &&
                 out.sizes() == q.sizes() && out.is_contiguous() &&
-                slots.numel() == tokens && blocks.dim() == 2 && blocks.size(0) == seqs &&
+                blocks.dim() == 2 && blocks.size(0) == seqs &&
                 cu.numel() == seqs + 1 && heads % kv_heads == 0,
                 "Inconsistent attention shapes/strides");
     // Reuse the same short verification-window shader mode as the MLX launcher.
@@ -297,11 +295,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   pybind11::class_<PagedAttention>(m, "PagedAttention")
       .def(pybind11::init<const std::string&, const std::string&, int>())
       .def("reshape_and_cache", &PagedAttention::reshape_and_cache)
-      .def("forward", &PagedAttention::forward,
-           pybind11::arg("q"), pybind11::arg("k"), pybind11::arg("v"),
-           pybind11::arg("kc"), pybind11::arg("vc"), pybind11::arg("slots"),
-           pybind11::arg("blocks"), pybind11::arg("lens"), pybind11::arg("cu"),
-           pybind11::arg("out"), pybind11::arg("max_seq_len"), pybind11::arg("scale"),
-           pybind11::arg("sliding_window"), pybind11::arg("softcap"),
-           pybind11::arg("window_seqlen_q"), pybind11::arg("block_ranges") = std::nullopt);
+      .def("forward", &PagedAttention::forward);
 }

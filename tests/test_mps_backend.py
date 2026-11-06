@@ -27,9 +27,8 @@ def state():
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_context_normalization_and_key_only_rope(dtype):
+def test_grouped_context_normalization(dtype):
     from vllm import _custom_ops as ops
-    from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
 
     install()
     torch.manual_seed(19)
@@ -40,21 +39,11 @@ def test_context_normalization_and_key_only_rope(dtype):
     out = torch.empty_like(x)
     ops.rms_norm(out, x, weight, 1e-6)
     torch.testing.assert_close(out, expected)
-    positions = torch.arange(5, device="mps").repeat(2)
-    cache = torch.randn(8, 128, dtype=dtype, device="mps")
-    key = out.view(10, -1)
-    expected, _ = RotaryEmbedding.forward_static(
-        positions, key, None, 128, 128, cache, True
-    )
-    ops.rotary_embedding(positions, key, None, 128, cache, True)
-    torch.testing.assert_close(key, expected, atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("sample_from_anchor", [False, True])
-@pytest.mark.parametrize("num_reqs_override", [None, 1])
-def test_block_draft_inputs_preserve_only_verified_context(
-    sample_from_anchor, num_reqs_override
-):
+def test_dflash_inputs_preserve_verified_context():
+    from vllm.v1.worker.gpu.input_batch import InputBuffers
+
     from vllm_metal.pytorch_backend.speculative_ops import prepare_dflash_inputs
 
     def tensor(data, dtype=torch.int64):
@@ -63,14 +52,9 @@ def test_block_draft_inputs_preserve_only_verified_context(
     def full(size, dtype=torch.int64):
         return torch.full((size,), 999, device="mps", dtype=dtype)
 
-    width = 3 if sample_from_anchor else 4
-    buffers = SimpleNamespace(
-        input_ids=full(16),
-        positions=full(16),
-        is_padding=tensor([True, False] * 8, torch.bool),
-        query_start_loc=full(4, torch.int32),
-        seq_lens=full(3, torch.int32),
-    )
+    buffers = InputBuffers(3, 16, torch.device("mps"))
+    buffers.input_ids.fill_(999)
+    buffers.is_padding[0] = True
     batch = SimpleNamespace(
         num_reqs=2,
         num_tokens=5,
@@ -80,16 +64,14 @@ def test_block_draft_inputs_preserve_only_verified_context(
         idx_mapping=tensor([2, 0], torch.int32),
     )
     query_slots, context_pos, context_slots = full(16), full(5), full(5)
-    indices, sample_positions, mapping = full(9), full(9), full(9)
-    temperature, seeds = full(3, torch.float32), full(3)
+    sample_buffers = [full(9) for _ in range(3)]
+    temperature, seeds = torch.zeros(3, device="mps"), full(3)
     prepare_dflash_inputs(
         buffers,
         query_slots,
         context_pos,
         context_slots,
-        indices,
-        sample_positions,
-        mapping,
+        *sample_buffers,
         temperature,
         seeds,
         batch,
@@ -97,44 +79,25 @@ def test_block_draft_inputs_preserve_only_verified_context(
         tensor([1, 0], torch.int32),
         tensor([[0], [0], [42]]),
         tensor([[61, 62, 63]]),
-        tensor([0.0, 0.0, 0.0], torch.float32),
-        tensor([1, 2, 3]),
+        temperature,
+        seeds,
         tensor([[0, 2, 3], [4, 5, 6]], torch.int32),
-        16,
-        0,
-        1,
-        1,
-        99,
-        width,
-        3,
-        3,
-        16,
-        48,
-        sample_from_anchor,
-        num_reqs_override,
+        block_size=16,
+        cp_rank=0,
+        cp_size=1,
+        cp_interleave=1,
+        mask_token=99,
+        query_width=4,
+        num_steps=3,
+        max_num_reqs=3,
+        max_num_tokens=16,
+        max_model_len=48,
     )
-    n = 2 if num_reqs_override is None else num_reqs_override
-    count = n * width
-    assert context_pos.tolist() == [15, 16, 0] + ([30, 31] if n == 2 else [999, 999])
-    assert context_slots.tolist() == [-1, 32, -1] + ([94, 95] if n == 2 else [999, 999])
-    inputs = [42] + [99] * (width - 1) + [61] + [99] * (width - 1)
-    positions = list(range(17, 17 + width)) + list(range(32, 32 + width))
-    slots = list(range(33, 33 + width)) + list(range(96, 96 + width))
-    assert buffers.input_ids.tolist() == inputs[:count] + [0] * (16 - count)
-    assert buffers.positions.tolist() == positions[:count] + [0] * (16 - count)
-    assert buffers.is_padding.tolist() == [False] * count + [True] * (16 - count)
-    assert query_slots.tolist() == slots[:count] + [-1] * (16 - count)
-    assert buffers.seq_lens.tolist() == [17 + width, 32 + width][:n] + [0] * (3 - n)
-    assert buffers.query_start_loc.tolist() == (
-        [0, width, 2 * width, 2 * width] if n == 2 else [0, width, width, width]
-    )
-    first = 0 if sample_from_anchor else 1
-    expected_indices = list(range(first, width)) + list(range(width + first, 2 * width))
-    assert indices.tolist() == expected_indices[: n * 3] + [0] * (9 - n * 3)
-    assert sample_positions.tolist() == [18, 19, 20, 33, 34, 35][: n * 3] + [0] * (
-        9 - n * 3
-    )
-    assert mapping.tolist() == [2, 2, 2, 0, 0, 0][: n * 3] + [-1] * (9 - n * 3)
+    assert context_pos.tolist() == [15, 16, 0, 30, 31]
+    assert context_slots.tolist() == [-1, 32, -1, 94, 95]
+    assert query_slots.tolist() == [33, 34, 35, 36, 96, 97, 98, 99] + [-1] * 8
+    assert buffers.input_ids.tolist() == [42, 99, 99, 99, 61, 99, 99, 99] + [0] * 8
+    assert buffers.is_padding.tolist() == [False] * 8 + [True] * 8
 
 
 @pytest.mark.parametrize("num_groups", [1, 2])

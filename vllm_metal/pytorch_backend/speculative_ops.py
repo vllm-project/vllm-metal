@@ -41,11 +41,7 @@ def prepare_dflash_inputs(
     sample_from_anchor=False,
     num_reqs_override=None,
 ):
-    if cp_size != 1 or cp_rank != 0:
-        raise NotImplementedError("MPS drafting requires a single device")
     n = batch.num_reqs if num_reqs_override is None else num_reqs_override
-    if not 0 < n <= batch.num_reqs:
-        raise ValueError("Draft request count must fit the target batch")
     total = int(batch.num_scheduled_tokens[:n].sum())
     cu = batch.query_start_loc[: n + 1]
     ends = cu[1:] - rejected[:n]
