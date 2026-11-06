@@ -197,24 +197,10 @@ LFM3 support covers text generation with BF16 and MLX-quantized checkpoints.
 LFM3-VL image input and LFM3-Audio audio input are listed under multimodal models.
 Omni and d1 variants require separate integrations.
 
-LFM3-Audio accepts waveforms through the offline `multi_modal_data["audio"]`
-API and audio content in chat requests. Clips are resampled to 16 kHz mono;
-each must be nonempty and at most 30 seconds after resampling. Precomputed
-audio embeddings are unsupported. The processor and audio encoder come from
-mlx-vlm, and the adapter restricts generation to text. Speech synthesis,
-speech-output history, and the transcription/translation REST endpoints are
-outside this integration.
-
-For an initial single-request setup:
-
-```bash
-vllm serve LiquidAI/LFM3-Audio-2B-MLX-4bit --trust-remote-code \
-  --max-model-len 512 --max-num-seqs 1 --limit-mm-per-prompt '{"audio": 1}'
-```
-
-A 30-second clip uses 375 audio tokens; leave room for the prompt and reply
-within `--max-model-len`. This configuration is not a memory-fit guarantee.
-
+LFM3-Audio accepts waveform input through the offline API and audio chat
+requests, resampled to 16 kHz mono. Clips must be nonempty and at most
+30 seconds (375 audio tokens). Only text output is supported; precomputed
+audio embeddings and transcription/translation REST endpoints are unsupported.
 
 sliding-window attention (SWA) is not fully optimized.
 
