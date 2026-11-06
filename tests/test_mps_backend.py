@@ -302,17 +302,27 @@ def test_explicit_cache_budget_must_fit_one_metal_buffer(mps_memory, limit, larg
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
 @pytest.mark.parametrize(
-    ("fused", "num_tokens", "hidden_size"),
+    ("fused", "num_tokens", "hidden_size", "float_weight"),
     [
-        (False, 4, 128),
-        (True, 4, 128),
-        (True, 1, 1024),
-        (True, 4, 1024),
-        (True, 3, 1028),
+        (False, 4, 128, False),
+        (True, 4, 128, False),
+        (True, 1, 1024, False),
+        (True, 4, 1024, False),
+        (True, 3, 1028, False),
+        (False, 1, 5120, True),
+        (True, 1, 5120, True),
     ],
-    ids=["plain", "residual", "decode", "batched-decode", "tail"],
+    ids=[
+        "plain",
+        "residual",
+        "decode",
+        "batched-decode",
+        "tail",
+        "qwen38-float-weight",
+        "qwen38-float-weight-residual",
+    ],
 )
-def test_rms_norm_parity(dtype, fused, num_tokens, hidden_size):
+def test_rms_norm_parity(dtype, fused, num_tokens, hidden_size, float_weight):
     from vllm import ir
 
     import vllm_metal.pytorch_backend.normalization  # noqa: F401
@@ -324,6 +334,9 @@ def test_rms_norm_parity(dtype, fused, num_tokens, hidden_size):
     args[-2].copy_(
         torch.tensor([1.25, 1.75, 0.75, 1.5], dtype=dtype).repeat(hidden_size // 4)
     )
+    if float_weight:
+        args = list(args)
+        args[-2] = args[-2].float() + 0.00390625
     if fused:
         # This row distinguishes FP32 accumulation and cast-before-weight from
         # rounding the sum early or applying the learned weight before casting.
