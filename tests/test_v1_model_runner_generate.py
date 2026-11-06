@@ -199,16 +199,15 @@ class TestDrafterReleaseOnLifecycle:
         runner = make_stub_runner(tokenizer=object())
         runner._drafter = _RecordingDrafter()
 
-        # Eviction + preemption + resume all invalidate the drafter's per-request
+        # Eviction and preemption invalidate the drafter's per-request
         # state, mirroring the runtime recurrent-state release path.
         runner._reconcile_request_lifecycle(
             {"done"},
             preempted_req_ids={"paused"},
-            resumed_req_ids={"back"},
             materialize_runtime_state=False,
         )
 
-        assert released == [{"done", "paused", "back"}]
+        assert released == [{"done", "paused"}]
 
 
 class TestV1MetalModelRunnerGenerate:
@@ -2169,23 +2168,14 @@ class TestV1MetalModelRunnerGDNLifecycle:
     def _make_scheduler_output(
         self,
         *,
-        resumed_req_ids: set[str] | None = None,
         preempted_req_ids: set[str] | None = None,
         scheduled_encoder_inputs: dict[str, list[int]] | None = None,
     ) -> SchedulerOutput:
         return SchedulerOutput(
             scheduled_new_reqs=[],
-            scheduled_cached_reqs=CachedRequestData(
-                req_ids=list(resumed_req_ids or ()),
-                resumed_req_ids=resumed_req_ids or set(),
-                new_token_ids=[],
-                all_token_ids={},
-                new_block_ids=[None] * len(resumed_req_ids or ()),
-                num_computed_tokens=[0] * len(resumed_req_ids or ()),
-                num_output_tokens=[0] * len(resumed_req_ids or ()),
-            ),
-            num_scheduled_tokens=dict.fromkeys(resumed_req_ids or (), 1),
-            total_num_scheduled_tokens=len(resumed_req_ids or ()),
+            scheduled_cached_reqs=CachedRequestData.make_empty(),
+            num_scheduled_tokens={},
+            total_num_scheduled_tokens=0,
             scheduled_spec_decode_tokens={},
             num_invalid_spec_tokens=None,
             scheduled_encoder_inputs=scheduled_encoder_inputs or {},
@@ -2196,19 +2186,8 @@ class TestV1MetalModelRunnerGDNLifecycle:
             has_structured_output_requests=False,
         )
 
-    @pytest.mark.parametrize(
-        ("event_kwargs", "req_id"),
-        [
-            ({"preempted_req_ids": {"req-0"}}, "req-0"),
-            ({"resumed_req_ids": {"req-0"}}, "req-0"),
-        ],
-        ids=["preempted", "resumed"],
-    )
-    def test_preempt_or_resume_releases_runtime_state_not_runner_metadata(
-        self,
-        event_kwargs: dict[str, set[str]],
-        req_id: str,
-    ) -> None:
+    def test_preemption_releases_runtime_state_not_runner_metadata(self) -> None:
+        req_id = "req-0"
         runner, runtime, cache = self._make_runner()
         state = mr.RequestState(
             token_ids=[1, 2],
@@ -2233,7 +2212,7 @@ class TestV1MetalModelRunnerGDNLifecycle:
         )
         scheduler_output = self._make_scheduler_output(
             scheduled_encoder_inputs={req_id: [0]},
-            **event_kwargs,
+            preempted_req_ids={req_id},
         )
 
         with pytest.raises(RuntimeError, match="Multimodal encoder dispatch"):
@@ -3349,7 +3328,7 @@ class TestPipelineGateSpecDecodeDerivation:
             req_ids=[req_id],
             resumed_req_ids=set(),
             new_token_ids=[[7]],
-            all_token_ids={req_id: [1, 7]},
+            all_token_ids={},
             new_block_ids=[None],
             num_computed_tokens=[1],
             num_output_tokens=[1],
@@ -3999,7 +3978,7 @@ class TestDeferredDecodeSampleThreading:
             req_ids=["r0", "r1"],
             resumed_req_ids=set(),
             new_token_ids=[[7], [7]],
-            all_token_ids={"r0": [3, 9, 7], "r1": [3, 9, 7]},
+            all_token_ids={},
             new_block_ids=[None, None],
             num_computed_tokens=[2, 2],
             num_output_tokens=[2, 2],
@@ -4703,6 +4682,7 @@ class TestStateBlockIdLifecycle:
         return NewRequestData(
             req_id=req_id,
             prompt_token_ids=[1, 2, 3, 4, 5, 6],
+            prefill_token_ids=[1, 2, 3, 4, 5, 6],
             mm_features=[],
             sampling_params=SamplingParams(),
             pooling_params=None,
@@ -4754,7 +4734,7 @@ class TestStateBlockIdLifecycle:
         assert runner._state_block_ids_by_req["r"] == [[10, 12], [20, 22], [30, 32]]
         assert runner._request_states["r"].block_ids == [[40, 42]]
 
-    def test_resume_replaces_the_whole_table(self) -> None:
+    def test_readmission_replaces_every_block_group(self) -> None:
         runner = self._make_runner()
         runner._state_block_ids_by_req["r"] = [[10], [20], [30]]
         runner._request_states["r"] = mr.RequestState(
@@ -4764,16 +4744,13 @@ class TestStateBlockIdLifecycle:
             block_ids=[[40]],
         )
 
-        runner._update_cached_request_blocks(
-            CachedRequestData(
-                req_ids=["r"],
-                resumed_req_ids={"r"},
-                new_token_ids=[],
-                all_token_ids={"r": [1]},
-                new_block_ids=[([50], [60], [70], [80])],
-                num_computed_tokens=[0],
-                num_output_tokens=[0],
-            )
+        new_req = self._new_req("r")
+        new_req.block_ids = ([50], [60], [70], [80])
+        runner._reconcile_request_lifecycle(set(), preempted_req_ids={"r"})
+        runner._handle_new_requests(
+            mr._ExecutionBatch(),
+            [new_req],
+            SimpleNamespace(num_scheduled_tokens={"r": 1}),
         )
 
         assert runner._state_block_ids_by_req["r"] == [[50], [60], [70]]
@@ -4781,7 +4758,7 @@ class TestStateBlockIdLifecycle:
 
 
 class TestPreemptedReadmission:
-    """Preempted requests resume through the V1 and V2 scheduler contracts."""
+    """Preempted requests are readmitted through the V2 scheduler contract."""
 
     def _new_req(
         self,
@@ -4808,11 +4785,10 @@ class TestPreemptedReadmission:
         num_scheduled_tokens: int,
         *,
         preempted_req_ids: set[str] | None = None,
-        cached_reqs: CachedRequestData | None = None,
     ) -> SchedulerOutput:
         return SchedulerOutput(
             scheduled_new_reqs=[new_req] if new_req else [],
-            scheduled_cached_reqs=cached_reqs or CachedRequestData.make_empty(),
+            scheduled_cached_reqs=CachedRequestData.make_empty(),
             num_scheduled_tokens=(
                 {"r": num_scheduled_tokens} if num_scheduled_tokens else {}
             ),
@@ -4857,6 +4833,9 @@ class TestPreemptedReadmission:
         runner.vllm_config = VllmConfig()
         assert runner.vllm_config.use_v2_model_runner
         runner._paged_attention_runtime = Mock(spec=SDPAPagedAttentionRuntime)
+        runner._paged_scheduler_group_indices = (0,)
+        runner._request_states["r"].block_ids = [[0, 1]]
+        runner._paged_request_seq_lens["r"] = 7
         forward = Mock()
         monkeypatch.setattr(runner, "_start_paged_forward", forward)
         new_req = self._new_req([1, 2, 3, 4, 5, 6], num_computed_tokens=5)
@@ -4874,42 +4853,10 @@ class TestPreemptedReadmission:
         assert entry.result_mode == "cached_final"
         assert state.token_ids == [1, 2, 3, 4, 5, 6]
         assert state.prompt_len == 4
-
-    def test_v1_readmission_continues_from_cached_tokens(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
-        generator = torch.Generator().manual_seed(0)
-        runner = self._preempted_runner(generator)
-        runner.vllm_config = VllmConfig()
-        assert not runner.vllm_config.use_v2_model_runner
-        runner._paged_attention_runtime = Mock(spec=SDPAPagedAttentionRuntime)
-        forward = Mock()
-        monkeypatch.setattr(runner, "_start_paged_forward", forward)
-        cached_reqs = CachedRequestData(
-            req_ids=["r"],
-            resumed_req_ids={"r"},
-            all_token_ids={"r": [1, 2, 3, 4, 5, 6]},
-            new_block_ids=[([10, 11],)],
-            num_computed_tokens=[5],
-            num_output_tokens=[2],
-            new_token_ids=[],
-        )
-
-        runner.execute_model(self._scheduler_output(None, 0, preempted_req_ids={"r"}))
-        forward.assert_not_called()
-        runner.execute_model(self._scheduler_output(None, 1, cached_reqs=cached_reqs))
-        forward.assert_called_once()
-        entry = forward.call_args.args[0].paged_prefill_entries[0]
-
-        state = runner._request_states["r"]
-        assert state.token_ids == [1, 2, 3, 4, 5, 6]
-        assert state.prompt_len == 4
-        assert state.generator is generator
-        assert entry.prefill.token_ids == [6]
-        assert entry.prefill.start_pos == 5
-        assert entry.prefill.generator is generator
-        assert entry.result_mode == "cached_final"
+        assert state.block_ids == [[10, 11]]
+        assert state.generated_tokens == 0
+        assert "r" not in runner._paged_request_seq_lens
+        assert "r" not in runner._awaiting_readmission
 
     @pytest.mark.parametrize(
         ("prefill_token_ids", "owes_prompt_logprobs"),
@@ -4941,26 +4888,6 @@ class TestPreemptedReadmission:
 
         assert entry.prefill.token_ids == [7, 8, 9, 10]
         assert entry.prefill.prompt_len == 4
-        assert entry.result_mode == "new_final"
-
-    def test_v1_resumed_id_reentering_later_is_admitted_fresh(self) -> None:
-        runner = self._preempted_runner()
-        new_req = NewRequestData(
-            req_id="r",
-            prompt_token_ids=[7, 8, 9, 10],
-            mm_features=[],
-            sampling_params=SamplingParams(),
-            pooling_params=None,
-            block_ids=([10, 11],),
-            num_computed_tokens=0,
-            lora_request=None,
-        )
-
-        runner._reconcile_request_lifecycle(set(), preempted_req_ids={"r"})
-        runner._reconcile_request_lifecycle(set(), resumed_req_ids={"r"})
-        entry = self._admit(runner, new_req, 4)
-
-        assert entry.prefill.token_ids == [7, 8, 9, 10]
         assert entry.result_mode == "new_final"
 
     def test_non_last_pp_stage_keeps_the_prefill_tokens(self) -> None:

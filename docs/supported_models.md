@@ -30,7 +30,7 @@ do not add columns for unimplemented features. -->
 
 ## Text Pooling
 
-Metal V1 has experimental text-only pooling support. See
+The MLX backend has experimental text-only pooling support. See
 [Text Pooling](text_embedding_pooling.md) for scope, usage, and
 validation guidance. The reranker requires Qwen3 sequence-classification
 `hf_overrides`.

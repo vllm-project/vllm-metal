@@ -47,6 +47,9 @@ def _kv_dtype_bytes(cache_dtype: str, model_dtype: Any) -> int:
 # loses nothing, the scheduler retries the store on the next step.
 _DEFAULT_POOL_REQUESTS = 2
 
+# Copy of MLA_DEFAULT_QK_ROPE_HEAD_DIM. Its module imports mlx.
+_MLA_DEFAULT_QK_ROPE_HEAD_DIM = 64
+
 # Internal: set when this hook chose the pool size, so the memory planner may
 # shrink it to fit. The hook runs again in the engine core, where the size
 # alone would look user-set. Users must not set it.
@@ -61,18 +64,32 @@ def default_host_pool_bytes(vllm_config: VllmConfig) -> int:
     requests is the smallest pool with no retries at concurrency 4 in the
     #1037 measurements, where every size from half a request to four stored
     the same bytes. Offloading serves only uniform full-attention models, whose
-    KV is ``2 * layers * kv_heads * head_size`` elements per token; a
-    compressed layout only lets the same bytes hold more blocks. The token
-    count rounds up to whole blocks once the block size is known.
+    KV is ``2 * kv_heads * head_size`` elements per token and layer. MLA keeps
+    one latent row of ``kv_lora_rank + qk_rope_head_dim``. A compressed layout
+    only lets the same bytes hold more blocks. The token count rounds up to
+    whole blocks once the block size is known.
     """
     model_config = vllm_config.model_config
     parallel_config = vllm_config.parallel_config
     cache_config = vllm_config.cache_config
+    text_config = model_config.hf_text_config
+    # Metal runs MLA whenever the checkpoint has kv_lora_rank
+    # (MetalModelRunner.is_mla). vLLM's use_mla can be False for those, e.g.
+    # MiniCPM3, and then reports the per-head K/V shape.
+    kv_lora_rank = getattr(text_config, "kv_lora_rank", None)
+    if kv_lora_rank is not None:
+        per_layer = int(kv_lora_rank) + int(
+            getattr(text_config, "qk_rope_head_dim", _MLA_DEFAULT_QK_ROPE_HEAD_DIM)
+        )
+    else:
+        per_layer = (
+            2
+            * model_config.get_num_kv_heads(parallel_config)
+            * model_config.get_head_size()
+        )
     per_token = (
-        2
+        per_layer
         * model_config.get_num_layers_by_block_type(parallel_config)
-        * model_config.get_num_kv_heads(parallel_config)
-        * model_config.get_head_size()
         * _kv_dtype_bytes(cache_config.cache_dtype, model_config.dtype)
     )
     tokens = int(model_config.max_model_len)
@@ -145,10 +162,12 @@ def configure_kv_offloading(vllm_config: VllmConfig) -> None:
         raise NotImplementedError(
             "KV offloading on Metal does not support pooling models."
         )
-    if model_config.use_mla:
+    # Hybrid models keep recurrent state the connector cannot restore. The
+    # connector refuses their extra cache groups too, but after the weights.
+    if model_config.is_hybrid:
         raise NotImplementedError(
-            "KV offloading on Metal does not support MLA models yet; the "
-            "paged latent cache is not in the offload inventory."
+            "KV offloading on Metal supports a single full-attention KV cache "
+            "group; hybrid models are not supported."
         )
     speculative_config = vllm_config.speculative_config
     if speculative_config is not None and speculative_config.method in (

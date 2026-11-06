@@ -324,6 +324,11 @@ NB_MODULE(_paged_ops, m) {
         "[num_tokens, num_kv_heads, head_size]; caches are "
         "[num_blocks, block_size, num_kv_heads, head_size].");
 
+  m.def("gumbel_sample", &gumbel_sample_primitive_fn,
+        nb::arg("logits"), nb::arg("seeds"), nb::arg("positions"),
+        nb::arg("temperatures"), nb::arg("token_ids") = nb::none(),
+        "Return one int64 token ID per row. Divide logits by each positive temperature. "
+        "Pass 1 for pre-scaled logits and 0 for greedy selection.");
   m.def("gdn_state_scatter", &gdn_state_scatter_primitive_fn,
         nb::arg("pool"), nb::arg("src"), nb::arg("dst_ids"), nb::arg("zero") = false,
         nb::arg("paged") = false,

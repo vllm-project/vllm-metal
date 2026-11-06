@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-Metal vLLM v1 model runner.
+MLX model runner for vLLM's V2 scheduler contract.
 
 Orchestration only: coordinates scheduling, dispatch, and output assembly.
 Model-specific behavior belongs in adapters; backend-specific kernels live in
@@ -370,7 +370,7 @@ class _PagedForwardState(NamedTuple):
 class MetalModelRunner:
     """Model runner for MLX-based inference on Metal.
 
-    Implements the vLLM v1 model runner interface for Apple Silicon.
+    Implements the vLLM model runner interface for Apple Silicon.
     """
 
     # Class-level defaults so stub runners built via __new__ are safe on
@@ -1020,22 +1020,23 @@ class MetalModelRunner:
         """Hand the runtime's KV storage to the KV connector, and build its driver.
 
         Called by the worker after ``initialize_kv_cache`` when a KV connector
-        is configured. Only the SDPA runtime's ``KVCacheStorage`` is registered.
-        Hybrid and count-based (draft model) caches have no layout the connector
-        can address, and KV offloading does not support MLA models yet.
+        is configured. Only the SDPA and MLA runtimes' ``KVCacheStorage`` is
+        registered. Hybrid and count-based (draft model) caches have no layout
+        the connector can address.
         """
+        from vllm_metal.attention.runtime.mla import MLAPagedAttentionRuntime
         from vllm_metal.attention.runtime.sdpa import SDPAPagedAttentionRuntime
 
         runtime = self._paged_attention_runtime
         storage = None
-        if isinstance(runtime, SDPAPagedAttentionRuntime):
+        if isinstance(runtime, (SDPAPagedAttentionRuntime, MLAPagedAttentionRuntime)):
             try:
                 storage = runtime.storage
             except RuntimeError:
                 storage = None
         if storage is None:
             raise NotImplementedError(
-                "KV offloading on Metal requires the SDPA paged attention "
+                "KV offloading on Metal requires the SDPA or MLA paged attention "
                 "runtime with storage bound from the KV cache config; "
                 f"{type(runtime).__name__} provides none."
             )
@@ -1848,7 +1849,6 @@ class MetalModelRunner:
                 bool(scheduler_output.scheduled_new_reqs) or states_missing
             ),
             has_prefill_phase_requests=has_prefill_phase,
-            has_resumed_requests=bool(cached_reqs.resumed_req_ids),
             has_preempted_requests=bool(scheduler_output.preempted_req_ids),
             has_encoder_inputs=bool(scheduler_output.scheduled_encoder_inputs),
             has_spec_tokens=bool(
@@ -2952,31 +2952,17 @@ class MetalModelRunner:
             state = self._request_states[req_id]
 
             new_block_ids = cached_reqs.new_block_ids[i]
-            resumed = req_id in cached_reqs.resumed_req_ids
-            if not resumed:
-                if new_block_ids is not None:
+            if new_block_ids is not None:
+                for group_index, group_block_ids in enumerate(
+                    self._copy_paged_block_ids(new_block_ids)
+                ):
+                    state.block_ids[group_index].extend(group_block_ids)
+                if self._paged_state_group_indices:
+                    req_state_ids = self._state_block_ids_by_req[req_id]
                     for group_index, group_block_ids in enumerate(
-                        self._copy_paged_block_ids(new_block_ids)
+                        self._copy_state_block_ids(new_block_ids)
                     ):
-                        state.block_ids[group_index].extend(group_block_ids)
-                    if self._paged_state_group_indices:
-                        req_state_ids = self._state_block_ids_by_req[req_id]
-                        for group_index, group_block_ids in enumerate(
-                            self._copy_state_block_ids(new_block_ids)
-                        ):
-                            req_state_ids[group_index].extend(group_block_ids)
-                continue
-
-            assert new_block_ids is not None
-            # The scheduler can drop an in-flight output we already appended.
-            state.token_ids = cached_reqs.all_token_ids[req_id]
-            state.block_ids = self._copy_paged_block_ids(new_block_ids)
-            if self._paged_state_group_indices:
-                self._state_block_ids_by_req[req_id] = self._copy_state_block_ids(
-                    new_block_ids
-                )
-            state.generated_tokens = 0
-            self._paged_request_seq_lens.pop(req_id, None)
+                        req_state_ids[group_index].extend(group_block_ids)
 
     def _readmit_request(
         self,
@@ -3229,7 +3215,6 @@ class MetalModelRunner:
         evicted_req_ids: set[str],
         *,
         preempted_req_ids: set[str] | None = None,
-        resumed_req_ids: set[str] | None = None,
         materialize_runtime_state: bool = True,
     ) -> None:
         """Reconcile runner metadata and runtime-owned recurrent state."""
@@ -3250,23 +3235,13 @@ class MetalModelRunner:
         # dropped only when the engine finishes the request.
         self._prompt_logprobs_tracker.discard(evicted_req_ids)
 
-        if resumed_req_ids:
-            # A resumed request recomputes from a new prefix boundary; its
-            # first_prefill_start is re-seeded by the next chunk.
-            for req_id in resumed_req_ids:
-                self._mm_bidi_states.pop(req_id, None)
-
         if preempted_req_ids:
             self._awaiting_readmission.update(preempted_req_ids)
         self._awaiting_readmission -= evicted_req_ids
-        if resumed_req_ids:
-            self._awaiting_readmission -= resumed_req_ids
 
         invalidated = set(evicted_req_ids)
         if preempted_req_ids:
             invalidated.update(preempted_req_ids)
-        if resumed_req_ids:
-            invalidated.update(resumed_req_ids)
 
         # Discard draft KV validity tracking before eviction or recompute.
         if invalidated and self._drafter is not None:
@@ -3331,7 +3306,6 @@ class MetalModelRunner:
         self._reconcile_request_lifecycle(
             evicted_req_ids,
             preempted_req_ids=scheduler_output.preempted_req_ids,
-            resumed_req_ids=scheduler_output.scheduled_cached_reqs.resumed_req_ids,
             materialize_runtime_state=will_fail_fast_before_model_work,
         )
         if missing_cached_state_req_ids:

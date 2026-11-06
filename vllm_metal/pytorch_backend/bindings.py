@@ -8,11 +8,15 @@ import torch
 def register_kernel_overrides():
     from vllm.triton_utils.dispatcher import register_kernels
 
-    from vllm_metal.pytorch_backend import speculative_ops
+    from vllm_metal.pytorch_backend import sampling, speculative_ops
 
     module = "vllm.v1.worker.gpu.spec_decode.rejection_sampler"
+    sample_module = "vllm.v1.worker.gpu.sample"
     register_kernels(
         {
+            f"{sample_module}.gumbel._gumbel_sample_kernel": sampling.gumbel_sample,
+            f"{sample_module}.gumbel._temperature_kernel": sampling.temperature,
+            f"{sample_module}.min_p._min_p_kernel": sampling.min_p,
             f"{module}._gather_draft_sampled_kernel": speculative_ops.gather_draft_sampled,
             f"{module}._flatten_sampled_kernel": speculative_ops.flatten_sampled,
         }
@@ -117,7 +121,5 @@ def install():
 
     _install_input_ops()
     _install_speculative_ops()
-    # validate_request limits sampling to greedy; scoring uses upstream Torch ops.
-    sampler.gumbel_sample = lambda logits, *args, **kwargs: logits.argmax(dim=-1)
     sampler.compute_topk_scores = runtime.compute_topk_scores
     buffer_utils._metal_installed = True

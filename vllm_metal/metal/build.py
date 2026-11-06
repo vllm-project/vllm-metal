@@ -24,6 +24,7 @@ _THIS_DIR = Path(__file__).resolve().parent
 _SRC = _THIS_DIR / "mlx_bindings.cpp"
 _PAGED_ATTENTION = _THIS_DIR / "paged_attention.cpp"
 _GDN = _THIS_DIR / "gdn.cpp"
+_SAMPLING = _THIS_DIR / "sampling.cpp"
 _MLA = _THIS_DIR / "mla.cpp"
 _INTERNAL = _THIS_DIR / "ops_internal.h"
 _MLX_PATCH = _THIS_DIR / "mlx_patch.cpp"
@@ -59,6 +60,7 @@ METALLIB_NAMES = (
     "paged_mla_kern",
     "rope_kern",
     "normalization_kern",
+    "sampling_kern",
 )
 
 # Kept outside METALLIB_NAMES because wheels built with older SDKs omit it.
@@ -142,6 +144,7 @@ def _metallib_source(name: str) -> str:
         _build_nax_source,
         _build_normalization_source,
         _build_rope_source,
+        _build_sampling_source,
         _build_v2_paged_attention_source,
     )
 
@@ -152,6 +155,7 @@ def _metallib_source(name: str) -> str:
         NAX_METALLIB_NAME: _build_nax_source,
         "rope_kern": _build_rope_source,
         "normalization_kern": _build_normalization_source,
+        "sampling_kern": _build_sampling_source,
     }
     return builders[name]()
 
@@ -276,6 +280,7 @@ def _build_extension(sources: dict[str, str], build_dir: Path) -> None:
             str(_SRC),
             str(_PAGED_ATTENTION),
             str(_GDN),
+            str(_SAMPLING),
             str(_MLA),
             str(_MLX_PATCH),
             str(_DEVICE_SRC),
@@ -388,6 +393,7 @@ def _input_hash() -> str:
         _SRC,
         _PAGED_ATTENTION,
         _GDN,
+        _SAMPLING,
         _MLA,
         _INTERNAL,
         _MLX_PATCH,

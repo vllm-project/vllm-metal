@@ -41,6 +41,7 @@ import vllm_metal.compat as compat
 import vllm_metal.config as vm_config
 import vllm_metal.platform as platform_module
 from tests.stub_runner import make_gemma4_mixed_attention_runner
+from vllm_metal import _apply_model_runner_default
 from vllm_metal.config import reset_config
 from vllm_metal.platform import MetalPlatform
 from vllm_metal.v1.cache_policy import WorkerCachePlanner
@@ -301,12 +302,11 @@ class TestMetalPlatform:
         assert exc_info.value.parameter == control
 
     @pytest.mark.parametrize(
-        ("backend", "diffusion", "use_v2"),
+        ("backend", "diffusion"),
         [
-            ("mlx", False, "0"),
-            ("mlx", False, "1"),
-            ("mlx", True, "1"),
-            ("mps", False, "1"),
+            ("mlx", False),
+            ("mlx", True),
+            ("mps", False),
         ],
     )
     def test_validate_request_rejects_prompt_logprob_token_ids(
@@ -314,9 +314,8 @@ class TestMetalPlatform:
         monkeypatch: pytest.MonkeyPatch,
         backend: str,
         diffusion: bool,
-        use_v2: str,
     ) -> None:
-        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", use_v2)
+        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
         monkeypatch.setenv("VLLM_METAL_BACKEND", backend)
         monkeypatch.setattr(MetalPlatform, "_serves_diffusion", diffusion)
 
@@ -395,6 +394,19 @@ class TestMetalPlatform:
         self, pooling_params: PoolingParams
     ) -> None:
         MetalPlatform.validate_request({}, pooling_params)
+
+    @pytest.mark.parametrize("speculative", [False, True])
+    def test_mps_sampling_requires_greedy_only_for_speculation(
+        self, monkeypatch, speculative
+    ):
+        monkeypatch.setattr("vllm_metal.envs.VLLM_METAL_BACKEND", "mps")
+        monkeypatch.setattr(MetalPlatform, "_mps_speculative", speculative)
+        params = SamplingParams(temperature=0.8, top_k=25, top_p=0.85)
+        if speculative:
+            with pytest.raises(VLLMValidationError, match="temperature"):
+                MetalPlatform.validate_request({}, params)
+        else:
+            MetalPlatform.validate_request({}, params)
 
     def test_sleep_mode_is_available(self) -> None:
         assert MetalPlatform.is_sleep_mode_available()
@@ -602,32 +614,20 @@ class TestMetalPlatform:
         with pytest.raises(ValueError, match="too high for pipeline_parallel_size"):
             MetalPlatform.check_and_update_config(vllm_config)
 
-    def test_check_and_update_config_rejects_pipeline_with_async_scheduling(
-        self, monkeypatch: pytest.MonkeyPatch
+    @pytest.mark.parametrize("watermark", [False, True])
+    def test_mlx_rejects_explicit_v1_model_runner(
+        self, monkeypatch: pytest.MonkeyPatch, watermark: bool
     ) -> None:
-        """PP>1 requires synchronous scheduling; async scheduling is rejected.
-
-        The first stage has no sampler and rebuilds the token stream from the
-        scheduler's new_token_ids, which async scheduling leaves empty (sampled
-        tokens would travel a GPU broadcast we do not implement). Fail loud
-        rather than silently flip the user's scheduler config.
-        """
+        """Reject the opt-out even if upstream watermarking forces V2."""
+        monkeypatch.setenv("VLLM_METAL_BACKEND", "mlx")
         monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
-        vllm_config = self._platform_config(
-            speculative_config=None,
-            cache_config=SimpleNamespace(kv_cache_dtype_skip_layers=[]),
-            parallel_config=SimpleNamespace(
-                worker_cls="auto",
-                distributed_executor_backend="auto",
-                pipeline_parallel_size=2,
-                tensor_parallel_size=1,
-                disable_custom_all_reduce=False,
-            ),
-            model_config=None,
-            scheduler_config=SimpleNamespace(async_scheduling=True),
-        )
-        with pytest.raises(NotImplementedError, match="synchronous scheduling"):
-            MetalPlatform.check_and_update_config(vllm_config)
+        _apply_model_runner_default()
+
+        with pytest.raises(
+            ValueError,
+            match=r"MLX Model Runner V1 has been removed.*Unset .*VLLM_USE_V2_MODEL_RUNNER=1",
+        ):
+            VllmConfig(watermark_config=WatermarkConfig(key=0) if watermark else None)
 
     def test_check_and_update_config_rejects_pipeline_with_speculative_decoding(
         self,
@@ -724,13 +724,18 @@ class TestMetalPlatform:
         with pytest.raises(NotImplementedError, match="single process"):
             MetalPlatform.check_and_update_config(vllm_config)
 
-    def test_check_and_update_config_allows_explicit_v2_model_runner(
-        self, monkeypatch: pytest.MonkeyPatch
+    @pytest.mark.parametrize("runner_env", [None, "1"], ids=["default", "explicit"])
+    def test_mlx_uses_v2_model_runner_without_triton(
+        self, monkeypatch: pytest.MonkeyPatch, runner_env: str | None
     ) -> None:
-        """The platform hook runs before upstream's Triton validation."""
-        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+        """Registration selects V2 before upstream config resolves the runner."""
+        if runner_env is None:
+            monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
+        else:
+            monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", runner_env)
         monkeypatch.setenv("VLLM_METAL_BACKEND", "mlx")
         monkeypatch.setattr("vllm.config.vllm.HAS_TRITON", False)
+        _apply_model_runner_default()
 
         config = VllmConfig(
             parallel_config=ParallelConfig(
@@ -770,27 +775,23 @@ class TestMetalPlatform:
             async_scheduling is not False
         )
 
-    @pytest.mark.parametrize(
-        ("backend", "use_v2"), [("mlx", "0"), ("mlx", "1"), ("mps", "1")]
-    )
+    @pytest.mark.parametrize("backend", ["mlx", "mps"])
     @pytest.mark.parametrize("flag", ["enable_trace_replay", "return_sampling_mask"])
     def test_metal_rejects_unsupported_replay(
-        self, monkeypatch: pytest.MonkeyPatch, backend: str, use_v2: str, flag: str
+        self, monkeypatch: pytest.MonkeyPatch, backend: str, flag: str
     ) -> None:
-        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", use_v2)
+        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
         monkeypatch.setenv("VLLM_METAL_BACKEND", backend)
         config = self._platform_config(model_config=SimpleNamespace(**{flag: True}))
 
         with pytest.raises(NotImplementedError, match=f"Metal does not support {flag}"):
             MetalPlatform.check_and_update_config(config)
 
-    @pytest.mark.parametrize(
-        ("backend", "use_v2"), [("mlx", "0"), ("mlx", "1"), ("mps", "1")]
-    )
-    def test_metal_rejects_watermarking_even_when_forced_by_config(
-        self, monkeypatch: pytest.MonkeyPatch, backend: str, use_v2: str
+    @pytest.mark.parametrize("backend", ["mlx", "mps"])
+    def test_metal_rejects_watermarking(
+        self, monkeypatch: pytest.MonkeyPatch, backend: str
     ) -> None:
-        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", use_v2)
+        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
         monkeypatch.setenv("VLLM_METAL_BACKEND", backend)
         monkeypatch.setattr("vllm.config.vllm.HAS_TRITON", False)
 
@@ -799,13 +800,11 @@ class TestMetalPlatform:
         ):
             VllmConfig(watermark_config=WatermarkConfig(key=0))
 
-    @pytest.mark.parametrize(
-        ("backend", "use_v2"), [("mlx", "0"), ("mlx", "1"), ("mps", "1")]
-    )
+    @pytest.mark.parametrize("backend", ["mlx", "mps"])
     def test_metal_rejects_prefill_context_parallelism(
-        self, monkeypatch: pytest.MonkeyPatch, backend: str, use_v2: str
+        self, monkeypatch: pytest.MonkeyPatch, backend: str
     ) -> None:
-        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", use_v2)
+        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
         monkeypatch.setenv("VLLM_METAL_BACKEND", backend)
         monkeypatch.setattr("vllm.config.vllm.HAS_TRITON", False)
 
@@ -1560,19 +1559,17 @@ class TestMetalPlatform:
             ),
         )
 
-    @pytest.mark.parametrize("use_v2", ["0", "1"])
     def test_check_and_update_config_disables_async_scheduling_for_spec_decode(
         self,
         monkeypatch: pytest.MonkeyPatch,
-        use_v2: str,
     ) -> None:
-        """SD uses synchronous scheduling with both V1 and V2 model runners.
+        """Metal speculative decoding requires synchronous scheduling.
 
         vLLM 0.28.0 auto-enables async scheduling for draft-model SD
         (vllm#48341) before the platform hook runs; Metal proposers hand
         drafts back synchronously via take_draft_token_ids().
         """
-        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", use_v2)
+        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
         vllm_config = self._platform_config(
             speculative_config=SimpleNamespace(
                 method="draft_model",

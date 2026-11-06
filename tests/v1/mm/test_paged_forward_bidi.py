@@ -10,6 +10,7 @@ import mlx.core as mx
 import pytest
 import torch
 from vllm.sampling_params import SamplingParams
+from vllm.v1.core.sched.output import NewRequestData
 
 import vllm_metal.v1.model_runner as model_runner_module
 from tests.v1.mm.test_paged_forward_mm import (
@@ -375,7 +376,7 @@ class TestKeepDropRule:
 
 
 class TestLifecycle:
-    def test_state_is_dropped_on_eviction_and_resume(self) -> None:
+    def test_state_is_reset_on_readmission_and_dropped_on_eviction(self) -> None:
         adapter = _BidiAdapter()
         runner = _runner(adapter)
         runner.encoder_cache.add_request("req", [_image_feature()])
@@ -385,14 +386,31 @@ class TestLifecycle:
             runner,
             _mm_prefill("req", token_ids=PROMPT, prompt_len=6, full_prompt=PROMPT),
         )
-        assert "req" in runner._mm_bidi_states
-
-        runner._reconcile_request_lifecycle(set(), resumed_req_ids={"req"})
+        assert runner._mm_bidi_states["req"].first_prefill_start == 0
+        runner._request_states["req"] = RequestState(
+            token_ids=PROMPT,
+            prompt_len=len(PROMPT),
+            sampling_params=SamplingParams(),
+        )
+        runner._reconcile_request_lifecycle(set(), preempted_req_ids={"req"})
+        new_req = NewRequestData(
+            req_id="req",
+            prompt_token_ids=PROMPT,
+            prefill_token_ids=PROMPT,
+            mm_features=[_image_feature()],
+            sampling_params=SamplingParams(),
+            pooling_params=None,
+            block_ids=([0],),
+            num_computed_tokens=1,
+            lora_request=None,
+        )
+        scheduler_output = _scheduler_output()
+        scheduler_output.num_scheduled_tokens = {"req": len(PROMPT) - 1}
+        batch = model_runner_module._ExecutionBatch()
+        runner._handle_new_requests(batch, [new_req], scheduler_output)
         assert "req" not in runner._mm_bidi_states
 
-        _forward(
-            runner,
-            _mm_prefill("req", token_ids=PROMPT, prompt_len=6, full_prompt=PROMPT),
-        )
+        _forward(runner, runner._build_prefill_pack(batch)[0])
+        assert runner._mm_bidi_states["req"].first_prefill_start == 1
         runner._reconcile_request_lifecycle({"req"})
         assert "req" not in runner._mm_bidi_states
