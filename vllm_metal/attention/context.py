@@ -80,6 +80,9 @@ class PagedAttentionContext:
     # This lets attention wrappers distinguish pure prefill from mixed prefill+decode
     # without reverse-engineering one-token segments from ``cu_seqlens``.
     num_decode_requests: int = 0
+    # Request ids in packed order, set by the hybrid runtime: KDA and sparse MLA
+    # keep speculative verify records per request until acceptance.
+    req_ids: list[str] = field(default_factory=list)
     # Number of query rows contributed by the decode prefix. This differs from
     # ``num_decode_requests`` for speculative verification windows.
     num_decode_tokens: int = 0

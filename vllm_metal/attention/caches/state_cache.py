@@ -13,6 +13,7 @@ import mlx.core as mx
 if TYPE_CHECKING:
     from vllm_metal.attention.context import PagedAttentionContext
     from vllm_metal.attention.impls.gdn_spec import GDNSpecVerifyStep
+    from vllm_metal.attention.impls.kda import KDAVerifySpan
 
 
 @functools.cache
@@ -54,6 +55,8 @@ class PagedStateCache:
         # fixup (speculative decode on hybrid GDN models); None off the
         # speculative path. Owned by gdn_spec, cleared every step.
         self.spec_verify_stash: GDNSpecVerifyStep | None = None
+        # KDA's verify spans, until acceptance (kda.accept_kda_verify_spans).
+        self.kda_verify_spans: list[KDAVerifySpan] = []
 
     def store_conv_state(self, layer_idx: int, array: mx.array) -> None:
         """Store a layer's updated conv pool, keeping pool siblings aliased."""
@@ -370,7 +373,7 @@ class PagedStateCache:
 
 
 class StateSlotArraysCache:
-    """MLX-LM ``ArraysCache`` view over scheduler-owned state rows."""
+    """MLX-LM/mlx-vlm ``ArraysCache`` view over scheduler-owned state rows."""
 
     __slots__ = (
         "_cache_idx",
@@ -434,6 +437,24 @@ class StateSlotArraysCache:
 
     def advance(self, num_tokens: int) -> None:
         """Only length metadata advances, and packed slices carry none."""
+
+    def update_window(
+        self, index: int, source: mx.array, width: int, *, lengths: None = None
+    ) -> mx.array:
+        """mlx-vlm protocol: keep the trailing causal window of ``source``."""
+        self[index] = source[:, source.shape[1] - width :]
+        return self[index]
+
+    def update_recurrent(
+        self,
+        index: int,
+        length: int,
+        update: Callable[[mx.array, None], tuple[mx.array, ...]],
+    ) -> tuple[mx.array, mx.array]:
+        """mlx-vlm protocol: run one transition from the stored recurrent state."""
+        output, state = update(self[index], None)[:2]
+        self[index] = state
+        return output, state
 
     def flush(self) -> None:
         """Write the updated cache rows back to their scheduler-owned slots."""

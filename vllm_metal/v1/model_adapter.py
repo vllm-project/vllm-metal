@@ -363,12 +363,18 @@ class ModelAdapter(Protocol):
         """
 
     def build_multimodal_adapter(
-        self, model: Any, hf_config: Any, *, sidecar: Any | None = None
+        self,
+        model: Any,
+        hf_config: Any,
+        *,
+        sidecar: Any | None = None,
+        vllm_config: Any | None = None,
     ) -> MultimodalRuntimeAdapter | None:
         """Return a model-owned multimodal adapter for native VLM execution.
 
         ``sidecar`` is the loaded :class:`Gemma4VisionSidecar` on the
-        ``text_sidecar`` path and ``None`` otherwise.
+        ``text_sidecar`` path and ``None`` otherwise. ``vllm_config`` is the
+        engine's vLLM config; GLM-5-Next builds no adapter without it.
         """
 
     def build_yoco_cache_mapping(
@@ -439,6 +445,7 @@ _LFM2_VL_ARCHITECTURES: frozenset[str] = frozenset({"Lfm2VlForConditionalGenerat
 # d1 checkpoints also declare ``lfm3_vl`` but add decision heads, so match the
 # generative architecture only.
 _LFM3_VL_ARCHITECTURES: frozenset[str] = frozenset({"Lfm3VlForConditionalGeneration"})
+_GLM5_NEXT_MODEL_TYPES: frozenset[str] = frozenset({"glm5_next"})
 
 
 class DefaultModelAdapter(ModelAdapter):
@@ -638,6 +645,11 @@ class DefaultModelAdapter(ModelAdapter):
                 keep_audio,
                 keep_video,
             )
+        elif getattr(hf_config, "model_type", None) in _GLM5_NEXT_MODEL_TYPES:
+            self._restrict_modalities(
+                model_config.multimodal_config, keep_audio=False, keep_video=False
+            )
+            logger.info("Metal: GLM-5-Next serves images; video inputs are refused")
 
     @staticmethod
     def _restrict_modalities(
@@ -657,7 +669,7 @@ class DefaultModelAdapter(ModelAdapter):
             current = limits.get(modality)
             if current is not None and int(getattr(current, "count", 0)) > 0:
                 logger.warning(
-                    "Metal: %s inputs are unsupported on the Gemma 4 sidecar path; "
+                    "Metal: %s inputs are unsupported for this model; "
                     "overriding --limit-mm-per-prompt %s=%s with 0",
                     modality,
                     modality,
@@ -993,7 +1005,12 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
         return apply_pipeline_split(self.text_model(model), pp)
 
     def build_multimodal_adapter(
-        self, model: Any, hf_config: Any, *, sidecar: Any | None = None
+        self,
+        model: Any,
+        hf_config: Any,
+        *,
+        sidecar: Any | None = None,
+        vllm_config: Any | None = None,
     ) -> MultimodalRuntimeAdapter | None:
         """Build the native multimodal adapter for supported model families."""
         if sidecar is not None:
@@ -1051,6 +1068,35 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
             return cast(
                 MultimodalRuntimeAdapter,
                 Lfm2VlMultimodalAdapter.from_loaded_model(model),
+            )
+
+        if model_type in _GLM5_NEXT_MODEL_TYPES:
+            # With zero media limits there is nothing to encode: text only.
+            if (
+                vllm_config is None
+                or not vllm_config.model_config.supports_multimodal_inputs
+            ):
+                return None
+            from vllm.multimodal import MULTIMODAL_REGISTRY
+            from vllm.multimodal.encoder_budget import MultiModalBudget
+
+            from vllm_metal.multimodal.glm5_next import Glm5NextMultimodalAdapter
+
+            # One item at a time: profile vLLM's per-item maximum, like its GPU runner.
+            budget = MultiModalBudget(
+                vllm_config, MULTIMODAL_REGISTRY, enable_cache=False
+            )
+            max_tokens = max(budget.mm_max_toks_per_item.values())
+            logger.info(
+                "Metal: GLM-5-Next profiles a %d-token vision encode, the largest "
+                "item its processor settings allow",
+                max_tokens,
+            )
+            return cast(
+                MultimodalRuntimeAdapter,
+                Glm5NextMultimodalAdapter.from_loaded_model(
+                    model, max_encode_tokens=max_tokens
+                ),
             )
 
         return None

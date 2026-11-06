@@ -7,8 +7,8 @@ for method behavior and configuration details.
 | | MTP | Draft model | N-gram |
 |---|---|---|---|
 | `--speculative-config` method | `mtp` | `draft_model` | `ngram` |
-| Target models | Gemma4 | Non-hybrid paged-attention models | Non-hybrid paged-attention models and hybrid GDN targets |
-| Draft source | Matching Gemma4 assistant checkpoint | Separate smaller model | Prompt and output token history |
+| Target models | Gemma4, GLM-5.3-Flash | Non-hybrid paged-attention models | Non-hybrid paged-attention models and hybrid GDN targets |
+| Draft source | Matching Gemma4 assistant checkpoint, or GLM-5.3-Flash's own MTP layer | Separate smaller model | Prompt and output token history |
 | `num_speculative_tokens` | Configurable (2–3 typical) | Configurable (3–5 typical) | Configurable (3–5 typical) |
 | Additional model weights | Assistant checkpoint | Draft model | None |
 | Additional KV cache | None; reads target KV | Second scheduler-managed cache | None |
@@ -28,9 +28,11 @@ These methods currently have these Metal-specific constraints:
   speculation.
 - Scheduling must be synchronous. The Metal platform disables async scheduling
   when speculative decoding is configured.
-- Pipeline parallelism is not supported with speculative decoding.
+- Pipeline parallelism is not supported with speculative decoding, except
+  GLM-5.3-Flash MTP.
 - Multi-token verification is not supported on the multimodal paged path,
-  including text speculative decode sharing a batch with multimodal prefill.
+  including text speculative decode sharing a batch with multimodal prefill,
+  except for GLM-5.3-Flash, whose language model reads no positions.
 - Heterogeneous draft vocabularies are not supported.
 - `long_prefill_token_threshold`, when set, must be at least
   `1 + num_speculative_tokens`.
@@ -70,10 +72,10 @@ N-gram speculation supports the text-only execution path on hybrid GDN targets
   end-to-end serving throughput on representative workloads and concurrency
   before enabling it.
 
-Draft-model and MTP methods on hybrid targets remain unsupported until their
-proposers are validated with the state staging and boundary caps. Unsupported
-hybrid speculative pairings — a non-ngram method, or a non-GDN hybrid state
-family (mamba2, KDA, shortconv) — are rejected at startup, not at the first
+Draft-model methods and MTP other than GLM-5.3-Flash's on hybrid targets remain
+unsupported until their proposers are validated with the state staging and
+boundary caps. Unsupported hybrid speculative pairings — any other method, or a
+mamba2 or shortconv state family — are rejected at startup, not at the first
 verification.
 
 ## Gemma4 MTP
@@ -108,6 +110,34 @@ vllm serve "$TARGET" \
 
 Remote Hugging Face checkpoints are supported. Pin `revision` in
 `speculative_config` when publishing benchmark results.
+
+## GLM-5.3-Flash MTP
+
+GLM-5.3-Flash drafts with its own MTP layer through mlx-vlm's
+`Glm5NextMTPDraftModel`, which shares the target's embedding and LM head. MLX
+conversions drop that layer, so split it from the source checkpoint with
+`mlx_vlm.split_mtp` and name the result with `glm5_next_mtp_drafter`:
+
+```bash
+python -m mlx_vlm.split_mtp --source zai-org/GLM-5.3-Flash --output /path/to/glm-5.3-flash-mtp
+
+vllm serve /path/to/GLM-5.3-Flash-MLX \
+    --no-async-scheduling \
+    --speculative-config '{"method":"mtp","num_speculative_tokens":1}' \
+    --additional-config '{"glm5_next_mtp_drafter":"/path/to/glm-5.3-flash-mtp"}'
+```
+
+- Each request keeps its drafter cache outside the scheduler's KV cache; on a
+  prefix-cache hit it starts at the first uncached token.
+- A verify step writes the KDA state and the sparse layers' pooled keys as if
+  every draft were accepted. A partial accept restores the committed KDA state
+  and the committed unfinished pool's raw keys from mlx-vlm's cache records.
+- Under pipeline parallelism the last stage drafts, and one batch is in
+  flight at a time: vLLM takes drafts before it processes the sampled tokens of
+  an in-flight batch. Earlier stages learn a request's accepted drafts from its
+  next step's scheduler output and restore their state then.
+- At `pipeline_parallel_size` 1, steps that carry an image request return no
+  hidden states, and the requests in them stop drafting.
 
 ## Draft model
 

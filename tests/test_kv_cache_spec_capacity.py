@@ -6,14 +6,17 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import mlx.core as mx
+import pytest
 import torch
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_planning import get_uniform_page_size
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec, MLAAttentionSpec
 
 from tests.stub_runner import (
+    initialize_glm5_next_runtime,
     make_bailing_hybrid_plan,
     make_gdn_hybrid_plan,
+    make_glm5_next_stub_runner,
     make_nemotron_hybrid_plan,
     make_stub_runner,
 )
@@ -109,7 +112,19 @@ def test_plain_attention_spec_is_unchanged() -> None:
     assert _engine_blocks(specs, metal_per_block) == POOL_BLOCKS
 
 
-def test_hybrid_spec_omits_stateless_layers() -> None:
+@pytest.mark.parametrize(
+    ("first_layer_idx", "expected"),
+    [
+        (0, {"layers.0.mixer", "layers.2.self_attn", "layers.3.mixer"}),
+        # A pipeline stage names its layers globally: vLLM merges every
+        # stage's spec by name.
+        (1, {"layers.2.self_attn", "layers.3.mixer"}),
+    ],
+    ids=["whole_model", "pipeline_stage"],
+)
+def test_hybrid_spec_omits_stateless_layers(
+    first_layer_idx: int, expected: set[str]
+) -> None:
     runner = make_stub_runner(
         model_config=SimpleNamespace(
             runner_type="generate",
@@ -117,8 +132,11 @@ def test_hybrid_spec_omits_stateless_layers() -> None:
             max_model_len=2048,
             is_hybrid=True,
         ),
-        num_layers=4,
-        hybrid_runtime_plan=make_nemotron_hybrid_plan("M-*M"),
+        num_layers=4 - first_layer_idx,
+        first_layer_idx=first_layer_idx,
+        hybrid_runtime_plan=make_nemotron_hybrid_plan("M-*M").for_layers(
+            first_layer_idx, 4
+        ),
         num_kv_heads=1,
         head_dim=128,
         kv_cache_dtype=mx.float16,
@@ -132,11 +150,7 @@ def test_hybrid_spec_omits_stateless_layers() -> None:
 
     specs = runner._cache_policy.get_kv_cache_spec()
 
-    assert set(specs) == {
-        "layers.0.mixer",
-        "layers.2.self_attn",
-        "layers.3.mixer",
-    }
+    assert set(specs) == expected
 
 
 def test_hybrid_mamba_spec_reserves_one_state_block_per_request() -> None:
@@ -204,3 +218,49 @@ def test_bailing_hybrid_emits_mla_and_kda_specs() -> None:
 
     assert isinstance(specs["layers.0.linear_attn"], MambaSpec)
     assert isinstance(specs["layers.1.self_attn"], MLAAttentionSpec)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "error"),
+    [
+        ({"qk_rope_head_dim": 64}, "qk_rope_head_dim 0"),
+        ({"indexer_types": ["full"] * 3 + ["shared"]}, "shared"),
+        ({"index_kpool_always_select_tail": False}, "always_select_tail"),
+        ({"block_size": 34}, "multiple of index_kpool"),
+        ({"prefix_match_unit": 2}, "multiple of index_kpool"),
+    ],
+    ids=[
+        "rope",
+        "shared_indexer",
+        "no_tail",
+        "split_pool",
+        "hit_splits_pool",
+    ],
+)
+def test_glm5_next_specs_refuse_unsupported_configs(overrides, error) -> None:
+    """What the paged sparse layout cannot serve fails loudly instead of being
+    laid out: a RoPE latent, a layer reusing another layer's top-k, a
+    checkpoint that drops the incomplete tail pool, and a block or prefix-hit
+    unit that splits a pool."""
+    runner = make_glm5_next_stub_runner(**overrides)
+
+    with pytest.raises((ValueError, NotImplementedError), match=error):
+        runner._cache_policy.get_kv_cache_spec()
+
+
+def test_glm5_next_pooled_keys_share_the_latent_block() -> None:
+    """The pooled keys sit in the latent pages, so vLLM keeps the sparse
+    layers' KV groups at the latent block (prefix hits land on every block),
+    and the planner sizes a block as vLLM lays it out."""
+    runner = make_glm5_next_stub_runner()
+    runtime = initialize_glm5_next_runtime(runner, 12)
+
+    groups = runtime.storage.config.kv_cache_groups
+    assert {
+        group.kv_cache_spec.block_size
+        for group in groups
+        if isinstance(group.kv_cache_spec, MLAAttentionSpec)
+    } == {32}
+    assert runtime.storage.nbytes == (
+        12 * runner._cache_policy.get_cache_block_size_bytes()
+    )

@@ -15,7 +15,7 @@ from types import SimpleNamespace
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
-from mlx_lm.models import qwen3
+from mlx_lm.models import qwen3, qwen3_5
 
 from vllm_metal.distributed.pipeline import (
     PipelinedModel,
@@ -282,6 +282,32 @@ class TestPipelinedModel:
         assert out == "logits"
         assert stub.input_embeddings is None
 
+    @pytest.mark.parametrize("recv_first", [True, False])
+    def test_later_stage_waits_for_the_receive_alone_on_the_host(
+        self, monkeypatch: pytest.MonkeyPatch, recv_first: bool
+    ) -> None:
+        # The ring backend receives on the CPU, so a GPU command buffer that read
+        # the wire would wait through the whole upstream step, which the Metal
+        # watchdog counts. A forward that may submit GPU work itself receives
+        # before it is built; otherwise the caller's wait evaluates the receive,
+        # and nothing else, once.
+        stub = _StageStubModel()
+        wrapper = PipelinedModel(stub, _pp(1, 3))
+        wire = mx.ones((4, 32), dtype=wrapper._wire_dtype)
+        evaluated: list[tuple[mx.array, ...]] = []
+        monkeypatch.setattr(mx.distributed, "recv", lambda *args, **kwargs: wire)
+        monkeypatch.setattr(mx, "eval", lambda *arrays: evaluated.append(arrays))
+
+        wrapper(mx.zeros((1, 4), dtype=mx.int32), recv_first=recv_first)
+
+        assert len(evaluated) == int(recv_first)
+        assert stub.calls["backbone"].shape == (1, 4, 32)
+        wrapper.wait_for_recv()
+        wrapper.wait_for_recv()
+        assert len(evaluated) == 1
+        assert len(evaluated[0]) == 1
+        assert evaluated[0][0] is wire
+
     def test_wire_descriptor_skips_packed_quant_weight(self) -> None:
         # hidden from config; dtype from the first FLOATING param of the first owned
         # layer, NOT by probing embed_tokens (a streaming non-first stage does not
@@ -447,3 +473,135 @@ class TestDummyForwardMlxLmContract:
 
         assert out.shape == (1, 4, 32)
         assert out.dtype == wrapper._wire_dtype
+
+
+def _micro_qwen3_5() -> qwen3_5.Model:
+    text_config = {
+        "model_type": "qwen3_5",
+        "hidden_size": 32,
+        "intermediate_size": 64,
+        "num_hidden_layers": 6,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 8,
+        "vocab_size": 64,
+        "linear_num_value_heads": 2,
+        "linear_num_key_heads": 1,
+        "linear_key_head_dim": 8,
+        "linear_value_head_dim": 8,
+        "linear_conv_kernel_dim": 4,
+        "full_attention_interval": 2,
+    }
+    return qwen3_5.Model(qwen3_5.ModelArgs("qwen3_5", text_config))
+
+
+class TestGdnHybridStages:
+    def test_two_stages_reproduce_the_full_model_logits(self) -> None:
+        # mlx_lm's qwen3_5 keeps its text args on ``language_model``. Stage 0
+        # starts on a GDN layer, stage 1 on an attention layer.
+        mx.random.seed(0)
+        full = _micro_qwen3_5()
+        input_ids = mx.array([[1, 5, 9, 2, 7, 3]])
+        expected = full(input_ids)
+
+        stages = []
+        for rank in range(2):
+            model = _micro_qwen3_5()
+            model.update(full.parameters())
+            pp = _pp(rank, 2)
+            apply_pipeline_split(model, pp)
+            stages.append(PipelinedModel(model, pp))
+        wire = stages[0]._stage_forward(input_ids, None)
+        logits = stages[1]._stage_forward(input_ids, wire)
+
+        assert wire.shape == (1, 6, stages[1]._wire_hidden)
+        assert bool(mx.allclose(logits, expected, rtol=1e-5, atol=1e-5))
+
+
+def _micro_glm5_next() -> nn.Module:
+    from mlx_vlm.models.glm5_next.config import TextConfig
+    from mlx_vlm.models.glm5_next.language import LanguageModel
+
+    return LanguageModel(
+        TextConfig(
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=32,
+            moe_intermediate_size=16,
+            num_hidden_layers=4,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            n_routed_experts=4,
+            num_experts_per_tok=2,
+            first_k_dense_replace=1,
+            q_lora_rank=16,
+            kv_lora_rank=16,
+            qk_nope_head_dim=8,
+            qk_head_dim=8,
+            v_head_dim=8,
+            index_n_heads=2,
+            index_head_dim=8,
+            index_topk=8,
+            index_kpool=4,
+            linear_num_heads=2,
+            linear_head_dim=8,
+        )
+    )
+
+
+class TestHyperConnectionStages:
+    # Spliced input embeddings stand in for a multimodal prompt's.
+    @pytest.mark.parametrize("spliced", [False, True])
+    def test_two_stages_reproduce_the_full_model_logits(self, spliced: bool) -> None:
+        # GLM-5-Next keeps hc_mult residual streams between layers, so the wire
+        # must carry all of them for the split to match the unsplit model.
+        mx.random.seed(0)
+        full = _micro_glm5_next()
+        input_ids = mx.array([[1, 5, 9, 2, 7, 3]])
+        inputs_embeds = None
+        if spliced:
+            inputs_embeds = full.model.embed_tokens(input_ids)
+            inputs_embeds[:, 1:3] = mx.random.normal((1, 2, 32))
+        expected = full(input_ids, inputs_embeds=inputs_embeds).logits
+
+        stages = []
+        for rank in range(2):
+            model = _micro_glm5_next()
+            model.update(full.parameters())
+            pp = _pp(rank, 2)
+            apply_pipeline_split(model, pp)
+            stages.append(PipelinedModel(model, pp))
+        wire = stages[0](input_ids, inputs_embeds=inputs_embeds)
+        logits = stages[1]._stage_forward(input_ids, wire)
+
+        assert wire.shape == (1, 6, stages[1]._wire_hidden)
+        assert bool(mx.allclose(logits, expected, rtol=1e-5, atol=1e-5))
+
+
+def test_drafting_under_pipeline_parallelism_keeps_one_batch_in_flight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """vLLM takes a step's drafts before it processes that step's sampled
+    tokens, so drafting under synchronous PP keeps one batch in flight."""
+    from vllm.config import VllmConfig
+
+    from vllm_metal.patches.pp_speculative_batches import (
+        run_one_batch_when_drafting_under_pp,
+    )
+
+    monkeypatch.setattr(
+        VllmConfig, "max_concurrent_batches", VllmConfig.max_concurrent_batches
+    )
+    run_one_batch_when_drafting_under_pp()
+    config = object.__new__(VllmConfig)
+    object.__setattr__(
+        config, "parallel_config", SimpleNamespace(pipeline_parallel_size=2)
+    )
+    object.__setattr__(
+        config, "scheduler_config", SimpleNamespace(async_scheduling=False)
+    )
+    object.__setattr__(config, "speculative_config", None)
+    assert config.max_concurrent_batches == 2
+
+    object.__setattr__(config, "speculative_config", SimpleNamespace())
+    assert config.max_concurrent_batches == 1

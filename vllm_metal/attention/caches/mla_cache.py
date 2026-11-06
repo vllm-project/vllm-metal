@@ -21,7 +21,10 @@ class MLAPagedLatentCache:
 
     @classmethod
     def from_upstream(cls, storage, names) -> MLAPagedLatentCache:
-        """Bind latent views from vLLM's resolved cache layout."""
+        """Bind latent views from vLLM's resolved cache layout.
+
+        A block holds one row per stored state.
+        """
         if not names:
             raise ValueError("MLA cache requires at least one layer")
 
@@ -42,22 +45,28 @@ class MLAPagedLatentCache:
                     f"{actual}; expected {expected} from {names[0]!r}"
                 )
 
-        cache = cls(
-            num_layers=len(names),
-            latent_dim=first.head_size,
-            num_blocks=storage.config.num_blocks,
-            block_size=first.block_size,
-            _allocate=False,
-        )
         latent_tensors = []
         for name in names:
             latent = storage.tensors[name].transpose(1, 2)
             if latent.shape[2] != 1:
                 raise ValueError("MLA cache requires exactly one latent head")
             latent_tensors.append(latent.squeeze(2))
-        cache.latent_caches = storage.views(latent_tensors)
+        return cls.from_views(storage, latent_tensors)
+
+    @classmethod
+    def from_views(cls, storage, tensors) -> MLAPagedLatentCache:
+        """Bind ``[num_blocks, block_size, latent_dim]`` views of the storage."""
+        num_blocks, block_size, latent_dim = tensors[0].shape
+        cache = cls(
+            num_layers=len(tensors),
+            latent_dim=latent_dim,
+            num_blocks=num_blocks,
+            block_size=block_size,
+            _allocate=False,
+        )
+        cache.latent_caches = storage.views(tensors)
         cache.dtype = cache.latent_caches[0].dtype
-        cache.has_dense_pages = all(tensor.is_contiguous() for tensor in latent_tensors)
+        cache.has_dense_pages = all(tensor.is_contiguous() for tensor in tensors)
         cache._storage = storage
         return cache
 

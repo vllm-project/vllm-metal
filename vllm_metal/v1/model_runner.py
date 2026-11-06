@@ -71,6 +71,7 @@ from vllm_metal.config import get_config
 from vllm_metal.distributed import (
     PipelinedModel,
     PipelineGroup,
+    is_glm5_next,
     is_non_last_stage,
     pipeline_send,
 )
@@ -99,6 +100,10 @@ from vllm_metal.v1.draft_model_proposer import (
 from vllm_metal.v1.gemma4_mtp import (
     Gemma4MTPAssistantRuntime,
     Gemma4MTPAssistantSource,
+)
+from vllm_metal.v1.glm5_next_mtp_proposer import (
+    Glm5NextMTPProposer,
+    is_glm5_next_mtp,
 )
 from vllm_metal.v1.lora import EncoderLoRATarget, MetalLoRARuntime
 from vllm_metal.v1.mm import EncoderCache
@@ -325,6 +330,16 @@ class _PagedLogitsLayout(NamedTuple):
     cu_seqlens: list[int]
 
 
+class _MMPagedInputs(NamedTuple):
+    """Packed language-model inputs of a multimodal paged step."""
+
+    inputs_embeds: mx.array
+    position_ids: mx.array
+    visual_pos_masks: mx.array
+    deepstack_visual_embeds: Any | None
+    mm_prefill_deltas: dict[str, int]
+
+
 def text_path_selective_logits_allowed(is_vlm: bool, adapter: Any | None) -> bool:
     """Whether the split backbone/head path may serve this model's text batches.
 
@@ -471,6 +486,9 @@ class MetalModelRunner:
         # both to this stage's local slice under pipeline parallelism).
         self.num_layers: int = 0
         self.num_kv_cache_layers: int = 0
+        # Global index of this stage's first layer. KV cache specs name layers
+        # globally: vLLM merges every stage's specs by name.
+        self.first_layer_idx: int = 0
 
         # Per-layer KV cache shapes (None = uniform across layers)
         self.kv_heads_per_layer: list[int] | None = None
@@ -481,6 +499,9 @@ class MetalModelRunner:
         # Async forward state: stashed by execute_model, consumed by
         # sample_tokens (mirrors upstream's execute_model_state pattern).
         self._execute_model_state: _PagedForwardState | None = None
+        # A non-last pipeline stage's verify drafts per request, until the
+        # request's next step says how many were kept.
+        self._pp_verify_drafts: dict[str, tuple[int, ...]] = {}
         # What a failed sample_tokens call raised (type and message); the next
         # execute_model raises on it.
         self._sample_failure: str | None = None
@@ -584,6 +605,10 @@ class MetalModelRunner:
                 if self.hybrid_runtime_plan is not None
                 else None
             )
+            if family == "kda":
+                # GLM-5-Next's sparse layers attend a window like a prefill
+                # segment, without the window kernel and its head bound.
+                return None
             if family != "gdn":
                 return (
                     "window mode does not support non-GDN hybrid state "
@@ -757,6 +782,10 @@ class MetalModelRunner:
             proposer = DFlashProposer if spec.method == "dflash" else DSparkProposer
             self._drafter = proposer.build(self)
             self._aux_capture = self._drafter.target_capture(self._forward_model)
+        elif is_glm5_next_mtp(spec) and not is_non_last_stage(self.pp):
+            # Loaded before memory profiling, like the block drafters; under
+            # pipeline parallelism the last stage, which samples, drafts.
+            self._drafter = Glm5NextMTPProposer.build(self)
         elif spec is not None and spec.uses_draft_model():
             self._drafter = DraftModelProposer.build(
                 speculative_config=spec,
@@ -849,36 +878,45 @@ class MetalModelRunner:
         (``_start_paged_forward``) and the KV-cache spec size only this stage's
         layers — not the full model.
 
-        Only the validated path (uniform SDPA attention, e.g. Qwen3) is supported under
-        pipeline parallelism: fail loud on YOCO / hybrid / MLA models whose
-        KV-cache layer accounting does not map cleanly onto a contiguous layer
-        slice yet.
+        Only the validated paths (uniform SDPA attention, e.g. Qwen3, GDN
+        hybrids, e.g. Qwen3.5, and GLM-5-Next) are supported under pipeline
+        parallelism: fail loud on other YOCO / hybrid / MLA / pooling / VLM
+        configs.
         """
         if pp.size == 1:
             return
 
+        gdn_hybrid = (
+            self.hybrid_runtime_plan is not None
+            and self.hybrid_runtime_plan.family.label == "gdn"
+        )
         unsupported = (
             self._yoco_cache_mapping is not None
-            or self.is_hybrid
-            or self.is_mla
             or self._is_pooling
-            or self._is_vlm
+            or (
+                ((self.is_hybrid and not gdn_hybrid) or self.is_mla or self._is_vlm)
+                and not is_glm5_next(self._forward_model)
+            )
         )
         if unsupported:
             raise NotImplementedError(
                 "Pipeline parallelism on Metal is validated only for uniform-"
-                "attention generation on the paged path (e.g. Qwen3 with "
-                "paged attention); YOCO / hybrid / MLA / "
-                "pooling / VLM (multimodal) configs are not "
-                "supported under PP yet."
+                "attention and GDN hybrid generation on the paged path (e.g. "
+                "Qwen3, or Qwen3.5 with --language-model-only) and GLM-5-Next; "
+                "other YOCO / hybrid / MLA / pooling / VLM (multimodal) configs "
+                "are not supported under PP yet."
             )
 
-        self._model_adapter.apply_pipeline_split(self.model, pp)
+        span = self._model_adapter.apply_pipeline_split(self.model, pp)
+        assert span is not None  # a multi-stage group always splits
         # Mirror the sliced backbone's local layer count onto the runner so
         # offset_caches and KV-cache sizing cover only this stage's layers.
-        local_num_layers = len(self._forward_model.model.layers)
-        self.num_layers = local_num_layers
-        self.num_kv_cache_layers = local_num_layers
+        start, end = span
+        self.first_layer_idx = start
+        self.num_layers = end - start
+        self.num_kv_cache_layers = end - start
+        if self.hybrid_runtime_plan is not None:
+            self.hybrid_runtime_plan = self.hybrid_runtime_plan.for_layers(start, end)
 
         # Install the PP-aware forward wrapper for this stage. It owns the stage
         # forward (recv -> local layers -> final norm + head on the last stage);
@@ -894,6 +932,8 @@ class MetalModelRunner:
         runtime = self._paged_attention_runtime
         if runtime is not None:
             runtime.extend_forward_eval_outputs(eval_outputs)
+        if self._pp_model is not None:
+            self._pp_model.wait_for_recv()
         mx.async_eval(*eval_outputs)
 
     def _extract_logits(self, model_output: Any) -> mx.array:
@@ -1003,6 +1043,11 @@ class MetalModelRunner:
     @property
     def moe_expert_reserved_bytes(self) -> int:
         return 0 if self._expert_store is None else self._expert_store.reserved_bytes
+
+    def sparse_mla_reserve_bytes(self, *, max_running_requests: int) -> int:
+        return self._cache_policy.sparse_mla_reserve_bytes(
+            max_running_requests=max_running_requests
+        )
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """Get KV cache specification.
@@ -1379,6 +1424,9 @@ class MetalModelRunner:
             return
         if Gemma4MTPAssistantSource.is_gemma4_mtp(spec):
             self._drafter = Gemma4MTPProposer(self)
+        elif is_glm5_next_mtp(spec):
+            # Loaded with the model; its MTP layer keeps request-local caches.
+            pass
         elif spec.method in ("dflash", "dspark"):
             from vllm_metal.v1.block_draft_proposer import BlockDraftProposer
 
@@ -1492,6 +1540,11 @@ class MetalModelRunner:
             self._spec_decode_controller.active_spec_decode_tokens(scheduler_output),
             self._paged_request_seq_lens,
         )
+        if is_non_last_stage(self.pp):
+            # The request's next step says which drafts were kept.
+            self._pp_verify_drafts.update(
+                (segment.req_id, segment.draft_token_ids) for segment in decode_segments
+            )
         # Any GDN verify-span stash left from a prior step is stale (consumed
         # or dropped when that step's verification resolved); start clean.
         hybrid_runtime = self._paged_attention_runtime
@@ -1664,7 +1717,7 @@ class MetalModelRunner:
                     input_ids,
                     offset_caches,
                 )
-            elif use_mm_forward:
+            elif use_mm_forward and (self.pp is None or self.pp.size == 1):
                 assert adapter is not None
                 selects = self._mm_forward_selects_rows(adapter)
                 if selects and not self._needs_prompt_logprob_rows(prefill_reqs):
@@ -1695,15 +1748,33 @@ class MetalModelRunner:
                 # layer slice -> final norm + head on the last stage). The runner
                 # owns the downstream send: only the last stage has logits; every
                 # other stage hands its raw hidden state to pipeline_send, whose
-                # lazy op is forced by the async_eval below.
+                # lazy op is forced by the async_eval below. A decode forward is
+                # built while the previous stage still runs; prefill attention
+                # may submit mid-forward, so a prefill step receives first.
+                # Only the first stage holds a multimodal adapter, so only it
+                # splices encoder rows.
                 assert self._pp_model is not None
-                stage_output = self._pp_model(input_ids, cache=offset_caches)
+                inputs_embeds = None
+                if use_mm_forward:
+                    inputs_embeds = self._mm_paged_inputs(
+                        input_ids, prefill_reqs, decode_segments
+                    ).inputs_embeds
+                stage_output = self._pp_model(
+                    input_ids,
+                    cache=offset_caches,
+                    inputs_embeds=inputs_embeds,
+                    recv_first=bool(prefill_reqs),
+                    return_hidden=collect_target_hidden_states,
+                )
+                target_hidden_states = None
+                if collect_target_hidden_states:
+                    # Only the last stage loads a drafter.
+                    stage_output, target_hidden_states = stage_output
                 if self.pp.is_last:
                     logits = self._extract_logits(stage_output)
                 else:
                     logits = None
                     pp_send_handle = pipeline_send(stage_output, self.pp)
-                target_hidden_states = None
             else:
                 # Intermediate-only prefill steps sample nothing: no chunk of
                 # theirs contributes a token, so the lm_head projection over
@@ -2129,6 +2200,14 @@ class MetalModelRunner:
                 apply_spec_decode_acceptance(
                     state_cache, GDNLazyKernels.shared(), committed_rows
                 )
+            hybrid_runtime.accept_spec_verify(
+                {
+                    req_id: len(ids)
+                    for (req_id, _), ids in zip(
+                        decode_reqs, decode_token_ids, strict=True
+                    )
+                }
+            )
 
         # ---- prompt logprobs for requests that asked for them ----
         self._gather_prefill_prompt_logprobs(
@@ -2368,6 +2447,9 @@ class MetalModelRunner:
         """
         if not scheduled_encoder_inputs:
             return
+        # Only the first pipeline stage embeds tokens, so only it encodes.
+        if self.pp is not None and not self.pp.is_first:
+            return
         adapter = self._multimodal_adapter
         if adapter is None or not adapter.forward_ready:
             raise RuntimeError(
@@ -2388,9 +2470,19 @@ class MetalModelRunner:
             return ()
 
         decode_reqs: list[tuple[str, RequestState]] = []
-        for req_id in scheduler_output.scheduled_cached_reqs.req_ids:
+        cached = scheduler_output.scheduled_cached_reqs
+        for i, req_id in enumerate(cached.req_ids):
             state = self._request_states.get(req_id)
-            if state is not None and state.generated_tokens > 0:
+            # A non-last pipeline stage appends this step's sampled tokens
+            # later (_update_pp_stage_states); the scheduler counts them.
+            generated = (
+                cached.num_output_tokens[i]
+                if is_non_last_stage(self.pp)
+                else state.generated_tokens
+                if state is not None
+                else 0
+            )
+            if state is not None and generated > 0:
                 decode_reqs.append((req_id, state))
         return tuple(decode_reqs)
 
@@ -2510,6 +2602,32 @@ class MetalModelRunner:
 
         ``hidden_states_only`` calls ``adapter.call_lm_hidden_states`` instead
         and returns the final hidden states, for the caller's selective head.
+        """
+        adapter = self._multimodal_adapter
+        assert adapter is not None
+        inputs = self._mm_paged_inputs(input_ids, prefill_reqs, decode_segments)
+        call_lm = (
+            cast(Any, adapter).call_lm_hidden_states
+            if hidden_states_only
+            else adapter.call_lm
+        )
+        model_output = call_lm(
+            input_ids,
+            inputs.inputs_embeds,
+            offset_caches,
+            inputs.position_ids,
+            visual_pos_masks=inputs.visual_pos_masks,
+            deepstack_visual_embeds=inputs.deepstack_visual_embeds,
+        )
+        return model_output, inputs.mm_prefill_deltas
+
+    def _mm_paged_inputs(
+        self,
+        input_ids: mx.array,
+        prefill_reqs: list[PrefillRequest],
+        decode_segments: tuple[PagedDecodeSegment, ...],
+    ) -> _MMPagedInputs:
+        """Packed language-model inputs of a multimodal paged step.
 
         Builds per-segment M-RoPE positions (sliced out of the full-prompt
         positions for mm prefill chunks, computed as ``cache_start_pos +
@@ -2526,7 +2644,9 @@ class MetalModelRunner:
         int-offset arange path on text segments.
 
         Any speculative-decode segment in the batch is rejected up
-        front: ``prepare_grouped`` may keep a ``num_query_tokens > 1``
+        front unless verify windows stay one segment per request and the
+        adapter supplies no segment positions:
+        ``prepare_grouped`` may keep a ``num_query_tokens > 1``
         verification window as one ``cu_seqlens`` segment, but this
         method's M-RoPE position handling has only been exercised with
         single-token decode segments. Supplying and validating per-row
@@ -2542,7 +2662,10 @@ class MetalModelRunner:
         assert encoder_cache is not None
 
         for segment in decode_segments:
-            if segment.num_query_tokens > 1:
+            if segment.num_query_tokens > 1 and (
+                getattr(adapter, "supplies_segment_positions", True)
+                or not self.merge_verify_windows
+            ):
                 raise NotImplementedError(
                     "Speculative decode is not supported on the multimodal "
                     "paged path yet: M-RoPE positions for a multi-token "
@@ -2748,21 +2871,13 @@ class MetalModelRunner:
         mm_prefill_deltas = {
             req_id: int(meta[1]) for req_id, meta in mm_request_meta.items()
         }
-
-        call_lm = (
-            cast(Any, adapter).call_lm_hidden_states
-            if hidden_states_only
-            else adapter.call_lm
-        )
-        model_output = call_lm(
-            input_ids,
+        return _MMPagedInputs(
             inputs_embeds,
-            offset_caches,
             position_ids,
-            visual_pos_masks=visual_pos_masks,
-            deepstack_visual_embeds=deepstack_visual_embeds,
+            visual_pos_masks,
+            deepstack_visual_embeds,
+            mm_prefill_deltas,
         )
-        return model_output, mm_prefill_deltas
 
     def _bidi_ranges_for_chunk(
         self, pr: PrefillRequest, features: list[MultiModalFeatureSpec]
@@ -2924,11 +3039,17 @@ class MetalModelRunner:
                 )
 
         cached = scheduler_output.scheduled_cached_reqs
-        if not cached.new_token_ids:
-            return
-        for i, req_id in enumerate(cached.req_ids):
+        drafts = self._pp_verify_drafts
+        for req_id in scheduler_output.finished_req_ids | (
+            scheduler_output.preempted_req_ids or set()
+        ):
+            drafts.pop(req_id, None)
+        # The verify rows each continuing request committed in its last step.
+        committed: dict[str, int] = {}
+        for i, (req_id, new_token_ids) in enumerate(
+            zip(cached.req_ids, cached.new_token_ids, strict=True)
+        ):
             state = self._request_states[req_id]
-            new_token_ids = cached.new_token_ids[i]
             # Append only the tokens not already reflected in token_ids (mirrors
             # upstream's num_new_tokens; tolerates >1 sampled token per step).
             num_new = (
@@ -2937,8 +3058,16 @@ class MetalModelRunner:
                 - len(state.token_ids)
             )
             if num_new > 0:
-                state.token_ids.extend(new_token_ids[-num_new:])
+                # A verify step's accepted drafts precede its sampled token.
+                accepted = drafts.pop(req_id, ())[
+                    : max(0, num_new - len(new_token_ids))
+                ]
+                state.token_ids.extend([*accepted, *new_token_ids][-num_new:])
                 state.generated_tokens = len(state.token_ids) - state.prompt_len
+                committed[req_id] = num_new
+        runtime = self._paged_attention_runtime
+        if isinstance(runtime, HybridPagedAttentionRuntime):
+            runtime.accept_spec_verify(committed)
 
     def _update_cached_request_blocks(
         self,

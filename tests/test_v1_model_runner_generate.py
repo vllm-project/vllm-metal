@@ -2047,8 +2047,14 @@ class TestV1MetalModelRunnerGDNSubmit:
         for actual, expected in zip(submitted[0][1:], runtime._arrays, strict=True):
             assert actual is expected
 
-    def test_non_last_pp_send_submits_runtime_outputs(self, monkeypatch) -> None:
+    @pytest.mark.parametrize("prefill", [True, False])
+    def test_non_last_pp_send_submits_runtime_outputs(
+        self, monkeypatch, prefill: bool
+    ) -> None:
+        # The stage waits for its receive before the submit; a prefill step
+        # waits before building its forward, which may submit mid-graph.
         submitted: list[tuple[object, ...]] = []
+        events: list[object] = []
         runtime = self.make_runtime_with_side_effects()
         runner = make_stub_runner(
             _paged_attention_runtime=runtime,
@@ -2058,13 +2064,28 @@ class TestV1MetalModelRunnerGDNSubmit:
         runner.pp = SimpleNamespace(size=2, is_last=False)
         stage_output = mx.array([[[1.0]]], dtype=mx.float32)
         send_handle = mx.array([2.0], dtype=mx.float32)
-        runner._pp_model = lambda input_ids, cache: stage_output
-        monkeypatch.setattr(mr, "pipeline_send", lambda output, pp: send_handle)
-        monkeypatch.setattr(mr.mx, "async_eval", lambda *args: submitted.append(args))
 
-        runner._start_paged_forward(
-            mr._ExecutionBatch(),
-            prefill_reqs=[
+        class _Stage:
+            def __call__(
+                self, input_ids, *, cache, inputs_embeds, recv_first, return_hidden
+            ):
+                events.append(("forward", recv_first))
+                return stage_output
+
+            def wait_for_recv(self) -> None:
+                events.append("wait")
+
+        def submit(*args) -> None:
+            events.append("submit")
+            submitted.append(args)
+
+        runner._pp_model = _Stage()
+        monkeypatch.setattr(mr, "pipeline_send", lambda output, pp: send_handle)
+        monkeypatch.setattr(mr.mx, "async_eval", submit)
+        prefill_reqs: list[mr.PrefillRequest] = []
+        decode_reqs: list[tuple[str, mr.RequestState]] = []
+        if prefill:
+            prefill_reqs.append(
                 mr.PrefillRequest(
                     req_id="pp-0",
                     token_ids=[1],
@@ -2075,11 +2096,27 @@ class TestV1MetalModelRunnerGDNSubmit:
                     start_pos=0,
                     full_prompt_token_ids=[1],
                 )
-            ],
-            decode_reqs=[],
+            )
+        else:
+            decode_state = mr.RequestState(
+                token_ids=[5, 6],
+                prompt_len=1,
+                sampling_params=SamplingParams(),
+                generator=None,
+                generated_tokens=1,
+            )
+            decode_state.block_ids = [[0]]
+            decode_reqs.append(("pp-0", decode_state))
+            runner._paged_request_seq_lens["pp-0"] = 1
+
+        runner._start_paged_forward(
+            mr._ExecutionBatch(),
+            prefill_reqs=prefill_reqs,
+            decode_reqs=decode_reqs,
             scheduler_output=SchedulerOutput.make_empty(),
         )
 
+        assert events == [("forward", prefill), "wait", "submit"]
         assert len(submitted) == 1
         assert submitted[0][0] is send_handle
         for actual, expected in zip(submitted[0][1:], runtime._arrays, strict=True):
@@ -4889,6 +4926,54 @@ class TestPreemptedReadmission:
         assert entry.prefill.token_ids == [7, 8, 9, 10]
         assert entry.prefill.prompt_len == 4
         assert entry.result_mode == "new_final"
+
+    @pytest.mark.parametrize("skipped_steps", [0, 1])
+    @pytest.mark.parametrize("accepted", [0, 2])
+    def test_non_last_pp_stage_commits_the_accepted_drafts(
+        self, accepted, skipped_steps
+    ) -> None:
+        """After a verify step, a non-last stage learns the kept drafts from
+        the request's next scheduler output, also after steps without it: it
+        appends them before the sampled token and rolls its verify spans back
+        to that depth."""
+        runner = make_stub_runner()
+        runner._request_states["r"] = mr.RequestState(
+            token_ids=[1, 2, 3, 4, 5],
+            prompt_len=4,
+            sampling_params=SamplingParams(),
+            generated_tokens=1,
+        )
+        runner._pp_verify_drafts = {"r": (7, 8)}
+        runner._paged_attention_runtime = Mock(spec=HybridPagedAttentionRuntime)
+        cached = CachedRequestData(
+            req_ids=["r"],
+            resumed_req_ids=set(),
+            new_token_ids=[[9]],
+            all_token_ids={},
+            new_block_ids=[None],
+            num_computed_tokens=[5 + accepted],
+            num_output_tokens=[2 + accepted],
+        )
+        output = self._scheduler_output(self._new_req([1], num_computed_tokens=0), 1)
+        output.scheduled_new_reqs = []
+        for _ in range(skipped_steps):
+            runner._update_pp_stage_states(output)
+        output.scheduled_cached_reqs = cached
+
+        runner._update_pp_stage_states(output)
+
+        assert runner._request_states["r"].token_ids == [
+            1,
+            2,
+            3,
+            4,
+            5,
+            *(7, 8)[:accepted],
+            9,
+        ]
+        runner._paged_attention_runtime.accept_spec_verify.assert_called_with(
+            {"r": accepted + 1}
+        )
 
     def test_non_last_pp_stage_keeps_the_prefill_tokens(self) -> None:
         runner = make_stub_runner()

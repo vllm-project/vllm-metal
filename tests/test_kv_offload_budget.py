@@ -27,6 +27,7 @@ def _planner(
     runner = SimpleNamespace(
         scheduler_memory_reporting_mode=lambda: "paged_attention_layout_budget",
         profile_run=lambda: _GB,
+        sparse_mla_reserve_bytes=lambda **_: 0,
     )
     worker = MetalWorker.__new__(MetalWorker)
     worker.model_runner = runner  # type: ignore[assignment]

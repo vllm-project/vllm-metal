@@ -288,21 +288,26 @@ class TestSpecDecodePolicy:
                 speculative_config=_gemma4_mtp_speculative_config(),
             )
 
-    def test_hybrid_scheduled_tokens_are_accepted(self) -> None:
+    @pytest.mark.parametrize(("method", "family"), [("ngram", "gdn"), ("mtp", "kda")])
+    def test_hybrid_scheduled_tokens_are_accepted(self, method, family) -> None:
         # Hybrid GDN targets verify n-gram drafts through packed decode spans
-        # with a post-verify state fixup (gdn_spec), so the handoff validates.
+        # with a post-verify state fixup (gdn_spec), and KDA targets (GLM-5-Next
+        # MTP) keep each span row's state until acceptance, so the handoff
+        # validates.
         SpeculativeDecodeController().validate_supported(
             _scheduler_output(scheduled_spec_decode_tokens={"r0": [1]}),
             [("r0", _request_state())],
             is_hybrid=True,
-            speculative_config=SimpleNamespace(method="ngram"),
-            hybrid_family="gdn",
+            speculative_config=SimpleNamespace(method=method),
+            hybrid_family=family,
         )
 
     def test_hybrid_rejects_non_gdn_state_family(self) -> None:
-        # The verify-span staging and acceptance rollback live in the GDN
-        # state wrapper only; other hybrid families have no rollback.
-        with pytest.raises(NotImplementedError, match="GDN state family only"):
+        # The verify-span staging and acceptance rollback live in the GDN and
+        # KDA state wrappers only; other hybrid families have no rollback.
+        with pytest.raises(
+            NotImplementedError, match="GDN and KDA state families only"
+        ):
             SpeculativeDecodeController().validate_supported(
                 _scheduler_output(scheduled_spec_decode_tokens={"r0": [1]}),
                 [("r0", _request_state())],
