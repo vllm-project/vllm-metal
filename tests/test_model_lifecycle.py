@@ -229,11 +229,10 @@ def _make_lifecycle(
 
 
 class TestModelLifecycle:
-    def test_audio_cache_dimensions_come_from_language_config(self):
+    def test_cache_dimensions_come_from_nested_language_config(self):
         lifecycle, _ = _make_lifecycle()
         model = SimpleNamespace(
             config=SimpleNamespace(
-                model_type="lfm3_audio",
                 lm_config=SimpleNamespace(**_TEXT_MODEL_ARGS),
                 audio_encoder_config=SimpleNamespace(hidden_size=1024),
             )

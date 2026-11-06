@@ -1,20 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
 """LFM3 audio input with text output on the MLX runner."""
 
+from dataclasses import dataclass
 from typing import Any, Self
 
+import mlx.core as mx
+
 from vllm_metal.multimodal import MultiModalFeatureSpec
-from vllm_metal.multimodal.lfm2_vl.adapter import (
-    Lfm2VlMultimodalAdapter,
-    Lfm2VlVisionEncodeResult,
-)
+from vllm_metal.multimodal.lfm_text import LfmTextAdapter
 from vllm_metal.multimodal.text_backbone import (
     resolve_backbone_embed_tokens,
     resolve_text_backbone,
 )
 
 
-class Lfm3AudioMultimodalAdapter(Lfm2VlMultimodalAdapter):
+@dataclass(frozen=True)
+class Lfm3AudioEncodeResult:
+    """Projected audio embeddings for one feature."""
+
+    hidden_states: mx.array
+    deepstack_visual_embeds: None = None
+
+
+class Lfm3AudioMultimodalAdapter(LfmTextAdapter):
     family = "LFM3-Audio"
     # The language wrapper masks speech placeholders after projecting logits.
     text_path_selective_logits_ok = False
@@ -42,7 +50,7 @@ class Lfm3AudioMultimodalAdapter(Lfm2VlMultimodalAdapter):
 
     def encode_multimodal(
         self, features: list[MultiModalFeatureSpec]
-    ) -> list[Lfm2VlVisionEncodeResult]:
+    ) -> list[Lfm3AudioEncodeResult]:
         outputs = []
         for feature in features:
             if feature.modality != "audio":
@@ -62,5 +70,5 @@ class Lfm3AudioMultimodalAdapter(Lfm2VlMultimodalAdapter):
             )
             if encoded.shape[0] != feature.mm_position.get_num_embeds():
                 raise ValueError("LFM3-Audio encoder and placeholder lengths disagree")
-            outputs.append(Lfm2VlVisionEncodeResult(hidden_states=encoded))
+            outputs.append(Lfm3AudioEncodeResult(hidden_states=encoded))
         return outputs

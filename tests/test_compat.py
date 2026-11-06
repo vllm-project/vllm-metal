@@ -276,7 +276,13 @@ class TestApplyCompatPatches:
         ]
 
 
-_METADATA_ARCHS = frozenset({"Lfm3ForCausalLM", "Lfm3VlForConditionalGeneration", "Lfm3AudioForConditionalGeneration"})
+_METADATA_ARCHS = frozenset(
+    {
+        "Lfm3ForCausalLM",
+        "Lfm3VlForConditionalGeneration",
+        "Lfm3AudioForConditionalGeneration",
+    }
+)
 
 
 class TestModelMetadataCompat:
