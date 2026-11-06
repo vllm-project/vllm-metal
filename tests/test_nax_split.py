@@ -16,10 +16,10 @@ from vllm_metal.attention.nax_split import (
 
 @pytest.fixture(
     params=[
-        pytest.param(144, 3, 0, (24, 4, 256, 16), 784, 31360, id="gqa6-h3"),
-        pytest.param(1328, 6, 1, (24, 4, 256, 16), 784, 31360, id="gqa6-h6"),
-        pytest.param(64, 4, 0, (16, 2, 256, 32), 544, 31680, id="gqa8-h4-q64"),
-        pytest.param(128, 4, 0, (16, 2, 256, 32), 544, 31681, id="gqa8-h4-kv-tail"),
+        pytest.param((144, 3, 0, (24, 4, 256, 16), 784, 31360), id="gqa6-h3"),
+        pytest.param((1328, 6, 1, (24, 4, 256, 16), 784, 31360), id="gqa6-h6"),
+        pytest.param((64, 4, 0, (16, 2, 256, 32), 544, 31680), id="gqa8-h4-q64"),
+        pytest.param((128, 4, 0, (16, 2, 256, 32), 544, 31681), id="gqa8-h4-kv-tail"),
     ]
 )
 def grouped_prefill_inputs(nax_prefill, request):
