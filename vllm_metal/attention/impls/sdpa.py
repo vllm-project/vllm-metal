@@ -781,10 +781,11 @@ def sdpa_forward(
     # The attention output keeps the query dtype, not the cache dtype.
     attention_output_dtype = queries.dtype
 
-    # Reshape to 3D: (1, heads, L, hd) → (L, heads, hd)
-    q_3d = mx.contiguous(queries[0].transpose(1, 0, 2).astype(kv_cache.dtype))
-    k_3d = mx.contiguous(keys[0].transpose(1, 0, 2).astype(kv_cache.dtype))
-    v_3d = mx.contiguous(values[0].transpose(1, 0, 2).astype(kv_cache.dtype))
+    # Reshape to 3D: (1, heads, L, hd) → (L, heads, hd). squeeze(0) is a view;
+    # [0] would gather a copy, which the transpose then makes contiguous again.
+    q_3d = mx.contiguous(queries.squeeze(0).transpose(1, 0, 2).astype(kv_cache.dtype))
+    k_3d = mx.contiguous(keys.squeeze(0).transpose(1, 0, 2).astype(kv_cache.dtype))
+    v_3d = mx.contiguous(values.squeeze(0).transpose(1, 0, 2).astype(kv_cache.dtype))
 
     # --- Kernel-format metadata (memoized per forward) ---
     # Converted on the group's first layer and reused by the rest (see
