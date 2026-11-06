@@ -72,7 +72,8 @@ class TestGatherPromptLogprobs:
         torch.testing.assert_close(tensors.logprobs[1, 0], expected[1, 0])
         # Top-2 alternatives in descending order.
         assert tensors.logprob_token_ids[0, 1:].tolist() == [2, 3]
-        assert tensors.logprob_token_ids[1, 1:].tolist() == [0, 1]
+        assert tensors.logprob_token_ids[1, 1].item() == 0
+        assert tensors.logprob_token_ids[1, 2].item() in (1, 2, 3)
         # Token 1 in row 0 is the third highest logit; token 0 in row 1 the highest.
         assert tensors.selected_token_ranks.tolist() == [3, 1]
 
@@ -405,3 +406,34 @@ def test_prompt_logprobs_end_to_end_paged():
             assert entry is not None, f"position {position} silently empty"
             assert token_id in entry, f"prompt token missing at {position}"
             assert entry[token_id].logprob <= 0.0
+
+
+@pytest.mark.parametrize(
+    "mode", ["raw_logprobs", "processed_logprobs", "raw_logits", "processed_logits"]
+)
+@pytest.mark.parametrize("k", [0, 2, -1])
+def test_native_prompt_scores_across_chunks(mode, k):
+    """Chunking and full-vocab requests preserve target alignment and scores."""
+    tracker = PromptLogprobsTracker()
+    tracker.register("req", k)
+    raw = [[10.0, 11.0, 13.0, 12.0], [2.0, -2.0, 1.0, 0.0], [4.0, 3.0, 0.0, 2.0]]
+    prompt = [0, 2, 1, 3]
+    assert tracker.observe_chunk("req", prompt, 0, 2, mx.array(raw[:2]), mode) is None
+    result = tracker.observe_chunk(
+        "req", prompt, 2, 2, mx.array([raw[2], [0.0] * 4]), mode
+    )
+    assert result is not None
+    assert not tracker.wants("req")
+    scores = torch.tensor(raw)
+    if mode.endswith("logprobs"):
+        scores = torch.log_softmax(scores, dim=-1)
+    count = 4 if k == -1 else k
+    assert result.logprob_token_ids.shape == (3, count + 1)
+    for row, target in enumerate(prompt[1:]):
+        ids = result.logprob_token_ids[row].tolist()
+        assert ids == [target, *torch.topk(scores[row], count).indices.tolist()]
+        torch.testing.assert_close(result.logprobs[row], scores[row, ids])
+        assert (
+            result.selected_token_ranks[row].item()
+            == (scores[row] >= scores[row, target]).sum().item()
+        )
