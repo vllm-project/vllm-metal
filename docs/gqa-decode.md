@@ -20,7 +20,7 @@ best efficiency; this implementation does not adopt its wave-efficiency model.
 ## Automatic eligibility and partition selection
 
 The supported `(query heads, KV heads, head dimension)` geometries are
-`(32,8,128)`, `(24,4,256)`, `(16,2,128)`, and `(16,2,256)`.
+`(32,8,128)`, `(24,8,128)`, `(24,4,256)`, `(16,2,128)`, and `(16,2,256)`.
 Kernel block16 is supported for each; block32 is additionally supported for
 `(24,4,256)` and `(16,2,256)`. The existing scope is not inferred from a model-name
 list.
@@ -73,7 +73,7 @@ For one request on a 40-core GPU this gives:
 | Q/KV/head dimension | Start P256 | Start P512 |
 |---|---:|---:|
 | 32/8/128 | 10,752 | 21,504 |
-| 24/4/256 | 14,080 | 28,160 |
+| 24/8/128 or 24/4/256 | 14,080 | 28,160 |
 | 16/2/128 or 256 | 21,248 | 42,496 |
 
 These values scale with the detected core count; they are not per-device or
