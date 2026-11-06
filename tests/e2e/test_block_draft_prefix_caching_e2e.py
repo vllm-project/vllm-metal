@@ -90,7 +90,7 @@ def _serve(pair, verify_window, caching, path):
     first_windows = []
     reject_next = False
     propose = proposer.propose
-    verify = runner._spec_decode_controller.verify_greedy
+    verify = runner._spec_decode_controller.verify
 
     def record_propose(ctx):
         nonlocal reject_next
@@ -123,8 +123,8 @@ def _serve(pair, verify_window, caching, path):
             reject_next = False
         return result
 
-    def record_verify(logits, requests, segments):
-        result = verify(logits, requests, segments)
+    def record_verify(logits, requests, segments, *args, **kwargs):
+        result = verify(logits, requests, segments, *args, **kwargs)
         for segment, tokens in zip(segments, result, strict=True):
             count = len(segment.draft_token_ids)
             stats["drafted"] += count
@@ -145,7 +145,7 @@ def _serve(pair, verify_window, caching, path):
         return result
 
     proposer.propose = record_propose
-    runner._spec_decode_controller.verify_greedy = record_verify
+    runner._spec_decode_controller.verify = record_verify
     assert_v2_model_runner(llm)
     track_preemptions_and_resumptions(scheduler, stats, resumption_key="resumed")
     records = {}

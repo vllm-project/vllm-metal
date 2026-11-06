@@ -180,10 +180,10 @@ def _serve(
             return result
 
         proposer.propose = check_propose
-        verify = runner._spec_decode_controller.verify_greedy
+        verify = runner._spec_decode_controller.verify
 
-        def record_verify(logits, requests, segments):
-            result = verify(logits, requests, segments)
+        def record_verify(logits, requests, segments, *args, **kwargs):
+            result = verify(logits, requests, segments, *args, **kwargs)
             states = dict(requests)
             for segment, tokens in zip(segments, result, strict=True):
                 state = states[segment.req_id]
@@ -194,7 +194,7 @@ def _serve(
                 stats["rejected"] += len(segment.draft_token_ids) - len(tokens) + 1
             return result
 
-        runner._spec_decode_controller.verify_greedy = record_verify
+        runner._spec_decode_controller.verify = record_verify
         assert_v2_model_runner(llm)
         track_preemptions_and_resumptions(scheduler, stats, resumption_key="resumed")
         # The prefill's first output can finish the request by itself.

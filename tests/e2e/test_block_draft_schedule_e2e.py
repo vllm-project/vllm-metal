@@ -70,7 +70,7 @@ def _serve_scheduled(
         "injected_rejection": 0,
     }
     propose = proposer.propose
-    verify = runner._spec_decode_controller.verify_greedy
+    verify = runner._spec_decode_controller.verify
 
     def record_propose(ctx):
         result = propose(ctx)
@@ -101,8 +101,8 @@ def _serve_scheduled(
                 stats["injected_rejection"] += 1
         return result
 
-    def record_verify(logits, requests, segments):
-        result = verify(logits, requests, segments)
+    def record_verify(logits, requests, segments, *args, **kwargs):
+        result = verify(logits, requests, segments, *args, **kwargs)
         for segment, tokens in zip(segments, result, strict=True):
             stats["accepted"] += len(tokens) - 1
             stats["rejected"] += len(segment.draft_token_ids) - len(tokens) + 1
@@ -111,7 +111,7 @@ def _serve_scheduled(
     proposer.propose = record_propose
     assert_v2_model_runner(llm)
     track_preemptions_and_resumptions(scheduler, stats)
-    runner._spec_decode_controller.verify_greedy = record_verify
+    runner._spec_decode_controller.verify = record_verify
 
     def step_until(predicate):
         outputs = {}
