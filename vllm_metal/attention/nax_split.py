@@ -18,8 +18,9 @@ many short requests distinct from one long request with the same tile count.
 Native dispatch decides whether to use the whole-batch or prefill-subset score.
 Windowed attention and callers missing layout metadata retain the legacy rule.
 
-The hint describes the single-head BQ64 baseline. Native grouped GQA selection
-compares against this chosen baseline; grouped kernels do not use its split flag.
+The execution hint describes the single-head BQ64 pipeline. Grouped GQA keeps
+its existing calibration reference, supplied independently so a new BQ64 hint
+does not evict an established grouped route.
 """
 
 from __future__ import annotations
@@ -31,8 +32,8 @@ from typing import Any
 
 _BQ = 64  # Q rows per NAX threadgroup
 _TILE_KV = 32  # KV tokens per tile
-# Fewer full Q blocks than this leave too little split work to pay for the
-# slower partial blocks (measured: one to three full blocks lose 1-12%).
+# Conservative reference retained for grouped calibration and missing layout
+# metadata; the batch-work score below can admit smaller BQ64 grids.
 MIN_FULL_BLOCKS = 4
 # Split only when full-block KV tiles outnumber partial-block KV tiles by
 # this factor.  head_size 256 gains ~45% per full tile, head_size <= 128
@@ -145,6 +146,16 @@ def nax_tile_work(
     )
 
 
+def nax_grouped_reference_hint(work: NaxTileWork, head_size: int) -> int:
+    """The established BQ64 policy against which grouped layouts were calibrated."""
+    factor = _MIN_FULL_TO_PARTIAL.get(head_size, _MIN_FULL_TO_PARTIAL_DEFAULT)
+    return int(
+        head_size <= 512
+        and work.full_blocks >= MIN_FULL_BLOCKS
+        and work.full_tiles >= factor * work.partial_tiles
+    )
+
+
 def nax_split_hint(
     work: NaxTileWork,
     head_size: int,
@@ -163,11 +174,7 @@ def nax_split_hint(
         or work.query_tokens <= work.sequences
         or work.sliding_window >= 0
     ):
-        factor = _MIN_FULL_TO_PARTIAL.get(head_size, _MIN_FULL_TO_PARTIAL_DEFAULT)
-        return int(
-            work.full_blocks >= MIN_FULL_BLOCKS
-            and work.full_tiles >= factor * work.partial_tiles
-        )
+        return nax_grouped_reference_hint(work, head_size)
 
     # A calibrated work score, not a latency prediction. The complete-block
     # grid and actual output slices share one capacity estimate across shapes.
@@ -205,16 +212,19 @@ def nax_split_kwargs(
     work: NaxTileWork | None,
     head_size: int,
     *,
+    gpu_core_count: int | None,
+    num_heads: int,
+    num_kv_heads: int,
     prefill_work: NaxTileWork | None = None,
-    gpu_core_count: int = 0,
-    num_heads: int = 0,
-    num_kv_heads: int = 0,
 ) -> dict[str, int]:
     """``nax_split_hint`` keyword for one prefill ``paged_attention_primitive``.
 
     Empty when the native build predates the hint.  Without per-sequence
     metadata (``work`` is None) the original loop is used. A separate hint
     for the prefill subset is consumed only when native splits the batch.
+    Callers must explicitly supply the layout (zero requests the conservative
+    fallback). The grouped reference preserves the existing selection policy;
+    the batch score controls BQ64 only after grouped selection declines it.
     """
     if not capabilities.get("nax_split_hint", False):
         return {}
@@ -225,12 +235,16 @@ def nax_split_kwargs(
         return nax_split_hint(
             batch_work,
             head_size,
-            gpu_core_count=gpu_core_count,
+            gpu_core_count=gpu_core_count or 0,
             num_heads=num_heads,
             num_kv_heads=num_kv_heads,
         )
 
     kwargs = {"nax_split_hint": hint(work)}
+    if capabilities.get("nax_grouped_reference_hint", False) and work is not None:
+        kwargs["nax_grouped_reference_hint"] = nax_grouped_reference_hint(
+            work, head_size
+        )
     if capabilities.get("nax_prefill_split_hint", False) and prefill_work is not None:
         kwargs["nax_prefill_split_hint"] = hint(prefill_work)
     return kwargs

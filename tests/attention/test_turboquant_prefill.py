@@ -745,6 +745,7 @@ def test_rollout_requires_nax_or_explicit_opt_in(
     assert cores.call_count == int(selected and ready)
     assert recorded_ops[0][1].get("use_turboquant", False) == (not selected)
     assert ("nax_split_hint" in recorded_ops[0][1]) == (selected and ready)
+    assert ("nax_grouped_reference_hint" in recorded_ops[0][1]) == (selected and ready)
 
 
 def test_workspace_plan_key_includes_kv_geometry():

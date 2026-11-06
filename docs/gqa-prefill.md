@@ -20,86 +20,24 @@ is not required.
 `nax_prefill_work` counts the KV tiles visited by complete and partial query
 blocks. It keeps issued work, useful work, guarded-query work and isolated KV
 edges separate. `nax_gqa_work_score` compares each eligible grouped layout with
-the actual upstream pipeline, using query/KV heads and detected GPU cores to
-limit credit for parallel work. These counts are source-work proxies, not DRAM
+the established BQ64 reference policy, using query/KV heads and detected GPU
+cores to limit credit for parallel work. These counts are source-work proxies, not DRAM
 traffic, register allocation, measured occupancy or predicted milliseconds.
 
-The coefficients are manual conservative calibration weights. The original
-weights were calibrated with paired native-kernel comparisons on M5 (10 GPU
-cores), M5 Pro (20) and M5 Max (40), varying Q, prefix length, Q/KV head count,
-page alignment and execution order. The added complete-grid weights and cubic
-taper were calibrated only on the 40-core M5 Max, as marked below. The retained
-comparison includes upstream, h3 and h6; beating upstream alone does not
-establish the fastest layout.
+The coefficients are manual conservative calibration weights. They were
+calibrated with paired native-kernel comparisons on M5 (10 GPU cores), M5 Pro
+(20) and M5 Max (40), varying Q, prefix length, Q/KV head count, page alignment
+and execution order. The retained comparison includes upstream, h3 and h6;
+beating upstream alone does not establish the fastest layout.
 
 | Score component | Weights in the implementation | What the measurements constrain |
 |---|---|---|
 | Optimized upstream: padding, tail critical path, full work and guarded-Q savings | 13, 8, 2.5, 15 | A smaller Q tile can remove wasted/tail work, but grouping still costs extra KV streams and state |
 | Optimized upstream: stream/state and guarded-Q cost | 10/h, 3.5, 16 | Do not assume shared KV makes all per-head loads disappear |
-| Optimized upstream: complete-grid credit and stream-depth discount | 104, 0.038 | 40-core M5 Max only: admit grouped work while retaining long-stream short-query controls |
-| Optimized upstream: complete-block taper | Cubic exponent 3 | 40-core M5 Max only: retain the Q256 split control while admitting Q128/Q192 |
 | Guarded upstream: partial work, critical path, reuse and non-tail guarded work | 4, 0.875, 3.5, 4 | Long-prefix short queries differ from dense cold-prefill blocks |
 | Guarded upstream: lost grid capacity and additional group state | 10.5, 32, 3, 3.5, 0.75 | Wider groups must supply enough independent work for the GPU |
 | Fixed/core cost, KV edges and guarded Q tails | 11.5, 2, 5 | Preserve a margin for launch/edge/tail work rather than crediting every complete tile as a win |
 | Admission margin | 0.5 plus capacity-scaled tail reserve | A positive score alone is insufficient |
-
-### Complete blocks against a split baseline
-
-For an aligned h3 request without a query tail, the original split score
-reduces to `(2.5 - 10/3) * grouped.issued / baseline.issued`. It is negative
-even when h3 beats split. Expanding host split admission exposed this missing
-calibration; changing the host hint back would discard valid split speedups.
-
-The split score now adds `credit * baseline.fast / baseline.issued`, where
-`F = max(1, baseline.full_blocks)`, `density = heads * baseline.full_blocks /
-gpu_cores`, and `L = grouped.stream` is the mean KV-tile depth:
-
-```text
-credit = max(0, 104 * (F - 1) / (1 + density) - 0.038 * L) / F³
-```
-
-Multiple complete blocks amortize shared-stream work; the credit decays with
-grid density and block count. The depth discount keeps a long KV stream from
-receiving the same credit as a short one. A single complete block earns no
-credit. Only actual split fast work receives it; query tails and KV edges
-retain their existing costs. The added credit is identical for eligible h3/h6
-candidates, so their relative ranking and capacity gates stay unchanged.
-The real `upstream_split` still describes the work and fallback pipeline;
-there is no alternate flag pretending that split work is guarded work.
-
-The additional weights 104 and 0.038 and the cubic taper were calibrated only
-on M5 Max (40 cores), BF16, H24/K4/D256, page16, with fresh-process
-split/unsplit/h3/h6 measurements.
-At P31360, Q128 favors split (about 5.95 vs 6.32 ms for h3), while Q192
-favors h3 (6.25 vs 6.84 ms for split). With the grid weight 104, these two
-controls bound the depth weight to approximately 0.0373–0.0389; 0.038 leaves
-their scores below and above the 0.5 margin respectively. P8624/Q128 favors
-h3 (about 0.95 vs 1.04 ms for split) and also passes. An initial quadratic
-block decay also admitted P8192/Q256, where production ABBA retained a noisy
-regression after repetition. Cubic decay keeps that control on split while
-preserving the Q128/Q192 constraints; it is an empirical taper, not a hardware
-occupancy law. These are attention primitive wall times, not serving or pure
-GPU timestamps.
-
-CPU route tests cover 10/16/20/32/40 cores, including the APC geometry and
-H18/K3 at all four query lengths Q64/Q128/Q192/Q256 on 10 cores. They do not
-validate the new weights' performance on other GPUs. Known extrapolation
-limits for H24/K4/D256, page16, with a host split hint of 1 are:
-
-| GPU-core input | Geometry | Selector limitation |
-|---|---|---|
-| 10 | P8624/Q128 | Still routes split; the APC grouped route is not restored |
-| 12 → 13 | P8624/Q128 | Flips from split to h3 at the admission margin |
-| 40 → 42 | P31360/Q128 | The 40-core split control flips to h3 by 42 cores; 41 cores still routes split |
-
-These boundaries come from the compiled selector, not GPU measurements.
-They arise from the credit and admission margin, without new fixed core or
-shape gates. Host baseline changes and existing capacity policies also mean
-the final route has no global monotonicity guarantee. Some smaller-core Q192
-cases still retain split; no cross-device restoration or globally fastest
-selection is claimed. In particular, an eligible h3 can still trail a forced
-h6 that the unchanged capacity policy excludes. Keep those qualification
-limits separate from the older multi-device calibration.
 
 The source-work count is checked against an independent per-query-block loop
 in `tests/test_block_size_translation.py`. It compares all work fields with
@@ -108,6 +46,19 @@ modulo 16/64, both split modes, and longer full/tail/edge combinations. Correct
 work counts do not make empirical coefficients universal.
 Head dimension is an eligibility boundary here; this score is not a
 cross-dimension performance model.
+
+The host passes the grouped reference separately from its BQ64 execution hint.
+The reference retains the existing complete-block and full/partial-work rule,
+so expanding split admission does not change a previously selected grouped
+layout. If grouped eligibility, scoring or pipeline capacity rejects a layout,
+BQ64 executes the batch-work hint. Legacy native callers that omit the reference
+continue to use their execution hint for both decisions.
+
+This preserves established grouped choices without fitting new score weights
+to short cached appends. It also leaves some possible grouped-to-BQ64 gains
+unclaimed: replacing an established grouped choice needs its own comparative
+measurements. The reference is a policy compatibility input, not a claim that
+the guarded BQ64 pipeline will execute or that grouped is always fastest.
 
 The six-head candidate normally requires at least one complete group per core
 and enough complete SIMD-group work or KV work. A dense-work allowance requires

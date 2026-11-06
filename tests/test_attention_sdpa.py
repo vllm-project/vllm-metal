@@ -734,6 +734,7 @@ class _PagedRoutingOpsSpy:
         gqa_length_plan: object = None,
         nax_split_hint: int = -1,
         nax_prefill_split_hint: int = -1,
+        nax_grouped_reference_hint: int = -1,
     ) -> mx.array:
         del window_seqlen_q, sinks
         self.calls[-1].block_tables = block_tables.tolist()
@@ -746,6 +747,7 @@ class _PagedRoutingOpsSpy:
         self.calls[-1].gqa_length_plan = gqa_length_plan
         self.calls[-1].nax_split_hint = nax_split_hint
         self.calls[-1].nax_prefill_split_hint = nax_prefill_split_hint
+        self.calls[-1].nax_grouped_reference_hint = nax_grouped_reference_hint
         return mx.zeros_like(_query)
 
 
@@ -1108,6 +1110,7 @@ class TestSDPAForward:
             **spy.paged_attention_capabilities(),
             "nax_split_hint": supported != "none",
             "nax_prefill_split_hint": supported == "subset",
+            "nax_grouped_reference_hint": supported == "subset",
         }
         monkeypatch.setattr(spy, "paged_attention_capabilities", lambda: caps)
         monkeypatch.setattr(spy, "nax_ready", lambda: ready)
@@ -1144,6 +1147,9 @@ class TestSDPAForward:
         whole_hint = int(kind == "prefill")
         assert spy.calls[-1].nax_split_hint == (whole_hint if forwarded else -1)
         assert spy.calls[-1].nax_prefill_split_hint == (1 if subset else -1)
+        assert spy.calls[-1].nax_grouped_reference_hint == (
+            whole_hint if forwarded and supported == "subset" else -1
+        )
         # Matching layers reuse each whole/subset plan for their window.
         assert work.call_count == len(set(windows)) * (int(forwarded) + int(subset))
         assert cores.call_count == int(forwarded)

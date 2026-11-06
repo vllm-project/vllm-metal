@@ -24,7 +24,7 @@ from vllm_metal.attention.context import (
     prepare_unified,
 )
 from vllm_metal.attention.impls.sdpa import _kernel_metadata
-from vllm_metal.attention.nax_split import nax_split_hint, nax_tile_work
+from vllm_metal.attention.nax_split import nax_tile_work
 from vllm_metal.metal.constants import KERNEL_BLOCK_SIZES, MLA_KERNEL_BLOCK_SIZES
 
 
@@ -616,87 +616,34 @@ def test_nax_grouped_selects_width_from_capacity_and_real_work(
     )
 
 
-@pytest.mark.parametrize("enabled", [False, True])
-@pytest.mark.parametrize(
-    "q,cores,expected_hint,expected_group",
-    [
-        (64, 10, 1, 1),
-        (65, 10, 0, 1),
-        (128, 10, 1, 1),
-        (129, 20, 1, 3),
-        (144, 40, 0, 3),
-        (1328, 40, 1, 6),
-    ],
-)
-def test_nax_grouped_compares_against_host_selected_baseline(
-    nax_config_runner, enabled, q, cores, expected_hint, expected_group
+@pytest.mark.parametrize("cores,expected_group", [(10, 6), (20, 3), (40, 1)])
+def test_nax_grouped_keeps_its_reference_when_bq64_policy_changes(
+    nax_config_runner, cores, expected_group
 ):
-    """A new baseline can change grouped admission; disabling grouping keeps BQ64."""
-    prefix = 31360
-    hint = nax_split_hint(
+    """The reported long-prefix case keeps main's grouped candidate on each GPU."""
+    from vllm_metal.attention.nax_split import nax_split_kwargs
+
+    q, prefix = 128, 31360
+    hints = nax_split_kwargs(
+        {"nax_split_hint": True, "nax_grouped_reference_hint": True},
         nax_tile_work([0, q], [prefix + q]),
         256,
         num_heads=24,
         num_kv_heads=4,
         gpu_core_count=cores,
     )
-    assert hint == expected_hint
+    assert hints == {"nax_split_hint": 1, "nax_grouped_reference_hint": 0}
     cfg, _ = nax_config_runner(
-        q=q, prefix=prefix, cores=cores, upstream_split=hint, enabled=int(enabled)
+        q=q,
+        prefix=prefix,
+        cores=cores,
+        upstream_split=hints["nax_grouped_reference_hint"],
     )
-    group = expected_group if enabled else 1
-    assert cfg == ((64, 1, 128) if group == 1 else (16, group, 32 * group))
-
-
-@pytest.mark.parametrize(
-    "heads,prefix,cores,widths",
-    [
-        (24, 0, 10, (1, 3, 1, 1)),
-        (24, 0, 20, (1, 3, 3, 1)),
-        (24, 0, 32, (1, 3, 3, 1)),
-        (24, 0, 40, (1, 3, 3, 3)),
-        (24, 8192, 10, (1, 1, 1, 1)),
-        (24, 8192, 20, (1, 3, 1, 1)),
-        (24, 8192, 32, (1, 3, 3, 1)),
-        (24, 8192, 40, (1, 3, 3, 1)),
-        (24, 8624, 10, (1, 1, 1, 1)),
-        (24, 8624, 16, (1, 3, 1, 1)),
-        (24, 8624, 20, (1, 3, 1, 1)),
-        (24, 8624, 32, (1, 3, 3, 1)),
-        (24, 8624, 40, (1, 3, 3, 1)),
-        (24, 31360, 10, (1, 1, 1, 1)),
-        (24, 31360, 16, (1, 1, 1, 1)),
-        (24, 31360, 20, (1, 1, 1, 1)),
-        (24, 31360, 32, (1, 1, 1, 1)),
-        (24, 31360, 40, (1, 1, 3, 1)),
-        (18, 0, 10, (1, 3, 1, 1)),
-        (18, 8192, 10, (1, 3, 1, 1)),
-        (18, 8624, 10, (1, 3, 1, 1)),
-        (18, 31360, 10, (1, 1, 1, 1)),
-    ],
-)
-def test_nax_grouped_full_blocks_compare_with_split(
-    nax_config_runner, heads, prefix, cores, widths
-):
-    """Lock small-core APC admission and split controls for every query length."""
-    for q, width in zip((64, 128, 192, 256), widths, strict=True):
-        hint = nax_split_hint(
-            nax_tile_work([0, q], [prefix + q]),
-            256,
-            num_heads=heads,
-            num_kv_heads=heads // 6,
-            gpu_core_count=cores,
-        )
-        assert hint == 1
-        cfg, _ = nax_config_runner(
-            heads=heads,
-            kv_heads=heads // 6,
-            q=q,
-            prefix=prefix,
-            cores=cores,
-            upstream_split=hint,
-        )
-        assert cfg == ((64, 1, 128) if width == 1 else (16, width, 32 * width))
+    assert cfg == (
+        (64, 1, 128)
+        if expected_group == 1
+        else (16, expected_group, 32 * expected_group)
+    )
 
 
 @pytest.mark.parametrize(
@@ -704,8 +651,6 @@ def test_nax_grouped_full_blocks_compare_with_split(
     [
         ({}, 95, (64, 1, 128)),
         ({}, 96, (16, 3, 96)),
-        ({"q": 192, "upstream_split": 1}, 95, (64, 1, 128)),
-        ({"q": 192, "upstream_split": 1}, 96, (16, 3, 96)),
         ({"q": 1568, "prefix": 31199, "upstream_split": 1}, 191, (64, 1, 128)),
         ({"q": 1568, "prefix": 31199, "upstream_split": 1}, 192, (16, 6, 192)),
     ],
