@@ -144,10 +144,10 @@ def configure_kv_offloading(vllm_config: VllmConfig) -> None:
             "unset it to use the native KV offloading connector."
         )
     parallel_config = vllm_config.parallel_config
-    if parallel_config.pipeline_parallel_size > 1:
+    if parallel_config.world_size > 1:
         raise NotImplementedError(
-            "KV offloading on Metal does not support pipeline "
-            "parallelism yet; run with pipeline_parallel_size=1."
+            "KV offloading on Metal does not support pipeline or tensor "
+            "parallelism yet; run without pipeline/tensor parallelism."
         )
     # Each DP engine would cap the same disk root and evict the others' files.
     if parallel_config.data_parallel_size > 1:
