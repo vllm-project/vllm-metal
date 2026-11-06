@@ -161,8 +161,39 @@ mlx.launch -n 2 --backend ring tools/pp_parity_check.py Qwen/Qwen3-0.6B
 - **Checkpoint loading.** PP lazily slices MLX-LM safetensors; AWQ and GGUF are rejected because their loaders materialize the full model before slicing.
 - **Co-located stages oversubscribe the KV budget.** Each stage applies `--gpu-memory-utilization` to the whole device independently; neither knows the other exists, so two stages on one Mac claim roughly twice the fraction. Lower it when stacking. Separate Macs are unaffected.
 - **Synchronous scheduling required.** vLLM disables async scheduling for PP by default; an explicit `--async-scheduling` fails loud.
-- **TP=1 only.** PP+TP is rejected; tensor parallelism (`--tensor-parallel-size > 1`) is not implemented.
+- **TP=1 only.** PP+TP is rejected: MLX's ring and JACCL backends cannot split a group into per-stage TP groups. [Tensor parallelism](#tensor-parallelism) runs on its own.
 - **Model support.** YOCO / pooling / LoRA and speculative decoding other than GLM-5.3-Flash MTP are rejected, and so are hybrid / MLA / VLM models other than GDN hybrids such as Qwen3.5, whose multimodal checkpoints run under PP with `--language-model-only`, and GLM-5.3-Flash, whose stages pass all `hc_mult` hyper-connection streams (`hc_mult` × the hidden width per token) and whose first stage encodes image inputs. Other sliding-window and MoE models are untested.
+
+## Tensor parallelism
+
+Tensor parallelism (TP) shards every layer across ranks and all-reduces the attention and MLP outputs. After a lazy load, vllm-metal calls the model's own MLX `shard()` (mlx-lm or mlx-vlm); the KV cache and recurrent state then hold this rank's heads. Every rank runs the same forward and sampling, and vLLM returns rank 0's output.
+
+**One Mac** (`mp` executor; both ranks share one GPU):
+
+```bash
+vllm serve Qwen/Qwen3-0.6B \
+  --distributed-executor-backend mp \
+  --tensor-parallel-size 2 \
+  --gpu-memory-utilization 0.4
+```
+
+**Two Macs.** Bring up the Ray cluster as in the [two-Mac quick start](#quick-start-two-macs-over-thunderbolt), then on Mac A:
+
+```bash
+RAY_ADDRESS=auto VLLM_HOST_IP=10.0.0.1 \
+  vllm serve Qwen/Qwen3-0.6B \
+    --distributed-executor-backend ray \
+    --tensor-parallel-size 2
+```
+
+**Transport.** The all-reduces use the MLX ring over TCP by default, on the same ports as PP. To use JACCL (RDMA over Thunderbolt 5) instead, set MLX's own `MLX_IBV_DEVICES` to the JACCL device file (see the [MLX distributed docs](https://ml-explore.github.io/mlx/build/html/usage/distributed.html)) where you run `vllm serve`; Ray passes it to the workers, so the file must exist at that path on every Mac. `MLX_JACCL_COORDINATOR` defaults to rank 0's IP at `VLLM_METAL_RING_BASE_PORT`.
+
+**Limitations.**
+
+- **Models.** The model's MLX class must implement `shard()`, as mlx-lm's Qwen3 and Qwen3.5 do. Multimodal Qwen3.5 checkpoints need `--language-model-only`, which loads them through mlx-lm. MLA, pooling and multimodal models are rejected at load.
+- **No PP+TP**, for the MLX reason above.
+- **Rejected at config time**, as for PP: speculative decoding, LoRA, AWQ/GGUF checkpoints, speech-to-text models, MoE expert offloading, KV offloading and data parallelism.
+- **Co-located ranks oversubscribe the KV budget**, as for PP stages on one Mac.
 
 ## Data parallelism
 
