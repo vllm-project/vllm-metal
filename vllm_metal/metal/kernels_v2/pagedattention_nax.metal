@@ -753,6 +753,7 @@ void paged_attention_nax_grouped_full(
     device const int *cu_seqlens_q [[buffer(19)]],
     const constant int &num_seqs [[buffer(20)]],
     const constant int &sliding_window [[buffer(21)]],
+    const constant int &q_block_offset [[buffer(30)]],
     uint3 tgp [[threadgroup_position_in_grid]],
     uint3 tgpg [[threadgroups_per_grid]],
     uint sg_idx [[simdgroup_index_in_threadgroup]])
@@ -762,8 +763,9 @@ void paged_attention_nax_grouped_full(
   constexpr int TILE_KV = 32;
   constexpr int TD = HEAD_SIZE / 16;
   static_assert((GROUP_SIZE == 6 && BLOCK_SIZE == 16 &&
-                 (HEADS_PER_TG == 3 || HEADS_PER_TG == 6)) ||
-                (GROUP_SIZE == 8 && BLOCK_SIZE == 32 && HEADS_PER_TG == 4),
+                 (HEADS_PER_TG == 2 || HEADS_PER_TG == 3 || HEADS_PER_TG == 6)) ||
+                (GROUP_SIZE == 8 && BLOCK_SIZE == 32 &&
+                 (HEADS_PER_TG == 2 || HEADS_PER_TG == 4 || HEADS_PER_TG == 8)),
                 "unsupported grouped NAX layout");
 
   static_assert(HEADS_PER_TG > 0 && GROUP_SIZE % HEADS_PER_TG == 0,
@@ -773,7 +775,7 @@ void paged_attention_nax_grouped_full(
   // changing the per-head attention calculation or the buffer ABI.
   const int kv_head_idx = int(tgp.x) / (GROUP_SIZE / HEADS_PER_TG);
   const int head_idx = int(tgp.x) * HEADS_PER_TG + int(sg_idx);
-  const int q_block_global_idx = int(tgp.y);
+  const int q_block_global_idx = int(tgp.y) + q_block_offset;
   const long kv_token_stride = long(num_kv_heads) * kv_head_stride;
 
   // Varlen: map global q-block -> (sequence, block-within-sequence).
@@ -922,6 +924,7 @@ void paged_attention_nax_grouped_full(
       device const int *cu_seqlens_q [[buffer(19)]],                         \
       const constant int &num_seqs [[buffer(20)]],                           \
       const constant int &sliding_window [[buffer(21)]],                     \
+      const constant int &q_block_offset [[buffer(30)]],                     \
       uint3 tgp [[threadgroup_position_in_grid]],                            \
       uint3 tgpg [[threadgroups_per_grid]],                                  \
       uint sg_idx [[simdgroup_index_in_threadgroup]]);
@@ -929,3 +932,8 @@ void paged_attention_nax_grouped_full(
 instantiate_paged_attention_nax_grouped_full(bfloat16_t, 16, 6, 6, _full);
 instantiate_paged_attention_nax_grouped_full(bfloat16_t, 16, 6, 3, _sub_full);
 instantiate_paged_attention_nax_grouped_full(bfloat16_t, 32, 8, 4, _full);
+
+// Narrow and full-ratio candidates share the same per-head calculation.
+instantiate_paged_attention_nax_grouped_full(bfloat16_t, 16, 6, 2, _h2_full);
+instantiate_paged_attention_nax_grouped_full(bfloat16_t, 32, 8, 2, _h2_full);
+instantiate_paged_attention_nax_grouped_full(bfloat16_t, 32, 8, 8, _h8_full);

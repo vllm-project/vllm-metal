@@ -731,6 +731,7 @@ class _PagedRoutingOpsSpy:
         gqa_length_plan: object = None,
         nax_split_hint: int = -1,
         nax_prefill_split_hint: int = -1,
+        nax_work_plan: object = None,
     ) -> mx.array:
         del window_seqlen_q, sinks
         self.calls[-1].block_tables = block_tables.tolist()
@@ -743,6 +744,7 @@ class _PagedRoutingOpsSpy:
         self.calls[-1].gqa_length_plan = gqa_length_plan
         self.calls[-1].nax_split_hint = nax_split_hint
         self.calls[-1].nax_prefill_split_hint = nax_prefill_split_hint
+        self.calls[-1].nax_work_plan = nax_work_plan
         return mx.zeros_like(_query)
 
 
@@ -1103,8 +1105,11 @@ class TestSDPAForward:
             **spy.paged_attention_capabilities(),
             "nax_split_hint": supported != "none",
             "nax_prefill_split_hint": supported == "subset",
+            "nax_work_plan": supported == "subset",
         }
         monkeypatch.setattr(spy, "paged_attention_capabilities", lambda: caps)
+        plan = MagicMock(return_value=object())
+        monkeypatch.setattr(spy, "nax_prefill_plan", plan, raising=False)
         work = MagicMock(wraps=sdpa_mod.nax_tile_work)
         monkeypatch.setattr(sdpa_mod, "nax_tile_work", work)
         inner = _make_inner()
@@ -1135,6 +1140,12 @@ class TestSDPAForward:
         whole_hint = int(kind == "prefill")
         assert spy.calls[-1].nax_split_hint == (whole_hint if forwarded else -1)
         assert spy.calls[-1].nax_prefill_split_hint == (1 if subset else -1)
+        if forwarded and supported == "subset":
+            plan.assert_called_once_with(ctx.cu_seqlens, ctx.context_lens)
+            assert all(call.nax_work_plan is plan.return_value for call in spy.calls)
+        else:
+            plan.assert_not_called()
+            assert spy.calls[-1].nax_work_plan is None
         # Matching layers reuse each whole/subset plan for their window.
         assert work.call_count == len(set(windows)) * (int(forwarded) + int(subset))
 

@@ -45,7 +45,7 @@ inline const char* paged_dispatch_name(PagedDispatch family) {
 }
 
 inline PagedDispatch nax_prefill_dispatch_family(kernels::NaxConfig cfg) {
-  if (cfg.HEADS_PER_TG == 4) return PagedDispatch::NaxGqa8Prefill;
+  if (cfg.HEADS_PER_TG > 1 && cfg.GQA_RATIO == 8) return PagedDispatch::NaxGqa8Prefill;
   return cfg.HEADS_PER_TG > 1 ? PagedDispatch::NaxGqa6Prefill : PagedDispatch::NaxPrefill;
 }
 using hardware::detected_gpu_core_count;
@@ -113,6 +113,36 @@ struct GqaDecodeLengthPlan {
           *partition_offsets == *other.partition_offsets));
   }
 };
+
+// CPU lengths are shared across layers; kernel execution still reads its
+// device metadata. This plan affects cost estimation, not row ownership.
+struct NaxPrefillPlan {
+  std::shared_ptr<const std::vector<kernels::NaxSequence>> sequences;
+  int query_tokens = 0;
+  int max_length = 0;
+
+  bool operator==(const NaxPrefillPlan& other) const {
+    return sequences == other.sequences ||
+        (sequences && other.sequences && *sequences == *other.sequences);
+  }
+};
+
+inline NaxPrefillPlan nax_prefill_plan(
+    const std::vector<int>& cu_seqlens, const std::vector<int>& kv_lengths) {
+  if (cu_seqlens.size() != kv_lengths.size() + 1 || cu_seqlens.front() != 0)
+    throw std::invalid_argument("NAX prefill lengths require cumulative Q starting at zero");
+  auto sequences = std::make_shared<std::vector<kernels::NaxSequence>>();
+  sequences->reserve(kv_lengths.size());
+  int max_length = 0;
+  for (size_t i = 0; i < kv_lengths.size(); ++i) {
+    const int64_t q = int64_t(cu_seqlens[i + 1]) - cu_seqlens[i];
+    if (q <= 0 || kv_lengths[i] < q)
+      throw std::invalid_argument("NAX prefill lengths require 0 < Q <= KV per sequence");
+    sequences->push_back({static_cast<int>(q), kv_lengths[i]});
+    max_length = std::max(max_length, kv_lengths[i]);
+  }
+  return {std::move(sequences), cu_seqlens.back(), max_length};
+}
 
 extern std::atomic<PagedDispatch> g_last_dispatch;
 extern std::atomic<int> g_last_gqa_partition;
@@ -185,7 +215,8 @@ array paged_attention_primitive_fn(
     int max_decode_context_len = 0, bool gqa_disabled = false,
     int gqa_test_partition = 0,
     const std::optional<GqaDecodeLengthPlan>& gqa_length_plan = std::nullopt,
-    int nax_split_hint = -1, int nax_prefill_split_hint = -1);
+    int nax_split_hint = -1, int nax_prefill_split_hint = -1,
+    const std::optional<NaxPrefillPlan>& nax_work_plan = std::nullopt);
 std::tuple<array, array, array, array, array> tq_encode_primitive_fn(
     const array& key, const array& value,
     const array& key_cache, const array& value_cache,

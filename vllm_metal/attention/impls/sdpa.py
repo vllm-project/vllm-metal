@@ -1135,6 +1135,14 @@ def sdpa_forward(
                         )
                     return ctx.nax_tile_work[key]
 
+                if capabilities is not None and capabilities.get(
+                    "nax_work_plan", False
+                ):
+                    if ctx.nax_work_plan is None:
+                        ctx.nax_work_plan = ops.nax_prefill_plan(
+                            ctx.cu_seqlens, ctx.context_lens
+                        )
+                    paged_kwargs["nax_work_plan"] = ctx.nax_work_plan
                 work = tile_work(0)
                 if (
                     capabilities["nax_prefill_split_hint"]

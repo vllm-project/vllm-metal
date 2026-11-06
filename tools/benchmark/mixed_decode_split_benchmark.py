@@ -185,6 +185,10 @@ class Arms:
         self.work_prefill = nax_tile_work(cu[d:], shape.kv_lens[d:])
         prefill_cu = [c - cu[d] for c in cu[d:]]
         self.work_prefill_only = nax_tile_work(prefill_cu, shape.kv_lens[d:])
+        self.plan_all = self.plan_prefill = None
+        if capabilities.get("nax_work_plan", False):
+            self.plan_all = self.ops.nax_prefill_plan(cu, shape.kv_lens)
+            self.plan_prefill = self.ops.nax_prefill_plan(prefill_cu, shape.kv_lens[d:])
         x = inputs
         self.decode_x = Inputs(
             query=x.query[:d],
@@ -221,25 +225,30 @@ class Arms:
             **kwargs,
         )
 
-    def _nax(self, work, prefill_work=None) -> dict[str, int]:
-        return nax_split_kwargs(
-            self.caps, work, self.shape.head_size, prefill_work=prefill_work
+    def _nax(self, work, prefill_work=None, *, plan=None) -> dict[str, object]:
+        kwargs: dict[str, object] = dict(
+            nax_split_kwargs(
+                self.caps, work, self.shape.head_size, prefill_work=prefill_work
+            )
         )
+        if plan is not None:
+            kwargs["nax_work_plan"] = plan
+        return kwargs
 
     def unsplit(self) -> list[mx.array]:
-        kwargs = {"num_decode_requests": 0, "num_decode_tokens": 0}
-        kwargs.update(self._nax(self.work_all))
+        kwargs: dict[str, object] = {"num_decode_requests": 0, "num_decode_tokens": 0}
+        kwargs.update(self._nax(self.work_all, plan=self.plan_all))
         return [self._call(self.x, max(self.shape.kv_lens), **kwargs)]
 
     def split_native(self) -> list[mx.array]:
         d = self.shape.num_decode
-        kwargs = {
+        kwargs: dict[str, object] = {
             "num_decode_requests": d,
             "num_decode_tokens": d,
             "max_decode_context_len": max(self.decode_lens),
             "gqa_length_plan": self.ops.gqa_decode_length_plan(self.decode_lens),
         }
-        kwargs.update(self._nax(self.work_all, self.work_prefill))
+        kwargs.update(self._nax(self.work_all, self.work_prefill, plan=self.plan_all))
         return [self._call(self.x, max(self.shape.kv_lens), **kwargs)]
 
     def _decode_only(self, gqa_disabled: bool) -> mx.array:
@@ -259,8 +268,8 @@ class Arms:
         return self._call(self.decode_x, max(self.decode_lens), **kwargs)
 
     def _prefill_only(self) -> mx.array:
-        kwargs = {"num_decode_requests": 0, "num_decode_tokens": 0}
-        kwargs.update(self._nax(self.work_prefill_only))
+        kwargs: dict[str, object] = {"num_decode_requests": 0, "num_decode_tokens": 0}
+        kwargs.update(self._nax(self.work_prefill_only, plan=self.plan_prefill))
         return self._call(self.prefill_x, self.shape.prefill_len, **kwargs)
 
     def split_emulated(self) -> list[mx.array]:

@@ -1,311 +1,225 @@
 # Grouped NAX prefill
 
-The MLX NAX dispatcher uses BQ16 threadgroups for three or six query heads
-within a six-head KV group, or four query heads within an eight-head KV group.
-`VLLM_METAL_NAX_GQA_PREFILL` defaults to `1`;
-set it to `0` and restart workers to retain upstream NAX.
+`VLLM_METAL_NAX_GQA_PREFILL` defaults to `1`. Set it to `0` and restart workers
+to retain single-head upstream NAX. Each dispatch executes one selected kernel.
 
-Eligibility is based on tensor geometry and attention features, not a model
-name: BF16, head dimension 256, one ordinary
-causal sequence, no mixed suffix offset, sliding window, softcap or sinks.
-Supported layouts are GQA6 with kernel page16 and GQA8 with kernel page32.
-Kernel pages may be translated from larger physical cache pages. Other shapes
-retain their established route. Each dispatch executes one selected kernel.
+The compiled candidate sets are **GQA6: h2, h3, h6** and **GQA8: h2, h4, h8**.
+Here `h` is the number of query heads sharing one threadgroup, not the model's
+Q/KV ratio. Grouped kernels use BQ16 and `32 * h` threads; upstream uses BQ64
+and 128 threads. Wider groups share KV loads but reduce independent groups
+and increase logical state. None is uniformly fastest.
 
-All layouts preserve the per-head calculation. h3 uses 96 threads, h4 uses 128
-and h6 uses 192; none is always fastest. Complete query/KV tiles omit bounds checks,
-while partial tiles and causal masking remain guarded. Whole-request alignment
-is not required.
+## Supported requests
 
-## Admission and calibration
+Automatic grouping requires MLX NAX, BF16, D256, one ordinary causal sequence,
+no mixed suffix, sliding window, softcap or attention sinks. GQA6 uses kernel
+page16; GQA8 uses page32. These are geometry constraints, not model names.
+Larger physical pages may translate to either kernel-page size. Complete Q/KV
+tiles omit bounds checks; partial tiles and causal masking remain guarded.
+Neither the whole request nor the final physical page must be complete.
 
-`nax_prefill_work` counts the KV tiles visited by complete and partial query
-blocks. It keeps issued work, useful work, guarded-query work and isolated KV
-edges separate. `nax_gqa_work_score` compares each eligible grouped layout with
-the actual upstream pipeline, using query/KV heads and detected GPU cores to
-limit credit for parallel work. These counts are source-work proxies, not DRAM
-traffic, register allocation, measured occupancy or predicted milliseconds.
+The adaptive replacement additionally requires exact CPU Q/KV lengths and the
+calibrated dense interleaved KV strides. The model runner builds one immutable
+length plan per forward and shares it across layers. Calls without that plan,
+or with other valid strides, retain the previous h3/h6/h4 policy. Unsupported
+geometry and insufficient pipeline capacity retain upstream. There is no
+fixed 32K total-KV admission cap.
 
-The coefficients are manual conservative calibration weights. They were
-calibrated with paired native-kernel comparisons on M5 (10 GPU cores), M5 Pro
-(20) and M5 Max (40), varying Q, prefix length, Q/KV head count, page alignment
-and execution order. The retained comparison includes upstream, h3 and h6;
-beating upstream alone does not establish the fastest layout.
+## Selection and work accounting
 
-| Score component | Weights in the implementation | What the measurements constrain |
-|---|---|---|
-| Optimized upstream: padding, tail critical path, full work and guarded-Q savings | 13, 8, 2.5, 15 | A smaller Q tile can remove wasted/tail work, but grouping still costs extra KV streams and state |
-| Optimized upstream: stream/state and guarded-Q cost | 10/h, 3.5, 16 | Do not assume shared KV makes all per-head loads disappear |
-| Guarded upstream: partial work, critical path, reuse and non-tail guarded work | 4, 0.875, 3.5, 4 | Long-prefix short queries differ from dense cold-prefill blocks |
-| Guarded upstream: lost grid capacity and additional group state | 10.5, 32, 3, 3.5, 0.75 | Wider groups must supply enough independent work for the GPU |
-| Fixed/core cost, KV edges and guarded Q tails | 11.5, 2, 5 | Preserve a margin for launch/edge/tail work rather than crediting every complete tile as a win |
-| Admission margin | 0.5 plus capacity-scaled tail reserve | A positive score alone is insufficient |
+Selection has three layers:
 
-The source-work count is checked against an independent per-query-block loop
-in `tests/test_block_size_translation.py`. It compares all work fields with
-the compiled C++ helper, including every prefix residue modulo 32 and Q residue
-modulo 16/64, both split modes, and longer full/tail/edge combinations. Correct
-work counts do not make empirical coefficients universal.
-Head dimension is an eligibility boundary here; this score is not a
-cross-dimension performance model.
+1. Check features, compiled layouts and available device capacity.
+2. Count each sequence's actual causal tile visits for upstream and all three
+   grouped widths. Include issued/useful work, Q tails, KV edges, QK/PV
+   operations, potential KV streams, logical state, threads and group counts.
+3. Compare relative costs with the actual upstream pipeline **and** the retained
+   h3/h6/h4 choice. Replace the retained choice only when the predicted benefit
+   exceeds a margin. Finally check the selected pipeline's thread limit.
 
-The six-head candidate normally requires at least one complete group per core
-and enough complete SIMD-group work or KV work. A dense-work allowance requires
-at least 32 complete h6 groups per core and at least 95% full-tile work. The
-additional guarded h6 allowance is restricted to the measured 10-core range;
-scaling that allowance by group/core counts alone produced regressions.
+For a layout, the calibrated score combines bulk work, the longest tile stream
+and potential KV-stream cost with a smooth fourth-power maximum, plus launch
+cost. Dimensions scale matrix work and logical state; the kernel page and
+compiled width determine the layout rate. GPU cores normalize available work.
+These are source-operation estimates, not measured register occupancy, cache
+traffic or milliseconds. Parameterizing dimensions does not qualify D128/D512:
+they require compiled kernels and separate performance validation.
 
-An earlier calibration run (base `93562f1`) produced the following
-paired native measurements. They explain why the wider guarded allowance was not
-extended to 20/40 cores. These are kernel timings, not model TTFT:
+The minimum replacement margin is 15%, with an additional reserve of
+`0.30 * min(1, cores / full_upstream_SIMD_groups) * full_work_fraction`.
+This is a **predicted** margin, not a promise of 15% observed speedup. It prevents
+complete but underfilled grids from receiving the same confidence as dense
+work. Existing profitable h3/h6/h4 routes remain when predictions are close.
+The retained GQA6 policy still contains its earlier 10-core guarded-h6
+allowance; the new common comparison has no model or chip-name allowlist.
 
-| GPU cores | Workload | Candidate/reference | Two-round latency change | Decision |
-|---:|---|---|---|---|
-| 10 | H24/K4, Q144/P31360 | h6 / retained h3 | -12.51%, -11.83% | Retain the 10-core guarded allowance |
-| 20 | H48/K8, Q144/P24577 | broader h6 / retained h3 | +36.29%, +36.65% | Reject broad guarded admission |
-| 40 | H96/K16, Q144/P24577 | broader h6 / retained h3 | +33.15%, +36.63% | Reject broad guarded admission |
-| 80 | No available NAX execution host | Not measured | No performance result | Do not infer performance from CPU policy tests |
+`nax_prefill_resources` sums sequences independently; it never combines two
+partial requests into a complete block. It also accounts for the starting Q
+remainder of mixed suffixes and value slicing. Independent block-loop tests
+cover D128/D256/D512 accounting, all widths, both split modes, translated pages,
+every Q16/Q64 and prefix32 residue, and longer boundaries. Multi-sequence and
+mixed automatic admission remains disabled pending its own performance study.
 
-These rows have different head geometries and must not be pooled into a
-cross-device speedup. Full results, exact measured artifacts, final-source
-regressions and serving measurements belong in the accompanying PR evidence.
+## Calibration and independent validation
 
-Known limitations remain: some odd-K selections trail historical experimental
-layouts even while beating upstream; D128/D512 and other ratios need their own
-compiled layouts and resource validation. Other models with matching geometry have operator
-coverage, not a blanket whole-model performance guarantee.
+The adaptive coefficients were fitted on base `5e09bb9` using 64 predefined
+geometries on M5 (10 GPU cores), M5 Pro (20) and M5 Max (40). The matrix varies
+Q, prefix, absolute Q/KV heads and page tails without model names. It contains
+2,304 paired grouped-versus-NAX observations (both upstream pipeline controls)
+and 768 direct width comparisons, all in both execution orders. The robust
+relative-cost fit weights direct width comparisons twice; order disagreement
+and median absolute deviation reduce observation weight. Coefficients and the
+15% plus capacity reserve were frozen before independent validation.
 
-## Context length
+The independent set has 40 additional geometries, including Q/KV head counts
+absent from calibration. All predictions were recorded before timing. It used
+700 direct pairs against actual main-default routes and retained h3/h6/h4,
+8 warmups and 16 paired cycles per order, with identical logical tensors and
+one shader library across all hosts. Outputs were bitwise equal before and
+after timing; logical-page reconstruction, input immutability and actual
+pipeline/grid/thread identities were checked.
 
-There is no hard 32K total-KV admission limit. For GQA6, removing the earlier
-calibration cap was checked on M5/Pro/Max with 100 paired operator case-runs
-across the 32K boundary, 64K and approximately 128K KV. Outputs were bitwise equal and
-no admitted path showed a repeated significant loss above 2% against actual
-upstream or h3 in that matrix. This is operator evidence, not 128K model E2E
-or a speedup guarantee at arbitrary lengths. Complete-work density, tail cost
-and core capacity still gate admission.
+| GPU cores | Independent shapes | Changed from retained route | Main-relative kernel gains over 5% | Repeated losses over 2% versus main or retained route |
+|---:|---:|---:|---:|---:|
+| 10 | 40 | 31 | 32 | 0 |
+| 20 | 40 | 24 | 24 | 0 |
+| 40 | 40 | 12 | 13 | 0 |
 
-## GQA8 admission
+A repeated loss requires both order medians above 2% and both paired-cycle
+confidence intervals above zero. These intervals do not measure uncertainty
+between independent server workers. The counts above are kernel evidence,
+not serving or TTFT results; main already includes GQA6 optimization.
 
-GQA8 adds the page32/h4 instance to the same grouped shader. The ratio names
-the model's Q/KV-head ratio; the threadgroup handles four of those query heads.
-It reuses the existing work counter and guarded-pipeline score with no extra
-group-state growth. The GQA6 h3/h6 policy remains unchanged.
+Native regression exercises every width with real physical-page translation,
+including 784-to-16 and 1056-to-32, and compares interleaved physical storage
+against compact storage and upstream output. Test-only core overrides establish
+route correctness, not performance on the simulated core count. The parity
+tool also passes exact CPU lengths and requires h2/h3/h4/h6/h8 launches.
 
-Only the guarded upstream pipeline is eligible. A candidate is rejected if
-it reduces the useful group count available to the detected GPU cores:
-`min(cores, grouped.groups) < min(cores, baseline.groups)`. The remaining score
-must exceed `0.5 + 32 * cores * grouped.tail_stream / baseline.issued`.
-Upstream split/optimized requests retain their existing pipeline. Thus long
-cold prompts need not use GQA8 grouping, while cached short queries can qualify.
-Head counts, Q/prefix work and GPU capacity drive this decision; there is no
-model-name or chip-name allowlist and no fixed total-KV length limit.
+## Serving validation
 
-The guarded score weights were calibrated with the earlier GQA8 implementation
-(base `2a2a2d0`) on 10/20/40-core M5 devices. They are empirical work weights,
-not predicted milliseconds or a guarantee for unseen shapes. Earlier h8
-experiments retained some wins over h4; this bounded implementation does not
-claim to be the fastest of every experimental layout. There is no 80-core GPU
-measurement. Current-source results must be reported separately from that
-earlier calibration and from the GQA6 serving measurements below.
+The baseline is actual main `5e09bb9`, with its default GQA6 optimization
+enabled; the adaptive arm also uses the default-on flag. This is an incremental
+comparison against main, not against forcibly disabled GQA6. Both arms use
+MLX 0.32.4, vLLM 0.33.0+cpu, BF16 attention, APC, batch size one, identical
+input IDs and 16 generated tokens. Models are Qwen3.6-35B-A3B-OptiQ-4bit
+(GQA8, H16/K2) and Qwen3.8-27B-4bit (GQA6, H24/K4). GPU cores / RAM are
+M5 10 / 32 GiB, Pro 20 / 64 GiB and Max 40 / 48 GiB.
 
-## GQA8 validation and serving
+Each comparison uses two independent workers per arm in ABBA order; Max 35B
+also has a BAAB repeat because its cold result changed materially. Main
+streaming measurements use one warmup and two formal requests per case/worker.
+The separate official `vllm bench serve` uses eight formal cached requests
+per case/worker, including the first CLI sample, after distinct-salt priming
+and server warmup. There are three cached CLI groups for 35B and two for 27B.
+Cold CLI runs use two requests per worker. Negative changes mean faster.
 
-These measurements use feature commit `3fe4b06` on main `5e09bb9`. Negative
-latency changes are faster. Operator timings and model serving are separate.
+Explicit KV budgets are 1 GiB for 35B and 4 GiB for 27B. Every worker has
+the expected APC capacity: 49 physical pages of 1056 tokens for 35B,
+83 pages of 784 for 27B. The actual cache hits are 31,680 and 31,360 tokens,
+respectively. Kernel pages are 32 and 16. Cold inputs have zero cache hits.
 
-The paired native matrix includes current upstream, the retained experimental
-h4/h8 layouts and GQA6 controls, in both execution orders. All 442 case-runs
-were bitwise equal. No admitted path had a repeated significant loss above 2%
-against current upstream or old h4 in this matrix. The canonical rows below
-use H16/K2/D256, BF16, page32 and prefix31680. Admission varies by geometry and
-core count, so the total reference comparisons differ between devices.
+The main-client TTFT changes below keep all boundary controls, including
+unchanged upstream routes. They are separate from official CLI measurements.
 
-| GPU / memory | Q64 kernel change (two orders) | Q128 kernel change (two orders) | Paired case-runs |
-|---|---|---|---|
-| M5, 10 cores / 32 GiB | -32.32% / -31.77% | -45.00% / -39.00% | 142 |
-| M5 Pro, 20 cores / 64 GiB | -17.16% / -16.73% | -31.05% / -29.02% | 150 |
-| M5 Max, 40 cores / 48 GiB | -16.40% / -16.63% | -15.72% / -14.63% | 150 |
+| GPU / model / order | Q16 | Q32 | Q63 | Q64 | Q65 | Q128 | Q144 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| M5 / 35B¹ | -10.00% | -9.05% | -0.04% | -7.96% | -8.95% | -18.31% | — |
+| M5 Pro / 35B | -11.46% | -8.98% | +0.22% | -5.11% | +0.12% | -9.85% | — |
+| M5 Max / 35B ABBA | -14.99% | -16.43% | +1.29% | -6.09% | +1.46% | -7.60% | — |
+| M5 Max / 35B BAAB | -13.10% | -14.47% | +1.02% | -7.56% | +1.40% | -7.52% | — |
+| M5 / 27B | -0.12% | -0.07% | +0.03% | -0.12% | -22.27% | — | +0.00% |
+| M5 Max / 27B | -1.80% | -0.09% | -0.79% | -1.08% | -2.13% | — | -0.53% |
 
-The bounded h4 addition is not the fastest of every experimental layout.
-Retained repeated old-h8 wins are:
+M5 27B Q65 changes from upstream to h3: 1099.73 → 854.79 ms (−22.27%).
+Q144 retains h6. Other measured 27B cases are approximately flat against
+main's already-enabled GQA6, rather than a new broad GQA6 serving gain.
 
-| GPU | Geometry | h4 latency change versus old h8 |
-|---|---|---|
-| M5 | H128/K16, Q208/P17409 | +8.15% / +7.84% |
-| M5 Pro | H128/K16, Q32/P255 | +24.89% / +38.97% |
-| M5 Max | H96/K12, Q96/P255 | +27.04% / +29.04% |
+| GPU / model / order | New Q tokens | CLI TTFT main → adaptive (ms) | TTFT change | E2E change | Zero-swap-in worker pairs |
+| --- | --- | --- | --- | --- | --- |
+| M5 / 35B¹ | 16 | 352.12 → 274.61 | -22.01% | -9.78% | 2/2 |
+| M5 / 35B¹ | 64 | 409.21 → 391.78 | -4.26% | -3.71% | 1/2 |
+| M5 / 35B¹ | 128 | 537.92 → 426.50 | -20.71% | -12.25% | 1/2 |
+| M5 Pro / 35B | 16 | 179.55 → 158.75 | -11.58% | -4.31% | 1/2 |
+| M5 Pro / 35B | 64 | 235.26 → 226.92 | -3.54% | -0.76% | 2/2 |
+| M5 Pro / 35B | 128 | 250.99 → 229.14 | -8.71% | -4.39% | 1/2 |
+| M5 Max / 35B ABBA | 16 | 161.32 → 142.12 | -11.90% | -5.88% | 0/2 |
+| M5 Max / 35B ABBA | 64 | 204.37 → 180.65 | -11.61% | -6.62% | 0/2 |
+| M5 Max / 35B ABBA | 128 | 205.71 → 168.60 | -18.04% | -10.10% | 1/2 |
+| M5 Max / 35B BAAB | 16 | 164.96 → 139.73 | -15.30% | -7.42% | 2/2 |
+| M5 Max / 35B BAAB | 64 | 189.88 → 189.69 | -0.10% | -0.07% | 1/2 |
+| M5 Max / 35B BAAB | 128 | 192.17 → 168.85 | -12.14% | -6.31% | 1/2 |
+| M5 / 27B | 64 | 587.24 → 589.69 | +0.42% | +0.04% | 0/2 |
+| M5 / 27B | 144 | 1182.32 → 1171.67 | -0.90% | -0.28% | 0/2 |
+| M5 Max / 27B | 64 | 288.54 → 283.86 | -1.62% | -0.80% | 0/2 |
+| M5 Max / 27B | 144 | 410.08 → 399.24 | -2.65% | -1.36% | 1/2 |
 
-Serving uses the same Qwen3.6-35B-A3B-OptiQ-4bit checkpoint, MLX 0.32.4,
-vLLM 0.33.0+cpu, BF16 attention, APC enabled, batch size one, 16 output
-tokens and GPU-memory fraction .65. Each run has two independent workers per
-arm; baseline explicitly disables `VLLM_METAL_NAX_GQA_PREFILL`, while the
-enabled arm uses its default. M5 has operator coverage only; this checkpoint
-was not forced into its 32 GiB serving budget.
+¹ For M5 35B, the official client runs on Pro through SSH forwarding to the
+M5 loopback server. The model, main streaming client and route checks remain
+on M5. Both arms use identical transport, runtime, tokenizer and input IDs;
+do not compare or pool these absolute CLI latencies with local-client runs.
+The CLI mean includes client startup and transport variability; the separate
+M5 main-client Q16/Q128 changes are −10.00%/−18.31%.
 
-Each run checks 52 main requests, with one warmup and two formal requests per
-case/worker. Complete 16-token output IDs, Q63/64/65/128 work and native
-dispatch events match the expected routes. Cached cases hit 31680 tokens;
-priming requests hit zero.
-Q64/Q128 select h4; Q63/Q65 retain upstream. Main TTFT changes are:
+Cold 32K full-input controls are retained separately:
 
-| GPU / order | Q63 main TTFT | Q64 main TTFT | Q65 main TTFT | Q128 main TTFT |
-|---|---|---|---|---|
-| M5 Max / ABBA | +2.63% | -9.55% | +1.02% | -8.40% |
-| M5 Max / BAAB | -0.32% | -7.20% | +0.84% | -8.22% |
-| M5 Pro / ABBA | +2.06% | -4.51% | +1.03% | -12.88% |
+| GPU / model / order | Cold 32K TTFT main → adaptive (s) | Change | Zero-swap-in worker pairs |
+| --- | --- | --- | --- |
+| M5 / 35B¹ | 37.170 → 36.910 | -0.70% | 0/2 |
+| M5 Pro / 35B | 17.956 → 17.956 | +0.00% | 0/2 |
+| M5 Max / 35B ABBA | 11.121 → 12.057 | +8.42% | 0/2 |
+| M5 Max / 35B BAAB | 11.582 → 11.108 | -4.09% | 1/2 |
+| M5 / 27B | 155.095 → 155.041 | -0.04% | 0/2 |
+| M5 Max / 27B | 45.539 → 45.292 | -0.54% | 0/2 |
 
-The independent `vllm bench serve` protocol has 16 formal samples per
-case/worker (128 per run), after a distinct-salt prime and server warmup.
-The first CLI sample is retained. Saved input IDs and decoded output texts
-are checked completely across workers for each case; complete CLI output
-token IDs are not asserted. These samples are not pooled with the main client.
+There is **no stable cold 32K improvement**. Max 35B changes sign with execution
+order (+8.42%, −4.09%), so neither a cold speedup nor a causal regression is
+established. Its Q63/Q65 main-client fallback controls are approximately
+1–1.5% slower in both orders. M5 27B official Q64 is +0.42%. These observations
+are retained rather than discarded as noise.
 
-| GPU / order | New Q tokens | Upstream CLI TTFT ms | Enabled CLI TTFT ms | TTFT change | E2E change | Zero-swap-in worker pairs |
-|---|---|---|---|---|---|---|
-| M5 Max / ABBA | 64 | 183.37 | 162.61 | -11.32% | -5.70% | 1/2 |
-| M5 Max / ABBA | 128 | 191.74 | 177.49 | -7.43% | -3.94% | 1/2 |
-| M5 Max / BAAB | 64 | 175.63 | 167.35 | -4.71% | -2.38% | 0/2 |
-| M5 Max / BAAB | 128 | 183.09 | 172.54 | -5.76% | -2.90% | 2/2 |
-| M5 Pro / ABBA | 64 | 234.51 | 218.84 | -6.68% | -3.01% | 2/2 |
-| M5 Pro / ABBA | 128 | 253.87 | 230.15 | -9.34% | -4.39% | 2/2 |
+Across the six comparisons, 464 main requests pass complete 16-token output,
+APC and actual native dispatch checks; 512 official cached and 48 cold
+requests pass their audit. CLI input IDs and complete decoded texts are
+checked, but exact CLI output IDs are not asserted. Native MLX top-5 checks
+report 1 EXACT / 1 TOP_K_MATCH / 0 FAIL per checked 35B worker, and
+2 EXACT / 0 TOP_K_MATCH / 0 FAIL per checked 27B worker. The M5 35B native
+reference was generated on Pro with identical full-checkpoint file hashes.
 
-Cold requests have 32768 input tokens, distinct salts and actual APC hits of
-zero, with two requests per worker (eight per run). Native observations
-cover every chunk/layer: 31 x 1056 + 32 query tokens, all upstream NAX, with
-no GQA8 launch. Decoded texts match across arms.
+All completed workers have zero new swap-outs and no OS pressure event.
+Global swap-ins are reported per window, without source attribution. The
+tables retain all samples and show how many independent worker pairs also
+have a zero-swap-in window; that subset is not a substitute for the full data.
+Most cold controls have no clean pair. There is no across-worker confidence
+interval, and only two workers per arm.
 
-| GPU / order | Upstream cold TTFT s | Enabled cold TTFT s | TTFT change | Zero-swap-in worker pairs |
-|---|---|---|---|---|
-| M5 Max / ABBA | 11.294 | 11.928 | +5.61% | 0/2 |
-| M5 Max / BAAB | 12.591 | 11.897 | -5.52% | 0/2 |
-| M5 Pro / ABBA | 18.066 | 18.053 | -0.07% | 2/2 |
+Two earlier M5 35B attempts were stopped and excluded from performance
+results: native reference loading added 36 swap-out pages; starting a local
+official CLI added 16,780 pages and reached OS pressure level 2. Moving only
+the official CLI to Pro completed the controlled comparison. Pro's 16 client
+windows were independently checked for memory pressure and against its
+300-second quiet-gated resource lease. These failures remain part of the
+evidence; the finished run does not show that local CLI + model fits M5 RAM.
 
-Max cold results change sign with execution order; no cold-input speedup is
-claimed. Max's first Q63 main-control slowdown does not repeat in the reverse
-run, while its Q65 remains about 1% slower. Pro's Q63/Q65 main controls are
-2.06%/1.03% slower. Reverse-run Max CLI Q128 includes a
-worker pair that is 1.75% slower despite the lower overall mean. Keep these
-observations rather than claiming every request or worker improves.
+## Regression checks and remaining scope
 
-No valid run added swap-outs or raised OS memory pressure. Global swap-ins
-are recorded without attribution to this model; the CLI table gives the number
-of worker pairs with zero swap-ins across the whole CLI process. In particular,
-not every CLI result has two such pairs. No across-worker confidence interval
-or GPU-frequency/occupancy explanation is claimed.
+Max passed 382 affected tests; M5 and Pro each passed 137 native/SDPA tests.
+All three passed 121 enabled and 121 disabled parity cases. Two final CPU
+benchmark-view tests also pass. Independent work-count, batch-tail,
+mixed-Q-offset, build-invalidation, margin and wrong-view mutation checks
+fail with the injected defect and pass after restoration. Ruff, formatting
+and mypy pass. The final production Python formatting change has an identical
+AST; the tested native artifacts and serving harness remain unchanged.
 
-The native MLX short reference is checked separately from the timed requests.
-Both serving hosts record EXACT=1, TOP_K_MATCH=1, FAIL=0 per checked
-upstream/enabled worker, with identical serving outputs in both arms;
-the differing native prompt has
-tied top-two reported reference scores at the first divergence. This is not
-a claim of exact native-MLX output identity for both prompts.
+The conservative selector does not always choose the measured fastest width.
+For example, M5 GQA8 H16/K2 Q128/P31680 has a direct h2-over-h4 gain near 17%,
+but this cost model does not predict enough replacement margin and retains h4.
+80-core GPUs have no hardware measurement. Routine model requests are limited
+to 32K; longer-length CPU/resource coverage is not a new long-context serving
+claim. Other dimensions, ratios, strides and batch layouts need independent
+qualification before broadening adaptive admission. Pro 27B was not run.
 
-Each device passes 532 related tests plus 118 enabled and 118 disabled native
-parity cases. The CPU policy comparison preserves 20000 GQA6 decisions against
-main and 20000 GQA8 decisions against the earlier policy. The independent
-work-count oracle includes GQA8 head geometries. Mutation checks force upstream
-fallback and zero GQA8 output: the new route/output tests fail, then pass after
-exact restoration. The affected upstream RoPE/attention suites also pass 129
-tests on both serving hosts. Current source passes Ruff/format and mypy.
-The new GQA8 GPU matrix and model requests are at most 32K; longer KV lengths
-have CPU policy/work-count coverage here, without a new long-KV GQA8 hardware
-performance claim. There is no 128K model E2E or 80-core GPU measurement.
-
-PR #1171 was still open at validation. It changes upstream pipeline admission
-and can reduce GQA8 eligibility; these results do not claim additive gains
-against that proposal. D128/D512, other GQA ratios and h8 admission remain
-separate work.
-
-## Earlier GQA6 serving measurements
-
-The cached-request measurements in PR #1225 used feature commit `dadde59` on
-base `14554be`. The later test/diagnostic follow-up leaves the shader sources and
-admission policy unchanged; it is not a new serving measurement. The earlier
-cold-input run below used base `93562f1` and is reported separately.
-
-Both runs used the same local Qwen3.8-27B-4bit checkpoint files on M5 (10 cores),
-M5 Pro (20) and M5 Max (40): H24/K4/D256, BF16 attention, APC enabled, batch size
-one, 16 output tokens, MLX 0.32.4 and vLLM 0.32.0+cpu. GPU-memory fractions were
-.75 on M5 and .50 on Pro/Max. ABBA used two independent workers per arm.
-
-### Cached continuation, base `14554be`
-
-The main protocol had one warmup and two formal requests per case/worker, with
-31360 cached tokens. Q144 TTFT changes were -18.76% / -13.90% / -11.48% on
-M5/Pro/Max. All 56 main requests per device passed complete 16-token-ID, APC,
-CPU geometry and observed final-prefill-family checks. Four trailing Q1328
-requests checked route/output only and were excluded from timings.
-
-The boundary controls below retain small slower observations. Only M5 Q64
-selects grouped h3; the other listed boundary routes stay upstream.
-
-| GPU | Q63 TTFT change | Q64 TTFT change | Q65 TTFT change |
-|---|---:|---:|---:|
-| M5 (10 cores) | +0.13% | -10.83% | -0.02% |
-| M5 Pro (20 cores) | +1.09% | -0.27% | +0.35% |
-| M5 Max (40 cores) | +0.85% | -0.24% | -0.18% |
-
-The separate `vllm bench serve` protocol used 16 formal requests per case/worker
-(128 per device), one server warmup per case and the prefix retained after the
-main protocol. The first CLI sample was retained. These samples are not pooled
-with the main protocol or earlier runs with distinct cache salts.
-
-| GPU | Q | Upstream CLI TTFT ms | Enabled CLI TTFT ms | TTFT change | E2E change | Zero-swap-in CLI worker pairs |
-|---|---:|---:|---:|---:|---:|---:|
-| M5 (10 cores) | 64 | 677.07 | 607.60 | -10.26% | -2.58% | 2/2 |
-| M5 (10 cores) | 144 | 1550.02 | 1222.90 | -21.10% | -9.02% | 1/2 |
-| M5 Pro (20 cores) | 64 | 397.78 | 394.40 | -0.85% | -0.28% | 0/2 |
-| M5 Pro (20 cores) | 144 | 714.48 | 620.81 | -13.11% | -5.54% | 0/2 |
-| M5 Max (40 cores) | 64 | 274.67 | 275.88 | +0.44% | +0.28% | 0/2 |
-| M5 Max (40 cores) | 144 | 444.17 | 396.80 | -10.66% | -4.72% | 0/2 |
-
-### Cold 32K input, earlier base `93562f1`
-
-These are full-prompt serving requests, with actual APC hits of zero. Each
-worker submitted two formal 32768-token requests with distinct salts (eight
-requests per device), through `vllm bench serve`. The scheduler used
-20 x 1568 + 784 + 624 query tokens, so this is complete prompt processing
-through chunked prefill, not one 32768-row kernel launch. Native observations
-covered the chunks/layers, and the enabled requests used grouped layouts.
-Decoded texts matched across arms; this CLI protocol did not assert complete
-output token IDs.
-
-| GPU | Upstream cold TTFT s | Enabled cold TTFT s | TTFT change | E2E change | Zero-swap-in CLI worker pairs |
-|---|---:|---:|---:|---:|---:|
-| M5 (10 cores) | 165.666 | 155.836 | -5.93% | -5.87% | 0/2 |
-| M5 Pro (20 cores) | 78.631 | 77.058 | -2.00% | -1.98% | 0/2 |
-| M5 Max (40 cores) | 45.442 | 43.740 | -3.75% | -3.70% | 0/2 |
-
-These earlier cold numbers are not a cold-serving retest on `14554be`. The
-final-source regression checked cold priming outputs but made no new cold
-performance claim. Neither run includes 128K full-model E2E.
-
-### Measurement limits and regression coverage
-
-Max main Q144 has a zero-swap-in subset covering only one of two worker pairs;
-both complete pairs favor the candidate, but the full mean is not a fully
-paging-free result. CLI windows include client startup and global swap-ins;
-the cold run has no clean worker pair. No valid run added swap-outs or raised
-OS memory pressure. Samples were retained without attributing global swap-ins
-to this model, and no across-worker confidence interval is claimed.
-
-Feature serving observed the final prefill family after natural sampling and
-CPU chunk/layer geometry, without extra GPU fences. It did not collect per-layer
-native function/grid/width events. Native-MLX short references recorded
-EXACT=2, TOP_K_MATCH=0, FAIL=0 for each checked baseline/default worker.
-
-Each device covered 1075 related cases (1066 initial passes, then the exact nine
-MPS cases after building the missing extension) and 107+107 native parity cases
-against tiled attention. FP32 was used for error calculation, not a complete
-independent FP32 attention implementation for every case.
-
-The feature owns native h3/h4/h6 regression and physical-page translation
-tests (784-to-16 and 544-to-32) in `tests/test_nax_split.py`, independently of
-event tracing. They assert the executed width after pipeline-capacity fallback
-and compare translated,
-interleaved physical storage against compact kernel-page storage and upstream
-NAX. `tools/nax_prefill_parity.py` also requires all three widths under fixed host
-planning, with poisoned padding and real physical-page translation. Geometry
-cases that intentionally allow fallback are labelled separately. These are
-correctness tests; simulated core counts are not hardware performance data.
+PR #1171 was still open during this calibration. Both upstream pipeline
+controls were measured, but the serving baseline is main `5e09bb9`; no additive
+serving gain against that proposal is claimed. [Earlier measurements](gqa-prefill-history.md)
+retain the original GQA6 and bounded GQA8 results, separately from this selector.

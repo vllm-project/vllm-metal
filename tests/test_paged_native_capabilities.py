@@ -26,6 +26,7 @@ def test_structured_capabilities_are_normalized():
         "gqa_mixed_decode_plan": False,
         "nax_split_hint": False,
         "nax_prefill_split_hint": False,
+        "nax_work_plan": False,
     }
     query.assert_called_once_with()
 

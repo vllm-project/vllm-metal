@@ -111,6 +111,7 @@ class Case:
     kv_heads: int = KV_HEADS
     cache_page: int = 0
     expected_widths: tuple[int, int] | None = None
+    planning_cores: int = 40
 
     def __str__(self) -> str:
         return (
@@ -268,6 +269,26 @@ def _grouped_cases() -> list[Case]:
             expected_widths=(4, 1),
         )
     )
+    cases.extend(
+        Case(
+            mx.bfloat16,
+            256,
+            page,
+            f"grouped-required-gqa{heads // kv_heads}-h{width}",
+            seqs=((q, prefix),),
+            poison_padding=True,
+            q_heads=heads,
+            kv_heads=kv_heads,
+            cache_page=physical,
+            expected_widths=expected,
+            planning_cores=cores,
+        )
+        for heads, kv_heads, page, physical, q, prefix, cores, width, expected in (
+            (24, 4, 16, 784, 64, 31360, 20, 2, (2, 1)),
+            (16, 2, 32, 1056, 16, 31680, 40, 2, (2, 2)),
+            (64, 8, 32, 1056, 1024, 17, 10, 8, (8, 8)),
+        )
+    )
     for dtype, d, page, window, softcap, sinks in [
         (mx.float16, 256, 16, -1, 0.0, False),
         (mx.bfloat16, 128, 16, -1, 0.0, False),
@@ -376,6 +397,9 @@ def _run(
 ) -> tuple[mx.array, str, int]:
     key_cache, value_cache, query, block_tables, seq_lens, cu_seqlens, sinks = built
     ops.set_nax_enabled(enabled)
+    cumulative = [0]
+    for q, _ in case.seqs:
+        cumulative.append(cumulative[-1] + q)
     out = ops.paged_attention_primitive(
         query,
         key_cache,
@@ -390,6 +414,7 @@ def _run(
         max(int(x) for x in seq_lens.tolist()),
         case.sliding_window,
         sinks=sinks,
+        nax_work_plan=ops.nax_prefill_plan(cumulative, [q + p for q, p in case.seqs]),
         **({} if split_hint is None else {"nax_split_hint": split_hint}),
     )
     mx.eval(out)
@@ -426,7 +451,7 @@ def _forced_hints(case: Case) -> bool:
 def _check(ops, case: Case) -> tuple[bool, str]:
     # This is route correctness under fixed host planning, not GPU timing.
     if case.expected_widths is not None:
-        ops._override_detected_gpu_core_count_for_test(40)
+        ops._override_detected_gpu_core_count_for_test(case.planning_cores)
     try:
         return _check_case(ops, case)
     finally:

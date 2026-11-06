@@ -306,7 +306,7 @@ def nax_policy_binary(tmp_path_factory):
     source = directory / "check.cpp"
     source.write_text(
         '#include "paged_attention_kernels.h"\n'
-        "#include <cstdlib>\n#include <iostream>\n#include <iomanip>\n"
+        "#include <cstdlib>\n#include <iostream>\n#include <iomanip>\n#include <vector>\n"
         "int main(int argc, char** argv) {\n"
         "  using namespace vllm_metal::kernels;\n"
         '  if (argc == 2 && std::string(argv[1]) == "work") {\n'
@@ -318,6 +318,41 @@ def nax_policy_binary(tmp_path_factory):
         "        << ' ' << w.guarded_q << ' ' << w.kv_edge << ' ' << w.fast\n"
         "        << ' ' << w.stream << ' ' << w.tail_stream << ' ' << w.groups\n"
         "        << ' ' << w.full_blocks << '\\n';\n"
+        "    }\n"
+        "    return 0;\n"
+        "  }\n"
+        '  if (argc == 2 && std::string(argv[1]) == "resources") {\n'
+        "    int heads, kv, dim, page, physical, bq, width, threads, slices, split, offset, n;\n"
+        "    while (std::cin >> heads >> kv >> dim >> page >> physical >> bq\n"
+        "                    >> width >> threads >> slices >> split >> offset >> n) {\n"
+        "      std::vector<NaxSequence> seq(n);\n"
+        "      for (auto& s : seq) std::cin >> s.query_tokens >> s.kv_tokens;\n"
+        "      auto r = nax_prefill_resources(seq,\n"
+        "          {heads, kv, dim, dim, page, physical, 2 * dim, 2 * dim * kv},\n"
+        "          {bq, 32, width, threads, slices}, split, offset);\n"
+        "      auto w = r.work;\n"
+        "      std::cout << std::setprecision(17) << w.issued << ' ' << w.active\n"
+        "        << ' ' << w.guarded << ' ' << w.guarded_q << ' ' << w.kv_edge\n"
+        "        << ' ' << w.fast << ' ' << w.groups << ' ' << w.full_blocks\n"
+        "        << ' ' << r.qk_flops << ' ' << r.value_flops\n"
+        "        << ' ' << r.kv_stream_bytes << ' ' << r.page_visits\n"
+        "        << ' ' << r.query_tokens << ' ' << r.sequences\n"
+        "        << ' ' << r.launched_groups << ' ' << r.logical_state_bytes\n"
+        "        << ' ' << r.threads << ' ' << r.longest_stream\n"
+        "        << ' ' << r.full_stream << ' ' << r.tail_stream\n"
+        "        << ' ' << r.stream_footprint_bytes << ' ' << r.logical_kv_bytes << '\\n';\n"
+        "    }\n"
+        "    return 0;\n"
+        "  }\n"
+        '  if (argc == 2 && std::string(argv[1]) == "adaptive") {\n'
+        "    int heads, kv, dim, page, physical, q, prefix, cores, split, head_stride;\n"
+        "    while (std::cin >> heads >> kv >> dim >> page >> physical >> q\n"
+        "                    >> prefix >> cores >> split >> head_stride) {\n"
+        "      NaxSequence sequence{q, prefix + q};\n"
+        "      auto cfg = select_nax_config(\n"
+        "          {heads, kv, dim, dim, page, physical, head_stride, kv * head_stride},\n"
+        "          {&sequence, &sequence + 1}, 0, true, true, true, split, cores);\n"
+        "      std::cout << cfg.HEADS_PER_TG << '\\n';\n"
         "    }\n"
         "    return 0;\n"
         "  }\n"
@@ -451,6 +486,142 @@ def test_nax_work_counts_match_independent_causal_loop(nax_policy_binary):
     for case, row in zip(cases, rows, strict=True):
         actual = tuple(map(float, row.split()))
         assert actual == _nax_work_loop(*case), case
+
+
+def test_nax_adaptive_requires_margin_and_retains_profitable_widths(nax_policy_binary):
+    """New widths must earn a replacement; full blocks alone are insufficient."""
+    # Hq, Hkv, D, kernel/physical page, Q, prefix, cores, upstream split, K stride.
+    cases = [
+        ([16, 2, 256, 32, 1056, 16, 31680, cores, 0, 512], 2) for cores in (10, 20, 40)
+    ] + [
+        ([24, 4, 256, 16, 784, 64, 31360, 20, 0, 512], 2),
+        ([24, 4, 256, 16, 784, 64, 31360, 40, 0, 512], 1),
+        ([24, 4, 256, 16, 784, 144, 31360, 10, 0, 512], 6),
+        ([24, 4, 256, 16, 784, 144, 31360, 40, 0, 512], 3),
+        ([16, 2, 256, 32, 1056, 63, 31680, 10, 0, 512], 1),
+        ([16, 2, 256, 32, 1056, 16, 31680, 10, 0, 256], 1),
+        ([16, 2, 128, 32, 1056, 16, 31680, 10, 0, 256], 1),
+    ]
+    result = subprocess.run(
+        [str(nax_policy_binary), "adaptive"],
+        input="\n".join(" ".join(map(str, row)) for row, _ in cases) + "\n",
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert list(map(int, result.stdout.split())) == [width for _, width in cases]
+
+
+def test_nax_batch_resources_keep_sequence_tails_and_layout(nax_policy_binary):
+    """Batching must not create full blocks; dimensions and widths scale work."""
+    batches = [
+        [(q, prefix) for q, prefix in ((15, 31), (1, 32), (63, 33))],
+        [(q, prefix) for q, prefix in ((64, 31), (65, 257), (129, 0))],
+        [(31, 8193), (33, 24575)],
+    ]
+    cases, expected = [], []
+    for seqs in batches:
+        for heads, kv, widths in ((24, 4, (2, 3, 6)), (40, 5, (2, 4, 8))):
+            for dim in (128, 256, 512):
+                for page, physical in ((16, 784), (32, 1056)):
+                    for bq, width, slices in [(16, h, 1) for h in widths] + [
+                        (64, 1, 1),
+                        (64, 1, 2),
+                    ]:
+                        threads = 128 if width == 1 else width * 32
+                        for split in (0, 1):
+                            offset = (0, 1, 15, 16, 63, 64)[len(cases) % 6]
+                            cases.append(
+                                [
+                                    heads,
+                                    kv,
+                                    dim,
+                                    page,
+                                    physical,
+                                    bq,
+                                    width,
+                                    threads,
+                                    slices,
+                                    split,
+                                    offset,
+                                    len(seqs),
+                                    *[x for q, p in seqs for x in (q, q + p)],
+                                ]
+                            )
+                            rows = [
+                                _nax_work_loop(q, p, heads, heads // width, bq, split)
+                                for q, p in seqs
+                            ]
+                            counts = [sum(r[i] for r in rows) for i in range(6)]
+                            groups = sum(r[8] for r in rows) * slices
+                            full = sum(r[9] for r in rows)
+                            # Independent block loops count matrix tile and page
+                            # footprints, including padded rows in the Q tail.
+                            tile_elements = sum(
+                                heads * bq * 32
+                                for q, p in seqs
+                                for start in range(0, q, bq)
+                                for _ in range(0, p + min(q, start + bq), 32)
+                            )
+                            group_visits = tile_elements // (bq * 32 * width)
+                            tokens = sum(q for q, _ in seqs)
+                            cu = offset
+                            launched = 0
+                            for i, (q, _) in enumerate(seqs):
+                                launched += len(
+                                    range(cu // bq + i, (cu + q) // bq + i + 1)
+                                )
+                                cu += q
+                            full_stream = max(
+                                (
+                                    len(range(0, p + start + bq, 32))
+                                    for q, p in seqs
+                                    for start in range(0, q - bq + 1, bq)
+                                ),
+                                default=0,
+                            )
+                            tail_stream = max((r[7] for r in rows), default=0)
+                            footprint = (
+                                sum(r[6] * (heads // width) for r in rows)
+                                * 64
+                                * dim
+                                * (slices + 1)
+                            )
+                            expected.append(
+                                [
+                                    *counts,
+                                    groups,
+                                    full,
+                                    2 * tile_elements * dim * slices,
+                                    2 * tile_elements * dim,
+                                    2 * group_visits * 32 * dim * (slices + 1),
+                                    group_visits * (32 // page),
+                                    tokens,
+                                    len(seqs),
+                                    launched * (heads // width) * slices,
+                                    bq
+                                    * width
+                                    * (4 * (dim // slices) + 2 * dim + 4 * 32 + 8),
+                                    threads,
+                                    max(len(range(0, q + p, 32)) for q, p in seqs),
+                                    full_stream,
+                                    tail_stream,
+                                    footprint,
+                                    sum(q + p for q, p in seqs) * kv * 4 * dim,
+                                ]
+                            )
+    result = subprocess.run(
+        [str(nax_policy_binary), "resources"],
+        input="\n".join(" ".join(map(str, row)) for row in cases) + "\n",
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    for row, reference in zip(result.stdout.splitlines(), expected, strict=True):
+        actual = list(map(float, row.split()))
+        assert actual[:20] == reference[:20]
+        assert actual[20] == pytest.approx(reference[20], rel=1e-14)
+        assert actual[21] == reference[21]
 
 
 @pytest.mark.parametrize(

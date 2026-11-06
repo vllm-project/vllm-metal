@@ -16,10 +16,15 @@ from vllm_metal.attention.nax_split import (
 
 @pytest.fixture(
     params=[
-        pytest.param((144, 3, 0, (24, 4, 256, 16), 784, 31360), id="gqa6-h3"),
-        pytest.param((1328, 6, 1, (24, 4, 256, 16), 784, 31360), id="gqa6-h6"),
-        pytest.param((64, 4, 0, (16, 2, 256, 32), 544, 31680), id="gqa8-h4-q64"),
-        pytest.param((128, 4, 0, (16, 2, 256, 32), 544, 31681), id="gqa8-h4-kv-tail"),
+        pytest.param((144, 3, 0, (24, 4, 256, 16), 784, 31360, 40), id="gqa6-h3"),
+        pytest.param((1328, 6, 1, (24, 4, 256, 16), 784, 31360, 40), id="gqa6-h6"),
+        pytest.param((64, 4, 0, (16, 2, 256, 32), 544, 31680, 40), id="gqa8-h4-q64"),
+        pytest.param(
+            (128, 4, 0, (16, 2, 256, 32), 544, 31681, 40), id="gqa8-h4-kv-tail"
+        ),
+        pytest.param((64, 2, 0, (24, 4, 256, 16), 784, 31360, 20), id="gqa6-h2"),
+        pytest.param((16, 2, 0, (16, 2, 256, 32), 1056, 31680, 40), id="gqa8-h2"),
+        pytest.param((1024, 8, 1, (64, 8, 256, 32), 1056, 17, 10), id="gqa8-h8"),
     ]
 )
 def grouped_prefill_inputs(nax_prefill, request):
@@ -29,11 +34,11 @@ def grouped_prefill_inputs(nax_prefill, request):
     if os.environ.get("VLLM_METAL_NAX_GQA_PREFILL", "1") != "1":
         pytest.skip("Grouped layout coverage requires GQA prefill enabled")
     ops = nax_prefill
-    query_tokens, width, hint, geometry, cache_page, prefix = request.param
+    query_tokens, width, hint, geometry, cache_page, prefix, cores = request.param
     heads, _, head_size, _ = geometry
     # Fix host planning to cover every layout on each NAX-capable test host.
-    # This override is not a measurement of a 40-core GPU.
-    ops._override_detected_gpu_core_count_for_test(40)
+    # This override tests route/output correctness, not hardware performance.
+    ops._override_detected_gpu_core_count_for_test(cores)
     try:
         inputs = _mixed_inputs(
             [1],
@@ -52,6 +57,10 @@ def grouped_prefill_inputs(nax_prefill, request):
             num_decode_tokens=0,
             max_decode_context_len=0,
         )
+        if width in (2, 8):
+            inputs["nax_work_plan"] = ops.nax_prefill_plan(
+                [0, query_tokens], [prefix + query_tokens]
+            )
         yield ops, inputs, width, hint
     finally:
         mx.synchronize()
@@ -80,8 +89,9 @@ def test_nax_grouped_translated_pages_match_compact_cache(grouped_prefill_inputs
         ),
     }
     direct = _mixed_call(compact, nax_split_hint=hint)
-    assert ops.last_paged_dispatch() == family
-    assert ops.last_nax_heads_per_threadgroup() == width
+    compact_width = 1 if width in (2, 8) else width
+    assert ops.last_paged_dispatch() == (family if compact_width > 1 else "nax_prefill")
+    assert ops.last_nax_heads_per_threadgroup() == compact_width
     assert mx.array_equal(translated, direct)
 
     ops._override_detected_gpu_core_count_for_test(0)
@@ -96,6 +106,56 @@ def test_nax_grouped_translated_pages_match_compact_cache(grouped_prefill_inputs
     ops._set_paged_dispatch_diagnostics(False)
     assert ops.last_nax_heads_per_threadgroup() == 0
     ops._set_paged_dispatch_diagnostics(True)
+
+
+@pytest.mark.parametrize(
+    "cu,kv",
+    [
+        ([], []),
+        ([1, 3], [3]),
+        ([0, 2], []),
+        ([0, 0], [4]),
+        ([0, 3, 2], [4, 4]),
+        ([0, 5], [4]),
+    ],
+)
+def test_native_nax_plan_rejects_invalid_sequence_lengths(cu, kv):
+    from vllm_metal.metal import get_ops
+
+    with pytest.raises(ValueError, match="NAX prefill lengths"):
+        get_ops().nax_prefill_plan(cu, kv)
+
+
+def test_native_nax_plan_checks_request_bounds_without_device_readback():
+    from vllm_metal.metal import get_ops
+
+    ops = get_ops()
+    inputs = _mixed_inputs([1], prefill_kv=128)
+    plan = ops.nax_prefill_plan([0, 1, 3], [1, 128])
+    assert (plan.query_tokens, plan.max_length) == (3, 128)
+    assert (
+        ops.paged_attention_primitive(**inputs, nax_work_plan=plan).shape
+        == inputs["query"].shape
+    )
+    for cu, kv in (([0, 3], [128]), ([0, 1, 4], [1, 128]), ([0, 1, 3], [1, 256])):
+        wrong = ops.nax_prefill_plan(cu, kv)
+        with pytest.raises(ValueError, match="NAX prefill plan"):
+            ops.paged_attention_primitive(**inputs, nax_work_plan=wrong)
+
+
+def test_grouped_prefill_uses_exact_lengths_under_a_loose_kv_bound(
+    grouped_prefill_inputs,
+):
+    """An allocation bound is not an exact prefix length for cost selection."""
+    ops, inputs, width, hint = grouped_prefill_inputs
+    q = inputs["query"].shape[0]
+    kv = inputs["max_seq_len"]
+    plan = ops.nax_prefill_plan([0, q], [kv])
+    reference = _mixed_call(inputs, nax_split_hint=hint)
+    loose = inputs | {"max_seq_len": kv * 2}
+    actual = _mixed_call(loose, nax_split_hint=hint, nax_work_plan=plan)
+    assert ops.last_nax_heads_per_threadgroup() == width
+    assert mx.array_equal(actual, reference)
 
 
 def _work(seqs):
@@ -199,6 +259,52 @@ def test_sliding_window_counts_only_tiles_inside_the_window():
 def test_length_mismatch_is_rejected():
     with pytest.raises(ValueError):
         nax_tile_work([0, 4], [4, 5])
+
+
+@pytest.mark.parametrize("supports_plan", [True, False])
+def test_mixed_benchmark_reuses_exact_plans_for_each_execution_view(
+    monkeypatch, supports_plan
+):
+    """A sliced prefill must not inherit the whole batch's decode Q offsets."""
+    from types import SimpleNamespace
+    from unittest.mock import Mock, call
+
+    from tools.benchmark import mixed_decode_split_benchmark as bench
+
+    whole, prefill = object(), object()
+    ops = Mock(nax_prefill_plan=Mock(side_effect=[whole, prefill]))
+    monkeypatch.setattr(bench, "get_ops", lambda: ops)
+    monkeypatch.setattr(
+        bench,
+        "mx",
+        SimpleNamespace(
+            array=np.array, arange=np.arange, int32=np.int32, eval=lambda *args: None
+        ),
+    )
+    shape = bench.Shape(24, 4, 256, 16, "bfloat16", 2, 512, 65, 4096)
+    inputs = bench.Inputs(
+        query=np.zeros((67, 24, 256)),
+        key_cache=None,
+        value_cache=None,
+        block_tables=np.zeros((3, 1)),
+        seq_lens=np.array(shape.kv_lens),
+        cu_seqlens=np.array([0, 1, 2, 67]),
+    )
+    arms = bench.Arms(shape, inputs, {"nax_work_plan": supports_plan})
+    for _ in range(2):
+        arms.unsplit()
+        arms.split_native()
+        arms.split_emulated()
+    expected = [whole, whole, None, prefill] * 2 if supports_plan else [None] * 8
+    assert [
+        c.kwargs.get("nax_work_plan")
+        for c in ops.paged_attention_primitive.call_args_list
+    ] == expected
+    assert ops.nax_prefill_plan.call_args_list == (
+        [call([0, 1, 2, 67], [512, 512, 4161]), call([0, 65], [4161])]
+        if supports_plan
+        else []
+    )
 
 
 @pytest.mark.parametrize("head_size", [128, 512])
@@ -343,7 +449,9 @@ def test_nax_trace_reports_executed_layout(grouped_prefill_inputs):
         event = trace["events"][0]
         heads = inputs["query"].shape[1]
         ratio = heads // inputs["num_kv_heads"]
-        suffix = f"_gqa{ratio}" + ("_sub_full" if width == 3 else "_full")
+        suffix = f"_gqa{ratio}"
+        suffix += f"_h{width}" if width in (2, 8) else ("_sub" if width == 3 else "")
+        suffix += "_full"
         assert event["function"].endswith(suffix)
         assert event["family"] == f"nax_gqa{ratio}_prefill"
         assert event["HEADS_PER_TG"] == width and event["threads"] == width * 32
