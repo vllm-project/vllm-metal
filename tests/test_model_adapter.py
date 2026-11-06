@@ -19,6 +19,7 @@ import vllm_metal.envs as envs
 import vllm_metal.v1.model_adapter as model_adapter_module
 from vllm_metal.config import reset_config
 from vllm_metal.multimodal.lfm2_vl import Lfm2VlMultimodalAdapter
+from vllm_metal.multimodal.lfm3_vl import Lfm3VlMultimodalAdapter
 from vllm_metal.multimodal.paddleocr_vl import PaddleOCRVLMultimodalAdapter
 from vllm_metal.multimodal.qwen3_vl import Qwen3VLMultimodalAdapter
 from vllm_metal.v1.model_adapter import (
@@ -1078,6 +1079,30 @@ class TestBuildMultimodalAdapter:
         adapter = DefaultModelAdapter().build_multimodal_adapter(model, hf_config)
 
         assert isinstance(adapter, Lfm2VlMultimodalAdapter)
+
+    @pytest.mark.parametrize(
+        ("architecture", "expected"),
+        [
+            ("Lfm3VlForConditionalGeneration", Lfm3VlMultimodalAdapter),
+            ("D1Model", None),
+        ],
+    )
+    def test_lfm3_vl_adapter_skips_d1_decision_models(
+        self, architecture: str, expected: type | None
+    ) -> None:
+        # d1 checkpoints reuse model_type "lfm3_vl" but add decision heads.
+        model = SimpleNamespace(
+            language_model=_Lfm2VlLanguageModelStub(),
+            encode_images=lambda *a, **k: [],
+        )
+        hf_config = SimpleNamespace(model_type="lfm3_vl", architectures=[architecture])
+
+        adapter = DefaultModelAdapter().build_multimodal_adapter(model, hf_config)
+
+        if expected is None:
+            assert adapter is None
+        else:
+            assert type(adapter) is expected
 
     def test_generic_vlm_has_no_model_owned_adapter(self) -> None:
         model = SimpleNamespace()

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Hybrid n-gram speculation across V2 preemption with local Qwen3.5-0.8B.
+"""N-gram speculation across V2 preemption with local Qwen3.5-0.8B and Qwen3-0.6B.
 
 Divergent prompts check structure; repeated prompts require spec-on/off token
 identity. Each arm owns one engine in a spawned process; not run in CI.
@@ -14,13 +14,13 @@ import pytest
 from huggingface_hub import try_to_load_from_cache
 
 
-def _local_model_path() -> str | None:
-    model = os.environ.get("QWEN35_MODEL_PATH")
+def _local_model_path(model_id: str, env_var: str) -> str:
+    model = os.environ.get(env_var)
     if not model:
-        config = try_to_load_from_cache("Qwen/Qwen3.5-0.8B", "config.json")
+        config = try_to_load_from_cache(model_id, "config.json")
         if isinstance(config, str):
             model = str(Path(config).parent)
-    for candidate in (model, "~/.cache/modelscope/hub/models/Qwen/Qwen3.5-0.8B"):
+    for candidate in (model, f"~/.cache/modelscope/hub/models/{model_id}"):
         if not candidate:
             continue
         path = Path(candidate).expanduser()
@@ -34,14 +34,7 @@ def _local_model_path() -> str | None:
             and any(weight.is_file() for weight in path.glob("*.safetensors"))
         ):
             return str(path.resolve())
-    return None
-
-
-MODEL_PATH = _local_model_path()
-pytestmark = pytest.mark.skipif(
-    MODEL_PATH is None,
-    reason="Qwen/Qwen3.5-0.8B not in local cache (set QWEN35_MODEL_PATH)",
-)
+    pytest.skip(f"{model_id} not in local cache (set {env_var})")
 
 
 def _run_arm(case: str, enable_spec: bool, out_path: str, model: str):
@@ -150,10 +143,11 @@ def _run_arm(case: str, enable_spec: bool, out_path: str, model: str):
 def test_ngram_spec_divergent_hybrid_preemption_structure_v2(
     run_in_spawn_process, tmp_path
 ):
+    model = _local_model_path("Qwen/Qwen3.5-0.8B", "QWEN35_MODEL_PATH")
     # Spec-on/off greedy differs only at exact top-2 logit ties / batch-shape
     # numerics here, even without preemption and on V1; identity is not an oracle.
     path = tmp_path / "divergent.json"
-    run_in_spawn_process(_run_arm, "divergent", True, str(path), MODEL_PATH)
+    run_in_spawn_process(_run_arm, "divergent", True, str(path), model)
     arm = json.loads(path.read_text(encoding="utf-8"))
     assert arm["use_v2"]
     assert arm["async_scheduling"] is False
@@ -175,15 +169,23 @@ def test_ngram_spec_divergent_hybrid_preemption_structure_v2(
 
 @pytest.mark.slow
 @pytest.mark.skipif(os.environ.get("VLLM_METAL_E2E", "1") != "1", reason="e2e disabled")
-def test_ngram_spec_repeated_is_lossless_across_hybrid_preemption_v2(
-    run_in_spawn_process, tmp_path
+@pytest.mark.parametrize(
+    ("model_id", "model_env"),
+    [
+        pytest.param("Qwen/Qwen3.5-0.8B", "QWEN35_MODEL_PATH", id="hybrid"),
+        pytest.param("Qwen/Qwen3-0.6B", "QWEN3_MODEL_PATH", id="non-hybrid"),
+    ],
+)
+def test_ngram_spec_repeated_is_lossless_across_preemption_v2(
+    run_in_spawn_process, tmp_path, model_id, model_env
 ):
+    model = _local_model_path(model_id, model_env)
     arms = []
     for enable_spec in (False, True):
         label = "spec-on" if enable_spec else "spec-off"
         path = tmp_path / f"{label}.json"
         run_in_spawn_process(
-            _run_arm, "repeated", enable_spec, str(path), MODEL_PATH, label=label
+            _run_arm, "repeated", enable_spec, str(path), model, label=label
         )
         arm = json.loads(path.read_text(encoding="utf-8"))
         assert arm["use_v2"], label

@@ -1,15 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for MLX-native temperature/top-k/top-p sampling."""
 
-from unittest.mock import Mock
-
 import mlx.core as mx
 import pytest
 import torch
 from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 
-from vllm_metal.v1.sampling_batch import SamplingBatch, seeded_row_key
+from tests.stub_runner import make_stub_runner
+from vllm_metal.v1.sampling_batch import SamplingBatch, native_sampling_key
 
 VOCAB_SIZE = 512
 BATCH_SIZE = 4
@@ -103,6 +102,8 @@ class TestNativeRandomEligibility:
                 "allowed token ids",
                 [_random_params(allowed_token_ids=[1, 2])],
             ),
+            ("logit bias", [_random_params(logit_bias={1: 5.0})]),
+            ("min tokens still pending", [_random_params(min_tokens=2)]),
         ],
     )
     def test_ineligible_batches_fall_back(self, label, params_list) -> None:
@@ -113,6 +114,11 @@ class TestNativeRandomEligibility:
         params._bad_words_token_ids = [[99]]
 
         assert not SamplingBatch.params_allow_native_random([params])
+
+    def test_min_tokens_returns_to_native_random_once_reached(self) -> None:
+        params = [_random_params(min_tokens=2), _random_params()]
+        assert not SamplingBatch.params_allow_native_random(params, [1, 0])
+        assert SamplingBatch.params_allow_native_random(params, [2, 0])
 
 
 class TestTopKTopPMaskParity:
@@ -239,10 +245,7 @@ class TestTopKTopPMaskParity:
 
 class TestMlxRandomTokens:
     def test_greedy_row_with_tied_maximum_stays_on_the_argmax(self) -> None:
-        """A greedy row must resolve to the argmax even when the top logits
-        tie. Masking it by value keeps every tied token, and the categorical
-        draw then picks between them; vLLM's greedy path takes the argmax.
-        """
+        """A greedy row in a mixed batch picks the lowest token ID on an exact tie."""
         logits = mx.array([[1.0, 5.0, 5.0, 0.0], [1.0, 2.0, 3.0, 4.0]])
         params = [
             _random_params(temperature=0.0),
@@ -362,6 +365,66 @@ class TestMlxRandomTokens:
             assert abs(counts[index] / draws - expected) < 0.02
 
 
+class TestNativeSamplingKey:
+    @pytest.mark.parametrize(
+        ("seed", "step", "legacy_key_seed"),
+        [
+            (0, 0, 0xCFD8C22A91380BA0),
+            (7, 3, 0x3D1DD505FE98FC2C),
+            (-7, 3, 0xA9DE8C3DA842F403),
+        ],
+    )
+    def test_engine_keys_are_separate_from_legacy_request_keys(
+        self, seed: int, step: int, legacy_key_seed: int
+    ) -> None:
+        """Preserve #1233's request keys without sharing the engine stream."""
+        request_key = native_sampling_key(seed, step)
+        engine_key = native_sampling_key(seed, step, domain="engine")
+        legacy_key = mx.random.key(legacy_key_seed)
+        mx.eval(request_key, engine_key, legacy_key)
+        assert request_key.tolist() == legacy_key.tolist()
+        assert engine_key.tolist() != request_key.tolist()
+
+    @pytest.mark.parametrize("seed", [0, 42, -7])
+    def test_engine_seed_and_step_reproduce_keys_and_tokens(self, seed: int) -> None:
+        runner = make_stub_runner(
+            _native_sampling_enabled=True, _native_sampling_step=11
+        )
+        runner.model_config.seed = seed
+        key = runner._next_native_sample_key()
+        same_key = native_sampling_key(seed, 11, domain="engine")
+        next_key = runner._next_native_sample_key()
+        logits = mx.zeros((8, VOCAB_SIZE))
+        params = [_random_params(temperature=0.8, top_k=0, top_p=1.0)] * 8
+        tokens = [
+            SamplingBatch.native_sample_tokens(
+                logits,
+                params,
+                vocab_size=VOCAB_SIZE,
+                next_native_rng_key=lambda k=k: k,
+                output_lengths=[0] * len(params),
+            )
+            for k in (key, same_key, next_key)
+        ]
+        mx.eval(key, same_key, next_key, *tokens)
+        assert key.tolist() == same_key.tolist()
+        assert key.tolist() != next_key.tolist()
+        assert tokens[0].tolist() == tokens[1].tolist()
+        assert tokens[0].tolist() != tokens[2].tolist()
+
+    @pytest.mark.parametrize("seeds", [(0, 42), (0, 0), (42, 42)])
+    def test_runner_keys_respect_engine_seed(self, seeds: tuple[int, int]) -> None:
+        keys = []
+        for seed in seeds:
+            runner = make_stub_runner(
+                _native_sampling_enabled=True, _native_sampling_step=11
+            )
+            runner.model_config.seed = seed
+            keys.append(runner._next_native_sample_key())
+        mx.eval(*keys)
+        assert (keys[0].tolist() == keys[1].tolist()) == (seeds[0] == seeds[1])
+
+
 class TestSeededNativeSampling:
     """Seeded requests draw from a seed-derived per-request MLX key."""
 
@@ -379,12 +442,13 @@ class TestSeededNativeSampling:
             vocab_size=VOCAB_SIZE,
             next_native_rng_key=lambda: key,
             output_lengths=output_lengths,
+            allow_seed=True,
         )
         mx.eval(tokens)
         return tokens.tolist()
 
     @pytest.mark.parametrize(
-        ("params", "expected_calls"),
+        ("params", "steps_per_call"),
         [
             ([_random_params(seed=1), _random_params(seed=2)], 0),
             ([_random_params(seed=1), _random_params(temperature=0.0)], 0),
@@ -392,22 +456,23 @@ class TestSeededNativeSampling:
         ],
         ids=["all-seeded", "seeded-plus-greedy", "seeded-plus-unseeded"],
     )
-    def test_engine_key_consumed_only_by_unseeded_random_rows(
-        self, params: list[SamplingParams], expected_calls: int
+    def test_engine_counter_advances_only_for_unseeded_random_rows(
+        self, params: list[SamplingParams], steps_per_call: int
     ) -> None:
         logits = mx.random.normal((len(params), VOCAB_SIZE), key=mx.random.key(3))
-        next_key = Mock(return_value=mx.random.key(0))
+        runner = make_stub_runner(_native_sampling_enabled=True)
         steps = 4
         for n in range(steps):
             tokens = SamplingBatch.native_sample_tokens(
                 logits,
                 params,
                 vocab_size=VOCAB_SIZE,
-                next_native_rng_key=next_key,
+                next_native_rng_key=runner._next_native_sample_key,
                 output_lengths=[n] * len(params),
+                allow_seed=True,
             )
             mx.eval(tokens)
-        assert next_key.call_count == expected_calls * steps
+        assert runner._native_sampling_step == steps_per_call * steps
 
     def test_seeded_rows_are_eligible_only_with_allow_seed(self) -> None:
         params = [_random_params(seed=7), _random_params()]
@@ -415,11 +480,15 @@ class TestSeededNativeSampling:
         assert SamplingBatch.params_allow_native_random(params, allow_seed=True)
 
     def test_row_key_is_pure_and_position_dependent(self) -> None:
-        a = seeded_row_key(7, 3)
-        b = seeded_row_key(7, 3)
+        a = native_sampling_key(7, 3)
+        b = native_sampling_key(7, 3)
         mx.eval(a, b)
         assert a.tolist() == b.tolist()
-        others = [seeded_row_key(7, 4), seeded_row_key(8, 3), seeded_row_key(-7, 3)]
+        others = [
+            native_sampling_key(7, 4),
+            native_sampling_key(8, 3),
+            native_sampling_key(-7, 3),
+        ]
         mx.eval(*others)
         assert all(o.tolist() != a.tolist() for o in others)
 
@@ -480,11 +549,12 @@ class TestSeededNativeSampling:
             vocab_size=VOCAB_SIZE,
             next_native_rng_key=lambda: key,
             output_lengths=[0, 0, 0],
+            allow_seed=True,
         )
         mx.eval(base, mixed)
         assert [base.tolist()[i] for i in (0, 2)] == [mixed.tolist()[i] for i in (0, 2)]
 
-    def test_deferred_call_without_lengths_rejects_seeded_rows(self) -> None:
+    def test_deferred_call_without_allow_seed_rejects_seeded_rows(self) -> None:
         logits = mx.zeros((1, VOCAB_SIZE))
         with pytest.raises(RuntimeError, match="gate desync"):
             SamplingBatch.native_sample_tokens(
@@ -492,4 +562,91 @@ class TestSeededNativeSampling:
                 [_random_params(seed=1)],
                 vocab_size=VOCAB_SIZE,
                 next_native_rng_key=lambda: mx.random.key(0),
+                output_lengths=[0],
             )
+
+
+def _sampling_golden_cases():
+    # The two sampled IDs per case come from the pinned vLLM FP32 Triton sampler:
+    # https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/worker/gpu/sample/gumbel.py#L165-L205
+    for vocab_size, sampled_ids in (
+        (3, (1, 1)),
+        (1025, (524, 991)),
+        (6562, (3619, 3169)),
+    ):
+        logits = ((torch.arange(vocab_size) % 17).float() / 8).repeat(5, 1)
+        logits[0].zero_()
+        logits[:, 2::5] = -float("inf")
+        # An invalid row must still return a real ID, even across reordered tiles.
+        logits[3:].fill_(float("nan"))
+        logits[4, -1] = -20.0
+        seeds, positions, temperatures = (
+            [42, -1, (1 << 62) + 31, 42, 42],
+            [0, 2, 17, 0, 0],
+            [0.0, 0.8, 1.5, 1.0, 1.0],
+        )
+        expected = [0, *sampled_ids, 0, vocab_size - 1]
+        yield logits, seeds, positions, temperatures, expected
+
+
+def test_mlx_sampler_matches_upstream_with_padding_and_reordering():
+    """Padded MLX rows preserve upstream draws and original token-ID ties."""
+    from vllm_metal.metal import get_ops
+
+    for logits, seeds, positions, temperatures, expected in _sampling_golden_cases():
+        values = mx.array(logits.numpy())
+        order = mx.argsort(values, axis=-1)[:, ::-1]
+        values = mx.pad(
+            mx.take_along_axis(values, order, axis=-1),
+            ((0, 0), (1, 2)),
+            constant_values=1000.0,
+        )[:, 1:-2]
+        mlx_ids = get_ops().gumbel_sample(
+            values,
+            mx.array(seeds, dtype=mx.int64),
+            mx.array(positions, dtype=mx.int64),
+            mx.array(temperatures, dtype=mx.float32),
+            order,
+        )
+        assert mlx_ids.tolist() == expected, logits.shape[-1]
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="requires MPS")
+def test_mps_sampler_matches_upstream_with_padding(run_in_spawn_process):
+    """Padded MPS rows preserve upstream draws and token-ID ties."""
+    run_in_spawn_process(_check_mps_sampler_against_upstream)
+
+
+def _check_mps_sampler_against_upstream():
+    from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+
+    from vllm_metal.pytorch_backend.bindings import register_kernel_overrides
+
+    register_kernel_overrides()
+    for logits, seeds, positions, temperatures, expected in _sampling_golden_cases():
+        mps_logits = torch.nn.functional.pad(logits.to("mps"), (1, 2), value=1000.0)
+        mps_ids = gumbel_sample(
+            mps_logits[:, 1:-2],
+            torch.arange(len(seeds), dtype=torch.int32, device="mps"),
+            torch.tensor(temperatures, device="mps"),
+            torch.tensor(seeds, device="mps"),
+            torch.tensor(positions, device="mps"),
+            True,
+            False,
+        )
+        assert mps_ids.cpu().tolist() == expected, logits.shape[-1]
+
+
+def test_broadcast_logits_use_per_row_candidate_ids():
+    from vllm_metal.metal import get_ops
+
+    # The same strided scores select different token IDs in the two rows.
+    scores = mx.array([[-9.0, 1.0, -9.0, 5.0, -9.0, 2.0]])[:, 1::2]
+    tokens = get_ops().gumbel_sample(
+        mx.broadcast_to(scores, (2, 3)),
+        mx.zeros(2, mx.int64),
+        mx.zeros(2, mx.int64),
+        mx.zeros(2, mx.float32),
+        mx.array([[1, 0, 2], [0, 2, 1]], dtype=mx.uint32),
+    )
+    assert tokens.tolist() == [0, 2]

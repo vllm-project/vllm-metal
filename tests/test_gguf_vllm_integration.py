@@ -886,7 +886,9 @@ def test_remote_plain_type_tags_resolve_past_projector_siblings(
     assert resolved == str(snapshot / gguf_name)
 
 
-@pytest.mark.parametrize("tag", ["Q6_K", "Q6_K_L", "Q8_0", "IQ4_NL", "IQ4_XS"])
+@pytest.mark.parametrize(
+    "tag", ["Q6_K", "Q6_K_L", "Q8_0", "IQ4_NL", "IQ4_XS", "IQ3_S", "IQ3_M"]
+)
 def test_remote_tag_resolves_its_own_file(tmp_path, monkeypatch, tag) -> None:
     snapshot = tmp_path / "weights"
     repo_files = [
@@ -898,6 +900,8 @@ def test_remote_tag_resolves_its_own_file(tmp_path, monkeypatch, tag) -> None:
         "model-Q8_0.gguf",
         "model-IQ4_NL.gguf",
         "model-IQ4_XS.gguf",
+        "model-IQ3_S.gguf",
+        "model-IQ3_M.gguf",
     ]
     monkeypatch.setattr(
         gguf_source,

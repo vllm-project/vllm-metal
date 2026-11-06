@@ -55,6 +55,8 @@ _SUPPORTED_REMOTE_TAGS = frozenset(
         "Q6_K_L",
         "IQ4_NL",
         "IQ4_XS",
+        "IQ3_S",
+        "IQ3_M",
         "F16",
         "F32",
         "BF16",

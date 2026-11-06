@@ -34,9 +34,13 @@ def validate_metal_support(kv_cache_config: KVCacheConfig) -> None:
     elif any(name.startswith("draft_layers.") for name in groups[0].layer_names):
         # Draft-model spec decode registers its KV in the same group.
         got = "a draft model's KV; drop --speculative-config"
-    elif isinstance(groups[0].kv_cache_spec, FullAttentionSpec) and not isinstance(
-        groups[0].kv_cache_spec, MLAAttentionSpec
+    elif isinstance(groups[0].kv_cache_spec, MLAAttentionSpec) and (
+        type(groups[0].kv_cache_spec) is not MLAAttentionSpec
     ):
+        # Subclasses such as HiddenStateCacheSpec do not hold attention KV.
+        got = type(groups[0].kv_cache_spec).__name__
+    elif isinstance(groups[0].kv_cache_spec, FullAttentionSpec):
+        # MLAAttentionSpec is a FullAttentionSpec: one latent row per token.
         return
     else:
         got = type(groups[0].kv_cache_spec).__name__

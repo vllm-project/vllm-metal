@@ -110,7 +110,7 @@ class MetalProposer(Protocol):
         ...
 
     def release_requests(self, req_ids: set[str]) -> None:
-        """Clear per-request drafter state on eviction, preemption, or resume.
+        """Clear per-request drafter state on eviction or preemption.
 
         The runner calls this before a request can reuse an ID or recompute
         its prefix. Physical KV blocks remain scheduler-owned; a stateless

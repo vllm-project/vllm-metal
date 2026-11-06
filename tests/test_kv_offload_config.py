@@ -16,7 +16,10 @@ from vllm.config import AuxOutputConfig
 
 from vllm_metal.config import reset_config
 from vllm_metal.platform import MetalPlatform
-from vllm_metal.v1.kv_offload.config import AUTO_POOL_KEY  # noqa: E402
+from vllm_metal.v1.kv_offload.config import (  # noqa: E402
+    AUTO_POOL_KEY,
+    configure_kv_offloading,
+)
 
 _CONFIG_LOGGER = "vllm_metal.v1.kv_offload.config"
 
@@ -57,6 +60,7 @@ def _base_config(**cache_overrides) -> SimpleNamespace:
             max_model_len=4096,
             multimodal_config=None,
             hf_config=SimpleNamespace(model_type="qwen3"),
+            hf_text_config=SimpleNamespace(model_type="qwen3"),
             is_hybrid=False,
             runner_type="generate",
             use_mla=False,
@@ -238,6 +242,7 @@ def _nixl_config() -> SimpleNamespace:
 def test_other_connector_without_offloading_is_left_alone() -> None:
     vllm_config = _base_config()
     vllm_config.kv_transfer_config = _nixl_config()
+    vllm_config.kv_transfer_config.kv_connector_extra_config["canonical_layout"] = True
     before = vars(vllm_config.kv_transfer_config).copy()
     MetalPlatform.check_and_update_config(vllm_config)
     assert vars(vllm_config.kv_transfer_config) == before
@@ -263,6 +268,39 @@ def test_unknown_spec_name_rejected() -> None:
         MetalPlatform.check_and_update_config(vllm_config)
 
 
+def _canonical_config(connector, size, value) -> SimpleNamespace:
+    vllm_config = _base_config(kv_offloading_size=size)
+    vllm_config.kv_transfer_config = SimpleNamespace(
+        kv_connector=connector,
+        kv_connector_module_path=None,
+        kv_role=None,
+        kv_connector_extra_config={"canonical_layout": value},
+    )
+    return vllm_config
+
+
+@pytest.mark.parametrize(
+    "connector,size,value",
+    [
+        (None, 1.0, True),
+        ("OffloadingConnector", None, True),
+        ("MetalOffloadingConnector", None, True),
+        (None, 1.0, "false"),
+    ],
+)
+def test_canonical_layout_rejected(connector, size, value) -> None:
+    """Reject every entry path using upstream's truthiness rules."""
+    vllm_config = _canonical_config(connector, size, value)
+    with pytest.raises(NotImplementedError, match="canonical_layout"):
+        MetalPlatform.check_and_update_config(vllm_config)
+
+
+def test_canonical_layout_off_is_accepted() -> None:
+    vllm_config = _canonical_config(None, 1.0, False)
+    MetalPlatform.check_and_update_config(vllm_config)
+    assert vllm_config.kv_transfer_config.kv_connector == "MetalOffloadingConnector"
+
+
 def test_simple_kv_offload_env_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("vllm.envs.VLLM_USE_SIMPLE_KV_OFFLOAD", True, raising=False)
     vllm_config = _base_config(kv_offloading_size=1.0)
@@ -281,6 +319,7 @@ def test_validate_metal_support_guards() -> None:
     import torch
     from vllm.v1.kv_cache_interface import (
         FullAttentionSpec,
+        HiddenStateCacheSpec,
         MLAAttentionSpec,
         SlidingWindowSpec,
     )
@@ -304,8 +343,10 @@ def test_validate_metal_support_guards() -> None:
         validate_metal_support(SimpleNamespace(kv_cache_groups=[group, group]))
     with pytest.raises(NotImplementedError, match="SlidingWindowSpec"):
         check(SlidingWindowSpec(**dims, sliding_window=128))
-    with pytest.raises(NotImplementedError, match="MLAAttentionSpec"):
-        check(MLAAttentionSpec(**dims))
+    # MLA keeps one latent head per token and offloads like full attention.
+    check(MLAAttentionSpec(**{**dims, "num_kv_heads": 1}))
+    with pytest.raises(NotImplementedError, match="HiddenStateCacheSpec"):
+        check(HiddenStateCacheSpec(**{**dims, "num_kv_heads": 1}))
     # Draft-model spec decode shares the full-attention group; point the user
     # at the flag.
     with pytest.raises(NotImplementedError, match="--speculative-config"):
@@ -375,7 +416,7 @@ def test_tier_events_without_global_events_are_accepted() -> None:
     assert tier["enable_kv_events"] is True
 
 
-def test_pooling_and_mla_rejected_at_config_time() -> None:
+def test_pooling_rejected_at_config_time() -> None:
     """Shapes the offload path does not serve fail before the weights load,
     not at KV cache registration after them."""
     vllm_config = _base_config(kv_offloading_size=1.0)
@@ -383,10 +424,23 @@ def test_pooling_and_mla_rejected_at_config_time() -> None:
     with pytest.raises(NotImplementedError, match="pooling"):
         MetalPlatform.check_and_update_config(vllm_config)
 
+
+@pytest.mark.parametrize("use_mla", [False, True])
+def test_hybrid_rejected_at_config_time(use_mla: bool) -> None:
+    """Hybrids fail before the weights load: Qwen3.5 (use_mla=False), and Ling
+    and Kimi Linear (use_mla=True), which the old use_mla check refused here."""
+    vllm_config = _base_config(kv_offloading_size=1.0)
+    vllm_config.model_config.use_mla = use_mla
+    vllm_config.model_config.is_hybrid = True
+    with pytest.raises(NotImplementedError, match="single full-attention KV cache"):
+        configure_kv_offloading(vllm_config)
+
+
+def test_mla_accepted_at_config_time() -> None:
     vllm_config = _base_config(kv_offloading_size=1.0)
     vllm_config.model_config.use_mla = True
-    with pytest.raises(NotImplementedError, match="MLA"):
-        MetalPlatform.check_and_update_config(vllm_config)
+    MetalPlatform.check_and_update_config(vllm_config)
+    assert vllm_config.kv_transfer_config.kv_connector == "MetalOffloadingConnector"
 
 
 def _tiered(kv_offloading_size: float = 1.0) -> SimpleNamespace:
@@ -541,6 +595,63 @@ def test_default_pool_rounds_the_request_up_to_whole_blocks() -> None:
 
     extra = vllm_config.kv_transfer_config.kv_connector_extra_config
     assert extra["cpu_bytes_to_use"] == 2 * 2 * 4112 * 2
+
+
+@pytest.mark.parametrize("use_mla", [False, True])
+def test_default_pool_for_mla_holds_one_latent_row_per_token(use_mla: bool) -> None:
+    """Metal runs MLA whenever the checkpoint has kv_lora_rank. vLLM 0.32
+    reports MiniCPM3 as use_mla=False, with 40 KV heads of 32, which would
+    size the pool 8.9x too big."""
+    vllm_config = _base_config()
+    vllm_config.model_config.use_mla = use_mla
+    vllm_config.model_config.hf_text_config = SimpleNamespace(
+        model_type="minicpm3", kv_lora_rank=256, qk_rope_head_dim=32
+    )
+    vllm_config.kv_transfer_config = _metal_connector_without_size()
+    _uniform_model(vllm_config, layers=62, kv_heads=40, head_size=32)
+
+    MetalPlatform.check_and_update_config(vllm_config)
+
+    extra = vllm_config.kv_transfer_config.kv_connector_extra_config
+    # layers * (kv_lora_rank + qk_rope_head_dim) * fp16, two 4096-token requests.
+    assert extra["cpu_bytes_to_use"] == 62 * 288 * 2 * 4096 * 2 == 292_552_704
+
+
+def test_default_pool_for_mla_without_rope_dim_uses_the_runtime_default() -> None:
+    vllm_config = _base_config()
+    vllm_config.model_config.hf_text_config = SimpleNamespace(
+        model_type="deepseek_v2", kv_lora_rank=512
+    )
+    vllm_config.kv_transfer_config = _metal_connector_without_size()
+    _uniform_model(vllm_config, layers=2, kv_heads=1, head_size=576)
+    vllm_config.model_config.dtype = torch.float32
+
+    MetalPlatform.check_and_update_config(vllm_config)
+
+    extra = vllm_config.kv_transfer_config.kv_connector_extra_config
+    # layers * (kv_lora_rank + default rope 64) * fp32, two 4096-token requests.
+    assert extra["cpu_bytes_to_use"] == 2 * 576 * 4 * 4096 * 2
+
+
+def test_default_pool_for_null_kv_lora_rank_holds_k_and_v() -> None:
+    vllm_config = _base_config()
+    vllm_config.model_config.hf_text_config = SimpleNamespace(
+        model_type="qwen3", kv_lora_rank=None
+    )
+    vllm_config.kv_transfer_config = _metal_connector_without_size()
+    _uniform_model(vllm_config, layers=2, kv_heads=4, head_size=64)
+
+    MetalPlatform.check_and_update_config(vllm_config)
+
+    extra = vllm_config.kv_transfer_config.kv_connector_extra_config
+    assert extra["cpu_bytes_to_use"] == 2 * 2 * 4 * 64 * 2 * 4096 * 2
+
+
+def test_mla_pool_rope_default_matches_the_runtime() -> None:
+    from vllm_metal.attention.impls.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
+    from vllm_metal.v1.kv_offload import config
+
+    assert config._MLA_DEFAULT_QK_ROPE_HEAD_DIM == MLA_DEFAULT_QK_ROPE_HEAD_DIM
 
 
 def test_explicit_pool_bytes_in_the_connector_config_are_kept() -> None:

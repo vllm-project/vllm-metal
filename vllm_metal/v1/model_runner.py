@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-Metal vLLM v1 model runner.
+MLX model runner for vLLM's V2 scheduler contract.
 
 Orchestration only: coordinates scheduling, dispatch, and output assembly.
 Model-specific behavior belongs in adapters; backend-specific kernels live in
@@ -128,6 +128,7 @@ from vllm_metal.v1.proposer import (
 from vllm_metal.v1.sampling_batch import (
     SamplingBatch,
     create_request_generator,
+    native_sampling_key,
     sample_decode_tokens,
     sample_from_logits,
     sample_prefill_tokens,
@@ -369,7 +370,7 @@ class _PagedForwardState(NamedTuple):
 class MetalModelRunner:
     """Model runner for MLX-based inference on Metal.
 
-    Implements the vLLM v1 model runner interface for Apple Silicon.
+    Implements the vLLM model runner interface for Apple Silicon.
     """
 
     # Class-level defaults so stub runners built via __new__ are safe on
@@ -397,15 +398,8 @@ class MetalModelRunner:
         self.scheduler_config = vllm_config.scheduler_config
         self.use_async_scheduling = bool(self.scheduler_config.async_scheduling)
         self.metal_config = get_config()
-        # MLX-native sampling key chain (VLLM_METAL_NATIVE_SAMPLING, default on).
-        # Derived from the engine seed, so sampling is reproducible for a
-        # fixed request schedule; split once per sampling call. A live key is
-        # the single runtime capability signal for the native random path.
-        self._native_sample_key: mx.array | None = (
-            mx.random.key(self.model_config.seed)
-            if envs.VLLM_METAL_NATIVE_SAMPLING
-            else None
-        )
+        self._native_sampling_enabled = envs.VLLM_METAL_NATIVE_SAMPLING
+        self._native_sampling_step = 0
         self._model_adapter: ModelAdapter = DefaultModelAdapter()
         self._cache_policy = ModelCachePolicy(self, self._model_adapter)
         self._model_lifecycle = ModelLifecycle(self, self._model_adapter)
@@ -504,7 +498,10 @@ class MetalModelRunner:
         self._pp_model: PipelinedModel | None = None
 
         # Structured-output bitmask applier for the paged path.
-        self._structured_output_applier = MetalStructuredOutputApplier()
+        self._structured_output_applier = MetalStructuredOutputApplier(
+            mask_stride=vllm_config.num_speculative_tokens
+            + (0 if self.model_config.is_diffusion else 1)
+        )
 
         # Per-request prompt-logprobs accumulation across prefill chunks
         # (populated only for requests whose SamplingParams ask for it).
@@ -1023,22 +1020,23 @@ class MetalModelRunner:
         """Hand the runtime's KV storage to the KV connector, and build its driver.
 
         Called by the worker after ``initialize_kv_cache`` when a KV connector
-        is configured. Only the SDPA runtime's ``KVCacheStorage`` is registered.
-        Hybrid and count-based (draft model) caches have no layout the connector
-        can address, and KV offloading does not support MLA models yet.
+        is configured. Only the SDPA and MLA runtimes' ``KVCacheStorage`` is
+        registered. Hybrid and count-based (draft model) caches have no layout
+        the connector can address.
         """
+        from vllm_metal.attention.runtime.mla import MLAPagedAttentionRuntime
         from vllm_metal.attention.runtime.sdpa import SDPAPagedAttentionRuntime
 
         runtime = self._paged_attention_runtime
         storage = None
-        if isinstance(runtime, SDPAPagedAttentionRuntime):
+        if isinstance(runtime, (SDPAPagedAttentionRuntime, MLAPagedAttentionRuntime)):
             try:
                 storage = runtime.storage
             except RuntimeError:
                 storage = None
         if storage is None:
             raise NotImplementedError(
-                "KV offloading on Metal requires the SDPA paged attention "
+                "KV offloading on Metal requires the SDPA or MLA paged attention "
                 "runtime with storage bound from the KV cache config; "
                 f"{type(runtime).__name__} provides none."
             )
@@ -1809,6 +1807,7 @@ class MetalModelRunner:
         states_missing = False
         decode_req_ids: list[str] = []
         decode_params: list[SamplingParams] = []
+        decode_output_lengths: list[int] = []
         for req_id in cached_reqs.req_ids:
             state = self._request_states.get(req_id)
             if state is None:
@@ -1822,6 +1821,7 @@ class MetalModelRunner:
             decode_req_ids.append(req_id)
             if state.sampling_params is not None:
                 decode_params.append(state.sampling_params)
+                decode_output_lengths.append(len(state.token_ids) - state.prompt_len)
 
         adapter = self._multimodal_adapter
         mm_forward_forced = self._mm_forward_forced(adapter)
@@ -1849,7 +1849,6 @@ class MetalModelRunner:
                 bool(scheduler_output.scheduled_new_reqs) or states_missing
             ),
             has_prefill_phase_requests=has_prefill_phase,
-            has_resumed_requests=bool(cached_reqs.resumed_req_ids),
             has_preempted_requests=bool(scheduler_output.preempted_req_ids),
             has_encoder_inputs=bool(scheduler_output.scheduled_encoder_inputs),
             has_spec_tokens=bool(
@@ -1862,25 +1861,38 @@ class MetalModelRunner:
         sampling = SamplingShape(
             native_greedy=(
                 not states_missing
-                and SamplingBatch.params_allow_native_greedy(decode_params)
+                and SamplingBatch.params_allow_native_greedy(
+                    decode_params, decode_output_lengths
+                )
             ),
             native_random=(
-                self._native_sample_key is not None
+                self._native_sampling_enabled
                 and not states_missing
-                and SamplingBatch.params_allow_native_random(decode_params)
+                and SamplingBatch.params_allow_native_random(
+                    decode_params, decode_output_lengths
+                )
             ),
         )
         return self._decode_pipeline.evaluate_gate(capabilities, step, sampling)
 
     def _next_native_sample_key(self) -> mx.array:
-        """Split the runner's sampling key chain and return the step key."""
-        if self._native_sample_key is None:
+        """Derive a fresh key without retaining a lazy MLX RNG dependency.
+
+        The zero-based counter advances per native sampling sub-batch with
+        unseeded random rows (decode and prefill count separately). Greedy,
+        seeded-only and torch calls do not advance it. Deferred sampling
+        advances at graph construction, never again at resolution.
+        """
+        if not self._native_sampling_enabled:
             raise RuntimeError(
-                "native sampling key requested while the chain is disabled "
+                "native sampling key requested while native sampling is disabled "
                 "— gate desync."
             )
-        self._native_sample_key, subkey = mx.random.split(self._native_sample_key)
-        return subkey
+        key = native_sampling_key(
+            self.model_config.seed, self._native_sampling_step, domain="engine"
+        )
+        self._native_sampling_step += 1
+        return key
 
     def _sample_paged_batch(
         self,
@@ -1990,7 +2002,7 @@ class MetalModelRunner:
         vocab_size = self._vocab_size
         next_native_rng_key = (
             self._next_native_sample_key
-            if self._native_sample_key is not None
+            if self._native_sampling_enabled
             and self.vllm_config.speculative_config is None
             and self._drafter is None
             and grammar_output is None
@@ -2940,31 +2952,17 @@ class MetalModelRunner:
             state = self._request_states[req_id]
 
             new_block_ids = cached_reqs.new_block_ids[i]
-            resumed = req_id in cached_reqs.resumed_req_ids
-            if not resumed:
-                if new_block_ids is not None:
+            if new_block_ids is not None:
+                for group_index, group_block_ids in enumerate(
+                    self._copy_paged_block_ids(new_block_ids)
+                ):
+                    state.block_ids[group_index].extend(group_block_ids)
+                if self._paged_state_group_indices:
+                    req_state_ids = self._state_block_ids_by_req[req_id]
                     for group_index, group_block_ids in enumerate(
-                        self._copy_paged_block_ids(new_block_ids)
+                        self._copy_state_block_ids(new_block_ids)
                     ):
-                        state.block_ids[group_index].extend(group_block_ids)
-                    if self._paged_state_group_indices:
-                        req_state_ids = self._state_block_ids_by_req[req_id]
-                        for group_index, group_block_ids in enumerate(
-                            self._copy_state_block_ids(new_block_ids)
-                        ):
-                            req_state_ids[group_index].extend(group_block_ids)
-                continue
-
-            assert new_block_ids is not None
-            # The scheduler can drop an in-flight output we already appended.
-            state.token_ids = cached_reqs.all_token_ids[req_id]
-            state.block_ids = self._copy_paged_block_ids(new_block_ids)
-            if self._paged_state_group_indices:
-                self._state_block_ids_by_req[req_id] = self._copy_state_block_ids(
-                    new_block_ids
-                )
-            state.generated_tokens = 0
-            self._paged_request_seq_lens.pop(req_id, None)
+                        req_state_ids[group_index].extend(group_block_ids)
 
     def _readmit_request(
         self,
@@ -3217,7 +3215,6 @@ class MetalModelRunner:
         evicted_req_ids: set[str],
         *,
         preempted_req_ids: set[str] | None = None,
-        resumed_req_ids: set[str] | None = None,
         materialize_runtime_state: bool = True,
     ) -> None:
         """Reconcile runner metadata and runtime-owned recurrent state."""
@@ -3238,23 +3235,13 @@ class MetalModelRunner:
         # dropped only when the engine finishes the request.
         self._prompt_logprobs_tracker.discard(evicted_req_ids)
 
-        if resumed_req_ids:
-            # A resumed request recomputes from a new prefix boundary; its
-            # first_prefill_start is re-seeded by the next chunk.
-            for req_id in resumed_req_ids:
-                self._mm_bidi_states.pop(req_id, None)
-
         if preempted_req_ids:
             self._awaiting_readmission.update(preempted_req_ids)
         self._awaiting_readmission -= evicted_req_ids
-        if resumed_req_ids:
-            self._awaiting_readmission -= resumed_req_ids
 
         invalidated = set(evicted_req_ids)
         if preempted_req_ids:
             invalidated.update(preempted_req_ids)
-        if resumed_req_ids:
-            invalidated.update(resumed_req_ids)
 
         # Discard draft KV validity tracking before eviction or recompute.
         if invalidated and self._drafter is not None:
@@ -3319,7 +3306,6 @@ class MetalModelRunner:
         self._reconcile_request_lifecycle(
             evicted_req_ids,
             preempted_req_ids=scheduler_output.preempted_req_ids,
-            resumed_req_ids=scheduler_output.scheduled_cached_reqs.resumed_req_ids,
             materialize_runtime_state=will_fail_fast_before_model_work,
         )
         if missing_cached_state_req_ids:
@@ -3499,10 +3485,11 @@ class MetalModelRunner:
             [state.sampling_params for _, state in decode_reqs],
             vocab_size=self._vocab_size,
             next_native_rng_key=(
-                self._next_native_sample_key
-                if self._native_sample_key is not None
-                else None
+                self._next_native_sample_key if self._native_sampling_enabled else None
             ),
+            output_lengths=[
+                len(state.token_ids) - state.prompt_len for _, state in decode_reqs
+            ],
         )
         # Submit now: the token buffer is scheduled right after this step's
         # forward and ahead of the next step's encode, so the deferred

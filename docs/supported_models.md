@@ -30,7 +30,7 @@ do not add columns for unimplemented features. -->
 
 ## Text Pooling
 
-Metal V1 has experimental text-only pooling support. See
+The MLX backend has experimental text-only pooling support. See
 [Text Pooling](text_embedding_pooling.md) for scope, usage, and
 validation guidance. The reranker requires Qwen3 sequence-classification
 `hf_overrides`.
@@ -53,7 +53,8 @@ unsupported; leave `--video-pruning-rate` unset.
 | Qwen3-VL | 🔵 | | native multimodal paged generation | image and video input | `mlx-community/Qwen3-VL-4B-Instruct-4bit` |
 | Qwen3.5 / 3.6 (dense and MoE) | 🔵 | | native multimodal paged generation | image and video input; FP8 and GGUF checkpoints stay text-only | `mlx-community/Qwen3.5-4B-MLX-4bit` |
 | PaddleOCR-VL | 🔵 | | native multimodal paged generation | image input, no video | `PaddlePaddle/PaddleOCR-VL-1.6` |
-| LFM2-VL / LFM2.5-VL | 🔵 | | native multimodal paged generation on the ShortConv text tower | image input, no video; one tile grid plus thumbnail per image; needs a checkpoint packaged for Transformers, which the MLX conversions are not | `LiquidAI/LFM2.5-VL-1.6B` |
+| LFM2-VL / LFM2.5-VL | 🔵 | 🔵 | native multimodal paged generation on the ShortConv text tower | image input, no video; one tile grid plus thumbnail per image; needs a checkpoint packaged for Transformers, which the MLX conversions are not | `LiquidAI/LFM2.5-VL-1.6B` |
+| LFM3-VL | 🔵 | | native multimodal paged generation on the LFM3 text tower | image input, no video; needs `--trust-remote-code`; the image processor comes from mlx-vlm | `LiquidAI/LFM3-VL-2B-MLX-4bit` |
 | Gemma 4 | 🔵 | | mlx_lm text backbone + mlx-vlm encoder sidecar, paged generation | image input; audio and video input on E2B/E4B; bidirectional attention inside image blocks on sliding-window layers | `mlx-community/unsloth-gemma-4-26B-A4B-it-qat-oQ4`, `mlx-community/gemma-4-e2b-it-4bit` (audio, video) |
 
 Gemma 4 keeps its text path exactly as on the text-only table (mlx_lm model,
@@ -152,7 +153,7 @@ and TurboQuant are not validated.
 | Model | MLX | PyTorch MPS | Attention Kernel | Automatic Prefix Cache | Example checkpoint |
 | --- | --- | --- | --- | --- | --- |
 | Qwen3 | ✅ | 🔵 | GQA (paged) | ✅ | `Qwen/Qwen3-0.6B` |
-| Qwen3.5 / 3.6 / 3.8 | ✅ | | Hybrid SDPA + GDN linear (3.6 adds MoE) | 🔵 | `mlx-community/Qwen3.8-27B-8bit` |
+| Qwen3.5 / 3.6 / 3.8 | ✅ | 🔵 | Hybrid SDPA + GDN linear (3.6 adds MoE) | 🔵 | `mlx-community/Qwen3.8-27B-8bit` |
 | Qwen3-Next | ✅ | | Hybrid SDPA + GDN linear | 🔵 | `mlx-community/Qwen3-Next-80B-A3B-Instruct-8bit` |
 | LFM2 / LFM2.5 | ✅ | 🔵 | Hybrid SDPA + ShortConv | ✅ | `LiquidAI/LFM2.5-1.2B-Instruct` |
 | LFM3 | 🔵 | | Hybrid full/sliding SDPA + ShortConv | ✅ | `LiquidAI/LFM3-1.7B-MLX-4bit` (needs `--trust-remote-code`) |
@@ -168,10 +169,10 @@ and TurboQuant are not validated.
 | GPT-OSS | 🔵 | | Sink attention (paged) | ✅ | `openai/gpt-oss-20b` |
 | Flint | 🔵 | | GQA + per-layer sliding window + learned sinks, no RoPE on full-attention layers (paged) | ✅ | `RecursiveSI/flint-int4` |
 | Ling-3.0 Tiny | 🔵 | | Hybrid MLA + KDA (paged latent + recurrent state) | 🔵 | `inclusionAI/Ling-3.0-tiny` (BF16 or converted MXFP8) |
-| GLM-4.5 | Not verified | | MLA (paged latent cache, MLX SDPA — no Metal kernel) | Not verified | — |
+| GLM-4.5 | Not verified | | GQA (paged) | Not verified | — |
 | MiniCPM3-4B | ✅ | | MLA (paged latent cache) | ✅ | `mlx-community/MiniCPM3-4B-4bit` |
 | MiniCPM4 | ✅ | | GQA (paged) | ✅ | `openbmb/MiniCPM4-0.5B-mlx` (needs `--trust-remote-code`) |
-| GLM-4.7-Flash | 🔵 | | GQA (paged) | ✅ | `mlx-community/GLM-4.7-Flash-4bit` |
+| GLM-4.7-Flash | 🔵 | | MLA (paged latent cache) | ✅ | `mlx-community/GLM-4.7-Flash-4bit` |
 | DeepSeek-R1-Distill-Qwen | ✅ | | GQA (paged) | ✅ | `mlx-community/DeepSeek-R1-Distill-Qwen-7B-3bit` |
 | Phi-4-mini | ✅ | | GQA packed qkv (paged) | ✅ | `microsoft/Phi-4-mini-instruct` |
 | Phi-3.5-mini | ✅ | | MHA packed qkv (paged) | ✅ | `mlx-community/Phi-3.5-mini-instruct-4bit` |
@@ -192,7 +193,8 @@ and TurboQuant are not validated.
 **Hunyuan on MPS:** use `--generation-config vllm` to override the checkpoint’s unsupported `repetition_penalty=1.05` default.
 
 LFM3 support covers text generation with BF16 and MLX-quantized checkpoints.
-Vision, audio, and omni variants require separate integrations.
+LFM3-VL image input is listed under multimodal models. Audio, omni, and d1
+variants require separate integrations.
 
 sliding-window attention (SWA) is not fully optimized.
 

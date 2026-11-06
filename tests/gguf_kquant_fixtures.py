@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Field-built K-quant and IQ4 GGUF blocks, which gguf-py can dequantize but not quantize."""
+"""Field-built K-quant and IQ GGUF blocks, which gguf-py can dequantize but not quantize."""
 
 from __future__ import annotations
 
@@ -157,3 +157,18 @@ def build_iq4_blocks(
         [d.view(np.uint8), scales_h.view(np.uint8), scales_l, nibbles], axis=1
     )
     return blocks.reshape(rows, -1)
+
+
+def build_iq3s_blocks(rows: int, cols: int, seed: int = 0) -> np.ndarray:
+    """Build valid random IQ3_S superblocks, one byte row per row."""
+    block_elems, block_bytes = gguf.GGML_QUANT_SIZES[QT.IQ3_S]
+    if cols % block_elems:
+        raise ValueError(
+            f"IQ3_S rows need a multiple of {block_elems} columns, got {cols}"
+        )
+    rng = np.random.default_rng(seed)
+    n = rows * (cols // block_elems)
+    d = rng.uniform(2**-10, 2**-4, (n, 1)).astype(np.float16)
+    # Every grid index, sign bit and scale nibble is valid, so the rest is random.
+    rest = rng.integers(0, 256, (n, block_bytes - 2), dtype=np.uint8)
+    return np.concatenate([d.view(np.uint8), rest], axis=1).reshape(rows, -1)

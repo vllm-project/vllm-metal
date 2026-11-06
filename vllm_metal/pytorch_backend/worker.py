@@ -35,9 +35,19 @@ def configure_mps(config, *, omni=False):
         model.get_head_size() not in MPSAttentionBackend.get_supported_head_sizes()
         or model.is_encoder_decoder
         or model.is_diffusion
-        or (model.is_multimodal_model and not omni)
+        # MPS attention is causal only; prefix LMs attend bidirectionally
+        # over image tokens.
+        or model.is_mm_prefix_lm
         or model.is_moe
-        or (model.has_inner_state and state_layers != {"conv", "full_attention"})
+        or (
+            model.has_inner_state
+            and state_layers
+            not in ({"conv", "full_attention"}, {"linear_attention", "full_attention"})
+        )
+        or (
+            "linear_attention" in state_layers
+            and config.cache_config.mamba_ssm_cache_dtype not in ("auto", "float32")
+        )
         or model.use_mla
         or model.quantization is not None
         or (model.runner_type != "generate" and not omni)
@@ -50,8 +60,8 @@ def configure_mps(config, *, omni=False):
     ):
         raise NotImplementedError(
             "Experimental MPS requires an unquantized dense autoregressive "
-            "text decoder with a supported attention head size, optional "
-            "ShortConv state, fp16/bf16, "
+            "causal decoder with a supported attention head size, optional "
+            "ShortConv or Gated DeltaNet state, fp16/bf16, "
             "one GPU, and no LoRA/KV transfer."
         )
     spec = config.speculative_config
@@ -67,7 +77,12 @@ def configure_mps(config, *, omni=False):
         raise NotImplementedError("MPS speculation currently supports greedy EAGLE3")
     if config.cache_config.block_size is None:
         config.cache_config.block_size = 16
-    if not MPSAttentionBackend.supports_block_size(config.cache_config.block_size):
+    block_size = config.cache_config.block_size
+    # The engine core resets a hybrid model's block size to its smallest
+    # group's, which is max_model_len for mamba groups.
+    if not MPSAttentionBackend.supports_block_size(block_size) and not (
+        model.is_hybrid and block_size == model.max_model_len
+    ):
         raise ValueError("MPS requires a cache block size divisible by 8")
     if getattr(model, "use_fp64_gumbel", False):
         raise NotImplementedError("Experimental MPS does not support use_fp64_gumbel")
