@@ -51,8 +51,9 @@ class PagedAttention {
   int gpu_cores_;
 
   id<MTLComputePipelineState> pipeline(const std::string& name, bool split = false,
-                                      int window_q = 0) {
-    const auto key = name + "_wq" + std::to_string(window_q);
+                                      int window_q = 0, bool block_attention = false) {
+    const auto key = name + "_wq" + std::to_string(window_q)
+        + "_block" + std::to_string(block_attention);
     auto it = pipelines_.find(key);
     if (it != pipelines_.end()) return it->second;
     auto constants = [[MTLFunctionConstantValues alloc] init];
@@ -63,6 +64,7 @@ class PagedAttention {
     // loop. The split pipeline is only chosen by the MLX launcher.
     [constants setConstantValue:&no type:MTLDataTypeBool atIndex:41];
     [constants setConstantValue:&split type:MTLDataTypeBool atIndex:10];
+    [constants setConstantValue:&block_attention type:MTLDataTypeBool atIndex:120];
     int kbits = 8, vbits = 3;
     [constants setConstantValue:&kbits type:MTLDataTypeInt atIndex:60];
     [constants setConstantValue:&vbits type:MTLDataTypeInt atIndex:70];
@@ -91,6 +93,43 @@ class PagedAttention {
     [enc setBytes:&value length:sizeof(T) atIndex:i];
   }
 
+  static void check_cache(const Tensor& k, const Tensor& v, const Tensor& kc,
+                          const Tensor& vc, const Tensor& slots) {
+    for (auto* t : {&k, &v, &kc, &vc, &slots})
+      TORCH_CHECK(t->is_mps(), "All cache buffers must be on MPS");
+    TORCH_CHECK(kc.dim() == 4 &&
+                (kc.size(1) == 8 || kc.size(1) == 16 || kc.size(1) == 32) &&
+                kc.stride(3) == 1 && vc.strides() == kc.strides() && kc.sizes() == vc.sizes(),
+                "MPS attention requires [blocks,8/16/32,kv_heads,head_dim] KV");
+    TORCH_CHECK(k.scalar_type() == at::kHalf || k.scalar_type() == at::kBFloat16,
+                "MPS cache writes require fp16 or bf16");
+    for (auto* t : {&v, &kc, &vc})
+      TORCH_CHECK(t->scalar_type() == k.scalar_type(), "K/V/cache dtype mismatch");
+    TORCH_CHECK(k.sizes() == v.sizes() && k.dim() == 3 &&
+                k.size(1) == kc.size(2) && k.size(2) == kc.size(3) &&
+                k.stride(2) == 1 && k.stride(1) == k.size(2) &&
+                v.stride(2) == 1 && v.stride(1) == v.size(2) &&
+                slots.numel() == k.size(0) && slots.scalar_type() == at::kLong &&
+                slots.is_contiguous(), "Inconsistent cache shapes/strides");
+  }
+
+  void encode_cache(id<MTLComputeCommandEncoder> enc, const Tensor& k,
+                    const Tensor& v, const Tensor& kc, const Tensor& vc,
+                    const Tensor& slots) {
+    const std::string dt = k.scalar_type() == at::kHalf ? "half" : "bfloat16_t";
+    [enc setComputePipelineState:pipeline(kernels::reshape_and_cache_name(dt, dt))];
+    buffer(enc, 0, k); buffer(enc, 1, v);
+    buffer(enc, 2, kc); buffer(enc, 3, vc); buffer(enc, 4, slots);
+    scalar<int>(enc, 7, k.stride(0)); scalar<int>(enc, 8, v.stride(0));
+    scalar<int>(enc, 9, kc.size(2)); scalar<int>(enc, 10, kc.size(3));
+    scalar<int>(enc, 11, kc.size(1));
+    scalar<int64_t>(enc, 12, kc.stride(0));
+    scalar<int64_t>(enc, 13, kc.stride(1));
+    scalar<int64_t>(enc, 14, kc.stride(2));
+    [enc dispatchThreadgroups:MTLSizeMake(k.size(0), 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+  }
+
  public:
   PagedAttention(const std::string& path, const std::string& nax_path, int gpu_cores)
       : gpu_cores_(gpu_cores) {
@@ -116,11 +155,24 @@ class PagedAttention {
     [nax_library_ release];
   }
 
+  void reshape_and_cache(const Tensor& k, const Tensor& v, const Tensor& kc,
+                         const Tensor& vc, const Tensor& slots) {
+    check_cache(k, v, kc, vc, slots);
+    if (k.size(0) == 0) return;
+    auto stream = at::mps::getCurrentMPSStream();
+    at::mps::dispatch_sync_with_rethrow(stream->queue(), ^{
+      @autoreleasepool {
+        encode_cache(stream->commandEncoder(), k, v, kc, vc, slots);
+      }
+    });
+  }
+
   void forward(const Tensor& q, const Tensor& k, const Tensor& v,
                const Tensor& kc, const Tensor& vc, const Tensor& slots,
                const Tensor& blocks, const Tensor& lens, const Tensor& cu,
                const Tensor& out, int max_seq_len, double scale,
-               int sliding_window, double softcap, int window_seqlen_q) {
+               int sliding_window, double softcap, int window_seqlen_q,
+               const std::optional<Tensor>& block_ranges) {
     for (auto* t : {&q, &k, &v, &kc, &vc, &slots, &blocks, &lens, &cu, &out})
       TORCH_CHECK(t->is_mps(), "All paged attention buffers must be on MPS");
     TORCH_CHECK(q.dim() == 3 && q.is_contiguous() &&
@@ -128,11 +180,8 @@ class PagedAttention {
                  q.size(2) == 256 || q.size(2) == 512),
                 "MPS attention requires contiguous Q with head_dim=64/96/128/256/512");
     const int head_size = q.size(2);
-    TORCH_CHECK(kc.dim() == 4 &&
-                (kc.size(1) == 8 || kc.size(1) == 16 || kc.size(1) == 32) &&
-                kc.size(3) == head_size &&
-                kc.stride(3) == 1 && vc.strides() == kc.strides() && kc.sizes() == vc.sizes(),
-                "MPS attention requires [blocks,8/16/32,kv_heads,head_dim] KV");
+    check_cache(k, v, kc, vc, slots);
+    TORCH_CHECK(kc.size(3) == head_size, "Query and cache head sizes must match");
     const int block_size = kc.size(1);
     TORCH_CHECK(q.scalar_type() == at::kHalf || q.scalar_type() == at::kBFloat16,
                 "Experimental MPS attention requires fp16 or bf16");
@@ -147,31 +196,35 @@ class PagedAttention {
     const int tokens = q.size(0), heads = q.size(1), kv_heads = kc.size(2);
     const int seqs = lens.numel();
     const int parts = (max_seq_len + kPartitionSize - 1) / kPartitionSize;
-    TORCH_CHECK(k.sizes() == v.sizes() && k.dim() == 3 && k.size(0) == tokens &&
-                k.size(1) == kv_heads && k.size(2) == head_size &&
-                k.stride(2) == 1 && k.stride(1) == head_size &&
-                v.stride(2) == 1 && v.stride(1) == head_size &&
+    TORCH_CHECK(k.size(0) == tokens &&
                 out.sizes() == q.sizes() && out.is_contiguous() &&
                 slots.numel() == tokens && blocks.dim() == 2 && blocks.size(0) == seqs &&
                 cu.numel() == seqs + 1 && heads % kv_heads == 0,
                 "Inconsistent attention shapes/strides");
     // Reuse the same short verification-window shader mode as the MLX launcher.
-    const bool window = tokens > seqs && window_seqlen_q > 1 &&
+    const bool block_attention = block_ranges.has_value();
+    if (block_attention) {
+      const auto& ranges = *block_ranges;
+      TORCH_CHECK(ranges.is_mps() && ranges.scalar_type() == at::kInt &&
+                  ranges.is_contiguous() && ranges.dim() == 2 &&
+                  ranges.size(0) == tokens && ranges.size(1) == 2 && tokens > seqs,
+                  "Block attention requires int32 [query tokens,2] ranges");
+    }
+    const bool window = !block_attention && tokens > seqs && window_seqlen_q > 1 &&
         head_size <= VLLM_METAL_PA_WINDOW_MAX_HEAD;
     const int window_q = window ?
         (window_seqlen_q + VLLM_METAL_PA_WINDOW_ROWS - 1) / VLLM_METAL_PA_WINDOW_ROWS : 0;
     const bool prefill = tokens > seqs && !window;
-    const bool nax = prefill && nax_library_ != nil;
+    const bool nax = prefill && !block_attention && nax_library_ != nil;
     const bool split = !prefill
         && kernels::should_split_decode(heads, tokens, parts, gpu_cores_);
     const std::string dt = q.scalar_type() == at::kHalf ? "half" : "bfloat16_t";
     const auto cfg = kernels::select_tile_config(head_size).value();
-    auto scatter = pipeline(kernels::reshape_and_cache_name(dt, dt));
     auto name = nax ? kernels::nax_name(dt, head_size, block_size) :
         prefill ? kernels::tiled_name(dt, head_size, block_size, cfg) :
         kernels::paged_name(
             dt, dt, dt, head_size, block_size, split ? kPartitionSize : 0);
-    auto attn = pipeline(name, split, window_q);
+    auto attn = pipeline(name, split, window_q, block_attention);
     id<MTLComputePipelineState> reduce = nil;
     Tensor tmp, sums, maxes;
     if (split) {
@@ -185,17 +238,7 @@ class PagedAttention {
     at::mps::dispatch_sync_with_rethrow(stream->queue(), ^{
       @autoreleasepool {
         auto enc = stream->commandEncoder();
-        [enc setComputePipelineState:scatter];
-        buffer(enc, 0, k); buffer(enc, 1, v);
-        buffer(enc, 2, kc); buffer(enc, 3, vc); buffer(enc, 4, slots);
-        scalar<int>(enc, 7, k.stride(0)); scalar<int>(enc, 8, v.stride(0));
-        scalar<int>(enc, 9, kv_heads); scalar<int>(enc, 10, head_size);
-        scalar<int>(enc, 11, block_size);
-        scalar<int64_t>(enc, 12, kc.stride(0));
-        scalar<int64_t>(enc, 13, kc.stride(1));
-        scalar<int64_t>(enc, 14, kc.stride(2));
-        [enc dispatchThreadgroups:MTLSizeMake(tokens, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        encode_cache(enc, k, v, kc, vc, slots);
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         [enc setComputePipelineState:attn];
         buffer(enc, 2, split ? tmp : out); buffer(enc, 3, q);
@@ -208,6 +251,7 @@ class PagedAttention {
         scalar<int>(enc, 16, kc.stride(0)); scalar<int>(enc, 17, kc.stride(2));
         buffer(enc, 19, cu); scalar<int>(enc, 20, seqs);
         scalar<int>(enc, 21, sliding_window);
+        if (block_attention) buffer(enc, 22, *block_ranges);
         int grid_y = window ? seqs * window_q : tokens, threads = 256;
         if (prefill) {
           grid_y = tokens / (nax ? kernels::kNaxBQ : cfg.BQ) + seqs;
@@ -252,5 +296,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         &override_max_buffer_length_for_test);
   pybind11::class_<PagedAttention>(m, "PagedAttention")
       .def(pybind11::init<const std::string&, const std::string&, int>())
-      .def("forward", &PagedAttention::forward);
+      .def("reshape_and_cache", &PagedAttention::reshape_and_cache)
+      .def("forward", &PagedAttention::forward,
+           pybind11::arg("q"), pybind11::arg("k"), pybind11::arg("v"),
+           pybind11::arg("kc"), pybind11::arg("vc"), pybind11::arg("slots"),
+           pybind11::arg("blocks"), pybind11::arg("lens"), pybind11::arg("cu"),
+           pybind11::arg("out"), pybind11::arg("max_seq_len"), pybind11::arg("scale"),
+           pybind11::arg("sliding_window"), pybind11::arg("softcap"),
+           pybind11::arg("window_seqlen_q"), pybind11::arg("block_ranges") = std::nullopt);
 }

@@ -1,5 +1,8 @@
 # Experimental DFlash serving
 
+For PyTorch MPS, see [DFlash on the MPS backend](pytorch-mps.md#dflash-speculative-decoding).
+This page describes the MLX path.
+
 This implements the first experimental serving stage of
 [RFC #825](https://github.com/vllm-project/vllm-metal/issues/825): synchronous
 DFlash drafting with native Metal block attention and

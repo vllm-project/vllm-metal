@@ -55,6 +55,7 @@ def _install_input_ops():
 
 def _install_speculative_ops():
     from vllm.v1.worker.gpu.spec_decode import rejection_sampler
+    from vllm.v1.worker.gpu.spec_decode.dflash import speculator as dflash
     from vllm.v1.worker.gpu.spec_decode.target_dependent_ar import speculator
 
     from vllm_metal.pytorch_backend import input_ops, runtime, speculative_ops
@@ -63,6 +64,7 @@ def _install_speculative_ops():
     speculator.prepare_prefill_inputs = speculative_ops.prepare_prefill_inputs
     speculator.prepare_decode_inputs = speculative_ops.prepare_decode_inputs
     speculator.update_draft_inputs = speculative_ops.update_draft_inputs
+    dflash.prepare_dflash_inputs = speculative_ops.prepare_dflash_inputs
     rejection_sampler.rejection_sample = speculative_ops.rejection_sample
     rejection_sampler.get_num_sampled_and_rejected = (
         input_ops.get_num_sampled_and_rejected
@@ -88,11 +90,16 @@ def install():
     from vllm.v1.worker.gpu import buffer_utils, model_runner
     from vllm.v1.worker.gpu.sample import sampler
 
-    from vllm_metal.pytorch_backend import runtime
+    from vllm_metal.pytorch_backend import normalization, rotary, runtime
     from vllm_metal.pytorch_backend.models.qwen3_5 import install as install_qwen3_5
 
     if getattr(buffer_utils, "_metal_installed", False):
         return
+
+    # DFlash context precompute calls these operators directly, outside the
+    # RMSNorm IR and RotaryEmbedding layer dispatch used by normal forwards.
+    torch.library.impl("_C::rms_norm", "MPS", normalization.rms_norm_out)
+    torch.library.impl("_C::rotary_embedding", "MPS", rotary.rotary_embedding)
 
     @ShortConv.register_oot
     class MPSShortConv(ShortConv):
