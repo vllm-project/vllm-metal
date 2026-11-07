@@ -208,12 +208,16 @@ changing partition selection or removing empty producer workgroups.
 
 Mixed batches use an explicit decode sub-batch. The native split separates the
 leading ordinary decode rows from the prefill kernel (#851 for tiled prefill,
-and NAX on M5) when the batch carries decode metadata and the decode rows hold
-at least 512 tokens of KV work. `sdpa_forward` passes a `GqaDecodeLengthPlan`
-built from only those rows' context lengths (capability
-`gqa_mixed_decode_plan`); the work is the plan's exact sum of those lengths.
-Without a plan, the longest decode row stands in for it as a lower bound. The
-prefix call then treats rows and sequences `0..D-1` as a pure decode batch: the
+and NAX on M5) whenever the batch carries decode metadata; pre-M5 GPUs also
+require the decode rows to hold at least 512 tokens of KV work. The two
+kernels write disjoint rows of one output, so they are encoded in one
+concurrent scope and overlap on the GPU; a split-KV reduce inside it waits on
+an explicit barrier for its producer. `sdpa_forward` passes a
+`GqaDecodeLengthPlan` built from only those rows' context lengths (capability
+`gqa_mixed_decode_plan`); the pre-M5 work is the plan's exact sum of those
+lengths, and without a plan the longest decode row stands in for it as a lower
+bound. The prefix call then treats rows and sequences `0..D-1` as a pure
+decode batch: the
 GQA grid, reducer and scratch use `D` requests and the plan's maximum length,
 not the batch-wide count or `max_seq_len`. Without that plan, or with GQA
 disabled, the prefix keeps the per-token kernel, whose split-KV partitions are
@@ -338,13 +342,13 @@ enablement or performance claims of this two-tier routing policy:
    [#851](https://github.com/vllm-project/vllm-metal/pull/851) (and its NAX
    counterpart) now uses GQA through a decode-prefix length plan (see the
    mixed-batch paragraph above). The tiled-era 4096-token context threshold
-   for that split is now a 512-token decode-work floor (the sum of the decode
-   rows' context lengths): on M5, many short decode rows gain the most from
-   the split, while a single 256-token row next to a short NAX prefill was
-   slower split (`tools/benchmark/mixed_decode_split_benchmark.py`). M1 Max
-   kernel and serving measurements on the tiled route agree with the floor.
-   The native split's overhead at short prefills remains: fixing it would let
-   the floor come down.
+   became a 512-token decode-work floor (the sum of the decode rows' context
+   lengths) while the split's two halves serialized. On M5 the floor is gone:
+   once the halves overlap, the native split matches two independent calls and
+   measured no slower than the unsplit kernel down to one 256-token decode
+   row next to a 64-token prefill
+   (`tools/benchmark/mixed_decode_split_benchmark.py`). Pre-M5 GPUs keep the
+   floor until the concurrent split is measured there.
 3. **TurboQuant decode:** `paged_attention_gqa_decode_tq` reads packed K/V
    and their scales in place, dequantizing each lane's slice in registers with
    no per-step materialization of the history. Its partials stay in the

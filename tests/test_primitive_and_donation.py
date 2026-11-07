@@ -264,31 +264,33 @@ def test_primitive_vs_reference_varlen(
 
 
 @pytest.mark.parametrize(
-    "decode_lengths,head_size,split_decode",
+    "mixed_decode_floor", [False, True], ids=["m5", "pre-m5"], indirect=True
+)
+@pytest.mark.parametrize(
+    "decode_lengths,head_size",
     [
-        # Split once the decode rows' context lengths sum to 512 tokens.
-        ([256], 128, False),
-        ([511], 128, False),
-        ([512], 128, True),
+        pytest.param([64], 128, id="single-short"),
+        pytest.param([256], 128, id="single-medium"),
+        pytest.param([511], 128, id="below-floor"),
+        pytest.param([512], 128, id="at-floor"),
         # Uneven rows count their exact sum, not rows x longest context.
-        ([256, 64], 128, False),
-        ([447, 64], 128, False),
-        ([448, 64], 128, True),
-        ([256, 256], 128, True),
-        # Many short rows split: they gain the most.
-        ([64] * 33, 128, True),
-        ([4096] + [64] * 32, 128, True),
-        ([4096] + [64] * 32, 256, True),
-        ([4096] + [64] * 32, 512, True),
+        pytest.param([256, 64], 128, id="uneven-pair"),
+        pytest.param([447, 64], 128, id="uneven-below-floor"),
+        pytest.param([448, 64], 128, id="uneven-at-floor"),
+        pytest.param([64] * 33, 128, id="many-short-rows"),
+        pytest.param([4096] + [64] * 32, 128, id="split-kv-reduce-d128"),
+        pytest.param([4096] + [64] * 32, 256, id="split-kv-reduce-d256"),
+        pytest.param([4096] + [64] * 32, 512, id="split-kv-reduce-d512"),
     ],
 )
-def test_mixed_batch_splits_decode_by_work(
+def test_mixed_batch_splits_decode_rows(
     decode_lengths: list[int],
     head_size: int,
-    split_decode: bool,
+    mixed_decode_floor: bool,
     force_tiled_prefill,
 ) -> None:
-    """Enough decode work takes the decode kernel; prefill rows keep tiled bit-for-bit."""
+    """Split decode rows take the decode kernel; prefill rows keep tiled bit-for-bit."""
+    split_decode = not mixed_decode_floor or sum(decode_lengths) >= 512
     decode_rows = len(decode_lengths)
     decode_context = max(decode_lengths)
     seq_lens = [(1, length) for length in decode_lengths] + [(32, 64)]
@@ -323,18 +325,23 @@ def test_mixed_batch_splits_decode_by_work(
             decode_context=decode_context,
             decode_lengths=decode_lengths,
         )
+
     assert whole_family == "tiled_prefill"
     assert mixed_family == ("mixed_prefill_decode" if split_decode else "tiled_prefill")
     np.testing.assert_array_equal(mixed[:decode_rows], expected_decode)
     np.testing.assert_array_equal(mixed[decode_rows:], whole_tiled[decode_rows:])
 
 
+@pytest.mark.parametrize("mixed_decode_floor", [True], ids=["pre-m5"], indirect=True)
 @pytest.mark.parametrize(
     "decode_lengths,split_decode",
     [([256, 256], False), ([512, 64], True)],
 )
 def test_mixed_batch_without_length_plan_bounds_work_by_longest_row(
-    decode_lengths: list[int], split_decode: bool, force_tiled_prefill
+    decode_lengths: list[int],
+    split_decode: bool,
+    mixed_decode_floor: bool,
+    force_tiled_prefill,
 ) -> None:
     """Without a length plan the longest row is a lower bound on the decode work."""
     seq_lens = [(1, length) for length in decode_lengths] + [(32, 64)]
@@ -349,6 +356,7 @@ def test_mixed_batch_without_length_plan_bounds_work_by_longest_row(
     finally:
         mx.synchronize()
         ops._set_paged_dispatch_diagnostics(previous)
+
     assert family == ("mixed_prefill_decode" if split_decode else "tiled_prefill")
 
 
@@ -362,13 +370,10 @@ def test_mixed_batch_without_length_plan_bounds_work_by_longest_row(
         (65, 4096, 256, mx.bfloat16, 100, True),
         (3, 4096, 64, mx.float16, 100, True),
         (2, 4096, 512, mx.bfloat16, -1, False),
-        # Many short decode rows leave the NAX tile too.
+        # Short and uneven decode rows leave the NAX tile too.
         (9, 512, 128, mx.float16, -1, False),
-        # Below the decode-work floor the whole batch stays on NAX.
         (1, 256, 128, mx.float16, -1, False),
-        # Uneven rows: 256 + 64 stays on NAX; 448 + 64 reaches the floor.
         (2, 256, 128, mx.float16, -1, False),
-        (2, 448, 128, mx.float16, -1, False),
     ],
 )
 def test_nax_mixed_batch_splits_decode_prefix(
@@ -380,9 +385,8 @@ def test_nax_mixed_batch_splits_decode_prefix(
     use_sinks: bool,
     nax_prefill,
 ) -> None:
-    """Enough decode work leaves the NAX tile; prefill rows keep NAX bit-for-bit."""
+    """Decode rows leave the NAX tile; prefill rows keep NAX bit-for-bit."""
     decode_lengths = [decode_context] + [64] * (decode_rows - 1)
-    split_decode = sum(decode_lengths) >= 512
     seq_lens = [(1, length) for length in decode_lengths] + [(129, 259), (64, 64)]
     mx.random.seed(0)
     num_kv_heads, num_query_heads = 2, 8
@@ -408,28 +412,24 @@ def test_nax_mixed_batch_splits_decode_prefix(
     whole_nax, whole_family = _run_attention(
         d, sliding_window=sliding_window, sinks=sinks
     )
-    expected_decode = whole_nax[:decode_rows]
-    if split_decode:
-        decode = {
-            **d,
-            "query": d["query"][:decode_rows],
-            "block_tables": d["block_tables"][:decode_rows],
-            "kv_lens_arr": d["kv_lens_arr"][:decode_rows],
-            "cu_seqlens_q": mx.arange(decode_rows + 1, dtype=mx.int32),
-        }
-        expected_decode, _ = _run_attention(
-            decode,
-            decode_rows=decode_rows,
-            decode_context=decode_context,
-            sliding_window=sliding_window,
-            sinks=sinks,
-            decode_lengths=decode_lengths,
-        )
+    decode = {
+        **d,
+        "query": d["query"][:decode_rows],
+        "block_tables": d["block_tables"][:decode_rows],
+        "kv_lens_arr": d["kv_lens_arr"][:decode_rows],
+        "cu_seqlens_q": mx.arange(decode_rows + 1, dtype=mx.int32),
+    }
+    expected_decode, _ = _run_attention(
+        decode,
+        decode_rows=decode_rows,
+        decode_context=decode_context,
+        sliding_window=sliding_window,
+        sinks=sinks,
+        decode_lengths=decode_lengths,
+    )
 
     assert whole_family == "nax_prefill"
-    assert mixed_family == (
-        "mixed_nax_prefill_decode" if split_decode else "nax_prefill"
-    )
+    assert mixed_family == "mixed_nax_prefill_decode"
     np.testing.assert_array_equal(mixed[:decode_rows], expected_decode)
     np.testing.assert_array_equal(mixed[decode_rows:], whole_nax[decode_rows:])
 
