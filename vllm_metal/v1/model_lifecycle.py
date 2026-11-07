@@ -15,7 +15,6 @@ from mlx_vlm.utils import get_model_path as mlx_vlm_model_path
 from mlx_vlm.utils import load_model as mlx_vlm_load_model
 from vllm.logger import init_logger
 
-from vllm_metal.attention.impls.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
 from vllm_metal.attention.runtime.factory import build_hybrid_runtime_plan
 from vllm_metal.compat import (
     apply_compat_patches,
@@ -142,11 +141,12 @@ class GenerationLoadRequest:
             )
         )
 
-        # A pipeline-parallel stage prunes its non-owned layers right after load, so
-        # the generic MLX loaders stay lazy until the stage-owned weights are known.
+        # A pipeline-parallel stage prunes its non-owned layers and a tensor-
+        # parallel rank shards its weights right after load, so the generic MLX
+        # loaders stay lazy until the rank-owned weights are known.
         # The custom GGUF and AWQ loaders cannot honor this contract.
         pp = runner.pp
-        lazy_weights = pp is not None and pp.size > 1
+        lazy_weights = (pp is not None and pp.size > 1) or runner.tp_group is not None
 
         return cls(
             model_name=(
@@ -252,9 +252,11 @@ class ModelLifecycle:
         ):
             return None
 
-        if runner.pp is not None and runner.pp.size > 1:
+        pp = runner.pp
+        if (pp is not None and pp.size > 1) or runner.tp_group is not None:
             raise NotImplementedError(
-                "Metal encoder pooling does not support pipeline parallelism yet."
+                "Metal encoder pooling does not support pipeline or tensor "
+                "parallelism yet."
             )
         if runner.vllm_config.lora_config is not None:
             raise NotImplementedError(
@@ -546,9 +548,7 @@ class ModelLifecycle:
 
         if runner.is_mla:
             runner.num_kv_heads = 1
-            runner.head_dim = int(args["kv_lora_rank"]) + int(
-                args.get("qk_rope_head_dim", MLA_DEFAULT_QK_ROPE_HEAD_DIM)
-            )
+            runner.head_dim = runner.mla_latent_dim
         return int(default_head_dim) if default_head_dim is not None else None
 
     def _install_yoco_cache_mapping(self, args: dict[str, Any]) -> None:

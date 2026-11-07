@@ -4,16 +4,20 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import mlx.core as mx
+import pytest
 import torch
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_planning import get_uniform_page_size
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec, MLAAttentionSpec
 
 from tests.stub_runner import (
+    initialize_glm5_next_runtime,
     make_bailing_hybrid_plan,
     make_gdn_hybrid_plan,
+    make_glm5_next_stub_runner,
     make_nemotron_hybrid_plan,
     make_stub_runner,
 )
@@ -178,6 +182,50 @@ def test_hybrid_mamba_spec_reserves_one_state_block_per_request() -> None:
     assert cdiv(prompt_tokens, spec.block_size) == 1
 
 
+def test_tensor_parallel_spec_holds_one_rank_share(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After shard(), the spec sizes this rank's KV heads and GDN state."""
+    monkeypatch.setattr(mx.distributed, "all_sum", lambda x, **_: x)
+    group = SimpleNamespace(size=lambda: 2)
+    model = Mock(spec=["shard", "parameters"])
+    runner = make_stub_runner(
+        model_config=SimpleNamespace(
+            runner_type="generate",
+            get_head_size=lambda: 128,
+            max_model_len=2048,
+            is_hybrid=True,
+        ),
+        model=model,
+        num_layers=2,
+        hybrid_runtime_plan=make_gdn_hybrid_plan(
+            2,
+            [1],
+            conv_kernel_dim=4,
+            conv_dim=64,
+            num_v_heads=2,
+            value_head_dim=64,
+            key_head_dim=64,
+        ),
+        num_kv_heads=2,
+        head_dim=128,
+        kv_cache_dtype=mx.float16,
+        cache_config=SimpleNamespace(
+            block_size=544,
+            mamba_page_size_padded=None,
+            mamba_block_size=2048,
+            mamba_cache_mode="none",
+        ),
+    )
+
+    runner.apply_tensor_parallel(group)
+
+    model.shard.assert_called_once_with(group)
+    specs = runner._cache_policy.get_kv_cache_spec()
+    assert specs["layers.1.self_attn"].num_kv_heads == 1
+    assert specs["layers.0.linear_attn"].shapes == ((3, 32), (1, 64, 64))
+
+
 def test_bailing_hybrid_emits_mla_and_kda_specs() -> None:
     runner = make_stub_runner(
         model_args={"model_type": "bailing_hybrid", "kv_lora_rank": 512},
@@ -204,3 +252,73 @@ def test_bailing_hybrid_emits_mla_and_kda_specs() -> None:
 
     assert isinstance(specs["layers.0.linear_attn"], MambaSpec)
     assert isinstance(specs["layers.1.self_attn"], MLAAttentionSpec)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "error"),
+    [
+        ({"qk_rope_head_dim": 64}, "qk_rope_head_dim 0"),
+        ({"indexer_types": ["full"] * 3 + ["shared"]}, "shared"),
+        ({"index_kpool_always_select_tail": False}, "always_select_tail"),
+        ({"block_size": 34}, "multiple of index_kpool"),
+        (
+            {"speculative_config": SimpleNamespace(num_speculative_tokens=1)},
+            "speculative",
+        ),
+        ({"prefix_match_unit": 2}, "multiple of index_kpool"),
+    ],
+    ids=[
+        "rope",
+        "shared_indexer",
+        "no_tail",
+        "split_pool",
+        "speculative",
+        "hit_splits_pool",
+    ],
+)
+def test_glm5_next_specs_refuse_unsupported_configs(overrides, error) -> None:
+    """What the paged sparse layout cannot serve fails loudly instead of being
+    laid out: a RoPE latent, a layer reusing another layer's top-k, a
+    checkpoint that drops the incomplete tail pool, a block or prefix-hit
+    unit that splits a pool, and speculative decoding (rejected drafts would
+    stay in the pooled keys and tails)."""
+    runner = make_glm5_next_stub_runner(**overrides)
+
+    with pytest.raises((ValueError, NotImplementedError), match=error):
+        runner._cache_policy.get_kv_cache_spec()
+
+
+def test_glm5_next_pooled_keys_share_the_latent_block() -> None:
+    """The pooled keys sit in the latent pages, so vLLM keeps the sparse
+    layers' KV groups at the latent block (prefix hits land on every block),
+    and the planner sizes a block as vLLM lays it out."""
+    runner = make_glm5_next_stub_runner()
+    runtime = initialize_glm5_next_runtime(runner, 12)
+
+    groups = runtime.storage.config.kv_cache_groups
+    assert {
+        group.kv_cache_spec.block_size
+        for group in groups
+        if isinstance(group.kv_cache_spec, MLAAttentionSpec)
+    } == {32}
+    assert runtime.storage.nbytes == (
+        12 * runner._cache_policy.get_cache_block_size_bytes()
+    )
+
+
+def test_glm5_next_tensor_parallel_spec_splits_only_the_kda_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GLM-5-Next shards under TP: a rank holds half of each KDA state, while
+    the replicated latent and its pooled keys keep their whole spec."""
+    monkeypatch.setattr(mx.distributed, "all_sum", lambda x, **_: x)
+    whole = make_glm5_next_stub_runner(linear_num_heads=2)
+    runner = make_glm5_next_stub_runner(linear_num_heads=2)
+    runner.model = Mock(spec=["shard", "parameters"])
+
+    runner.apply_tensor_parallel(SimpleNamespace(size=lambda: 2))
+
+    specs = runner._cache_policy.get_kv_cache_spec()
+    latent = whole._cache_policy.get_kv_cache_spec()["layers.3.self_attn"]
+    assert specs["layers.3.self_attn"] == latent
+    assert specs["layers.0.linear_attn"].shapes == ((1, 12), (1, 4, 4))
