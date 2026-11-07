@@ -50,7 +50,8 @@ more draft tokens do not always improve throughput.
   features, not optional follow-ups to a single-request implementation.
 
 Qwen3.5 Gated DeltaNet uses the shared Metal recurrence for packed decode and
-prefill in one launch, with unexpanded Q/K heads. Its FP32 state uses upstream
+prefill in one launch through `torch.mps.load_metallib`, like RoPE and RMSNorm,
+with unexpanded Q/K heads. Its FP32 state uses upstream
 `MambaSpec`'s `[slots, value_heads, value_dim, key_dim]` layout and physical page
 stride directly. Fresh sequences initialize their state inside the kernel;
 resumed sequences keep it, and PAD/empty rows leave state and output untouched.

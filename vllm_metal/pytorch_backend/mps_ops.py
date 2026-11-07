@@ -1,17 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Experimental PyTorch-stream launcher; no new attention shaders."""
+"""PyTorch-stream launchers for precompiled shared Metal kernels."""
 
 import importlib
 import logging
 from functools import cache
+
+import torch
 
 logger = logging.getLogger(__name__)
 
 
 @cache
 def _load_mps_module():
-    import torch  # Load libtorch before importing the linked extension.
-
     from vllm_metal import envs
     from vllm_metal.metal.build import (
         build_mps,
@@ -66,15 +66,104 @@ def get_mps_ops():
 
 
 @cache
-def get_mps_gdn_ops():
+def _gdn_kernel(input_dtype, output_dtype):
     from vllm_metal import envs
     from vllm_metal.metal.build import prepare_metallib
 
-    module = _load_mps_module()
     path = prepare_metallib(
         "gdn_kern", build_from_source=envs.VLLM_METAL_BUILD_FROM_SOURCE
     )
-    return module.GDNLinearAttention(str(path))
+    library = torch.mps.load_metallib(path)
+    types = {
+        torch.float32: "float",
+        torch.float16: "half",
+        torch.bfloat16: "bfloat16_t",
+    }
+    name = "gdn_linear_attention_" + types[input_dtype]
+    if input_dtype != torch.float32:
+        name += "_state_float"
+    if output_dtype != input_dtype:
+        name += "_out_" + types[output_dtype]
+    kernel = getattr(library, name + "_initial")
+    if kernel.thread_execution_width != 32 or kernel.max_threads_per_threadgroup < 32:
+        raise RuntimeError("GDN requires a 32-lane SIMD group")
+    return library, kernel
+
+
+def _validate_gdn(q, k, v, g, beta, state, cu_seqlens, slots, y, initial):
+    if any(
+        t.device.type != "mps"
+        for t in (q, k, v, g, beta, state, cu_seqlens, slots, y, initial)
+    ):
+        raise RuntimeError("All GDN buffers must be on MPS")
+    if q.dtype not in (torch.float32, torch.float16, torch.bfloat16) or any(
+        not t.is_contiguous() or t.dtype != q.dtype for t in (q, k, v, g, beta)
+    ):
+        raise RuntimeError(
+            "GDN Q/K/V/g/beta must be packed fp32/fp16/bf16 with the same dtype"
+        )
+    if not y.is_contiguous() or not (
+        y.dtype == q.dtype
+        or q.dtype == torch.float32
+        and y.dtype in (torch.float16, torch.bfloat16)
+    ):
+        raise RuntimeError(
+            "GDN Y must be packed, with the input dtype or fp32 inputs and fp16/bf16 output"
+        )
+    if (
+        q.ndim != 3
+        or k.shape != q.shape
+        or v.ndim != 3
+        or v.shape[0] != q.shape[0]
+        or y.shape != v.shape
+    ):
+        raise RuntimeError("GDN requires Q/K [T,Hk,Dk] and V/Y [T,Hv,Dv]")
+    tokens, hk, dk = q.shape
+    _, hv, dv = v.shape
+    if dk <= 0 or dk > 256 or dk % 32:
+        raise RuntimeError(
+            "GDN requires Dk to be a positive multiple of 32, at most 256"
+        )
+    if hk <= 0 or hv <= 0 or hv % hk or dv <= 0:
+        raise RuntimeError("Invalid GDN heads or value dimension")
+    if g.shape != (tokens, hv) or beta.shape != g.shape:
+        raise RuntimeError("GDN g/beta must be [T,Hv]")
+    if (
+        state.dtype != torch.float32
+        or state.ndim != 4
+        or state.shape[0] == 0
+        or state.shape[1:] != (hv, dv, dk)
+        or state.stride()[1:] != (dv * dk, dk, 1)
+        or state.stride(0) < hv * dv * dk
+    ):
+        raise RuntimeError(
+            "GDN state must be fp32 [slots,Hv,Dv,Dk] with dense inner rows"
+        )
+    if (
+        cu_seqlens.dtype != torch.int32
+        or slots.dtype != torch.int32
+        or cu_seqlens.ndim != 1
+        or slots.ndim != 1
+        or not cu_seqlens.is_contiguous()
+        or not slots.is_contiguous()
+        or cu_seqlens.numel() != slots.numel() + 1
+    ):
+        raise RuntimeError(
+            "GDN metadata must be packed int32 cu_seqlens [B+1], slots [B]"
+        )
+    if (
+        initial.dtype != torch.bool
+        or initial.shape != slots.shape
+        or not initial.is_contiguous()
+    ):
+        raise RuntimeError("GDN has_initial_state must be packed bool [B]")
+    if (
+        any(t.numel() > 2**31 - 1 for t in (q, k, v, g, beta, y))
+        or max(slots.numel() * hv, hv * dv * dk) > 2**31 - 1
+    ):
+        raise RuntimeError(
+            "GDN packed input/output or state row exceeds int32 indexing"
+        )
 
 
 def gdn_linear_attention(
@@ -95,6 +184,33 @@ def gdn_linear_attention(
     the same launch without reading the old slot contents.
     Inputs, state and Y must not overlap. Autograd is not supported.
     """
-    get_mps_gdn_ops().gdn_linear_attention(
+    _validate_gdn(
         q, k, v, g, beta, state_pool, cu_seqlens, slot_mapping, y, has_initial_state
+    )
+    if slot_mapping.numel() == 0 or q.shape[0] == 0:
+        return
+    hk, dk = q.shape[1:]
+    hv, dv = v.shape[1:]
+    _, kernel = _gdn_kernel(q.dtype, y.dtype)
+    kernel(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        state_pool,
+        cu_seqlens,
+        slot_mapping,
+        y,
+        slot_mapping.numel(),
+        hk,
+        hv,
+        dk,
+        dv,
+        state_pool.stride(0),
+        has_initial_state,
+        threads=(32 * dv, 1, slot_mapping.numel() * hv),
+        group_size=(32, 1, 1),
+        # Python ints default to int64; only the slot stride is int64 in the shader.
+        arg_casts=dict.fromkeys(range(9, 14), "int32"),
     )

@@ -4,11 +4,12 @@
 from itertools import accumulate
 from math import prod
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 
-pytestmark = pytest.mark.skipif(
+requires_mps = pytest.mark.skipif(
     not torch.backends.mps.is_available(), reason="Requires Apple Silicon MPS"
 )
 
@@ -40,6 +41,7 @@ def _reference(q, k, v, decay, beta, state):
 @pytest.mark.parametrize("heads", [(16, 16), (16, 32)], ids=["0.8B", "9B-GQA"])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
 @pytest.mark.parametrize("prefill", [False, True], ids=["decode", "prefill-boundaries"])
+@requires_mps
 @torch.inference_mode()
 def test_packed_gdn_matches_recurrence(heads, dtype, prefill):
     from vllm_metal.pytorch_backend.mps_ops import gdn_linear_attention
@@ -109,6 +111,7 @@ def test_packed_gdn_matches_recurrence(heads, dtype, prefill):
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@requires_mps
 @torch.inference_mode()
 def test_qwen_core_carries_state_in_one_launch(monkeypatch, dtype):
     from vllm.model_executor.layers.mamba.abstract import MambaBase
@@ -253,3 +256,203 @@ def test_qwen_core_carries_state_in_one_launch(monkeypatch, dtype):
         )
     for t, saved in zip(layer.kv_cache, untouched, strict=True):
         torch.testing.assert_close(t[4], saved, atol=0, rtol=0)
+
+
+@pytest.fixture
+def gdn_inputs():
+    # Metadata-only MPS tensors let Linux exercise the real validation/launch ABI.
+    from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
+
+    mode = FakeTensorMode()
+    # Preserve a nonzero offset and a physical gap between state slots.
+    state = FakeTensor(
+        mode,
+        torch.empty(5, 1041, device="meta")[1:, :1024].view(4, 4, 8, 32),
+        torch.device("mps"),
+    )
+    with mode:
+
+        def make(dtype=torch.float32, output_dtype=torch.float32, tokens=3, requests=2):
+            q, k = (
+                torch.empty(tokens, 2, 32, dtype=dtype, device="mps") for _ in range(2)
+            )
+            v = torch.empty(tokens, 4, 8, dtype=dtype, device="mps")
+            g, beta = (
+                torch.empty(tokens, 4, dtype=dtype, device="mps") for _ in range(2)
+            )
+            cu = torch.empty(requests + 1, dtype=torch.int32, device="mps")
+            slots = torch.empty(requests, dtype=torch.int32, device="mps")
+            y = torch.empty(tokens, 4, 8, dtype=output_dtype, device="mps")
+            initial = torch.empty(requests, dtype=torch.bool, device="mps")
+            return [q, k, v, g, beta, state, cu, slots, y, initial]
+
+        yield make
+
+
+@pytest.fixture
+def gdn_library(monkeypatch):
+    from vllm_metal.metal import build
+    from vllm_metal.pytorch_backend import mps_ops
+
+    kernel = Mock(thread_execution_width=32, max_threads_per_threadgroup=1024)
+    load = Mock()
+    monkeypatch.setattr(torch.mps, "load_metallib", load)
+    monkeypatch.setattr(
+        build, "prepare_metallib", Mock(return_value="gdn_kern.metallib")
+    )
+    monkeypatch.setattr(
+        mps_ops,
+        "_load_mps_module",
+        Mock(side_effect=AssertionError("GDN must not load the custom extension")),
+    )
+    mps_ops._gdn_kernel.cache_clear()
+    yield kernel, load
+    mps_ops._gdn_kernel.cache_clear()
+
+
+@pytest.mark.parametrize(
+    "dtype,output_dtype,name",
+    [
+        (torch.float32, torch.float32, "float"),
+        (torch.float16, torch.float16, "half_state_float"),
+        (torch.bfloat16, torch.bfloat16, "bfloat16_t_state_float"),
+        (torch.float32, torch.float16, "float_out_half"),
+        (torch.float32, torch.bfloat16, "float_out_bfloat16_t"),
+    ],
+)
+def test_gdn_torch_launcher_preserves_buffers_and_shader_abi(
+    gdn_inputs, gdn_library, dtype, output_dtype, name
+):
+    from vllm_metal.pytorch_backend import mps_ops
+
+    kernel, load = gdn_library
+    library = SimpleNamespace(**{f"gdn_linear_attention_{name}_initial": kernel})
+    load.return_value = library
+    args = gdn_inputs(dtype, output_dtype)
+    mps_ops.gdn_linear_attention(*args)
+    call_args, kwargs = kernel.call_args
+    assert all(
+        actual is expected
+        for actual, expected in zip(call_args[:9], args[:9], strict=True)
+    )
+    assert call_args[9:15] == (2, 2, 4, 32, 8, 1041)
+    assert call_args[15] is args[9]
+    assert kwargs == {
+        "threads": (256, 1, 8),
+        "group_size": (32, 1, 1),
+        "arg_casts": dict.fromkeys(range(9, 14), "int32"),
+    }
+    assert mps_ops._gdn_kernel(dtype, output_dtype) == (library, kernel)
+    load.assert_called_once_with("gdn_kern.metallib")
+    kernel.assert_called_once()
+
+
+@pytest.mark.parametrize("width,max_threads", [(16, 1024), (32, 16)])
+def test_gdn_torch_launcher_rejects_incompatible_simd(gdn_library, width, max_threads):
+    from vllm_metal.pytorch_backend import mps_ops
+
+    kernel, load = gdn_library
+    kernel.thread_execution_width, kernel.max_threads_per_threadgroup = (
+        width,
+        max_threads,
+    )
+    load.return_value = SimpleNamespace(gdn_linear_attention_float_initial=kernel)
+    with pytest.raises(RuntimeError, match="32-lane SIMD"):
+        mps_ops._gdn_kernel(torch.float32, torch.float32)
+    kernel.assert_not_called()
+
+
+@pytest.mark.parametrize("tokens,requests", [(0, 2), (3, 0)])
+def test_gdn_empty_launch_does_not_load_a_library(
+    gdn_inputs, gdn_library, tokens, requests
+):
+    from vllm_metal.pytorch_backend import mps_ops
+
+    _, load = gdn_library
+    mps_ops.gdn_linear_attention(*gdn_inputs(tokens=tokens, requests=requests))
+    load.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "index,change,error",
+    [
+        (0, lambda t: t.to("cpu"), "must be on MPS"),
+        (1, lambda t: t.to(torch.float16), "same dtype"),
+        (1, lambda t: t.transpose(0, 1), "packed"),
+        (2, lambda t: t.narrow(0, 0, 2), r"Q/K \[T,Hk,Dk\]"),
+        (
+            3,
+            lambda t: torch.empty(t.shape[0], 2, dtype=t.dtype, device=t.device),
+            r"g/beta must be",
+        ),
+        (5, lambda t: t.to(torch.float16), "state must be fp32"),
+        (5, lambda t: t.transpose(2, 3), "dense inner rows"),
+        (5, lambda t: t.as_strided(t.shape, (1, 256, 32, 1)), "dense inner rows"),
+        (6, lambda t: t.to(torch.int64), "metadata must be packed int32"),
+        (7, lambda t: t.narrow(0, 0, 1), "metadata must be packed int32"),
+        (8, lambda t: t.to(torch.bfloat16).transpose(1, 2), "Y must be packed"),
+        (9, lambda t: t.to(torch.int32), "has_initial_state must be packed bool"),
+    ],
+)
+def test_gdn_invalid_buffers_fail_before_loading(
+    gdn_inputs, gdn_library, index, change, error
+):
+    from vllm_metal.pytorch_backend import mps_ops
+
+    _, load = gdn_library
+    args = gdn_inputs()
+    args[index] = change(args[index])
+    with pytest.raises(RuntimeError, match=error):
+        mps_ops.gdn_linear_attention(*args)
+    load.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "hk,dk,error",
+    [
+        (2, 31, "positive multiple of 32"),
+        (2, 288, "positive multiple of 32"),
+        (3, 32, "Invalid GDN heads"),
+        (0, 32, "Invalid GDN heads"),
+    ],
+)
+def test_gdn_invalid_head_geometry_fails_before_loading(
+    gdn_inputs, gdn_library, hk, dk, error
+):
+    from vllm_metal.pytorch_backend import mps_ops
+
+    _, load = gdn_library
+    args = gdn_inputs()
+    args[:2] = [torch.empty(3, hk, dk, device="mps") for _ in range(2)]
+    with pytest.raises(RuntimeError, match=error):
+        mps_ops.gdn_linear_attention(*args)
+    load.assert_not_called()
+
+
+@pytest.mark.parametrize("tokens,requests", [(2**25, 2), (3, 2**29)])
+def test_gdn_rejects_int32_index_overflow(gdn_inputs, gdn_library, tokens, requests):
+    from vllm_metal.pytorch_backend import mps_ops
+
+    _, load = gdn_library
+    with pytest.raises(RuntimeError, match="exceeds int32 indexing"):
+        mps_ops.gdn_linear_attention(*gdn_inputs(tokens=tokens, requests=requests))
+    load.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "dtype,output_dtype",
+    [
+        (torch.float16, torch.bfloat16),
+        (torch.bfloat16, torch.float16),
+        (torch.float16, torch.float32),
+    ],
+)
+def test_gdn_rejects_unsupported_output_casts(
+    gdn_inputs, gdn_library, dtype, output_dtype
+):
+    from vllm_metal.pytorch_backend import mps_ops
+
+    _, load = gdn_library
+    with pytest.raises(RuntimeError, match="Y must be packed"):
+        mps_ops.gdn_linear_attention(*gdn_inputs(dtype, output_dtype))
+    load.assert_not_called()
