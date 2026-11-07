@@ -269,12 +269,12 @@ class TestRunnerWiring:
         from vllm.sampling_params import SamplingParams
 
         import vllm_metal.v1.model_runner as mr
+        from tests.stub_runner import admit_prefill_request
 
         runner = self._runner()
         prompt = [3, 1, 4, 1, 5, 9]
         vocab = 16
         params = SamplingParams(temperature=0, prompt_logprobs=1)
-        runner._prompt_logprobs_tracker.register("req-p", 1)
 
         def _prefill(start: int, end: int, prompt_len: int | None):
             return mr.PrefillRequest(
@@ -288,6 +288,7 @@ class TestRunnerWiring:
                 full_prompt_token_ids=prompt,
             )
 
+        admit_prefill_request(runner, _prefill(0, len(prompt), len(prompt)))
         batch = mr._ExecutionBatch()
         chunk1 = mx.zeros((1, 4, vocab))
         runner._gather_prefill_prompt_logprobs(

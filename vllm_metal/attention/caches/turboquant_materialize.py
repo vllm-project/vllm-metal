@@ -21,8 +21,8 @@ _SOURCE = """
     const size_t vector = thread_position_in_grid.x / 32;
     const uint head = vector % KV_HEADS;
     const size_t token = vector / KV_HEADS;
-    const size_t page = pages[token];
-    const size_t offset = offsets[token];
+    const size_t page = pages[token * pages_strides[0]];
+    const size_t offset = offsets[token * offsets_strides[0]];
     const size_t kb = page * k_data_strides[0] + offset * k_data_strides[1]
                     + head * k_data_strides[2];
     const size_t vb = page * v_data_strides[0] + offset * v_data_strides[1]

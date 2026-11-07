@@ -12,6 +12,7 @@ import pytest
 import torch
 from vllm.lora.layers import LoRAMapping
 from vllm.sampling_params import SamplingParams
+from vllm.v1.core.sched.output import NewRequestData
 
 import vllm_metal.v1.model_runner as model_runner_mod
 from tests.stub_runner import make_stub_runner
@@ -1170,10 +1171,11 @@ def test_handle_new_request_registers_lora_before_paged_prefill() -> None:
         _lora=spy_lora,
     )
     lora_request = SimpleNamespace(lora_int_id=17)
-    new_req = SimpleNamespace(
+    new_req = NewRequestData(
         req_id="req-lora",
         pooling_params=None,
         prompt_token_ids=[1, 2, 3],
+        mm_features=[],
         sampling_params=SamplingParams(temperature=0, max_tokens=1),
         block_ids=([4],),
         num_computed_tokens=0,

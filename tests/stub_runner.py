@@ -11,6 +11,7 @@ import mlx.core as mx
 import torch
 from vllm.config import AttentionConfig, CacheConfig, DeviceConfig
 from vllm.v1.attention.backends.utils import record_kv_cache_layout
+from vllm.v1.core.sched.output import NewRequestData
 
 import vllm_metal.v1.model_runner as mr
 from vllm_metal.attention.caches.placement import KV_CACHE_LAYOUT
@@ -32,6 +33,27 @@ from vllm_metal.v1.pooling.backends.decoder.factory import (
 from vllm_metal.v1.prompt_logprobs import PromptLogprobsTracker
 from vllm_metal.v1.spec_decode import SpeculativeDecodeController
 from vllm_metal.v1.structured_output import MetalStructuredOutputApplier
+
+
+def admit_prefill_request(
+    runner: mr.MetalModelRunner, prefill: mr.PrefillRequest
+) -> mr.RequestState:
+    """Install history for tests that start at a final prefill's forward/sample."""
+    assert prefill.prompt_len is not None
+    token_ids = list(prefill.full_prompt_token_ids or prefill.token_ids)
+    return runner._admit_request(
+        NewRequestData(
+            req_id=prefill.req_id,
+            prompt_token_ids=token_ids[: prefill.prompt_len],
+            prefill_token_ids=token_ids,
+            mm_features=[],
+            sampling_params=prefill.sampling_params,
+            pooling_params=prefill.pooling_params,
+            block_ids=tuple(prefill.block_ids),
+            num_computed_tokens=prefill.start_pos,
+            lora_request=None,
+        )
+    )
 
 
 def initialize_hybrid_runtime(

@@ -72,7 +72,7 @@ def _context(
     if decode_token_ids is None:
         decode_token_ids = [[state.token_ids[-1]] for _, state in decode_reqs]
     if prefill_result_modes is None:
-        prefill_result_modes = ["new_final"] * len(prefill_reqs)
+        prefill_result_modes = ["final"] * len(prefill_reqs)
     if request_states is None:
         request_states = dict(decode_reqs)
     return ProposeContext(
@@ -251,7 +251,7 @@ class TestNgramProposePropose:
         prefill = SimpleNamespace(req_id="p0")
         ctx = _context(
             prefill_reqs=[prefill],
-            prefill_result_modes=["new_final"],
+            prefill_result_modes=["final"],
             request_states={"p0": state},
         )
 
@@ -313,7 +313,7 @@ class TestNgramProposePropose:
         ctx = _context(
             decode_reqs=[("r0", state)],
             prefill_reqs=[prefill],
-            prefill_result_modes=["new_final"],
+            prefill_result_modes=["final"],
             request_states={"r0": state},
         )
 
