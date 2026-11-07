@@ -14,6 +14,7 @@ import vllm_metal.envs as envs
 from vllm_metal.config import (
     DSPARK_DRAFT_QUANTIZATION_KEY,
     DSPARK_DRAFT_QUANTIZATION_Q4,
+    QWEN_MTP_DRAFTER_KEY,
     get_config,
 )
 
@@ -604,6 +605,20 @@ class MetalPlatform(Platform):
                     f"{DSPARK_DRAFT_QUANTIZATION_KEY} requires method='dspark'"
                 )
 
+        if isinstance(add, dict) and QWEN_MTP_DRAFTER_KEY in add:
+            from vllm_metal.v1.qwen_mtp_proposer import is_qwen_mtp
+
+            drafter = add[QWEN_MTP_DRAFTER_KEY]
+            if not isinstance(drafter, str) or not drafter:
+                raise ValueError(
+                    f"{QWEN_MTP_DRAFTER_KEY} must be a repo id or path, got {drafter!r}"
+                )
+            if not is_qwen_mtp(vllm_config.speculative_config):
+                raise ValueError(
+                    f"{QWEN_MTP_DRAFTER_KEY} requires method='mtp' on a Qwen3.5 "
+                    "family target"
+                )
+
         # Apply TurboQuant config from --additional-config
         # Example: --additional-config '{"turboquant": true, "k_quant": "q4_0"}'
         if isinstance(add, dict) and add.get("turboquant"):
@@ -787,8 +802,13 @@ class MetalPlatform(Platform):
                 model_config.hf_text_config.model_type
             )
             if vllm_config.speculative_config is not None:
+                from vllm_metal.v1.qwen_mtp_proposer import is_qwen_mtp
+
                 spec_method = vllm_config.speculative_config.method
-                if spec_method != "ngram" or state_family.label != "gdn":
+                hybrid_validated = spec_method == "ngram" or is_qwen_mtp(
+                    vllm_config.speculative_config
+                )
+                if not hybrid_validated or state_family.label != "gdn":
                     # The verify-span staging and acceptance rollback live in
                     # the GDN state wrapper only; other hybrid state families
                     # (mamba2, KDA, shortconv) would silently corrupt their
@@ -798,17 +818,17 @@ class MetalPlatform(Platform):
                     # forward.
                     raise NotImplementedError(
                         "Speculative decoding on hybrid models on Metal is "
-                        "implemented for the ngram method on GDN-family "
-                        "targets only; this configuration pairs method "
-                        f"{spec_method!r} with the {state_family.label!r} "
-                        "state family."
+                        "implemented for the ngram method and Qwen3.5 MTP on "
+                        "GDN-family targets only; this configuration pairs "
+                        f"method {spec_method!r} with the "
+                        f"{state_family.label!r} state family."
                     )
                 if not envs.VLLM_METAL_GDN_LAZY_KERNELS:
                     # Hybrid GDN verification runs multi-token spans through
                     # the variable-length lazy scan kernels; the eager path
                     # only implements single-row decode.
                     raise NotImplementedError(
-                        "ngram speculative decoding on hybrid GDN targets "
+                        "Speculative decoding on hybrid GDN targets "
                         "requires the lazy GDN kernels "
                         "(VLLM_METAL_GDN_LAZY_KERNELS=0 disables them)."
                     )
@@ -823,12 +843,12 @@ class MetalPlatform(Platform):
                         f"mamba_cache_mode {state_family.supported_cache_modes}, "
                         f"not {cache_config.mamba_cache_mode!r}",
                     )
-                # ngram+GDN is the one hybrid speculative configuration that
-                # keeps align-mode prefix caching: verification stages GDN
-                # state per verify span and caps drafts at the state-block
-                # boundary (gdn_spec), keeping align-mode checkpoints exact.
-                # Every other hybrid+speculative combination was rejected
-                # above, so no APC downgrade for speculators remains here.
+                # ngram and Qwen3.5 MTP on GDN keep align-mode prefix caching:
+                # verification stages GDN state per verify span and both
+                # proposers cap drafts at the state-block boundary (gdn_spec),
+                # keeping align-mode checkpoints exact. Every other
+                # hybrid+speculative combination was rejected above, so no
+                # APC downgrade for speculators remains here.
 
         # Pipeline parallelism is supported on Metal/MLX: each stage runs in its
         # own worker process and the inter-stage activations cross the

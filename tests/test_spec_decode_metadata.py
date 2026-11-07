@@ -311,8 +311,21 @@ class TestSpecDecodePolicy:
                 hybrid_family="mamba2",
             )
 
+    def test_hybrid_accepts_qwen_mtp_speculator(self) -> None:
+        SpeculativeDecodeController().validate_supported(
+            _scheduler_output(scheduled_spec_decode_tokens={"r0": [1]}),
+            [("r0", _request_state())],
+            is_hybrid=True,
+            speculative_config=SimpleNamespace(
+                method="mtp",
+                draft_model_config=SimpleNamespace(
+                    hf_config=SimpleNamespace(model_type="qwen3_5_mtp")
+                ),
+            ),
+        )
+
     def test_hybrid_rejects_non_ngram_speculator(self) -> None:
-        with pytest.raises(NotImplementedError, match="ngram method only"):
+        with pytest.raises(NotImplementedError, match="ngram method and Qwen3.5 MTP"):
             SpeculativeDecodeController().validate_supported(
                 _scheduler_output(scheduled_spec_decode_tokens={"r0": [1]}),
                 [("r0", _request_state())],

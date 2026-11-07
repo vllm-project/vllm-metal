@@ -11,6 +11,7 @@ import mlx.core as mx
 from vllm.v1.core.sched.output import SchedulerOutput
 
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPDraftSeed
+from vllm_metal.v1.qwen_mtp_proposer import is_qwen_mtp
 from vllm_metal.v1.sampling_batch import GREEDY_TEMPERATURE_EPS
 
 if TYPE_CHECKING:
@@ -143,7 +144,8 @@ class SpeculativeDecodeController:
         }
         has_invalid_spec_tokens = any(count > 0 for count in invalid_counts.values())
 
-        # Hybrid GDN targets verify n-gram drafts through packed decode spans:
+        # Hybrid GDN targets verify n-gram and Qwen MTP drafts through packed
+        # decode spans:
         # full-attention layers take the extra query rows, the GDN layers run
         # their state scan over the span, and the acceptance fixup in gdn_spec
         # rolls partial accepts back to the accepted depth. The staging and
@@ -161,12 +163,12 @@ class SpeculativeDecodeController:
             method = (
                 speculative_config.method if speculative_config is not None else None
             )
-            if method != "ngram":
+            if method != "ngram" and not is_qwen_mtp(speculative_config):
                 raise NotImplementedError(
                     "Speculative decode verification for hybrid models on "
-                    "Metal supports the ngram method only (draft-model, MTP, "
-                    "and block drafts are not validated on hybrid GDN "
-                    "targets yet)."
+                    "Metal supports the ngram method and Qwen3.5 MTP only "
+                    "(draft-model, other MTP, and block drafts are not "
+                    "validated on hybrid GDN targets yet)."
                 )
 
         decode_req_ids = {req_id for req_id, _ in decode_reqs}
