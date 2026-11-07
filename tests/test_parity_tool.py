@@ -13,6 +13,7 @@ from tools.check_parity import (
     http_generate,
     http_result,
     main,
+    serving,
 )
 from tools.parity_utils import parity_report
 
@@ -315,3 +316,47 @@ class TestParityTool:
         assert "--trust-remote-code cannot be combined with --method" in (
             capsys.readouterr().err
         )
+
+
+@pytest.mark.parametrize(
+    "prefix_caching,flag",
+    [(False, "--no-enable-prefix-caching"), (True, "--enable-prefix-caching")],
+)
+def test_serving_sets_prefix_caching_and_appends_args(
+    monkeypatch, tmp_path, prefix_caching, flag
+):
+    commands = []
+
+    class Exited:
+        pid = 12345
+
+        def __init__(self, command, **kwargs):
+            commands.append(command)
+
+        def poll(self):
+            return 1
+
+        def wait(self, timeout=None):
+            return 1
+
+    monkeypatch.setattr("subprocess.Popen", Exited)
+    monkeypatch.setattr("os.killpg", lambda pid, sig: None)
+    extra = ["--kv-offloading-size", "1"]
+    with (
+        pytest.raises(RuntimeError, match="exited during startup"),
+        serving(
+            "model",
+            64,
+            1,
+            0.5,
+            tmp_path / "log",
+            {},
+            prefix_caching=prefix_caching,
+            extra_args=extra,
+        ),
+    ):
+        pass
+    [command] = commands
+    assert flag in command
+    assert ("--no-enable-prefix-caching" in command) != prefix_caching
+    assert command[-2:] == extra
