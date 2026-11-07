@@ -71,7 +71,8 @@ dependencies = [
 
 [project.optional-dependencies]
 omni = [
-    "vllm-omni @ git+https://github.com/vllm-project/vllm-omni@c4ac0642bd3254b3aac9050a6aadeaf0c225633e",
+    "step-audio2==1.0.0",
+    "vllm-omni @ git+https://github.com/WindChimeRan/vllm-omni@eaaac594acd00c810e322326860909f7b483958f",
 ]
 build = [
     # Native Metal extension source builds
