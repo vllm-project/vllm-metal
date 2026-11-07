@@ -22,6 +22,7 @@ import statistics
 import subprocess
 import sys
 import time
+from itertools import pairwise
 from pathlib import Path
 from urllib.request import Request, urlopen
 
@@ -164,6 +165,73 @@ def settled_metrics(base: str, expected_requests: int, path: Path, *, arm: str) 
         if counts["requests"] > expected_requests or time.monotonic() > deadline:
             raise ValueError(f"Incomplete/unexpected request counters: {counts}")
         time.sleep(0.25)
+
+
+def position_acceptance(
+    before: str, after: str, *, draft_width: int, counters: dict[str, float]
+) -> dict | None:
+    """Reconcile settled per-position deltas with the window's scalar counters.
+
+    Yields divide by all verified draft blocks, including shorter blocks.
+    They are not conditional acceptance probabilities for admitted positions.
+    """
+    name = "vllm:spec_decode_num_accepted_tokens_per_pos_total"
+
+    def snapshot(text: str) -> dict[tuple, float]:
+        values = {}
+        groups: dict[tuple, set[int]] = {}
+        for family in text_string_to_metric_families(text):
+            for sample in family.samples:
+                if sample.name != name:
+                    continue
+                label = sample.labels.get("position", "")
+                if not label.isdecimal() or str(int(label)) != label:
+                    raise ValueError("Invalid draft-position label")
+                position = int(label)
+                group = tuple(
+                    sorted((k, v) for k, v in sample.labels.items() if k != "position")
+                )
+                key = (group, position)
+                value = sample.value
+                if (
+                    key in values
+                    or not math.isfinite(value)
+                    or value < 0
+                    or not value.is_integer()
+                ):
+                    raise ValueError("Invalid/duplicate draft-position counter")
+                values[key] = value
+                groups.setdefault(group, set()).add(position)
+        expected = set(range(draft_width))
+        if (draft_width and not groups) or any(
+            positions != expected for positions in groups.values()
+        ):
+            raise ValueError("Missing/unexpected draft-position counters")
+        return values
+
+    start, end = snapshot(before), snapshot(after)
+    if start.keys() != end.keys():
+        raise ValueError("Draft-position series changed during measurement")
+    accepted = [0.0] * draft_width
+    for key, value in end.items():
+        delta = value - start[key]
+        if delta < 0:
+            raise ValueError("Draft-position counter reset during measurement")
+        accepted[key[1]] += delta
+    if sum(accepted) != counters["accepted_tokens"] or any(
+        later > earlier for earlier, later in pairwise([counters["drafts"], *accepted])
+    ):
+        raise ValueError("Draft-position counts disagree with verified prefixes")
+    if not draft_width:
+        return None
+    drafts = counters["drafts"]
+    return {
+        "accepted_tokens_by_position": accepted,
+        "accepted_tokens_per_draft_by_position": [v / drafts for v in accepted]
+        if drafts
+        else None,
+        "mean_accepted_draft_tokens": sum(accepted) / drafts if drafts else None,
+    }
 
 
 def validate_measurement(
@@ -460,6 +528,17 @@ def run_arm(
                         input_lens=[len(row["input_ids"]) for row in reference],
                         output_len=args.output_len,
                     )
+                    acceptance = position_acceptance(
+                        (phase_dir / "metrics-before.txt").read_text(),
+                        (phase_dir / "metrics-after.txt").read_text(),
+                        draft_width=0
+                        if arm == "target"
+                        else args.dspark_width
+                        if arm == "dspark"
+                        else args.draft_width,
+                        counters=delta,
+                    )
+                    write_json(phase_dir / "acceptance.json", acceptance)
                 # Immediate bench scrapes may precede the engine's stats flush;
                 # retain them raw and use settled, warmup-excluded counters here.
                 row = {
@@ -468,6 +547,7 @@ def run_arm(
                     "concurrency": concurrency,
                     "path": str(phase_dir.relative_to(args.output_dir)),
                     "counters": delta,
+                    "acceptance": acceptance,
                     "memory": memory,
                     "scheduler_capacity": capacity,
                     "benchmark": result,
@@ -528,6 +608,7 @@ def summarize(rows: list[dict]) -> list[dict]:
                     "arm": arm,
                     "concurrency": concurrency,
                     "repeat_ids": repeats,
+                    "acceptance_per_repeat": [r.get("acceptance") for r in selected],
                     "output_tokens_per_s": rates,
                     "median_output_tokens_per_s": statistics.median(rates),
                     "paired_throughput_ratio_vs_target": ratios,

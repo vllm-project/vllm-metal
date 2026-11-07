@@ -16,6 +16,7 @@ from tools.benchmark.dspark_serving_benchmark import (
     COUNTERS,
     machine_state,
     metric_counts,
+    position_acceptance,
     run_arm,
     scheduler_capacity,
     stop_server,
@@ -153,6 +154,86 @@ def test_measurement_uses_only_completed_timed_requests():
     }
 
 
+def position_metrics(values, *, engine="0"):
+    return "\n".join(
+        "vllm:spec_decode_num_accepted_tokens_per_pos_total"
+        f'{{engine="{engine}",position="{i}"}} {v}'
+        for i, v in enumerate(values)
+    )
+
+
+def test_position_yields_exclude_warmup_and_aggregate_engines():
+    result, before, after = measurement()
+    counters = validate_measurement(
+        result, before, after, input_lens=[3, 5], output_len=8, arm="dspark"
+    )
+    start = position_metrics([5, 3, 1]) + "\n" + position_metrics([0, 0, 0], engine="1")
+    end = position_metrics([7, 4, 1]) + "\n" + position_metrics([1, 1, 1], engine="1")
+    # A counter's creation timestamp is not an acceptance observation.
+    end += '\nvllm:spec_decode_num_accepted_tokens_per_pos_created{position="0"} 123\n'
+    assert position_acceptance(start, end, draft_width=3, counters=counters) == {
+        "accepted_tokens_by_position": [3, 2, 1],
+        "accepted_tokens_per_draft_by_position": [3 / 7, 2 / 7, 1 / 7],
+        "mean_accepted_draft_tokens": 6 / 7,
+    }
+
+
+def test_absent_target_positions_and_zero_draft_yields_are_not_probabilities():
+    counters = {"drafts": 0, "accepted_tokens": 0}
+    assert position_acceptance("", "", draft_width=0, counters=counters) is None
+    text = position_metrics([0, 0, 0])
+    result = position_acceptance(text, text, draft_width=3, counters=counters)
+    assert result == {
+        "accepted_tokens_by_position": [0, 0, 0],
+        "accepted_tokens_per_draft_by_position": None,
+        "mean_accepted_draft_tokens": None,
+    }
+
+
+@pytest.mark.parametrize(
+    "bad_snapshot",
+    [
+        "",  # missing data must not become a zero
+        position_metrics([3, 2]),  # incomplete width
+        position_metrics([3, 2, 1, 0]),  # unexpected position
+        position_metrics([3, 2, 1]).replace('position="1"', 'position="bad"'),
+        position_metrics([3, 2, 1]).replace('position="1"', 'position="01"'),
+        position_metrics([3, 2, 1]) + "\n" + position_metrics([3]),
+        *[position_metrics([3, 2, value]) for value in ("NaN", "+Inf", -1, 0.5)],
+    ],
+)
+def test_invalid_position_evidence_is_rejected(bad_snapshot):
+    with pytest.raises(ValueError):
+        position_acceptance(
+            position_metrics([0, 0, 0]),
+            bad_snapshot,
+            draft_width=3,
+            counters={"drafts": 7, "accepted_tokens": 6},
+        )
+
+
+@pytest.mark.parametrize(
+    "start,end,drafts,accepted",
+    [
+        (position_metrics([1, 0, 0]), position_metrics([0, 1, 0]), 7, 0),
+        (position_metrics([0, 0, 0]), position_metrics([3, 2, 1], engine="1"), 7, 6),
+        (position_metrics([0, 0, 0]), position_metrics([1, 2, 0]), 7, 3),
+        (position_metrics([0, 0, 0]), position_metrics([3, 2, 1]), 2, 6),
+        (position_metrics([0, 0, 0]), position_metrics([3, 2, 1]), 7, 5),
+    ],
+)
+def test_position_deltas_must_describe_the_same_verified_prefixes(
+    start, end, drafts, accepted
+):
+    with pytest.raises(ValueError):
+        position_acceptance(
+            start,
+            end,
+            draft_width=3,
+            counters={"drafts": drafts, "accepted_tokens": accepted},
+        )
+
+
 @pytest.mark.parametrize(
     ("key", "value"),
     [
@@ -230,12 +311,22 @@ def serving_rows():
 
 
 def test_summary_pairs_repeats_in_execution_independent_order(serving_rows):
+    for row in serving_rows:
+        row["acceptance"] = (
+            {"accepted_tokens_by_position": [3 * row["repeat"], row["repeat"]]}
+            if row["arm"] != "target"
+            else None
+        )
     summary = summarize(serving_rows[::-1])
     dspark = next(row for row in summary if row["arm"] == "dspark")
     assert dspark["repeat_ids"] == [1, 2]
     assert dspark["paired_throughput_ratio_vs_target"] == [0.75, 0.75]
     assert dspark["median_paired_throughput_ratio_vs_target"] == 0.75
     assert dspark["median_output_tokens_per_s"] == 9
+    assert dspark["acceptance_per_repeat"] == [
+        {"accepted_tokens_by_position": [3, 1]},
+        {"accepted_tokens_by_position": [6, 2]},
+    ]
 
 
 def test_summary_preserves_timings_without_claiming_parity(tmp_path, serving_rows):
