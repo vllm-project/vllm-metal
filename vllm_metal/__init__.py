@@ -96,7 +96,7 @@ def _apply_mlx_buffer_defaults() -> None:
 def _apply_model_runner_default() -> None:
     """Select the runner contract implemented by the chosen Metal backend.
 
-    ``setdefault`` keeps an explicit user value authoritative.
+    Preserve explicit values so configuration can reject unsupported choices.
     """
     mps = os.environ.get("VLLM_METAL_BACKEND") == "mps"
     os.environ.setdefault("VLLM_USE_V2_MODEL_RUNNER", "1")

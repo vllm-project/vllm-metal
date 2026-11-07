@@ -707,6 +707,11 @@ def test_remote_load_source_repins_the_config_repo_revision_offline(
             ["mmproj-model-Q8_0.gguf"],
             "No 'Q8_0' GGUF file found in remote repository 'Qwen/Qwen3-0.6B-GGUF'.",
         ),
+        # Nor is a speculative draft, even when it is the only match.
+        (
+            ["mtp-model-Q8_0.gguf"],
+            "No 'Q8_0' GGUF file found in remote repository 'Qwen/Qwen3-0.6B-GGUF'.",
+        ),
     ],
 )
 def test_remote_load_source_rejects_unsupported_remote_matches(
@@ -856,14 +861,20 @@ def test_remote_load_source_admits_mistral_repo_config(tmp_path, monkeypatch) ->
 
 @pytest.mark.parametrize("offline", [False, True])
 @pytest.mark.parametrize("tag", ["F16", "F32", "BF16"])
-def test_remote_plain_type_tags_resolve_past_projector_siblings(
+def test_remote_plain_type_tags_resolve_past_projector_and_draft_siblings(
     tmp_path, monkeypatch, tag, offline
 ) -> None:
     monkeypatch.setattr(hf_constants, "HF_HUB_OFFLINE", offline)
     snapshot = tmp_path / "weights"
-    snapshot.mkdir()
+    (snapshot / "MTP").mkdir(parents=True)
     gguf_name = f"model-{tag}.gguf"
-    repo_files = [gguf_name, f"mmproj-{tag}.gguf", f"mmproj-model-{tag.lower()}.gguf"]
+    repo_files = [
+        gguf_name,
+        f"mmproj-{tag}.gguf",
+        f"mmproj-model-{tag.lower()}.gguf",
+        f"MTP/mtp-model-{tag}.gguf",
+        f"dflash-model-{tag}.gguf",
+    ]
     for filename in repo_files:
         (snapshot / filename).write_text("dummy")
     monkeypatch.setattr(
@@ -884,6 +895,29 @@ def test_remote_plain_type_tags_resolve_past_projector_siblings(
     )
 
     assert resolved == str(snapshot / gguf_name)
+
+
+@pytest.mark.parametrize("model_name", ["model-Q8_0-MTP.gguf", "model-MTP-Q8_0.gguf"])
+def test_remote_tag_selects_embedded_mtp_model_over_draft_sibling(
+    tmp_path, monkeypatch, model_name
+) -> None:
+    snapshot = tmp_path / "weights"
+    monkeypatch.setattr(
+        gguf_source,
+        "HfApi",
+        lambda: SimpleNamespace(
+            resolve_revision=_echo_revision,
+            list_repo_files=lambda **_: [model_name, "mtp-model-Q8_0.gguf"],
+        ),
+    )
+    monkeypatch.setattr(gguf_source, "snapshot_download", lambda **_: str(snapshot))
+    reference = gguf_source.RemoteGGUFReference(repo_id="org/model", quant_type="Q8_0")
+
+    resolved = reference.resolve(
+        cache_dir=None, revision=None, ignore_patterns=None, token=None
+    )
+
+    assert resolved == str(snapshot / model_name)
 
 
 @pytest.mark.parametrize(

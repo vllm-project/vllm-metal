@@ -32,6 +32,7 @@ from vllm.v1.kv_cache_interface import (  # noqa: E402
 from tests.stub_runner import make_cache_config, make_stub_runner  # noqa: E402
 from vllm_metal.attention.caches.placement import KV_CACHE_LAYOUT  # noqa: E402
 from vllm_metal.attention.runtime.hybrid import HybridPagedAttentionRuntime
+from vllm_metal.attention.runtime.mla import MLAPagedAttentionRuntime
 from vllm_metal.attention.runtime.sdpa import SDPAPagedAttentionRuntime
 from vllm_metal.config import MetalConfig
 from vllm_metal.stt.policy import STT_SCHED_AVAILABLE_BYTES  # noqa: E402
@@ -430,10 +431,19 @@ class TestSleepReleasesHostPool:
         runner.restore_kv_cache_memory()
         connector.restore_host_pool.assert_called_once_with()
 
-    def test_keeps_the_pool_if_the_kv_cache_cannot_be_freed(self, monkeypatch) -> None:
+    @pytest.mark.parametrize("runtime_kind", ["mock", "mla"])
+    def test_keeps_the_pool_if_the_kv_cache_cannot_be_freed(
+        self, monkeypatch, runtime_kind
+    ) -> None:
         connector = MagicMock(spec=MetalOffloadingConnector)
-        runtime = MagicMock()
-        runtime.release_kv_memory.side_effect = NotImplementedError
+        if runtime_kind == "mla":
+            # MLA offloads but does not support sleep yet.
+            runtime = MLAPagedAttentionRuntime(
+                num_layers=1, latent_dim=4, block_size=4, dtype=mx.float32
+            )
+        else:
+            runtime = MagicMock()
+            runtime.release_kv_memory.side_effect = NotImplementedError
         runner = self._runner(monkeypatch, connector, runtime)
 
         with pytest.raises(NotImplementedError):
