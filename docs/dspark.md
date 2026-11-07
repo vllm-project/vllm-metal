@@ -48,6 +48,11 @@ LoRA, TurboQuant and KV offloading are not supported with DSpark. Leave draft
 cache precision unset; the target's activation precision must match the draft
 checkpoint.
 
+[Sleep mode](configuration.md#sleep-mode) releases target and draft KV memory
+while retaining model weights. Both prefix caches start empty after wake.
+Kept requests recompute their prefixes, which can change greedy output near
+low-precision logit ties.
+
 ## Tune drafting
 
 - **Draft length:** Set `num_speculative_tokens` between 1 and the checkpoint's

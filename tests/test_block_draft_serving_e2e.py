@@ -412,3 +412,195 @@ def test_block_draft_serving_parity_and_lifecycle(
         draft_checkpoint,
         label=method,
     )
+
+
+def _sleep_round_trip(method, draft, revision, quantization, caching, path):
+    _spawn_env(True)
+    import mlx.core as mx
+    from vllm import SamplingParams
+
+    llm = _block_draft_llm(
+        revision="4dcb3d101c2a062e5c1d4bb173588c54ea6c4d25",
+        speculative_config={
+            "method": method,
+            "model": draft,
+            "revision": revision,
+            "num_speculative_tokens": DRAFT_WIDTHS[method],
+        },
+        additional_config={"dspark_draft_quantization": quantization}
+        if quantization
+        else {},
+        enable_sleep_mode=True,
+        enable_prefix_caching=caching,
+        num_gpu_blocks_override=256,
+        gpu_memory_utilization=0.5,
+        max_model_len=256,
+    )
+    engine = llm.llm_engine
+    runner = engine.model_executor.driver_worker.model_runner
+    storage = runner._paged_attention_runtime.storage
+    assert runner._drafter.cache.storage is storage
+    assert_v2_model_runner(llm)
+    prompts = [
+        {
+            "prompt": "A student saves a document, closes the program, and opens "
+            "the same document the next day. Explain how a computer stores and "
+            "retrieves that file, including the different roles of memory and storage."
+        },
+        {
+            "prompt": "Two identical plants receive the same amount of water, "
+            "but one grows near a window and the other stays in a dark room. "
+            "Explain why sunlight affects their growth and describe photosynthesis."
+        },
+    ]
+    params = SamplingParams(temperature=0, max_tokens=32, ignore_eos=True)
+    counts = {"drafted": 0, "accepted": 0, "target_decisions": 0}
+    verify = runner._spec_decode_controller.verify_greedy
+
+    def record_verify(logits, requests, segments):
+        result = verify(logits, requests, segments)
+        targets = mx.argmax(logits[0], axis=-1).tolist()
+        for segment, tokens in zip(segments, result, strict=True):
+            assert (
+                tokens == targets[segment.start_row : segment.start_row + len(tokens)]
+            )
+            counts["drafted"] += len(segment.draft_token_ids)
+            counts["accepted"] += len(tokens) - 1
+            counts["target_decisions"] += len(tokens)
+        return result
+
+    runner._spec_decode_controller.verify_greedy = record_verify
+
+    def generate(inputs):
+        before = counts.copy()
+        outputs = llm.generate(inputs, params, use_tqdm=False)
+        # In-process generate returns before finished-request cleanup reaches
+        # the worker. Drain it as the continuous engine loop would before pause.
+        assert engine.step() == []
+        return {
+            "tokens": [list(o.outputs[0].token_ids) for o in outputs],
+            "counters": {k: counts[k] - before[k] for k in counts},
+            "cached_tokens": sum(o.num_cached_tokens for o in outputs),
+        }
+
+    records = {"storage_bytes": storage.nbytes, "rounds": []}
+    try:
+        cold = generate(prompts)
+        warm = generate(prompts)
+        assert cold["counters"]["drafted"] > 0
+        records.update(cold=cold, warm=warm)
+        if caching:
+            assert warm["cached_tokens"] > 0
+        for level in (1, 0):
+            before = mx.get_active_memory()
+            llm.sleep(level=level)
+            if level == 0:
+                llm.release_kv_cache_memory()
+            freed = before - mx.get_active_memory()
+            assert storage.released
+            assert freed >= storage.nbytes
+            assert llm.wake_up(tags=["kv_cache"] if level == 0 else None)
+            assert not storage.released
+            after_cold = generate(prompts)
+            after_warm = generate(prompts)
+            assert after_cold == cold
+            assert after_warm == warm
+            records["rounds"].append(
+                {
+                    "level": level,
+                    "freed_bytes": freed,
+                    "cold": after_cold,
+                    "warm": after_warm,
+                }
+            )
+
+        # A kept request is re-prefilled after wake, not resumed from discarded KV.
+        assert llm.reset_prefix_cache()
+        uninterrupted = generate(prompts[:1])
+        records["uninterrupted"] = uninterrupted
+        for release in (False, True):
+            label = "kept_sleep" if release else "kept_recompute"
+            assert llm.reset_prefix_cache()
+            engine.add_request(
+                label,
+                prompts[0],
+                SamplingParams(temperature=0, max_tokens=32, ignore_eos=True),
+            )
+            for _ in range(50):
+                output = engine.step()
+                if output and len(output[0].outputs[0].token_ids) >= 2:
+                    assert not output[0].finished
+                    records[label + "_prefix"] = list(output[0].outputs[0].token_ids)
+                    break
+            else:
+                raise AssertionError("Request did not start decoding")
+            llm.sleep(level=int(release), mode="keep")
+            if not release:
+                assert llm.reset_prefix_cache(reset_running_requests=True)
+            assert storage.released == release
+            assert llm.wake_up()
+            for _ in range(100):
+                output = engine.step()
+                if output and output[0].finished:
+                    records[label] = list(output[0].outputs[0].token_ids)
+                    break
+            else:
+                raise AssertionError("Kept request did not finish after wake")
+            assert engine.step() == []
+        # Re-prefill can perturb low-precision near ties. The matched control
+        # recomputes too, but never releases the backing allocation.
+        assert records["kept_sleep_prefix"] == records["kept_recompute_prefix"]
+        assert records["kept_sleep"] == records["kept_recompute"]
+        records["kept_matches_uninterrupted"] = (
+            records["kept_sleep"] == uninterrupted["tokens"][0]
+        )
+        records["all_target_decisions"] = counts["target_decisions"]
+    finally:
+        path.write_text(json.dumps(records, indent=2))
+        engine.engine_core.shutdown()
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("caching", [False, True])
+@pytest.mark.parametrize(
+    "method,draft,revision,quantization",
+    [
+        (
+            "dflash",
+            DRAFT_MODELS["dflash"],
+            "b74e3a329c4d963783143b1e970d95b002be72bd",
+            None,
+        ),
+        (
+            "dspark",
+            DRAFT_MODELS["dspark"],
+            "3457dff1417cb84927f6098a5fcb7cee85c934b7",
+            None,
+        ),
+        (
+            "dspark",
+            DRAFT_MODELS["dspark"],
+            "3457dff1417cb84927f6098a5fcb7cee85c934b7",
+            "q4",
+        ),
+        (
+            "dspark",
+            "RedHatAI/Qwen3-4B-speculator.dspark",
+            "bdffaa5f011da5a1a58ad841a1f6ced3e87f2f23",
+            None,
+        ),
+    ],
+)
+def test_block_draft_sleep_round_trip(
+    tmp_path, run_in_spawn_process, method, draft, revision, quantization, caching
+):
+    run_in_spawn_process(
+        _sleep_round_trip,
+        method,
+        draft,
+        revision,
+        quantization,
+        caching,
+        tmp_path / "sleep.json",
+        label="sleep",
+    )

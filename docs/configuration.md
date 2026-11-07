@@ -101,7 +101,9 @@ Sleep levels mean something different on unified memory than on a GPU:
   comes back empty at wake. Prompts already on the disk tier still restore.
 
 Sleep mode supports dense, hybrid and MLA models on the MLX backend.
-Speculative decoding methods other than `ngram` are not supported yet.
+Supported speculative methods are `ngram`, `dflash` and `dspark`, subject to
+their target-model restrictions. Block drafters release their KV cache with
+the target's cache; both start empty after wake.
 
 ## KV Cache Memory Settings
 

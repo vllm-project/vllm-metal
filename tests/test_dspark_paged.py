@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """DSpark's slot-zero proposals over real shared Metal KV and ragged pages."""
 
+import gc
 from dataclasses import replace
 
 import mlx.core as mx
@@ -157,6 +158,41 @@ def test_single_request_with_head_major_projections(
                 atol=tolerance,
                 rtol=tolerance,
             )
+
+
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("quantized", [False, True])
+def test_compiled_drafts_release_storage_and_rebind_after_wake(dtype, quantized):
+    model, cache = make_cache(dtype, quantized=quantized)
+    draft = cache.compile_draft(num_draft_tokens=7, draft_topk=8)
+    tables, lengths = [[5, 2, 7, 1], [9, 3, 8, 4]], [15, 30]
+    features = [mx.random.normal((45, 64)).astype(dtype) for _ in range(3)]
+    anchors = mx.array([11, 21])
+    storage = cache.storage
+
+    def replay():
+        cache.write_context(
+            features,
+            [(table, 0, n) for table, n in zip(tables, lengths, strict=True)],
+        )
+        result = draft(anchors, list(zip(tables, lengths, strict=True)))
+        mx.eval(result, *storage.buffers)
+        return [np.array(a.astype(mx.float32)) for a in result]
+
+    expected = replay()
+    for _ in range(2):
+        gc.collect()
+        before = mx.get_active_memory()
+        storage.release()
+        gc.collect()
+        assert storage.released
+        assert before - mx.get_active_memory() >= storage.nbytes
+        storage.reallocate()
+        for tensor in storage.tensors.values():
+            tensor.fill_(float("nan"))
+        # Reuse the compiled function: every cache input must refer to the new pool.
+        for actual, reference in zip(replay(), expected, strict=True):
+            np.testing.assert_array_equal(actual, reference)
 
 
 def _check_ragged_proposals(
