@@ -1584,6 +1584,8 @@ class MetalModelRunner:
         mm_prefill_deltas: dict[str, int] = {}
         # Lazy send op for the non-last pipeline stage (None otherwise).
         pp_send_handle: mx.array | None = None
+        # Prompt logprobs read every prompt row, so no forward path may prune rows.
+        needs_prompt_logprob_rows = self._needs_prompt_logprob_rows(prefill_reqs)
 
         prepare_grouped(
             decode_info,
@@ -1591,6 +1593,7 @@ class MetalModelRunner:
             self._paged_group_block_sizes,
             merge_verify_windows=self.merge_verify_windows,
             tq_prefill_workspace_bytes=self.tq_prefill_workspace_bytes,
+            all_rows_consumed=needs_prompt_logprob_rows,
         )
         try:
             ctx = get_context()
@@ -1667,7 +1670,7 @@ class MetalModelRunner:
             elif use_mm_forward:
                 assert adapter is not None
                 selects = self._mm_forward_selects_rows(adapter)
-                if selects and not self._needs_prompt_logprob_rows(prefill_reqs):
+                if selects and not needs_prompt_logprob_rows:
                     logits_layout = self._paged_logits_layout(
                         cu_seqlens,
                         num_decode_segments=len(decode_segments),
@@ -1718,13 +1721,6 @@ class MetalModelRunner:
                     and bool(prefill_reqs)
                     and all(pr.prompt_len is None for pr in prefill_reqs)
                     and self._drafter is None
-                )
-                # Prompt-logprobs requests need a logits row for every prompt
-                # position, so their steps skip both head-pruning paths: the
-                # projection-free intermediate forward (no logits at all) and
-                # the selective layout (last prefill row only).
-                needs_prompt_logprob_rows = self._needs_prompt_logprob_rows(
-                    prefill_reqs
                 )
                 if (
                     intermediate_only

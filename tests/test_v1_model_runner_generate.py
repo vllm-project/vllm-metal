@@ -2496,7 +2496,10 @@ class TestStartPagedForwardSelectiveLogits:
                 logits=mx.zeros((1, num_logits_rows, 16)),
             )
 
-        monkeypatch.setattr(mr, "prepare_grouped", lambda *a, **k: None)
+        def capture_prepare_grouped(*_args, all_rows_consumed, **_kwargs):
+            captured["all_rows_consumed"] = all_rows_consumed
+
+        monkeypatch.setattr(mr, "prepare_grouped", capture_prepare_grouped)
         monkeypatch.setattr(runner, "_target_forward", fake_target_forward)
 
         decode_reqs = decode_reqs or []
@@ -2550,6 +2553,32 @@ class TestStartPagedForwardSelectiveLogits:
         assert state.cu_seqlens == [0, 3, 5]
         # ...while the logits layout has one row per prefill.
         assert state.logits_cu_seqlens == [0, 1, 2]
+
+    @pytest.mark.parametrize(
+        ("prompt_logprobs", "num_logits_rows", "logits_indices"),
+        [(True, 3, None), (False, 1, [2])],
+        ids=["prompt_logprobs", "sampling_only"],
+    )
+    def test_keeps_every_row_only_for_prompt_logprob_steps(
+        self,
+        monkeypatch,
+        prompt_logprobs: bool,
+        num_logits_rows: int,
+        logits_indices: list[int] | None,
+    ) -> None:
+        runner = self._make_runner()
+        if prompt_logprobs:
+            runner._prompt_logprobs_tracker.register("r0", 0)
+
+        captured = self._run(
+            runner,
+            monkeypatch,
+            [self._make_prefill("r0", [1, 2, 3])],
+            num_logits_rows=num_logits_rows,
+        )
+
+        assert captured["all_rows_consumed"] is prompt_logprobs
+        assert captured["logits_indices"] == logits_indices
 
     def test_does_not_request_selection_when_unsupported(self, monkeypatch) -> None:
         runner = self._make_runner(_selective_logits_supported=False)
