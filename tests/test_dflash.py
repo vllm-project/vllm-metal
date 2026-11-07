@@ -20,6 +20,7 @@ from vllm_metal.v1.dflash import (
     DFlashTargetCapture,
     load_dflash,
 )
+from vllm_metal.v1.model_adapter import DefaultModelAdapter
 
 
 def _config():
@@ -249,6 +250,44 @@ def test_capture_indices_and_borrowed_quantized_projection(tied):
         np.array(logits[:, 0]),
         np.array(project(full[:, 0])),
     )
+
+
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("tied", [False, True])
+def test_headless_prefill_retains_exact_draft_features(dtype, tied):
+    config = replace(_config(), intermediate_size=64)
+    target = qwen3.Model(
+        qwen3.ModelArgs.from_dict(
+            {
+                **asdict(config),
+                "model_type": "qwen3",
+                "num_hidden_layers": 4,
+                "tie_word_embeddings": tied,
+            }
+        )
+    )
+    target.set_dtype(dtype)
+    nn.quantize(target, group_size=32, bits=4)
+    capture = DFlashTargetCapture(target, config)
+    adapter = DefaultModelAdapter()
+    tokens = mx.array([[1, 4, 2, 7, 9]])
+    full = adapter.target_forward(
+        target, tokens, collect_hidden_states=True, aux_capture=capture
+    )
+    headless = adapter.intermediate_forward(target, tokens, aux_capture=capture)
+    np.testing.assert_array_equal(
+        np.array(
+            headless.hidden_states.reshape(-1, config.hidden_size).astype(mx.float32)
+        ),
+        np.array(full.hidden_states.astype(mx.float32)),
+    )
+    for actual, expected in zip(
+        headless.aux_hidden_states, full.aux_hidden_states, strict=True
+    ):
+        assert actual.shape == (tokens.size, config.hidden_size)
+        np.testing.assert_array_equal(
+            np.array(actual.astype(mx.float32)), np.array(expected.astype(mx.float32))
+        )
 
 
 def test_config_preserves_capture_order_and_validates_target():

@@ -1706,27 +1706,30 @@ class MetalModelRunner:
                 target_hidden_states = None
             else:
                 # Intermediate-only prefill steps sample nothing: no chunk of
-                # theirs contributes a token, so the lm_head projection over
-                # the whole chunk (and the sampling sync) is pure waste. The
-                # adapter runs the model without the projection — the KV and
-                # GDN cache writes are the step's real output. Any installed
-                # drafter is excluded outright: propose() runs unconditional
-                # per-step bookkeeping (finished-id pruning, pending-draft
-                # resolution) that the no-logits short-circuit would skip.
+                # theirs contributes a token. Block drafters still ingest all
+                # captured features on this path, without vocabulary logits.
+                # Other proposers retain their existing forward contract.
                 intermediate_only = (
                     not decode_reqs
                     and bool(prefill_reqs)
                     and all(pr.prompt_len is None for pr in prefill_reqs)
-                    and self._drafter is None
+                    and (self._drafter is None or self._aux_capture is not None)
                 )
                 if (
                     intermediate_only
                     and self._intermediate_forward_supported
                     and not needs_prompt_logprob_rows
                 ):
-                    intermediate_hidden = self._model_adapter.intermediate_forward(
-                        self._forward_model, input_ids, cache=offset_caches
-                    ).hidden_states
+                    capture = (
+                        {"aux_capture": self._aux_capture}
+                        if self._aux_capture is not None
+                        else {}
+                    )
+                    intermediate = self._model_adapter.intermediate_forward(
+                        self._forward_model, input_ids, cache=offset_caches, **capture
+                    )
+                    intermediate_hidden = intermediate.hidden_states
+                    target_aux_hidden_states = intermediate.aux_hidden_states
                     logits = None
                     target_hidden_states = None
                 else:
@@ -1755,7 +1758,9 @@ class MetalModelRunner:
         elif intermediate_hidden is not None:
             # Intermediate-only prefill: the KV/GDN cache writes are the real
             # output; the hidden states force them through the lazy graph.
-            self._submit_paged_forward_outputs(intermediate_hidden)
+            self._submit_paged_forward_outputs(
+                intermediate_hidden, *target_aux_hidden_states
+            )
         elif pp_send_handle is not None:
             # Non-last pipeline stage: no logits, just push the hidden state to
             # the next stage, plus any runtime-owned forward side effects.
@@ -1966,6 +1971,9 @@ class MetalModelRunner:
                 self._paged_request_seq_lens[pr.req_id] = pr.start_pos + len(
                     pr.token_ids
                 )
+            self._draft_token_ids = self._propose_draft_tokens(
+                paged_state, [], [0] * len(prefill_reqs)
+            )
             return batch, scheduler_output
 
         # ---- wait for MLX forward to complete ----
@@ -2164,32 +2172,40 @@ class MetalModelRunner:
             )
             batch.add_output(req_id, decode_token_ids[i], logprobs)
 
-        num_speculative_tokens = scheduler_output.num_spec_tokens_to_schedule
+        self._draft_token_ids = self._propose_draft_tokens(
+            paged_state, decode_token_ids, prefill_result.token_ids
+        )
+        return batch, scheduler_output
+
+    def _propose_draft_tokens(
+        self,
+        state: _PagedForwardState,
+        decode_token_ids: Sequence[Sequence[int]],
+        prefill_token_ids: Sequence[int],
+    ) -> DraftTokenIds | None:
+        if self._drafter is None:
+            return None
         draft_ctx = ProposeContext(
-            target_hidden_states=target_hidden_states,
-            target_aux_hidden_states=paged_state.target_aux_hidden_states,
-            decode_reqs=decode_reqs,
-            decode_segments=decode_segments,
+            target_hidden_states=state.target_hidden_states,
+            target_aux_hidden_states=state.target_aux_hidden_states,
+            decode_reqs=state.decode_reqs,
+            decode_segments=state.decode_segments,
             decode_token_ids=decode_token_ids,
-            prefill_reqs=prefill_reqs,
-            prefill_token_ids=prefill_result.token_ids,
+            prefill_reqs=state.prefill_reqs,
+            prefill_token_ids=prefill_token_ids,
             prefill_result_modes=[
-                entry.result_mode for entry in batch.paged_prefill_entries
+                entry.result_mode for entry in state.batch.paged_prefill_entries
             ],
             request_states=self._request_states,
-            cu_seqlens=cu_seqlens,
-            num_decode_segments=num_decode_segments,
-            num_speculative_tokens=num_speculative_tokens,
-            finished_req_ids=scheduler_output.finished_req_ids,
+            cu_seqlens=state.cu_seqlens,
+            num_decode_segments=len(state.decode_segments),
+            num_speculative_tokens=state.scheduler_output.num_spec_tokens_to_schedule,
+            finished_req_ids=state.scheduler_output.finished_req_ids,
             draft_caps=self._hybrid_draft_caps(
-                decode_segments, decode_token_ids, prefill_reqs
+                state.decode_segments, decode_token_ids, state.prefill_reqs
             ),
         )
-        self._draft_token_ids = (
-            self._drafter.propose(draft_ctx) if self._drafter is not None else None
-        )
-
-        return batch, scheduler_output
+        return self._drafter.propose(draft_ctx)
 
     def _hybrid_draft_caps(
         self,
