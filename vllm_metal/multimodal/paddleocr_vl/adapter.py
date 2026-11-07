@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import mlx.core as mx
+import numpy as np
 import torch
 from vllm.multimodal.inputs import MultiModalKwargsItem
 
@@ -164,32 +165,42 @@ class PaddleOCRVLMultimodalAdapter:
         input_tokens: list[int],
         mm_features: list[MultiModalFeatureSpec],
     ) -> tuple[mx.array, int]:
-        """Return ``((3, 1, seq_len) int32 positions, mrope_position_delta)``."""
+        """Return ``((3, 1, seq_len) int32 positions, mrope_position_delta)``.
+
+        Mirrors upstream vLLM's PaddleOCR-VL M-RoPE layout, placing each image
+        grid at its ``mm_position`` offset without reading token ids.
+        """
         if not input_tokens:
             return mx.zeros((3, 1, 0), dtype=mx.int32), 0
-        if self._language_model is None:
-            raise RuntimeError(
-                "language_model not loaded; get_mrope_input_positions unavailable. "
-                "Construct via PaddleOCRVLMultimodalAdapter.from_loaded_model."
-            )
 
         sorted_features = sorted(mm_features, key=lambda f: f.mm_position.offset)
-        image_grid_thw_values = self._validate_image_features_and_collect_grids(
-            sorted_features
-        )
-        image_grid_thw = (
-            mx.array(image_grid_thw_values, dtype=mx.int32)
-            if image_grid_thw_values
-            else None
-        )
-        input_ids = mx.array([input_tokens], dtype=mx.int32)
-        position_ids, rope_deltas = self._language_model.get_rope_index(
-            input_ids,
-            image_grid_thw=image_grid_thw,
-            video_grid_thw=None,
-            attention_mask=None,
-        )
-        return position_ids.astype(mx.int32), self._first_scalar_int(rope_deltas)
+        grids = self._validate_image_features_and_collect_grids(sorted_features)
+        llm_pos_ids_list: list[np.ndarray] = []
+        st = 0
+        for feature, (llm_grid_t, h, w) in zip(sorted_features, grids, strict=True):
+            llm_grid_h = h // self._spatial_merge_size
+            llm_grid_w = w // self._spatial_merge_size
+            offset = feature.mm_position.offset
+            text_len = offset - st
+            st_idx = llm_pos_ids_list[-1].max() + 1 if llm_pos_ids_list else 0
+            llm_pos_ids_list.append(
+                np.broadcast_to(np.arange(text_len), (3, text_len)) + st_idx
+            )
+            grid_indices = np.indices((llm_grid_t, llm_grid_h, llm_grid_w))
+            llm_pos_ids_list.append(grid_indices.reshape(3, -1) + text_len + st_idx)
+            st = offset + llm_grid_t * llm_grid_h * llm_grid_w
+
+        if st < len(input_tokens):
+            st_idx = llm_pos_ids_list[-1].max() + 1 if llm_pos_ids_list else 0
+            text_len = len(input_tokens) - st
+            llm_pos_ids_list.append(
+                np.broadcast_to(np.arange(text_len), (3, text_len)) + st_idx
+            )
+
+        llm_positions = np.concatenate(llm_pos_ids_list, axis=1)
+        mrope_position_delta = int(llm_positions.max()) + 1 - len(input_tokens)
+        positions = mx.array(llm_positions, dtype=mx.int32)
+        return positions[:, None, :], mrope_position_delta
 
     def call_lm(
         self,
@@ -319,9 +330,3 @@ class PaddleOCRVLMultimodalAdapter:
     @staticmethod
     def _feature_value(data: MultiModalKwargsItem, key: str) -> Any:
         return data[key].data
-
-    @staticmethod
-    def _first_scalar_int(value: mx.array) -> int:
-        if value.ndim == 0:
-            return int(value.item())
-        return int(value.reshape(-1)[0].item())
