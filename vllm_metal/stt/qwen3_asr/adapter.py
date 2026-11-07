@@ -6,7 +6,7 @@ from __future__ import annotations
 import mlx.core as mx
 
 from vllm_metal.stt.runtime import STTAudioInput, STTRuntimeAdapter
-from vllm_metal.stt.sampling import STTSampling
+from vllm_metal.stt.sampling import STTSampling, TokenLogprob
 
 from .model import Qwen3ASRModel
 from .transcriber import Qwen3ASRTranscriber
@@ -55,7 +55,11 @@ class Qwen3ASRRuntimeAdapter(STTRuntimeAdapter):
         audio_features: mx.array,
         prompt_token_ids: list[int],
         sampling: STTSampling,
+        logprobs_out: list[TokenLogprob] | None = None,
     ) -> list[int]:
+        # Tokens are not scored: vLLM only requests sample logprobs for
+        # verbose_json, which it rejects for models without segment
+        # timestamps, Qwen3-ASR included.
         if not prompt_token_ids:
             raise ValueError("Qwen3-ASR request must include prompt_token_ids.")
 

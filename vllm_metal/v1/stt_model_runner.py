@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
+import numpy as np
 import torch
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
@@ -27,13 +28,13 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheSpec,
 )
-from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
+from vllm.v1.outputs import DraftTokenIds, LogprobsLists, ModelRunnerOutput
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_metal.stt.loader import resolve_model_path
 from vllm_metal.stt.policy import STT_SCHED_BLOCK_BYTES, STT_SCHED_NOMINAL_HEAD_SIZE
 from vllm_metal.stt.runtime import STTRuntimeAdapter
-from vllm_metal.stt.sampling import STTSampling
+from vllm_metal.stt.sampling import STTSampling, TokenLogprob
 from vllm_metal.stt.serve import VLLMSTTRequestAdapter
 from vllm_metal.v1.model_lifecycle import load_stt_model
 
@@ -179,11 +180,18 @@ class STTModelRunner:
         req_ids: list[str] = []
         req_id_to_index: dict[str, int] = {}
         sampled_tokens: list[list[int]] = []
+        # Per request: the scored tokens, or None when it asked for no logprobs.
+        sampled_logprobs: list[list[TokenLogprob] | None] = []
 
         eot_token = self._stt_runtime_adapter.eot_token
 
         for new_req in scheduler_output.scheduled_new_reqs:
             stt_request = VLLMSTTRequestAdapter.from_vllm_request(new_req)
+            params = stt_request.sampling_params
+            # vLLM's verbose_json path sets logprobs to build segments.
+            logprobs: list[TokenLogprob] | None = (
+                [] if params is not None and params.logprobs is not None else None
+            )
 
             audio_features = self._stt_runtime_adapter.extract_audio_features(
                 stt_request.input_features
@@ -191,12 +199,14 @@ class STTModelRunner:
             tokens = self._stt_runtime_adapter.decode_tokens(
                 audio_features,
                 list(stt_request.prompt_token_ids),
-                STTSampling.from_request(stt_request.sampling_params, self._sampler),
+                STTSampling.from_request(params, self._sampler),
+                logprobs_out=logprobs,
             )
 
             req_ids.append(stt_request.req_id)
             req_id_to_index[stt_request.req_id] = len(req_ids) - 1
             sampled_tokens.append(tokens)
+            sampled_logprobs.append(logprobs)
 
         # Handle cached requests: STT processes everything in one shot,
         # so any "cached" (decode-phase) request just gets an EOT to finish.
@@ -205,6 +215,7 @@ class STTModelRunner:
             req_ids.append(req_id)
             req_id_to_index[req_id] = len(req_ids) - 1
             sampled_tokens.append([eot_token])
+            sampled_logprobs.append(None)
 
         if not req_ids:
             return ModelRunnerOutput(
@@ -220,8 +231,41 @@ class STTModelRunner:
             req_ids=req_ids,
             req_id_to_index=req_id_to_index,
             sampled_token_ids=sampled_tokens,
-            logprobs=None,
+            logprobs=_pack_sample_logprobs(sampled_tokens, sampled_logprobs),
             prompt_logprobs_dict={},
             pooler_output=[None] * len(req_ids),
         )
         return None
+
+
+def _pack_sample_logprobs(
+    sampled_tokens: list[list[int]],
+    sampled_logprobs: list[list[TokenLogprob] | None],
+) -> LogprobsLists | None:
+    """Pack per-request token logprobs into vLLM's flat sample-logprob rows.
+
+    One row per sampled token, sampled token in column 0, as vLLM's output
+    processor reads it; ``cu_num_generated_tokens`` marks where each request's
+    rows start. Tokens left unscored, and every token of a request that asked
+    for no logprobs (the scheduler never reads those rows), get 0.0 at rank 1.
+    """
+    if all(logprobs is None for logprobs in sampled_logprobs):
+        return None
+    token_ids: list[int] = []
+    values: list[float] = []
+    ranks: list[int] = []
+    starts: list[int] = []
+    for tokens, logprobs in zip(sampled_tokens, sampled_logprobs, strict=True):
+        starts.append(len(token_ids))
+        scored = logprobs or []
+        for pos, token in enumerate(tokens):
+            logprob, rank = scored[pos] if pos < len(scored) else (0.0, 1)
+            token_ids.append(token)
+            values.append(logprob)
+            ranks.append(rank)
+    return LogprobsLists(
+        logprob_token_ids=np.array(token_ids, dtype=np.int32).reshape(-1, 1),
+        logprobs=np.array(values, dtype=np.float32).reshape(-1, 1),
+        sampled_token_ranks=np.array(ranks, dtype=np.int32),
+        cu_num_generated_tokens=starts,
+    )

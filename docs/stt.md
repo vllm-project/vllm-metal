@@ -74,12 +74,15 @@ Translate audio to English. Same parameters as transcriptions (except `language`
 {"text": "Hello, world."}
 ```
 
-**`verbose_json`**:
+**`verbose_json`** (Whisper only; Qwen3-ASR has no segment timestamps):
 ```json
 {
   "text": "Hello, world.",
   "language": "en",
-  "duration": 2.5
+  "duration": 2.5,
+  "segments": [
+    {"id": 0, "start": 0.0, "end": 2.5, "text": "Hello, world.", "avg_logprob": -0.12, "...": "..."}
+  ]
 }
 ```
 

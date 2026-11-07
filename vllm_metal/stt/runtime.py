@@ -16,7 +16,7 @@ import numpy as np
 import torch
 from numpy.typing import NDArray
 
-from vllm_metal.stt.sampling import STTSampling
+from vllm_metal.stt.sampling import STTSampling, TokenLogprob
 
 STTAudioInput: TypeAlias = (
     mx.array
@@ -77,7 +77,15 @@ class STTRuntimeAdapter(ABC):
         audio_features: mx.array,
         prompt_token_ids: list[int],
         sampling: STTSampling,
-    ) -> list[int]: ...
+        logprobs_out: list[TokenLogprob] | None = None,
+    ) -> list[int]:
+        """Decode the transcript tokens, ending with the EOT token.
+
+        When ``logprobs_out`` is given, the adapter appends one entry per
+        returned token it scored, in order. Adapters may leave trailing tokens
+        unscored (for example an EOT appended after the decode budget ran out).
+        """
+        ...
 
     @abstractmethod
     def warm_up(self) -> None:

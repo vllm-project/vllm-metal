@@ -25,7 +25,7 @@ from vllm_metal.stt.audio import (
     split_audio,
 )
 from vllm_metal.stt.protocol import TranscriptionResult, TranscriptionSegment
-from vllm_metal.stt.sampling import STTSampling
+from vllm_metal.stt.sampling import STTSampling, TokenLogprob, score_token
 
 from .config import WHISPER_MAX_DECODE_TOKENS
 from .model import WhisperModel
@@ -225,6 +225,7 @@ class WhisperTranscriber:
         prompt_token_ids: list[int],
         sampling: STTSampling,
         max_tokens: int | None = None,
+        logprobs_out: list[TokenLogprob] | None = None,
     ) -> list[int]:
         if max_tokens is None:
             max_tokens = WHISPER_MAX_DECODE_TOKENS
@@ -253,6 +254,10 @@ class WhisperTranscriber:
             next_token = sampling.next_token(
                 prompt_token_ids, output_tokens, logits[:, -1, :]
             )
+            if logprobs_out is not None:
+                # Score before the EOT check so the EOT the adapter appends
+                # carries the logprob of the step that chose it.
+                logprobs_out.append(score_token(logits[:, -1, :], next_token))
             if next_token == eot_token:
                 break
             output_tokens.append(next_token)

@@ -8,7 +8,7 @@ import logging
 import mlx.core as mx
 
 from vllm_metal.stt.runtime import STTAudioInput, STTRuntimeAdapter
-from vllm_metal.stt.sampling import STTSampling
+from vllm_metal.stt.sampling import STTSampling, TokenLogprob
 
 from .model import WhisperModel
 from .transcriber import WhisperTranscriber
@@ -65,12 +65,16 @@ class WhisperRuntimeAdapter(STTRuntimeAdapter):
         audio_features: mx.array,
         prompt_token_ids: list[int],
         sampling: STTSampling,
+        logprobs_out: list[TokenLogprob] | None = None,
     ) -> list[int]:
         if not prompt_token_ids:
             logger.warning("STT: empty prompt_token_ids, returning EOT only")
             return [self.eot_token]
         tokens = self.transcriber.decode_tokens(
-            audio_features, prompt_token_ids, sampling=sampling
+            audio_features,
+            prompt_token_ids,
+            sampling=sampling,
+            logprobs_out=logprobs_out,
         )
         tokens.append(self.eot_token)
         return tokens
