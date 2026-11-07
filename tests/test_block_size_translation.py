@@ -24,6 +24,7 @@ from vllm_metal.attention.context import (
     prepare_unified,
 )
 from vllm_metal.attention.impls.sdpa import _kernel_metadata
+from vllm_metal.attention.nax_split import nax_tile_work
 from vllm_metal.metal.constants import KERNEL_BLOCK_SIZES, MLA_KERNEL_BLOCK_SIZES
 
 
@@ -612,6 +613,36 @@ def test_nax_grouped_selects_width_from_capacity_and_real_work(
     assert cfg == ((64, 1, 128) if group == 1 else (16, group, 32 * group))
     assert name == (
         f"paged_attention_nax_bfloat16_t_hs256_bs{changes.get('page', 16)}{suffix}"
+    )
+
+
+@pytest.mark.parametrize("cores,expected_group", [(10, 6), (20, 3), (40, 1)])
+def test_nax_grouped_keeps_its_reference_when_bq64_policy_changes(
+    nax_config_runner, cores, expected_group
+):
+    """The reported long-prefix case keeps main's grouped candidate on each GPU."""
+    from vllm_metal.attention.nax_split import nax_split_kwargs
+
+    q, prefix = 128, 31360
+    hints = nax_split_kwargs(
+        {"nax_split_hint": True, "nax_grouped_reference_hint": True},
+        nax_tile_work([0, q], [prefix + q]),
+        256,
+        num_heads=24,
+        num_kv_heads=4,
+        gpu_core_count=cores,
+    )
+    assert hints == {"nax_split_hint": 1, "nax_grouped_reference_hint": 0}
+    cfg, _ = nax_config_runner(
+        q=q,
+        prefix=prefix,
+        cores=cores,
+        upstream_split=hints["nax_grouped_reference_hint"],
+    )
+    assert cfg == (
+        (64, 1, 128)
+        if expected_group == 1
+        else (16, expected_group, 32 * expected_group)
     )
 
 

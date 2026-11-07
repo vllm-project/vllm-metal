@@ -20,8 +20,8 @@ is not required.
 `nax_prefill_work` counts the KV tiles visited by complete and partial query
 blocks. It keeps issued work, useful work, guarded-query work and isolated KV
 edges separate. `nax_gqa_work_score` compares each eligible grouped layout with
-the actual upstream pipeline, using query/KV heads and detected GPU cores to
-limit credit for parallel work. These counts are source-work proxies, not DRAM
+the established BQ64 reference policy, using query/KV heads and detected GPU
+cores to limit credit for parallel work. These counts are source-work proxies, not DRAM
 traffic, register allocation, measured occupancy or predicted milliseconds.
 
 The coefficients are manual conservative calibration weights. They were
@@ -46,6 +46,19 @@ modulo 16/64, both split modes, and longer full/tail/edge combinations. Correct
 work counts do not make empirical coefficients universal.
 Head dimension is an eligibility boundary here; this score is not a
 cross-dimension performance model.
+
+The host passes the grouped reference separately from its BQ64 execution hint.
+The reference retains the existing complete-block and full/partial-work rule,
+so expanding split admission does not change a previously selected grouped
+layout. If grouped eligibility, scoring or pipeline capacity rejects a layout,
+BQ64 executes the batch-work hint. Legacy native callers that omit the reference
+continue to use their execution hint for both decisions.
+
+This preserves established grouped choices without fitting new score weights
+to short cached appends. It also leaves some possible grouped-to-BQ64 gains
+unclaimed: replacing an established grouped choice needs its own comparative
+measurements. The reference is a policy compatibility input, not a claim that
+the guarded BQ64 pipeline will execute or that grouped is always fastest.
 
 The six-head candidate normally requires at least one complete group per core
 and enough complete SIMD-group work or KV work. A dense-work allowance requires
