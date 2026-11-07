@@ -47,6 +47,7 @@ def _base_config(**cache_overrides) -> SimpleNamespace:
             pipeline_parallel_size=1,
             tensor_parallel_size=1,
             prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
             world_size=1,
             data_parallel_size=1,
             disable_custom_all_reduce=False,
