@@ -182,10 +182,13 @@ def test_hybrid_mamba_spec_reserves_one_state_block_per_request() -> None:
     assert cdiv(prompt_tokens, spec.block_size) == 1
 
 
-def test_tensor_parallel_spec_holds_one_rank_share() -> None:
+def test_tensor_parallel_spec_holds_one_rank_share(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """After shard(), the spec sizes this rank's KV heads and GDN state."""
+    monkeypatch.setattr(mx.distributed, "all_sum", lambda x, **_: x)
     group = SimpleNamespace(size=lambda: 2)
-    model = Mock(spec=["shard"])
+    model = Mock(spec=["shard", "parameters"])
     runner = make_stub_runner(
         model_config=SimpleNamespace(
             runner_type="generate",
@@ -303,12 +306,15 @@ def test_glm5_next_pooled_keys_share_the_latent_block() -> None:
     )
 
 
-def test_glm5_next_tensor_parallel_spec_splits_only_the_kda_state() -> None:
+def test_glm5_next_tensor_parallel_spec_splits_only_the_kda_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """GLM-5-Next shards under TP: a rank holds half of each KDA state, while
     the replicated latent and its pooled keys keep their whole spec."""
+    monkeypatch.setattr(mx.distributed, "all_sum", lambda x, **_: x)
     whole = make_glm5_next_stub_runner(linear_num_heads=2)
     runner = make_glm5_next_stub_runner(linear_num_heads=2)
-    runner.model = Mock(spec=["shard"])
+    runner.model = Mock(spec=["shard", "parameters"])
 
     runner.apply_tensor_parallel(SimpleNamespace(size=lambda: 2))
 

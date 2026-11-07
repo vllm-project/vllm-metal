@@ -912,6 +912,12 @@ class MetalModelRunner:
                 f"under TP yet (got {type(self.model).__name__})."
             )
         self.model.shard(group)
+        # Materialize the shards, as mlx-lm's sharded_load does: otherwise the
+        # first forward frees the unsharded source tensors into the buffer
+        # cache, and profile_run counts them as overhead. The CPU barrier keeps
+        # a rank from waiting for a slower peer inside the next all-reduce.
+        mx.eval(self._forward_model.parameters())
+        mx.eval(mx.distributed.all_sum(mx.array(1.0), group=group, stream=mx.cpu))
         tp_size = group.size()
         self.num_kv_heads = max(1, self.num_kv_heads // tp_size)
         if self.hybrid_runtime_plan is not None:
