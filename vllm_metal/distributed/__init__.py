@@ -5,6 +5,7 @@ from vllm_metal.distributed.pipeline import (
     PipelinedModel,
     PipelineGroup,
     apply_pipeline_split,
+    is_glm5_next,
     is_non_last_stage,
     pipeline_send,
 )
@@ -13,6 +14,7 @@ __all__ = [
     "PipelineGroup",
     "PipelinedModel",
     "apply_pipeline_split",
+    "is_glm5_next",
     "is_non_last_stage",
     "pipeline_send",
 ]

@@ -84,14 +84,21 @@ class BailingV3HybridConfig:
         )
 
     def state_geometry(self) -> RecurrentStateGeometry:
-        projection_size = self.num_heads * self.head_dim
-        return RecurrentStateGeometry(
-            conv_kernel_dim=self.conv_kernel_dim,
-            conv_dim=3 * projection_size,
-            num_v_heads=self.num_heads,
-            value_head_dim=self.head_dim,
-            key_head_dim=self.head_dim,
-        )
+        return kda_state_geometry(self.num_heads, self.head_dim, self.conv_kernel_dim)
+
+
+def kda_state_geometry(
+    num_heads: int, head_dim: int, conv_kernel_dim: int
+) -> RecurrentStateGeometry:
+    """KDA state: the q/k/v conv tail and one square recurrent state per head."""
+    projection_size = num_heads * head_dim
+    return RecurrentStateGeometry(
+        conv_kernel_dim=conv_kernel_dim,
+        conv_dim=3 * projection_size,
+        num_v_heads=num_heads,
+        value_head_dim=head_dim,
+        key_head_dim=head_dim,
+    )
 
 
 BAILING_MODEL_TYPES = frozenset({"bailing_hybrid"})
