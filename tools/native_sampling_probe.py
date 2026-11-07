@@ -12,8 +12,8 @@ Usage (against a server with native sampling on, the default):
     python tools/native_sampling_probe.py 60 0.7
 
 The request uses plain temperature/top-k/top-p sampling so it stays on the
-native path; pass ``--repetition-penalty`` to push it onto the torch
-fallback path instead.
+native path, including ``--repetition-penalty``. To test the torch
+fallback, start the server with ``VLLM_METAL_NATIVE_SAMPLING=0``.
 """
 
 from __future__ import annotations
