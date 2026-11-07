@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Numerical and cache-layout coverage for the private P256/P512 GQA kernels.
+"""Numerical and cache-layout coverage for the private GQA kernels.
 
 Tests force each specialization without GPU core detection. Production
 selection and fallback are covered separately in test_gqa_decode_routing.py.
@@ -102,7 +102,7 @@ def test_dispatch_diagnostics_are_disabled_in_a_fresh_process() -> None:
     )
 
 
-@pytest.mark.parametrize("test_partition", [None, *GQA_PARTITIONS])
+@pytest.mark.parametrize("test_partition", [None, 0, *GQA_PARTITIONS])
 def test_dispatch_diagnostics_require_opt_in(test_partition) -> None:
     ops = get_ops()
     mx.synchronize()
@@ -124,7 +124,9 @@ def test_dispatch_diagnostics_require_opt_in(test_partition) -> None:
             _assert_fallback()
             assert ops.last_gqa_partition_size() == 0
         else:
-            assert ops.last_paged_dispatch() == "gqa_decode"
+            assert ops.last_paged_dispatch() == (
+                "gqa_decode_nosplit" if test_partition == 0 else "gqa_decode"
+            )
             assert ops.last_gqa_partition_size() == test_partition
         _assert_close(unrecorded, reference, mx.bfloat16)
         np.testing.assert_array_equal(
@@ -199,19 +201,75 @@ def test_gqa_partial_page_tails(dtype, part, n_tok, q, kv, head, block):
     _assert_close(out, ref, dtype)
 
 
-@pytest.mark.parametrize("part", [0, 32, 64, 128, 1024])
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize(
+    "lengths", [[1], [3], [4], [257], [511, 512, 513], [1023, 17, 769]]
+)
+def test_nosplit_gqa_numerics_and_ragged_tails(dtype, lengths):
+    out, ref = _run_primitive(
+        lengths, dtype, interleaved=True, seed=720, test_partition=0
+    )
+    ops = get_ops()
+    assert _dispatch_family() == "gqa_decode_nosplit"
+    assert ops.last_gqa_partition_size() == 0
+    assert ops.last_gqa_num_requests() == len(lengths)
+    _assert_close(out, ref, dtype)
+
+
+@pytest.mark.parametrize("q,kv,head", [(24, 4, 256), (16, 2, 128)])
+def test_nosplit_rejects_geometries_only_shipped_for_split(q, kv, head):
+    kwargs = {
+        "kv_lens": [65],
+        "dtype": mx.float16,
+        "interleaved": True,
+        "seed": 721,
+        "num_query_heads": q,
+        "num_kv_heads": kv,
+        "head_size": head,
+    }
+    out, ref = _run_primitive(**kwargs, test_partition=256)
+    _assert_close(out, ref, mx.float16)
+    with pytest.raises(ValueError):
+        _run_primitive(**kwargs, test_partition=0)
+
+
+def test_nosplit_does_not_allocate_split_scratch_for_a_large_bound():
+    """A short history remains direct even when the allocation bound cannot reduce."""
+    ops = get_ops()
+    maximum = 1048577
+    query = mx.ones((1, 32, 128), mx.float16)
+    keys = mx.ones((1, 16, 8, 128), mx.float16)
+    values = mx.full(keys.shape, 2, mx.float16)
+    tables = mx.zeros((1, (maximum + 15) // 16), mx.int32)
+    lengths = mx.array([17], mx.int32)
+    mx.eval(query, keys, values, tables, lengths)
+    args = (query, keys, values, 128**-0.5, tables, lengths, 16, maximum)
+    with pytest.raises(ValueError, match="threadgroup memory limit"):
+        ops._gqa_paged_attention_for_test(*args, 256)
+    mx.synchronize()
+    before = mx.get_active_memory()
+    mx.reset_peak_memory()
+    out = ops._gqa_paged_attention_for_test(*args, 0)
+    mx.eval(out)
+    assert _dispatch_family() == "gqa_decode_nosplit"
+    assert mx.get_peak_memory() - before < 1024**2
+    np.testing.assert_allclose(np.array(out), 2, atol=2e-3)
+
+
+@pytest.mark.parametrize("part", [32, 64, 128, 1024])
 def test_private_gqa_entry_rejects_unshipped_partitions(part):
     with pytest.raises(ValueError, match="GQA test partition"):
         _run_primitive([65], mx.float16, interleaved=False, seed=0, test_partition=part)
 
 
 @pytest.mark.parametrize("cache", ["key", "value"])
+@pytest.mark.parametrize("partition", [0, 256])
 @pytest.mark.parametrize(
     "query_dtype,cache_dtype",
     [(mx.float16, mx.bfloat16), (mx.bfloat16, mx.float16), (mx.float16, mx.float32)],
 )
 def test_private_gqa_entry_rejects_mismatched_cache_dtype(
-    cache, query_dtype, cache_dtype
+    cache, partition, query_dtype, cache_dtype
 ):
     query = mx.zeros((1, 32, 128), dtype=query_dtype)
     key = mx.zeros((2, 16, 8, 128), dtype=query_dtype)
@@ -231,7 +289,7 @@ def test_private_gqa_entry_rejects_mismatched_cache_dtype(
             mx.array([17], dtype=mx.int32),
             16,
             17,
-            256,
+            partition,
         )
 
 
@@ -247,7 +305,7 @@ def test_private_gqa_partition_is_local_to_lazy_primitive():
         ops._gqa_paged_attention_for_test(
             q, k, v, 128**-0.5, tables, lengths, 16, 513, part
         )
-        for part in (256, 512)
+        for part in (0, 256, 512)
     ]
     outputs.append(
         ops.paged_attention_primitive(
@@ -265,7 +323,7 @@ def test_private_gqa_partition_is_local_to_lazy_primitive():
             -1,
         )
     )
-    for part, out in zip([256, 512, 0], outputs, strict=True):
+    for part, out in zip([0, 256, 512, 0], outputs, strict=True):
         mx.eval(out)
         assert ops.last_gqa_partition_size() == part
         assert np.allclose(np.array(out), 2, atol=2e-3)
@@ -296,15 +354,19 @@ def test_forced_partition_rejects_oversized_reducer(partition):
 
 
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
-@pytest.mark.parametrize("test_partition", GQA_PARTITIONS)
 @pytest.mark.parametrize(
-    "q_heads,kv_heads,head,block_size",
-    GQA_GEOMETRIES
-    + tuple(
-        (q, kv, head, {16: 784, 32: 1056}[block])
-        for q, kv, head, block in GQA_GEOMETRIES
-    )
-    + ((24, 4, 256, 800),),
+    "test_partition,q_heads,kv_heads,head,block_size",
+    [
+        (part, *geometry)
+        for part in GQA_PARTITIONS
+        for geometry in GQA_GEOMETRIES
+        + tuple(
+            (q, kv, head, {16: 784, 32: 1056}[block])
+            for q, kv, head, block in GQA_GEOMETRIES
+        )
+        + ((24, 4, 256, 800),)
+    ]
+    + [(0, 32, 8, 128, 16), (0, 32, 8, 128, 784)],
 )
 def test_gqa_reads_upstream_views_after_writes_and_block_copy(
     dtype, test_partition, q_heads, kv_heads, head, block_size
@@ -417,7 +479,9 @@ def test_gqa_reads_upstream_views_after_writes_and_block_copy(
             test_partition,
         )
         mx.eval(out)
-        assert _dispatch_family() == "gqa_decode"
+        assert _dispatch_family() == (
+            "gqa_decode_nosplit" if test_partition == 0 else "gqa_decode"
+        )
         assert ops.last_gqa_partition_size() == test_partition
         # Independent logical history; never gather the cache under test.
         ref = _grouped_paged_reference(

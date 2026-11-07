@@ -2092,6 +2092,8 @@ inline uint32_t gqa_broadcast_page_id(device const uint32_t *bt, int page,
 // One threadgroup per (PARTITION_SIZE-token partition, kv head, sequence);
 // each simdgroup owns one query head of the GQA group. Co-locating these
 // heads can improve KV cache locality; each simdgroup issues its own K/V loads.
+// PARTITION_SIZE=0 uses one group per (kv head, sequence) and writes the
+// final normalized output directly, without statistics buffers or a reducer.
 //
 // The producer walks pages, not tokens: PARTITION_SIZE is a multiple of
 // BLOCK_SIZE so the partition start is page-aligned. Lane 0 preloads the
@@ -2133,6 +2135,7 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE, int PARTITION_SIZE>
   static_assert(HEAD_SIZE % 32 == 0, "one lane-strided slice per lane");
   static_assert(PARTITION_SIZE % BLOCK_SIZE == 0,
                 "partition start is page-aligned");
+  constexpr bool USE_PARTITIONING = PARTITION_SIZE > 0;
   constexpr int SLICE = HEAD_SIZE / 32;  // elements per lane
   const int partition_idx = tg_pos.x;
   const int kv_head_idx = tg_pos.y;
@@ -2145,7 +2148,8 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE, int PARTITION_SIZE>
     // the partitioned per-token kernel).
     return;
   }
-  const int t_end = min(t0 + PARTITION_SIZE, context_len);
+  const int t_end = USE_PARTITIONING
+      ? min(t0 + PARTITION_SIZE, context_len) : context_len;
 
   const int group = tptg.x / 32;  // query heads per kv head (GQA group)
   const int head_idx = kv_head_idx * group + static_cast<int>(sg);
@@ -2259,13 +2263,16 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE, int PARTITION_SIZE>
     }
   }
 
-  const int64_t pidx = (use_compact_scratch
-      ? paged_attention_compact_offset(seq_idx, head_idx, num_heads, partition_offsets)
-      : (static_cast<int64_t>(seq_idx) * num_heads + head_idx) *
-          max_num_partitions) + partition_idx;
-  if (lane == 0) {
-    max_logits[pidx] = m;
-    exp_sums[pidx] = l;
+  int64_t pidx = static_cast<int64_t>(seq_idx) * num_heads + head_idx;
+  if constexpr (USE_PARTITIONING) {
+    pidx = (use_compact_scratch
+        ? paged_attention_compact_offset(seq_idx, head_idx, num_heads, partition_offsets)
+        : (static_cast<int64_t>(seq_idx) * num_heads + head_idx) *
+            max_num_partitions) + partition_idx;
+    if (lane == 0) {
+      max_logits[pidx] = m;
+      exp_sums[pidx] = l;
+    }
   }
   device T *out_ptr = tmp_out + pidx * HEAD_SIZE + lane * SLICE;
   const float inv_l = 1.f / (l + kPagedAttentionSoftmaxEpsilon);
@@ -2777,6 +2784,10 @@ instantiate_gqa_decode(half, VLLM_METAL_PARTITION_SIZE);
 // Established per-token and split-KV kernels remain at their original size.
 instantiate_gqa_decode(bfloat16_t, 256);
 instantiate_gqa_decode(half, 256);
+
+// Direct-output GQA for the initial head128/block16 dispatch domain.
+instantiate_gqa_decode_inner(bfloat16_t, 128, 16, 0);
+instantiate_gqa_decode_inner(half, 128, 16, 0);
 
 // TurboQuant producers for the same geometry domain. K is signed int8 (q8_0,
 // int8) or unsigned/packed uint8 (uint8 and sub-8-bit types); V is packed
