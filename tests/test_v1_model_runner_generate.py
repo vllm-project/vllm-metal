@@ -26,6 +26,7 @@ import vllm_metal.attention.impls.mm_prefix as mm_prefix_module
 import vllm_metal.envs as metal_envs
 import vllm_metal.v1.model_runner as mr
 from tests.stub_runner import (
+    admit_prefill_request,
     make_gdn_hybrid_plan,
     make_nemotron_hybrid_plan,
     make_state_cache,
@@ -1248,8 +1249,9 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         batch = mr._ExecutionBatch()
         output_idx = batch.add_output("p0", [])
         batch.paged_prefill_entries = [
-            mr._PendingPrefillEntry(output_idx, prefill, "new_final")
+            mr._PendingPrefillEntry(output_idx, prefill, "final")
         ]
+        admit_prefill_request(runner, prefill)
         runner._execute_model_state = mr._PagedForwardState(
             batch=batch,
             prefill_reqs=[prefill],
@@ -1511,8 +1513,9 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
             paged_state = runner._execute_model_state
             output_idx = paged_state.batch.add_output("p0", [])
             paged_state.batch.paged_prefill_entries = [
-                mr._PendingPrefillEntry(output_idx, prefill, "new_final")
+                mr._PendingPrefillEntry(output_idx, prefill, "final")
             ]
+            admit_prefill_request(runner, prefill)
             runner._execute_model_state = paged_state._replace(
                 prefill_reqs=[prefill],
                 logits=self._make_logits([4, 7]),
@@ -3657,8 +3660,9 @@ class TestDeferredDecodeSampleThreading:
         paged_state = self._paged_state(runner, [], prefill_reqs=[prefill])
         output_idx = paged_state.batch.add_output("r0", [])
         paged_state.batch.paged_prefill_entries = [
-            mr._PendingPrefillEntry(output_idx, prefill, "new_final")
+            mr._PendingPrefillEntry(output_idx, prefill, "final")
         ]
+        admit_prefill_request(runner, prefill)
         paged_state.scheduler_output.num_scheduled_tokens["r0"] = 1
         paged_state.scheduler_output.total_num_scheduled_tokens = 1
         runner._execute_model_state = paged_state._replace(
@@ -3709,8 +3713,9 @@ class TestDeferredDecodeSampleThreading:
         paged_state.batch.paged_decode_reqs = decode_reqs
         output_idx = paged_state.batch.add_output("p0", [])
         paged_state.batch.paged_prefill_entries = [
-            mr._PendingPrefillEntry(output_idx, prefill, "new_final")
+            mr._PendingPrefillEntry(output_idx, prefill, "final")
         ]
+        admit_prefill_request(runner, prefill)
         paged_state.scheduler_output.num_scheduled_tokens["p0"] = 1
         paged_state.scheduler_output.total_num_scheduled_tokens = 2
         runner._execute_model_state = paged_state._replace(
@@ -4181,6 +4186,47 @@ class TestDeferredDecodeSampleThreading:
         assert "r0" not in runner._request_states
         assert "r0" not in runner._paged_request_seq_lens
 
+    def test_preemption_drains_pending_sample_before_readmission(self, monkeypatch):
+        """A late token belongs to the old step, not the readmitted history."""
+        runner = make_stub_runner(_paged_attention_runtime=ForwardOutputRuntimeStub([]))
+        state = self._decode_state("r0")
+        runner._request_states["r0"] = state
+        runner._execute_model_state = self._paged_state(runner, [("r0", state)])
+        runner._decode_pipeline.begin_step(mr.PipelineGateDecision(True, "eligible"))
+        pending = runner._submit_deferred_decode_sample()
+        assert state.token_ids[-1] == mr.PENDING_TOKEN_PLACEHOLDER
+
+        preempt = self._paged_state(runner, []).scheduler_output
+        preempt.preempted_req_ids = {"r0"}
+        runner.execute_model(preempt)
+
+        assert state.token_ids == [3, 9, 1]
+        assert runner._request_states["r0"] is state
+        forward = Mock()
+        monkeypatch.setattr(runner, "_start_paged_forward", forward)
+        readmit = self._paged_state(runner, []).scheduler_output
+        readmit.scheduled_new_reqs = [
+            NewRequestData(
+                req_id="r0",
+                prompt_token_ids=[3],
+                prefill_token_ids=[3, 9],
+                mm_features=[],
+                sampling_params=state.sampling_params,
+                pooling_params=None,
+                block_ids=([1],),
+                num_computed_tokens=0,
+                lora_request=None,
+            )
+        ]
+        readmit.num_scheduled_tokens = {"r0": 2}
+        readmit.total_num_scheduled_tokens = 2
+        runner.execute_model(readmit)
+
+        assert forward.call_args.args[1][0].token_ids == [3, 9]
+        assert pending.get_output().sampled_token_ids == [[1]]
+        assert runner._request_states["r0"].token_ids == [3, 9]
+        assert runner._request_states["r0"] is not state
+
     def test_prefill_rows_in_deferred_submit_raise(self) -> None:
         # Arrange
         runner = make_stub_runner()
@@ -4590,7 +4636,7 @@ class TestIntermediateBodyOnlyForward:
             mr._PendingPrefillEntry(
                 output_idx=output_idx,
                 prefill=request,
-                result_mode="new_final",
+                result_mode="final",
             )
         )
         runner._execute_model_state = self._intermediate_only_state(
@@ -4648,11 +4694,13 @@ def test_intermediate_prefill_keeps_rng_and_drafter_bookkeeping(has_final_prefil
         )
     batch = mr._ExecutionBatch()
     for pr in prefills:
+        if pr.prompt_len is not None:
+            admit_prefill_request(runner, pr)
         batch.paged_prefill_entries.append(
             mr._PendingPrefillEntry(
                 output_idx=batch.add_output(pr.req_id, []),
                 prefill=pr,
-                result_mode="intermediate" if pr.prompt_len is None else "new_final",
+                result_mode="intermediate" if pr.prompt_len is None else "final",
             )
         )
     runner._request_states["chunk"] = mr.RequestState(
@@ -4786,8 +4834,8 @@ class TestStateBlockIdLifecycle:
         assert runner._request_states["r"].block_ids == [[80]]
 
 
-class TestPreemptedReadmission:
-    """Preempted requests are readmitted through the V2 scheduler contract."""
+class TestRequestAdmission:
+    """Fresh and preempted requests share the V2 admission contract."""
 
     def _new_req(
         self,
@@ -4853,6 +4901,22 @@ class TestPreemptedReadmission:
         )
         return runner
 
+    @pytest.mark.parametrize("num_scheduled", [2, 4])
+    def test_empty_output_is_allowed_only_for_intermediate_prefill(
+        self, monkeypatch, num_scheduled
+    ):
+        runner = make_stub_runner()
+        new_req = self._new_req([1, 2, 3, 4], num_computed_tokens=0)
+        scheduled = self._scheduler_output(new_req, num_scheduled)
+        batch = mr._ExecutionBatch()
+        runner._handle_new_requests(batch, [new_req], scheduled)
+        error = Mock()
+        monkeypatch.setattr(mr.logger, "error", error)
+
+        runner._validate_scheduled_outputs(batch, scheduled)
+
+        assert error.called is (num_scheduled == 4)
+
     def test_readmission_continues_from_prefill_tokens(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -4864,6 +4928,7 @@ class TestPreemptedReadmission:
         runner._paged_attention_runtime = Mock(spec=SDPAPagedAttentionRuntime)
         runner._paged_scheduler_group_indices = (0,)
         runner._request_states["r"].block_ids = [[0, 1]]
+        runner._request_states["r"].mrope_position_delta = -2
         runner._paged_request_seq_lens["r"] = 7
         forward = Mock()
         monkeypatch.setattr(runner, "_start_paged_forward", forward)
@@ -4879,13 +4944,23 @@ class TestPreemptedReadmission:
         assert entry.prefill.token_ids == [6]
         assert entry.prefill.start_pos == 5
         assert entry.prefill.generator is generator
-        assert entry.result_mode == "cached_final"
+        assert entry.result_mode == "final"
         assert state.token_ids == [1, 2, 3, 4, 5, 6]
         assert state.prompt_len == 4
         assert state.block_ids == [[10, 11]]
         assert state.generated_tokens == 0
+        assert state.mrope_position_delta == -2
         assert "r" not in runner._paged_request_seq_lens
         assert "r" not in runner._awaiting_readmission
+
+    def test_readmission_rejects_missing_full_history(self) -> None:
+        runner = self._preempted_runner()
+        new_req = self._new_req([1, 2, 3, 4, 5, 6], num_computed_tokens=0)
+        new_req.prefill_token_ids = None
+        runner._reconcile_request_lifecycle(set(), preempted_req_ids={"r"})
+
+        with pytest.raises(RuntimeError, match="missing prefill_token_ids"):
+            self._admit(runner, new_req, 4)
 
     @pytest.mark.parametrize(
         ("prefill_token_ids", "owes_prompt_logprobs"),
@@ -4909,22 +4984,113 @@ class TestPreemptedReadmission:
     def test_finished_id_reentering_in_the_same_step_is_admitted_fresh(
         self,
     ) -> None:
-        runner = self._preempted_runner()
-        new_req = self._new_req([7, 8, 9, 10], num_computed_tokens=0)
+        old_generator = torch.Generator().manual_seed(42)
+        runner = self._preempted_runner(old_generator)
+        runner._request_states["r"].mrope_position_delta = -2
+        new_req = self._new_req(
+            [7, 8, 9, 10],
+            num_computed_tokens=0,
+            sampling_params=SamplingParams(seed=7),
+        )
 
         runner._reconcile_request_lifecycle({"r"}, preempted_req_ids={"r"})
         entry = self._admit(runner, new_req, 4)
 
         assert entry.prefill.token_ids == [7, 8, 9, 10]
         assert entry.prefill.prompt_len == 4
-        assert entry.result_mode == "new_final"
+        assert entry.result_mode == "final"
+        state = runner._request_states["r"]
+        assert state.generator is not old_generator
+        assert state.generator.initial_seed() == 7
+        assert state.mrope_position_delta is None
 
-    def test_non_last_pp_stage_keeps_the_prefill_tokens(self) -> None:
-        runner = make_stub_runner()
+    @pytest.mark.parametrize("preempted", [False, True], ids=["fresh", "readmitted"])
+    def test_full_history_survives_chunked_prefill(self, monkeypatch, preempted):
+        """History is admitted before sampling; replay stays prefill until complete."""
+        runner = make_stub_runner(
+            model_args={"vocab_size": 8},
+            _paged_attention_runtime=ForwardOutputRuntimeStub([]),
+            _paged_block_size=16,
+            _intermediate_forward_supported=False,
+            _sampler=Sampler(),
+            num_layers=0,
+        )
+        seen_inputs = []
+
+        def forward(input_ids, **kwargs):
+            seen_inputs.append(input_ids.tolist()[0])
+            return mr.TargetModelForwardOutput(
+                logits=mx.broadcast_to(mx.arange(8), (*input_ids.shape, 8)).astype(
+                    mx.float32
+                )
+            )
+
+        monkeypatch.setattr(runner, "_target_forward", forward)
+        new_req = self._new_req(
+            [1, 2, 3, 4, 5, 6],
+            num_computed_tokens=2,
+            sampling_params=SamplingParams(temperature=0),
+        )
+        if preempted:
+            runner._request_states["r"] = self._preempted_runner()._request_states["r"]
+            runner.execute_model(
+                self._scheduler_output(None, 0, preempted_req_ids={"r"})
+            )
+        runner.execute_model(self._scheduler_output(new_req, 2))
+        state = runner._request_states["r"]
+        assert state.token_ids == [1, 2, 3, 4, 5, 6]
+        assert runner.sample_tokens(None).sampled_token_ids == [[]]
+
+        continuation = self._scheduler_output(None, 2)
+        continuation.scheduled_cached_reqs = CachedRequestData(
+            req_ids=["r"],
+            resumed_req_ids=set(),
+            new_token_ids=[],
+            all_token_ids={},
+            new_block_ids=[None],
+            num_computed_tokens=[4],
+            num_output_tokens=[2],
+        )
+        runner.execute_model(continuation)
+        output = runner.sample_tokens(None)
+
+        assert seen_inputs == [[3, 4], [5, 6]]
+        assert output.sampled_token_ids == [[7]]
+        state = runner._request_states["r"]
+        assert state.token_ids == [1, 2, 3, 4, 5, 6, 7]
+        assert state.generated_tokens == 3
+        assert state.prompt_len == 4
+        assert new_req.prefill_token_ids == [1, 2, 3, 4, 5, 6]
+
+    def test_non_last_pp_stage_keeps_the_prefill_tokens(self, monkeypatch) -> None:
+        runner = make_stub_runner(
+            pp=SimpleNamespace(size=2, is_last=False),
+            _paged_attention_runtime=ForwardOutputRuntimeStub([]),
+            _paged_block_size=16,
+        )
+        forward = Mock()
+        monkeypatch.setattr(runner, "_start_paged_forward", forward)
         new_req = self._new_req([1, 2, 3, 4, 5, 6], num_computed_tokens=5)
 
-        runner._update_pp_stage_states(self._scheduler_output(new_req, 1))
+        runner.execute_model(self._scheduler_output(new_req, 1))
 
         state = runner._request_states["r"]
         assert state.token_ids == [1, 2, 3, 4, 5, 6]
         assert state.prompt_len == 4
+        assert state.num_computed_tokens == 5
+        assert forward.call_args.args[1][0].token_ids == [6]
+
+        cached = self._scheduler_output(None, 1)
+        cached.scheduled_cached_reqs = CachedRequestData(
+            req_ids=["r"],
+            resumed_req_ids=set(),
+            new_token_ids=[[7]],
+            all_token_ids={},
+            new_block_ids=[None],
+            num_computed_tokens=[6],
+            num_output_tokens=[3],
+        )
+        runner.execute_model(cached)
+
+        assert state.token_ids == [1, 2, 3, 4, 5, 6, 7]
+        assert forward.call_args.args[2] == [("r", state)]

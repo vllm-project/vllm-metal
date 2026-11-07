@@ -393,7 +393,7 @@ class TestMixedDecodeAndPrefixHitPrefill:
 class TestCachedRequestContinuation:
     """Verify the cached/intermediate-chunk path works with prefix offsets."""
 
-    def test_cached_final_chunk_with_offset(self):
+    def test_final_prefill_chunk_with_offset(self):
         """Final chunk (computed + scheduled == prompt_len) with offset:
         token is kept and state transitions to decode phase."""
         runner = _make_paged_runner()
