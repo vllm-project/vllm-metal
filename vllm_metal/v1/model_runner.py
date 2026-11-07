@@ -506,9 +506,7 @@ class MetalModelRunner:
         # (populated only for requests whose SamplingParams ask for it).
         self._prompt_logprobs_tracker = PromptLogprobsTracker()
 
-        # One-step-ahead decode pipelining (owner: decode_pipeline.py).
-        # Gate-eligible pure-decode greedy steps defer the sampling sync one
-        # step so the next step's graph build overlaps the in-flight forward.
+        # Defer the sampling sync so the next graph build overlaps the forward.
         self._decode_pipeline = DecodePipeline(
             build_output=_ExecutionBatch.to_model_runner_output,
             validate=self._validate_scheduled_outputs,
@@ -1864,7 +1862,7 @@ class MetalModelRunner:
                 self._native_sampling_enabled
                 and not states_missing
                 and SamplingBatch.params_allow_native_random(
-                    decode_params, decode_output_lengths
+                    decode_params, decode_output_lengths, allow_seed=True
                 )
             ),
         )
@@ -3268,7 +3266,7 @@ class MetalModelRunner:
         token sampling, and request state updates happen — allowing the
         scheduler to run while the GPU was computing the forward pass.
         On pipeline-eligible steps the sync itself is deferred one step:
-        a lazy greedy sample is submitted and an async output is returned.
+        a lazy native sample is submitted and an async output is returned.
         """
         try:
             return self._sample_tokens(grammar_output)
@@ -3326,6 +3324,8 @@ class MetalModelRunner:
         ``execute_model`` sees advanced ``generated_tokens`` / seq lens; the
         token VALUES land later via ``DecodePipeline.resolve`` through direct
         ``RequestState`` references (never through runner dicts).
+        Seeded keys use the pre-increment ``generated_tokens`` count, matching
+        the synchronous path's output length even before token backfill.
         """
         paged_state = self._execute_model_state
         assert paged_state is not None
@@ -3352,9 +3352,8 @@ class MetalModelRunner:
             next_native_rng_key=(
                 self._next_native_sample_key if self._native_sampling_enabled else None
             ),
-            output_lengths=[
-                len(state.token_ids) - state.prompt_len for _, state in decode_reqs
-            ],
+            output_lengths=[state.generated_tokens for _, state in decode_reqs],
+            allow_seed=True,
         )
         # Submit now: the token buffer is scheduled right after this step's
         # forward and ahead of the next step's encode, so the deferred

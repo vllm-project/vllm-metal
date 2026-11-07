@@ -15,7 +15,8 @@ then resolves step ``k`` with a pure wait.
 Invariants the runner must keep (pinned by tests):
 
 - ``submit()`` happens only on gate-eligible steps: pure decode, batch-wide
-  native greedy, no spec/structured-output/pooling/PP/mm work in flight.
+  native greedy or native random sampling (including seeded requests), no
+  spec/structured-output/pooling/PP/mm work in flight.
 - All value-independent bookkeeping (placeholder append, ``generated_tokens``,
   seq-len advance) is done by the runner BEFORE ``submit()``; ``resolve()``
   only backfills token values through direct ``RequestState`` references and
