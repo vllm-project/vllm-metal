@@ -45,8 +45,9 @@ struct GqaDecodeGeometry {
   int head_size;
   int block_size;
 };
-constexpr std::array<GqaDecodeGeometry, 6> kGqaDecodeGeometries = {{
+constexpr std::array<GqaDecodeGeometry, 7> kGqaDecodeGeometries = {{
     {32, 8, 128, 16},
+    {24, 8, 128, 16},
     {24, 4, 256, 16},
     {24, 4, 256, 32},
     {16, 2, 128, 16},
