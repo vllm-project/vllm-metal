@@ -655,34 +655,33 @@ def test_broadcast_logits_use_per_row_candidate_ids():
 
 
 class TestNativeLogprobs:
-    @pytest.mark.parametrize(
-        "mode", ["raw_logprobs", "raw_logits", "processed_logprobs", "processed_logits"]
+    @pytest.fixture(
+        params=["raw_logprobs", "raw_logits", "processed_logprobs", "processed_logits"]
     )
-    @pytest.mark.parametrize("kind", ["greedy", "random", "filtered", "mixed"])
-    def test_scores_match_vllm_at_native_selected_tokens(self, monkeypatch, mode, kind):
+    def logprobs_mode(self, request):
+        return request.param
+
+    @pytest.fixture(
+        params=[
+            pytest.param({"temperature": 0.0}, id="greedy"),
+            pytest.param({"temperature": 0.7}, id="random"),
+            pytest.param(
+                {"temperature": 0.7, "top_k": 3, "top_p": 0.85, "min_p": 0.05},
+                id="filtered",
+            ),
+        ]
+    )
+    def sampling_kwargs(self, request):
+        return request.param
+
+    def _sample_with_reference(self, monkeypatch, mode, raw, params):
         from vllm.v1.sample.sampler import Sampler
 
         from vllm_metal.v1.sampling_batch import sample_from_logits
 
-        params = [
-            SamplingParams(
-                temperature=0 if kind in ("greedy", "mixed") else 0.7, logprobs=2
-            ),
-            SamplingParams(
-                temperature=0 if kind == "greedy" else 1.3, logprob_token_ids=[0, 3]
-            ),
-            SamplingParams(temperature=0 if kind == "greedy" else 0.5, logprobs=0),
-        ]
-        if kind in ("filtered", "mixed"):
-            params[1].top_k = 3
-            params[1].top_p = 0.85
-            params[1].min_p = 0.05
-        raw = [
-            [1.0, 4.0, 2.0, -1.0, 0.0],
-            [-2.0, 0.0, 3.0, 1.0, 2.0],
-            [0.0, 2.0, 1.0, -3.0, 4.0],
-        ]
-        batch = SamplingBatch(params, [[1]] * 3, [[], [2], [1, 2]], vocab_size=5)
+        batch = SamplingBatch(
+            params, [[1]] * len(params), [[] for _ in params], vocab_size=len(raw[0])
+        )
         metadata = batch.make_sampling_metadata()
         metadata.max_num_logprobs = -1
         metadata.logprob_token_ids = None
@@ -697,34 +696,88 @@ class TestNativeLogprobs:
             mx.array(raw), batch, sampler, next_native_rng_key=lambda: mx.random.key(9)
         )
         assert result.logprobs is not None
+        return result, expected_scores
+
+    def _assert_single_row_scores(self, result, reference):
+        ids = result.logprobs.logprob_token_ids[0].tolist()
+        selected = result.token_ids[0]
+        assert ids[0] == selected
+        torch.testing.assert_close(
+            torch.tensor(result.logprobs.logprobs[0]),
+            reference[0, ids],
+            atol=2e-6,
+            rtol=2e-6,
+        )
+        assert result.logprobs.sampled_token_ranks[0] == int(
+            (reference[0] >= reference[0, selected]).sum()
+        )
+
+    def test_topk_scores_match_vllm(self, monkeypatch, logprobs_mode, sampling_kwargs):
+        params = [SamplingParams(logprobs=2, **sampling_kwargs)]
+        raw = [[1.0, 3.0, 2.0, -1.0, 0.0]]
+        result, reference = self._sample_with_reference(
+            monkeypatch, logprobs_mode, raw, params
+        )
+        assert result.logprobs.logprob_token_ids.shape == (1, 3)
+        assert (
+            result.logprobs.logprob_token_ids[0, 1:].tolist()
+            == torch.topk(reference[0], 2).indices.tolist()
+        )
+        self._assert_single_row_scores(result, reference)
+
+    def test_explicit_token_scores_match_vllm(
+        self, monkeypatch, logprobs_mode, sampling_kwargs
+    ):
+        params = [SamplingParams(logprob_token_ids=[0, 3], **sampling_kwargs)]
+        raw = [[-2.0, 0.0, 3.0, 1.0, 2.0]]
+        result, reference = self._sample_with_reference(
+            monkeypatch, logprobs_mode, raw, params
+        )
+        assert result.logprobs.logprob_token_ids.shape == (1, 3)
+        assert result.logprobs.logprob_token_ids[0, 1:].tolist() == [0, 3]
+        self._assert_single_row_scores(result, reference)
+
+    def test_mixed_score_requests_preserve_row_alignment_and_padding(self, monkeypatch):
+        params = [
+            SamplingParams(temperature=0, logprobs=2),
+            SamplingParams(
+                temperature=1.3,
+                top_k=3,
+                top_p=0.85,
+                min_p=0.05,
+                logprob_token_ids=[0, 3],
+            ),
+            SamplingParams(temperature=0.5, logprobs=0),
+        ]
+        raw = [
+            [1.0, 4.0, 2.0, -1.0, 0.0],
+            [-2.0, 0.0, 3.0, 1.0, 2.0],
+            [0.0, 2.0, 1.0, -3.0, 4.0],
+        ]
+        result, reference = self._sample_with_reference(
+            monkeypatch, "raw_logprobs", raw, params
+        )
+        expected_ids = torch.tensor(
+            [
+                [result.token_ids[0], 1, 2],
+                [result.token_ids[1], 0, 3],
+                [result.token_ids[2], 0, 0],
+            ]
+        )
         assert result.logprobs.logprob_token_ids.shape == (3, 3)
-        for row, (selected, count) in enumerate(
-            zip(result.token_ids, [2, 2, 0], strict=True)
-        ):
-            ids = result.logprobs.logprob_token_ids[row, : count + 1].tolist()
-            assert ids[0] == selected
-            if row == 1:
-                assert ids[1:] == [0, 3]
-            elif count:
-                assert (
-                    ids[1:] == torch.topk(expected_scores[row], count).indices.tolist()
-                )
-            torch.testing.assert_close(
-                torch.tensor(result.logprobs.logprobs[row, : count + 1]),
-                expected_scores[row, ids],
-                atol=2e-6,
-                rtol=2e-6,
-            )
-            assert result.logprobs.sampled_token_ranks[row] == int(
-                (expected_scores[row] >= expected_scores[row, selected]).sum()
-            )
-        assert result.logprobs.logprobs[2, 1:].tolist() == [float("-inf")] * 2
-        assert not SamplingBatch.params_allow_native_greedy(
-            params, batch.output_lengths
+        assert result.logprobs.logprob_token_ids.tolist() == expected_ids.tolist()
+        expected_scores = reference.gather(1, expected_ids)
+        expected_scores[2, 1:] = -torch.inf
+        torch.testing.assert_close(
+            torch.tensor(result.logprobs.logprobs),
+            expected_scores,
+            atol=2e-6,
+            rtol=2e-6,
         )
-        assert not SamplingBatch.params_allow_native_random(
-            params, batch.output_lengths, allow_seed=True
-        )
+        expected_ranks = (reference >= expected_scores[:, :1]).sum(dim=-1)
+        assert result.logprobs.sampled_token_ranks.tolist() == expected_ranks.tolist()
+        assert not SamplingBatch.params_allow_native_greedy(params)
+        assert not SamplingBatch.params_allow_native_random(params, allow_seed=True)
 
     @pytest.mark.parametrize("logits_mode", [False, True])
     def test_inclusive_ranks_ties_and_masked_targets(self, logits_mode):

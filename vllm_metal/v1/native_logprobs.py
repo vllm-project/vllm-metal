@@ -10,6 +10,11 @@ from vllm.v1.outputs import LogprobsLists, LogprobsTensors
 
 from vllm_metal.tensor_bridge import mlx_to_torch
 
+# Conservative dispatch guards: amortize the chunk reduction/gather overhead
+# with a large vocabulary and at least 4x fewer entries in selected full chunks.
+_CHUNKED_TOPK_MIN_VOCAB_SIZE = 4096
+_CHUNKED_TOPK_MIN_SORT_REDUCTION = 4
+
 
 @dataclass(frozen=True)
 class NativeLogprobs:
@@ -38,8 +43,10 @@ def _topk_token_ids(values: mx.array, k: int) -> mx.array:
     batch_size, vocab_size = values.shape
     chunk_size = 256
     full_vocab = vocab_size // chunk_size * chunk_size
-    # Keep the full sort unless candidate selection cuts its width substantially.
-    if vocab_size < 4096 or k * chunk_size > full_vocab // 4:
+    if (
+        vocab_size < _CHUNKED_TOPK_MIN_VOCAB_SIZE
+        or k * chunk_size > full_vocab // _CHUNKED_TOPK_MIN_SORT_REDUCTION
+    ):
         return mx.argsort(-values, axis=-1)[:, :k].astype(mx.int32)
 
     chunks = values[:, :full_vocab].reshape(batch_size, -1, chunk_size)
