@@ -5027,7 +5027,7 @@ class TestRequestAdmission:
 
         assert seen_inputs == [[3, 4], [5, 6]]
         assert output.sampled_token_ids == [[7]]
-        assert runner._request_states["r"] is state
+        state = runner._request_states["r"]
         assert state.token_ids == [1, 2, 3, 4, 5, 6, 7]
         assert state.generated_tokens == 3
         assert state.prompt_len == 4

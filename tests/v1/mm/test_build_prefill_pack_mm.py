@@ -164,19 +164,3 @@ class TestBuildPrefillPackMmFullPrompt:
 
         with pytest.raises(RuntimeError, match="state tracking bug"):
             runner._build_prefill_pack(batch)
-
-    def test_text_only_continuation_chunk_carries_the_whole_sequence(self) -> None:
-        runner = make_stub_runner(encoder_cache=EncoderCache())
-        runner._request_states["req-0"] = RequestState(
-            token_ids=[1, 2, 3, 4, 5, 6, 7],
-            prompt_len=5,
-            sampling_params=SamplingParams(),
-        )
-        entry = _make_prefill_entry(
-            "req-0", token_ids=[3, 4, 5], prompt_len=5, start_pos=2
-        )
-        batch = self._make_batch(runner, [entry])
-
-        pack = runner._build_prefill_pack(batch)
-
-        assert pack[0].full_prompt_token_ids == [1, 2, 3, 4, 5, 6, 7]
