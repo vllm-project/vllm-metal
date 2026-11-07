@@ -24,6 +24,7 @@ _THIS_DIR = Path(__file__).resolve().parent
 _SRC = _THIS_DIR / "mlx_bindings.cpp"
 _PAGED_ATTENTION = _THIS_DIR / "paged_attention.cpp"
 _GDN = _THIS_DIR / "gdn.cpp"
+_GDN_KERNELS = _THIS_DIR / "gdn_kernels.h"
 _SAMPLING = _THIS_DIR / "sampling.cpp"
 _MLA = _THIS_DIR / "mla.cpp"
 _INTERNAL = _THIS_DIR / "ops_internal.h"
@@ -393,6 +394,7 @@ def _input_hash() -> str:
         _SRC,
         _PAGED_ATTENTION,
         _GDN,
+        _GDN_KERNELS,
         _SAMPLING,
         _MLA,
         _INTERNAL,
@@ -512,6 +514,7 @@ def _mps_input_hash() -> str:
     h = hashlib.sha256(str(torch.__version__).encode())
     for path in (
         _MPS_DIR / "mps_ops.mm",
+        _GDN_KERNELS,
         _KERNELS,
         _DEVICE,
         _DEVICE_SRC,
