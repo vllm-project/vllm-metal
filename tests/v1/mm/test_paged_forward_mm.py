@@ -12,6 +12,7 @@ import pytest
 import torch
 from vllm.sampling_params import SamplingParams
 
+import vllm_metal.v1.model_runner as mr
 from tests.stub_runner import make_stub_runner
 from vllm_metal.attention.context import get_context
 from vllm_metal.attention.runtime.sdpa import SDPAPagedAttentionRuntime
@@ -240,6 +241,42 @@ class TestSingleMmPrefillNoChunking:
         assert mx.allclose(
             embeds[0, 2], mx.ones(adapter.hidden_size, dtype=mx.float32)
         ).item()
+
+    def test_first_pipeline_stage_feeds_the_splice_to_its_stage(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        adapter = _MmAdapter()
+        runner = _runner(adapter)
+        runner.pp = SimpleNamespace(size=2, is_last=False)
+        stage = MagicMock(return_value=mx.zeros((1, 4, adapter.hidden_size)))
+        runner._pp_model = stage
+        monkeypatch.setattr(mr, "pipeline_send", lambda output, pp: output)
+        runner.encoder_cache.add_request(
+            "req-0", [_feature("img-0", offset=1, length=2)]
+        )
+        _put_encode(runner, "img-0", hidden_states=mx.ones((2, adapter.hidden_size)))
+        runner._spec_decode_controller.build_decode_segments = MagicMock(
+            return_value=()
+        )
+
+        runner._start_paged_forward(
+            batch=MagicMock(),
+            prefill_reqs=[
+                _mm_prefill(
+                    "req-0",
+                    token_ids=[10, 99, 99, 11],
+                    prompt_len=4,
+                    full_prompt=[10, 99, 99, 11],
+                )
+            ],
+            decode_reqs=[],
+            scheduler_output=_scheduler_output(),
+        )
+
+        # The stage runs the forward, not call_lm, on the spliced embeddings.
+        assert adapter.call_lm_calls == []
+        embeds = stage.call_args.kwargs["inputs_embeds"]
+        assert embeds[0, :, 0].tolist() == [0.0, 1.0, 1.0, 0.0]
 
 
 class TestMmPrefillChunkedFeatureSlicing:
