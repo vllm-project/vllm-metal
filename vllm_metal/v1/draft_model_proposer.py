@@ -20,13 +20,13 @@ draft cache's blocks "cached" based on its own per-step bookkeeping,
 trusting that whatever it scheduled, the worker actually computed -- for
 *every* registered group, uniformly, every step. But
 ``SpeculativeDecodeController.draft_eligible_requests`` intentionally
-excludes non-greedy requests and intermediate prefill chunks from
+excludes ineligible requests and intermediate prefill chunks from
 *drafting*. If those rows also skipped *ingest*, the scheduler would believe
 their draft cache blocks hold real KV when they never did, and a later,
 unrelated request whose prompt happens to hash-match that prefix could be
 handed those blocks as a "cache hit" -- silent data corruption, not just a
 missed optimization. So ``propose()`` ingests every decode and prefill row
-(chunked or not, greedy or not) to keep the draft cache's physical KV
+(chunked or not, drafted or not) to keep the draft cache's physical KV
 in sync with the scheduler within the draft model's context limit, and only
 *drafts* (produces returned token ids and runs extra lookahead steps) for the
 eligible subset. Ingest stops at the draft model's context limit; cached
@@ -35,12 +35,12 @@ positions beyond it are never read by this proposer.
 Each step: ingest advances every row's committed KV to ``committed_len``,
 then ``num_speculative_tokens - 1`` single-token decode steps run for
 drafting rows only. Drafts are handed back via ``take_draft_token_ids`` and
-verified next step by ``SpeculativeDecodeController.verify_greedy``.
+verified next step by ``SpeculativeDecodeController.verify``.
 
 **Skipping already-valid speculative KV (#482, direction 2).** The
 lookahead draft steps write KV for drafts ``d1..d(K-1)`` at positions
 ``[committed_len, committed_len + K - 1)``. When the next round's committed
-tokens match those drafts (greedy acceptance is a prefix, so accepted drafts
+tokens match those drafts (acceptance is a prefix, so accepted drafts
 keep their identities), that KV is exactly what the ingest would recompute
 -- so the ingest skips it (``_speculative_kv_valid_through``), shrinking the
 steady-state K+1-token ingest to 2 rows on full acceptance. A position is
@@ -499,9 +499,9 @@ class DraftModelProposer(NoOwnKVProposer):
     def _collect_draft_plans(
         self, ctx: ProposeContext, num_speculative_tokens: int
     ) -> list[_DraftPlan]:
-        # can_draft_greedy/draft_eligible_requests decide *drafting*
-        # eligibility only here (greedy + non-intermediate prefill +
-        # greedy-only sampling); ingest itself runs for every active row
+        # can_draft/draft_eligible_requests decide *drafting*
+        # eligibility only here (eligible request + non-intermediate
+        # prefill); ingest itself runs for every active row
         # regardless -- see module docstring.
         drafting_req_ids: set[str] = set()
         for req_id, state in self._controller.draft_eligible_requests(

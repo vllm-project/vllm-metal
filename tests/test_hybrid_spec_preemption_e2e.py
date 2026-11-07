@@ -48,14 +48,16 @@ def _run_arm(case: str, enable_spec: bool, out_path: str, model: str):
 
     readmitted, records = [], []
     original_readmit = MetalModelRunner._readmit_request
-    original_verify = SpeculativeDecodeController.verify_greedy
+    original_verify = SpeculativeDecodeController.verify
 
     def readmit(self, batch, new_req, scheduler_output):
         original_readmit(self, batch, new_req, scheduler_output)
         readmitted.append(new_req.req_id)
 
-    def verify(self, logits, decode_reqs, decode_segments):
-        result = original_verify(self, logits, decode_reqs, decode_segments)
+    def verify(self, logits, decode_reqs, decode_segments, *args, **kwargs):
+        result = original_verify(
+            self, logits, decode_reqs, decode_segments, *args, **kwargs
+        )
         for seg, ids in zip(decode_segments, result, strict=True):
             records.append(
                 (seg.req_id, seg.num_query_tokens, len(ids), seg.req_id in readmitted)
@@ -63,7 +65,7 @@ def _run_arm(case: str, enable_spec: bool, out_path: str, model: str):
         return result
 
     MetalModelRunner._readmit_request = readmit
-    SpeculativeDecodeController.verify_greedy = verify
+    SpeculativeDecodeController.verify = verify
     llm = LLM(
         model=model,
         max_model_len=1024,

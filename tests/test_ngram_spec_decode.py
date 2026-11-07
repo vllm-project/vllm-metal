@@ -45,12 +45,10 @@ def _proposer(
     )
 
 
-def _request_state(
-    token_ids: list[int], *, temperature: float = 0.0
-) -> SimpleNamespace:
+def _request_state(token_ids: list[int]) -> SimpleNamespace:
     return SimpleNamespace(
         token_ids=list(token_ids),
-        sampling_params=SamplingParams(temperature=temperature),
+        sampling_params=SamplingParams(temperature=0.0),
         generated_tokens=1,
     )
 
@@ -230,11 +228,13 @@ class TestNgramProposePropose:
 
         assert proposer.propose(ctx) is None
 
-    @pytest.mark.parametrize("temperature,max_tokens", [(0.8, 16), (0.0, 1)])
-    def test_skips_ineligible_request(self, temperature, max_tokens) -> None:
+    @pytest.mark.parametrize("logprobs,max_tokens", [(1, 16), (None, 1)])
+    def test_skips_ineligible_request(self, logprobs, max_tokens) -> None:
         proposer = _proposer(prompt_lookup_min=2)
-        state = _request_state([1, 2, 3, 1, 2, 3, 1, 2], temperature=temperature)
-        state.sampling_params.max_tokens = max_tokens
+        state = _request_state([1, 2, 3, 1, 2, 3, 1, 2])
+        state.sampling_params = SamplingParams(
+            temperature=0.0, logprobs=logprobs, max_tokens=max_tokens
+        )
         ctx = _context(decode_reqs=[("r0", state)])
 
         assert proposer.propose(ctx) is None

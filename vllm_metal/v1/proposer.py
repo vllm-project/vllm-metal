@@ -8,7 +8,7 @@ are interchangeable implementations; the runner holds no per-method knowledge.
 
 The shared *verify* half stays in
 :class:`vllm_metal.v1.spec_decode.SpeculativeDecodeController`
-(``build_decode_segments`` + ``verify_greedy``); only the *propose* half is
+(``build_decode_segments`` + ``verify``); only the *propose* half is
 polymorphic here.
 """
 

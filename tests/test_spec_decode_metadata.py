@@ -3,13 +3,16 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
 
 import mlx.core as mx
 import pytest
+import torch
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
+from vllm.v1.sample.sampler import Sampler
 
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPDraftSeed
 from vllm_metal.v1.spec_decode import (
@@ -28,13 +31,18 @@ def _request_state(
     max_tokens: int | None = 16,
     generated_tokens: int = 1,
     stop_token_ids: list[int] | None = None,
+    logprobs: int | None = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
+        token_ids=[0] + [6] * generated_tokens,
+        prompt_len=1,
         sampling_params=SamplingParams(
             temperature=temperature,
             max_tokens=max_tokens,
             stop_token_ids=stop_token_ids,
+            logprobs=logprobs,
         ),
+        generator=None,
         generated_tokens=generated_tokens,
     )
 
@@ -82,6 +90,12 @@ def _logits(token_ids: list[int], vocab_size: int = 16) -> mx.array:
         row[token_id] = 10.0
         rows.append(row)
     return mx.array([rows])
+
+
+def _verify(logits: mx.array, decode_reqs, segments, **kwargs) -> list[list[int]]:
+    return SpeculativeDecodeController().verify(
+        logits, decode_reqs, segments, Sampler(), vocab_size=logits.shape[-1], **kwargs
+    )
 
 
 class TestPagedDecodeSegment:
@@ -197,31 +211,21 @@ class TestSpecDecodePolicy:
         self, generated, max_tokens, eligible
     ) -> None:
         state = _request_state(generated_tokens=generated, max_tokens=max_tokens)
-        assert (
-            SpeculativeDecodeController().can_draft_greedy("r0", state, [1]) is eligible
-        )
+        assert SpeculativeDecodeController().can_draft("r0", state, [1]) is eligible
 
     @pytest.mark.parametrize(
         "params",
         [
+            SamplingParams(temperature=1.0, top_p=0.95),
+            SamplingParams(temperature=0.0, presence_penalty=1.0),
             SamplingParams(temperature=0.0, logit_bias={1: 5.0}),
             SamplingParams(temperature=0.0, min_tokens=2),
         ],
-        ids=["logit-bias", "min-tokens"],
+        ids=["temperature-top-p", "penalty", "logit-bias", "min-tokens"],
     )
-    def test_logits_processor_controls_are_not_drafted(
-        self, params: SamplingParams
-    ) -> None:
+    def test_sampling_parameters_are_drafted(self, params: SamplingParams) -> None:
         state = SimpleNamespace(sampling_params=params, generated_tokens=1)
-        assert not SpeculativeDecodeController().can_draft_greedy("r0", state, [1])
-
-    def test_min_tokens_request_is_drafted_once_reached(self) -> None:
-        params = SamplingParams(temperature=0.0, min_tokens=2)
-        controller = SpeculativeDecodeController()
-        pending = SimpleNamespace(sampling_params=params, generated_tokens=1)
-        reached = SimpleNamespace(sampling_params=params, generated_tokens=2)
-        assert not controller.can_draft_greedy("r0", pending, [1])
-        assert controller.can_draft_greedy("r0", reached, [1])
+        assert SpeculativeDecodeController().can_draft("r0", state, [1])
 
     @pytest.mark.parametrize(
         "sampled,ignore_eos,stop_tokens,eligible",
@@ -250,10 +254,7 @@ class TestSpecDecodePolicy:
             temperature=0, ignore_eos=ignore_eos, stop_token_ids=stop_tokens
         )
         state.sampling_params.update_from_generation_config({}, eos_token_id=2)
-        assert (
-            SpeculativeDecodeController().can_draft_greedy("r0", state, sampled)
-            is eligible
-        )
+        assert SpeculativeDecodeController().can_draft("r0", state, sampled) is eligible
 
     @pytest.mark.parametrize(
         "token_id,eligible", [(2, False), (8, True)], ids=["eos", "live"]
@@ -389,7 +390,7 @@ class TestSpecDecodePolicy:
 
 
 class TestGemma4MTPDraftSeeds:
-    @pytest.mark.parametrize("skip_reason", ["sampled", "output_budget", "stop_token"])
+    @pytest.mark.parametrize("skip_reason", ["logprobs", "output_budget", "stop_token"])
     def test_decode_seeds_use_last_accepted_target_row(self, skip_reason) -> None:
         seeds = SpeculativeDecodeController().build_gemma4_mtp_draft_seeds(
             decode_reqs=[
@@ -397,9 +398,9 @@ class TestGemma4MTPDraftSeeds:
                 (
                     "r1",
                     _request_state(
-                        temperature=0.7 if skip_reason == "sampled" else 0.0,
                         max_tokens=1 if skip_reason == "output_budget" else 16,
                         stop_token_ids=[9] if skip_reason == "stop_token" else None,
+                        logprobs=1 if skip_reason == "logprobs" else None,
                     ),
                 ),
             ],
@@ -491,7 +492,7 @@ class TestGemma4MTPDraftSeeds:
         )
 
 
-class TestVerifyGreedySpecDecode:
+class TestVerifySpecDecode:
     def test_specific_token_logprobs_are_not_draft_eligible(self) -> None:
         state = SimpleNamespace(
             sampling_params=SamplingParams(
@@ -501,7 +502,7 @@ class TestVerifyGreedySpecDecode:
             generated_tokens=1,
         )
 
-        assert not SpeculativeDecodeController().can_draft_greedy("r0", state, [1])
+        assert not SpeculativeDecodeController().can_draft("r0", state, [1])
 
     def test_accepts_all_drafts_and_emits_bonus_token(self) -> None:
         segment = PagedDecodeSegment(
@@ -514,11 +515,7 @@ class TestVerifyGreedySpecDecode:
             block_ids=((0,),),
         )
 
-        output = SpeculativeDecodeController().verify_greedy(
-            _logits([7, 8, 9]),
-            [("r0", _request_state())],
-            (segment,),
-        )
+        output = _verify(_logits([7, 8, 9]), [("r0", _request_state())], (segment,))
 
         assert output == [[7, 8, 9]]
 
@@ -533,15 +530,50 @@ class TestVerifyGreedySpecDecode:
             block_ids=((0,),),
         )
 
-        output = SpeculativeDecodeController().verify_greedy(
-            _logits([7, 5, 9]),
-            [("r0", _request_state())],
-            (segment,),
-        )
+        output = _verify(_logits([7, 5, 9]), [("r0", _request_state())], (segment,))
 
         assert output == [[7, 5]]
 
-    def test_rejects_non_greedy_sampling(self) -> None:
+    @pytest.mark.parametrize("native", [False, True], ids=["torch", "native"])
+    def test_sampled_rows_keep_the_target_distribution(self, native) -> None:
+        # Draft 1 at the first row: emitted tokens must follow that row's
+        # softmax, which accepts the draft with its probability 0.3.
+        probs = [0.5, 0.3, 0.2, 0.0]
+        row = [math.log(p) if p else -30.0 for p in probs]
+        n = 4000
+        segments = [
+            PagedDecodeSegment(
+                req_id=f"r{i}",
+                input_token_ids=(3, 1),
+                start_row=2 * i,
+                num_query_tokens=2,
+                draft_token_ids=(1,),
+                cache_start_pos=1,
+                block_ids=((0,),),
+            )
+            for i in range(n)
+        ]
+        reqs = [(f"r{i}", _request_state(temperature=1.0)) for i in range(n)]
+        torch.manual_seed(0)
+
+        output = _verify(
+            mx.array([[row] * (2 * n)]),
+            reqs,
+            segments,
+            next_native_rng_key=(lambda: mx.random.key(0)) if native else None,
+        )
+
+        firsts = [tokens[0] for tokens in output]
+        for token_id, p in enumerate(probs):
+            assert firsts.count(token_id) / n == pytest.approx(p, abs=0.03)
+        assert all((len(tokens) == 2) == (tokens[0] == 1) for tokens in output)
+
+    def test_rows_see_the_drafts_before_them(self) -> None:
+        # The presence penalty at the bonus row counts draft 7, so 9 wins.
+        logits = _logits([7, 7])
+        logits[0, 1, 9] = 9.0
+        state = _request_state()
+        state.sampling_params = SamplingParams(temperature=0.0, presence_penalty=2.0)
         segment = PagedDecodeSegment(
             req_id="r0",
             input_token_ids=(6, 7),
@@ -552,12 +584,23 @@ class TestVerifyGreedySpecDecode:
             block_ids=((0,),),
         )
 
-        with pytest.raises(NotImplementedError, match="greedy sampling"):
-            SpeculativeDecodeController().verify_greedy(
-                _logits([7, 9]),
-                [("r0", _request_state(temperature=0.7))],
-                (segment,),
-            )
+        assert _verify(logits, [("r0", state)], (segment,)) == [[7, 9]]
+
+    def test_rejects_sample_logprobs(self) -> None:
+        segment = PagedDecodeSegment(
+            req_id="r0",
+            input_token_ids=(6, 7),
+            start_row=0,
+            num_query_tokens=2,
+            draft_token_ids=(7,),
+            cache_start_pos=1,
+            block_ids=((0,),),
+        )
+        state = _request_state()
+        state.sampling_params = SamplingParams(temperature=0.0, logprobs=1)
+
+        with pytest.raises(NotImplementedError, match="sample logprobs"):
+            _verify(_logits([7, 9]), [("r0", state)], (segment,))
 
 
 class TestSchedulerPaddedDrafts:

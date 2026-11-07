@@ -1675,9 +1675,10 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         assert output.sampled_token_ids == [[7, 9]]
         assert req_state.token_ids == [1, 6, 7, 9]
 
-    def test_rejects_non_greedy_spec_decode_verification(self) -> None:
+    def test_rejects_sample_logprobs_spec_decode_verification(self) -> None:
         runner = self._make_runner()
-        req_state = self._make_state([1, 6], temperature=0.7)
+        req_state = self._make_state([1, 6])
+        req_state.sampling_params = SamplingParams(temperature=0.0, logprobs=1)
         decode_reqs = [("r0", req_state)]
         segment = mr.PagedDecodeSegment(
             req_id="r0",
@@ -1700,7 +1701,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
             scheduler_output,
         )
 
-        with pytest.raises(NotImplementedError, match="greedy sampling"):
+        with pytest.raises(NotImplementedError, match="sample logprobs"):
             runner.sample_tokens(grammar_output=None)
 
         assert req_state.token_ids == [1, 6]

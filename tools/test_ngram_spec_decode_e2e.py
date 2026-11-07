@@ -136,20 +136,20 @@ def _generate_with_acceptance_counting(llm: LLM, prompt: str, max_tokens: int):
     """Run greedy decode while counting drafted vs accepted draft tokens."""
     runner = llm.llm_engine.model_executor.driver_worker.model_runner
     controller = runner._spec_decode_controller
-    original_verify = controller.verify_greedy
+    original_verify = controller.verify
     counts = {"accepted": 0, "drafted": 0}
 
-    def counting_verify(logits, decode_reqs, decode_segments):
+    def counting_verify(logits, decode_reqs, decode_segments, *args, **kwargs):
         # Each verified row is (accepted drafts) + 1 trailing token (bonus on full
         # accept, else the target's correction), so accepted = len - 1.
-        result = original_verify(logits, decode_reqs, decode_segments)
+        result = original_verify(logits, decode_reqs, decode_segments, *args, **kwargs)
         for segment, output_ids in zip(decode_segments, result, strict=True):
             counts["drafted"] += len(segment.draft_token_ids)
             counts["accepted"] += len(output_ids) - 1
         return result
 
     with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(controller, "verify_greedy", counting_verify)
+        mp.setattr(controller, "verify", counting_verify)
         token_ids = _greedy(llm, [prompt], max_tokens)[prompt]
 
     return token_ids, counts

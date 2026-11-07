@@ -104,10 +104,10 @@ def run_child(model, enable_spec, prefix_caching, queue, canonical_prompts=None)
 
     active_tag = "initialization"
     verify_stats: list[dict] = []
-    orig = sd_mod.SpeculativeDecodeController.verify_greedy
+    orig = sd_mod.SpeculativeDecodeController.verify
 
-    def spy(self, logits, decode_reqs, decode_segments):
-        out = orig(self, logits, decode_reqs, decode_segments)
+    def spy(self, logits, decode_reqs, decode_segments, *args, **kwargs):
+        out = orig(self, logits, decode_reqs, decode_segments, *args, **kwargs)
         for segment, ids in zip(decode_segments, out, strict=True):
             verify_stats.append(
                 {
@@ -119,7 +119,7 @@ def run_child(model, enable_spec, prefix_caching, queue, canonical_prompts=None)
             )
         return out
 
-    sd_mod.SpeculativeDecodeController.verify_greedy = spy
+    sd_mod.SpeculativeDecodeController.verify = spy
     # Reach spy: admissions' num_computed_tokens prove the cached arms really
     # restored a prefix (a genuine hit), not just a config that fell back.
     admissions: list[dict] = []
@@ -246,7 +246,7 @@ def run_child(model, enable_spec, prefix_caching, queue, canonical_prompts=None)
         )
         generate_single("edge_restore", restore_prompt)
     finally:
-        sd_mod.SpeculativeDecodeController.verify_greedy = orig
+        sd_mod.SpeculativeDecodeController.verify = orig
         mr_mod.MetalModelRunner._handle_new_requests = orig_hnr
         ng_mod.NgramProposer.propose = orig_propose
         ng_mod.VllmNgramProposer.propose = orig_lookup

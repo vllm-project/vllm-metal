@@ -41,11 +41,11 @@ def _run_lookahead_lifecycle(prefix_caching, target_model="Qwen/Qwen3-0.6B"):
     proposer = runner._drafter
     stats = {"preemptions": 0, "resumptions": 0, "drafted": 0, "accepted": 0}
     released = set()
-    original_verify = runner._spec_decode_controller.verify_greedy
+    original_verify = runner._spec_decode_controller.verify
     original_release = proposer.release_requests
 
-    def verify(logits, requests, segments):
-        outputs = original_verify(logits, requests, segments)
+    def verify(logits, requests, segments, *args, **kwargs):
+        outputs = original_verify(logits, requests, segments, *args, **kwargs)
         for segment, tokens in zip(segments, outputs, strict=True):
             stats["drafted"] += len(segment.draft_token_ids)
             stats["accepted"] += len(tokens) - 1
@@ -85,7 +85,7 @@ def _run_lookahead_lifecycle(prefix_caching, target_model="Qwen/Qwen3-0.6B"):
 
         assert_v2_model_runner(llm)
         track_preemptions_and_resumptions(scheduler, stats)
-        runner._spec_decode_controller.verify_greedy = verify
+        runner._spec_decode_controller.verify = verify
         proposer.release_requests = release
         for i, prompt in enumerate(prompts):
             engine.add_request(f"pressure-{i}", {"prompt_token_ids": prompt}, sampling)
