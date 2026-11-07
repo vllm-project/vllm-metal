@@ -30,6 +30,8 @@ _REMOTE_SUFFIXES = ("-*", "")
 _SHARD_NAME_RE = re.compile(r"-\d+-of-(\d+)\.gguf$")
 # Multimodal projector files carry quant tags too, e.g. mmproj-BF16.gguf.
 _PROJECTOR_MARKER = "mmproj"
+# So do speculative drafts that lead with their method, e.g. mtp-Qwen3.8-27B-Q8_0.gguf.
+_DRAFT_PREFIXES = ("mtp-", "dflash-")
 _SUPPORTED_REMOTE_TAGS = frozenset(
     {
         "Q8_0",
@@ -178,7 +180,8 @@ class RemoteGGUFReference:
         filenames = [
             filename
             for filename in filenames
-            if _PROJECTOR_MARKER not in Path(filename).name.lower()
+            if _PROJECTOR_MARKER not in (basename := Path(filename).name.lower())
+            and not basename.startswith(_DRAFT_PREFIXES)
         ]
         if not filenames:
             raise ValueError(

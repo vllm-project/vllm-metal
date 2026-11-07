@@ -10,6 +10,7 @@ import vllm_metal.envs as envs
 PAGED_ATTENTION_MIN_BLOCKS = 16
 
 # Per-runner DSpark weight conversion, selected through additional_config.
+DSPARK_ADAPTIVE_PROFILE_KEY = "dspark_adaptive_profile"
 DSPARK_DRAFT_QUANTIZATION_KEY = "dspark_draft_quantization"
 DSPARK_DRAFT_QUANTIZATION_Q4 = "q4"
 DSPARK_Q4_GROUP_SIZE = 64

@@ -674,6 +674,8 @@ class ModelLifecycle:
             config_values = self._config_to_mapping(config)
             if is_vlm and "text_config" in config_values:
                 model_values = self._config_to_mapping(config_values["text_config"])
+            elif is_vlm and getattr(config, "lm_config", None) is not None:
+                model_values = self._config_to_mapping(config.lm_config)
             else:
                 model_values = config_values
 

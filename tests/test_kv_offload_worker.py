@@ -69,6 +69,42 @@ def test_roundtrip_turboquant() -> None:
     _roundtrip(make_turboquant_storage(), [1, 6], [2, 0])
 
 
+@pytest.mark.parametrize("blocks_per_chunk", [1, 2])
+def test_roundtrip_mla(blocks_per_chunk: int) -> None:
+    _roundtrip(
+        make_storage(mla=True, head_dim=36),
+        [3, 4, 5, 6],
+        [1, 3, 0, 2][: 4 // blocks_per_chunk],
+        blocks_per_chunk=blocks_per_chunk,
+    )
+
+
+def test_mla_latent_cache_reads_loaded_rows() -> None:
+    """MLA attention reads its own latent views of the storage. A store must
+    see rows it wrote, and a load must reach what it reads."""
+    from vllm_metal.attention.caches.mla_cache import MLAPagedLatentCache
+
+    storage = make_storage(mla=True, head_dim=36)
+    cache = MLAPagedLatentCache.from_upstream(storage, list(storage.tensors))
+    worker = make_worker(storage)
+    block, block_size = 2, storage.config.kv_cache_groups[0].kv_cache_spec.block_size
+    slots = mx.arange(block * block_size, (block + 1) * block_size)
+    for layer in range(cache.num_layers):
+        rows = mx.random.normal((block_size, cache.latent_dim)) + layer
+        cache.write_slots(layer, slots, rows)
+    mx.eval(*cache.latent_caches)
+    written = [np.array(latent[block]) for latent in cache.latent_caches]
+
+    assert worker.submit_store(1, gpu_spec([block]), CPULoadStoreSpec([0]))
+    zero_blocks(storage, [block])
+    mx.eval(*cache.latent_caches)
+    assert not np.array_equal(np.array(cache.latent_caches[0][block]), written[0])
+    assert worker.submit_load(2, CPULoadStoreSpec([0]), gpu_spec([block]))
+
+    for latent, expected in zip(cache.latent_caches, written, strict=True):
+        np.testing.assert_array_equal(np.array(latent[block]), expected)
+
+
 def test_roundtrip_chunk_spans_blocks() -> None:
     _roundtrip(make_storage(), [3, 4, 5, 6], [1, 3], blocks_per_chunk=2)
 
@@ -164,9 +200,13 @@ def test_load_is_ordered_after_pending_zeroing() -> None:
         np.testing.assert_array_equal(a, b)
 
 
-@pytest.mark.parametrize("turboquant", [False, True], ids=["fp16", "turboquant"])
-def test_pool_mirrors_every_cache_byte(turboquant: bool) -> None:
-    storage = make_turboquant_storage() if turboquant else make_storage()
+@pytest.mark.parametrize("kind", ["fp16", "turboquant", "mla"])
+def test_pool_mirrors_every_cache_byte(kind: str) -> None:
+    storage = {
+        "fp16": make_storage,
+        "turboquant": make_turboquant_storage,
+        "mla": lambda: make_storage(mla=True, head_dim=36),
+    }[kind]()
     worker = make_worker(storage)
     mirrored = sum(host.shape[2] for host in worker._host)
     assert mirrored * storage.config.num_blocks == storage.nbytes

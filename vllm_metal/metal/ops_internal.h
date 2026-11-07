@@ -222,3 +222,7 @@ struct NaxPrefillTraceResult {
 };
 void start_nax_prefill_dispatch_trace();
 NaxPrefillTraceResult take_nax_prefill_dispatch_trace();
+
+array gumbel_sample_primitive_fn(
+    const array& logits, const array& seeds, const array& positions,
+    const array& temperatures, const std::optional<array>& token_ids);

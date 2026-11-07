@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""DSpark serving alignment, admission and vLLM runner compatibility."""
+"""DSpark serving alignment and admission."""
 
 import itertools
 import json
@@ -13,13 +13,10 @@ import numpy as np
 import pytest
 import torch
 from vllm import SamplingParams
-from vllm.config import VllmConfig
-from vllm.config.compilation import CUDAGraphMode
 
 from tests.test_block_draft_proposer import _assert_committed, _features, _prefill
 from tests.test_dspark_paged import make_cache
 from tests.test_dspark_quantization import make_model
-from vllm_metal.patches.dspark_config import enable_dspark_for_metal_runner
 from vllm_metal.v1 import dspark_proposer
 from vllm_metal.v1.dspark_adaptive import AdaptiveVerificationProfile, VerificationCosts
 from vllm_metal.v1.dspark_proposer import DSparkProposer
@@ -254,65 +251,8 @@ def test_profile_materializes_dspark_owned_heads(
     assert proposer.kv_specs(16)[proposer.layer_names[0]].dtype == torch.float16
 
 
-@pytest.mark.parametrize("method", [None, "dflash", "dspark"])
-@pytest.mark.parametrize(
-    "worker", ["vllm_metal.v1.worker.MetalWorker", "vllm.v1.worker.gpu_worker.Worker"]
-)
-def test_config_bridge_preserves_other_runner_rejections(monkeypatch, method, worker):
-    # Use the real upstream validator; only replace unrelated model probes.
-    original = VllmConfig._get_v1_model_runner_unsupported_features
-    original = getattr(original, "__wrapped__", original)
-    monkeypatch.setattr(
-        VllmConfig, "_get_v1_model_runner_unsupported_features", original
-    )
-    enable_dspark_for_metal_runner()
-    first = VllmConfig._get_v1_model_runner_unsupported_features
-    enable_dspark_for_metal_runner()
-    assert VllmConfig._get_v1_model_runner_unsupported_features is first
-    config = SimpleNamespace(
-        parallel_config=SimpleNamespace(
-            worker_cls=worker,
-            prefill_context_parallel_size=2,
-            pipeline_parallel_size=2,
-            enable_batch_sharded_sampling=True,
-        ),
-        scheduler_config=SimpleNamespace(async_scheduling=True),
-        speculative_config=None
-        if method is None
-        else SimpleNamespace(
-            method=method,
-            enable_adaptive_verification=True,
-            is_xpress=lambda: False,
-            draft_lm_head_quantization=None,
-            draft_model_config=None,
-        ),
-        model_config=SimpleNamespace(
-            is_diffusion=True, architecture="LlamaForCausalLM"
-        ),
-        _dflash_needs_multi_kv_group=lambda: True,
-        _is_dflash_candidate_draft=lambda: True,
-    )
-    before = original(config)
-    after = first(config)
-    expected = [
-        item
-        for item in before
-        if not (
-            worker == "vllm_metal.v1.worker.MetalWorker"
-            and method == "dspark"
-            and item in ("dspark speculative decoding", "adaptive draft verification")
-        )
-    ]
-    assert after == expected
-    assert "prefill context parallel" in after
-    if method is not None and not (
-        method == "dspark" and worker == "vllm_metal.v1.worker.MetalWorker"
-    ):
-        assert "adaptive draft verification" in after
-
-
-def test_adaptive_prefix_budget_matches_exhaustive_expected_throughput():
-    """Search past local rate dips, enforce capacities, and preserve prefixes."""
+def test_adaptive_prefix_budget_matches_exhaustive_balanced_throughput():
+    """Search past rate dips without pricing an unmeasured ragged batch."""
     costs = VerificationCosts(
         128, (1.0, 2.0), ((8.0, 8.1, 8.2, 8.3), (6.0, 20.0, 20.0, 6.5, 6.6, 8.0, 20.0))
     )
@@ -333,11 +273,13 @@ def test_adaptive_prefix_budget_matches_exhaustive_expected_throughput():
         exhaustive = max(
             score(lengths)
             for lengths in itertools.product(*(range(c + 1) for c in capacities))
+            if max(lengths) - min(lengths) <= 1
         )
         assert score(admitted) == pytest.approx(exhaustive)
         assert all(
             0 <= value <= cap for value, cap in zip(admitted, capacities, strict=True)
         )
+        assert max(admitted) - min(admitted) <= 1
 
 
 def test_adaptive_budget_uses_calibration_and_interpolated_context_cost():
@@ -387,40 +329,54 @@ def test_adaptive_profile_rejects_stale_identity_and_incomplete_costs(tmp_path):
         load(data["identity"])
 
 
-@pytest.mark.parametrize("method", ["dspark", "dflash"])
-@pytest.mark.parametrize(
-    "worker", ["vllm_metal.v1.worker.MetalWorker", "vllm.v1.worker.gpu_worker.Worker"]
-)
-def test_only_native_dspark_can_adapt_without_cuda_graphs(monkeypatch, method, worker):
-    original = VllmConfig._validate_adaptive_verification
-    original = getattr(original, "__wrapped__", original)
-    monkeypatch.setattr(VllmConfig, "_validate_adaptive_verification", original)
-    config = SimpleNamespace(
-        speculative_config=SimpleNamespace(
-            method=method, enable_adaptive_verification=True
-        ),
-        parallel_config=SimpleNamespace(worker_cls=worker, pipeline_parallel_size=1),
-        lora_config=None,
-        compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode.NONE),
+def test_profile_path_enables_native_admission_without_cuda_option(
+    monkeypatch, tmp_path
+):
+    model = make_model(mx.float16)
+    path = tmp_path / "profile.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "identity": {"target": "test"},
+                "temperatures": [1.0] * 7,
+                "costs": [{"context": 0, "draft_ms": [1.0], "verify_ms": [[1.0] * 8]}],
+            }
+        )
     )
-    with pytest.raises(ValueError, match="full CUDA graphs"):
-        original(config)
-    enable_dspark_for_metal_runner()
-    installed = VllmConfig._validate_adaptive_verification
-    enable_dspark_for_metal_runner()
-    assert VllmConfig._validate_adaptive_verification is installed
-    if method == "dspark" and worker == "vllm_metal.v1.worker.MetalWorker":
-        installed(config)
-        config.lora_config = object()
-        with pytest.raises(ValueError, match="LoRA"):
-            installed(config)
-        config.lora_config = None
-        config.parallel_config.pipeline_parallel_size = 2
-        with pytest.raises(ValueError, match="pipeline parallelism"):
-            installed(config)
-    else:
-        with pytest.raises(ValueError, match="full CUDA graphs"):
-            installed(config)
+    spec = SimpleNamespace(
+        draft_model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(), quantization=None, max_model_len=32
+        ),
+        enable_adaptive_verification=False,
+        draft_sample_method="greedy",
+        rejection_sample_method="standard",
+        dspark_draft_topk=None,
+        quantization=None,
+        kv_cache_dtype=None,
+        num_speculative_tokens=7,
+    )
+    runner = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            speculative_config=spec,
+            cache_config=SimpleNamespace(enable_prefix_caching=False),
+            additional_config={"dspark_adaptive_profile": str(path)},
+        ),
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(to_dict=dict)),
+        scheduler_config=SimpleNamespace(max_num_seqs=1),
+        kv_cache_dtype=mx.float16,
+        _spec_decode_controller=SpeculativeDecodeController(),
+    )
+    monkeypatch.setattr(DSparkProposer, "_checkpoint_path", lambda runner: "unused")
+    monkeypatch.setattr(
+        DSparkProposer, "profile_identity", lambda *args: {"target": "test"}
+    )
+    monkeypatch.setattr(dspark_proposer, "load_dspark", lambda *args, **kwargs: model)
+    proposer = DSparkProposer.build(runner)
+    assert proposer.adaptive_profile is not None
+    assert proposer._draft_width(3) == 7
+    assert proposer.adaptive_profile.admit([[0.0] * 7], [7], 0) == [7]
+    assert not spec.enable_adaptive_verification
 
 
 def test_adaptive_proposer_returns_prefix_of_full_block_at_short_output_budget():

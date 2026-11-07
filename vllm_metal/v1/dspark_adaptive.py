@@ -93,11 +93,12 @@ class AdaptiveVerificationProfile:
         capacities: Sequence[int],
         context: float,
     ) -> list[int]:
-        """Maximize expected emitted tokens / measured draft-and-target time.
+        """Choose balanced prefixes using measured draft-and-target time.
 
         Each conditional confidence contributes its prefix survival probability.
-        Sorting these probabilities gives the best prefixes for every total
-        budget. Search all budgets: Metal dispatch costs need not be convex.
+        The cost table measures balanced lengths, so grow a common prefix and
+        allocate its next position by confidence. Search every feasible budget:
+        Metal dispatch costs need not be convex.
         This chooses work only; the unchanged target verifier decides acceptance.
         """
         batch, width = len(capacities), len(self.temperatures)
@@ -105,8 +106,8 @@ class AdaptiveVerificationProfile:
             raise ValueError("DSpark adaptive batch is outside its measured profile")
         if not math.isfinite(context) or context < 0:
             raise ValueError("DSpark adaptive context must be finite and nonnegative")
-        ranked = []
-        for request, (row, capacity) in enumerate(zip(logits, capacities, strict=True)):
+        probabilities = []
+        for row, capacity in zip(logits, capacities, strict=True):
             if (
                 len(row) != width
                 or type(capacity) is not int
@@ -116,9 +117,8 @@ class AdaptiveVerificationProfile:
                     "DSpark adaptive capacity does not match the draft block"
                 )
             survival = 1.0
-            for position, (value, temperature) in enumerate(
-                zip(row, self.temperatures, strict=True)
-            ):
+            prefix = []
+            for value, temperature in zip(row, self.temperatures, strict=True):
                 if not math.isfinite(value):
                     raise ValueError("DSpark confidence logits must be finite")
                 # Stable sigmoid; unlike clipping it preserves calibrated tails.
@@ -130,10 +130,8 @@ class AdaptiveVerificationProfile:
                     else exponential / (1 + exponential)
                 )
                 survival *= probability
-                if position < capacity:
-                    ranked.append((-survival, position, request))
-        # Earlier positions win ties, including probabilities rounded to zero/one.
-        ranked.sort()
+                prefix.append(survival)
+            probabilities.append(prefix)
         contexts = [table.context for table in self.costs]
         upper = min(bisect_right(contexts, context), len(contexts) - 1)
         lower = max(upper - 1, 0)
@@ -150,13 +148,22 @@ class AdaptiveVerificationProfile:
                 lo.verify_ms[batch - 1], hi.verify_ms[batch - 1], strict=True
             )
         ]
-        expected, best_rate, best_budget = float(batch), batch / costs[0], 0
-        for budget, (negative_survival, _, _) in enumerate(ranked, start=1):
-            expected -= negative_survival
-            rate = expected / costs[budget]
-            if rate > best_rate:
-                best_rate, best_budget = rate, budget
         admitted = [0] * batch
-        for _, _, request in ranked[:best_budget]:
-            admitted[request] += 1
-        return admitted
+        best = admitted.copy()
+        expected, best_rate, budget = float(batch), batch / costs[0], 0
+        for position in range(min(capacities) + 1):
+            ranked = sorted(
+                (-row[position], request)
+                for request, (row, capacity) in enumerate(
+                    zip(probabilities, capacities, strict=True)
+                )
+                if position < capacity
+            )
+            for negative_survival, request in ranked:
+                admitted[request] += 1
+                expected -= negative_survival
+                budget += 1
+                rate = expected / costs[budget]
+                if rate > best_rate:
+                    best_rate, best = rate, admitted.copy()
+        return best

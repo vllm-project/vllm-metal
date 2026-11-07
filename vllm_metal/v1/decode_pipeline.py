@@ -15,7 +15,8 @@ then resolves step ``k`` with a pure wait.
 Invariants the runner must keep (pinned by tests):
 
 - ``submit()`` happens only on gate-eligible steps: pure decode, batch-wide
-  native greedy, no spec/structured-output/pooling/PP/mm work in flight.
+  native greedy or native random sampling (including seeded requests), no
+  spec/structured-output/pooling/PP/mm work in flight.
 - All value-independent bookkeeping (placeholder append, ``generated_tokens``,
   seq-len advance) is done by the runner BEFORE ``submit()``; ``resolve()``
   only backfills token values through direct ``RequestState`` references and
@@ -94,7 +95,6 @@ class SchedulerStepShape:
 
     has_new_requests: bool
     has_prefill_phase_requests: bool
-    has_resumed_requests: bool
     has_preempted_requests: bool
     has_encoder_inputs: bool
     has_spec_tokens: bool
@@ -110,7 +110,6 @@ class SchedulerStepShape:
         blockers = (
             (self.has_new_requests, "new requests scheduled"),
             (self.has_prefill_phase_requests, "prefill-phase requests"),
-            (self.has_resumed_requests, "resumed requests"),
             (self.has_preempted_requests, "preempted requests"),
             (self.has_encoder_inputs, "encoder inputs scheduled"),
             (self.has_spec_tokens, "speculative decode"),
@@ -247,9 +246,8 @@ class DecodePipeline:
         """Block a step whose decode membership exceeds the pending rows.
 
         A cached request can re-enter a step after being absent from the
-        previous one (the scheduler re-syncs it via ``all_token_ids``); it
-        then has no pending lazy token to feed the next forward, so the step
-        must resolve the pending sample and take the synchronous path.
+        previous one; it has no pending lazy token to feed the next forward.
+        The step must resolve the pending sample and take the synchronous path.
         """
         if self._pending is None:
             return None

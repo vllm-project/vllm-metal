@@ -13,6 +13,7 @@ from vllm.logger import init_logger
 
 from vllm_metal.attention.caches.storage import KVCacheStorage
 from vllm_metal.config import (
+    DSPARK_ADAPTIVE_PROFILE_KEY,
     DSPARK_DRAFT_QUANTIZATION_KEY,
     DSPARK_DRAFT_QUANTIZATION_Q4,
     DSPARK_Q4_GROUP_SIZE,
@@ -33,8 +34,8 @@ class DSparkProposer(BlockDraftProposer):
     """Predict from every slot of an anchor plus K-1 masks, then verify on target.
 
     The shared lifecycle commits verified target features even while drafting
-    is paused. DSpark owns its embeddings and sequential Markov prediction head;
-    Optional calibrated prefix admission reduces the target's verification work.
+    is paused. DSpark owns its embeddings and sequential Markov prediction head.
+    Calibrated prefix admission can reduce the target's verification work.
     """
 
     name = "DSpark"
@@ -110,14 +111,12 @@ class DSparkProposer(BlockDraftProposer):
             draft_quantization=draft_quantization,
         )
         profile_path = (
-            additional.get("dspark_adaptive_profile")
+            additional.get(DSPARK_ADAPTIVE_PROFILE_KEY)
             if isinstance(additional, dict)
             else None
         )
         adaptive_profile = None
-        if spec.enable_adaptive_verification:
-            if not isinstance(profile_path, str) or not profile_path:
-                raise ValueError("Adaptive DSpark requires dspark_adaptive_profile")
+        if profile_path is not None:
             adaptive_profile = AdaptiveVerificationProfile.load(
                 profile_path,
                 identity=cls.profile_identity(
@@ -125,10 +124,6 @@ class DSparkProposer(BlockDraftProposer):
                 ),
                 width=spec.num_speculative_tokens,
                 max_num_seqs=runner.scheduler_config.max_num_seqs,
-            )
-        elif profile_path is not None:
-            raise ValueError(
-                "dspark_adaptive_profile requires enable_adaptive_verification"
             )
         if model.backbone.fc.weight.dtype != runner.kv_cache_dtype:
             raise NotImplementedError(

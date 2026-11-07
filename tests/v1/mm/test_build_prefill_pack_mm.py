@@ -47,7 +47,7 @@ def _make_prefill_entry(
     return _PendingPrefillEntry(
         output_idx=0,
         prefill=prefill,
-        result_mode="new_final",
+        result_mode="final",
     )
 
 
@@ -86,12 +86,11 @@ class TestIsMmRequest:
 
 class TestBuildPrefillPackMmFullPrompt:
     def _make_batch(
-        self, entries: list[_PendingPrefillEntry], new_reqs: list[NewRequestData]
+        self, runner, entries: list[_PendingPrefillEntry], new_reqs=()
     ) -> _ExecutionBatch:
-        batch = _ExecutionBatch()
-        batch.paged_prefill_entries = entries
-        batch.new_reqs_by_id = {nr.req_id: nr for nr in new_reqs}
-        return batch
+        for new_req in new_reqs:
+            runner._admit_request(new_req)
+        return _ExecutionBatch(paged_prefill_entries=entries)
 
     def test_text_only_start_pos_zero_keeps_full_prompt_none(self) -> None:
         # Behavior preservation: text-only first-chunk prefill still gets
@@ -100,7 +99,7 @@ class TestBuildPrefillPackMmFullPrompt:
         entry = _make_prefill_entry(
             "req-0", token_ids=[1, 2, 3], prompt_len=3, start_pos=0
         )
-        batch = self._make_batch([entry], [_new_req("req-0", [1, 2, 3])])
+        batch = self._make_batch(runner, [entry], [_new_req("req-0", [1, 2, 3])])
 
         pack = runner._build_prefill_pack(batch)
 
@@ -120,7 +119,7 @@ class TestBuildPrefillPackMmFullPrompt:
         entry = _make_prefill_entry(
             "req-0", token_ids=[1, 99], prompt_len=4, start_pos=0
         )
-        batch = self._make_batch([entry], [])
+        batch = self._make_batch(runner, [entry])
 
         pack = runner._build_prefill_pack(batch)
 
@@ -136,7 +135,7 @@ class TestBuildPrefillPackMmFullPrompt:
         entry = _make_prefill_entry(
             "req-0", token_ids=[3, 9, 8], prompt_len=3, start_pos=2
         )
-        batch = self._make_batch([entry], [])
+        batch = self._make_batch(runner, [entry])
 
         pack = runner._build_prefill_pack(batch)
 
@@ -145,49 +144,23 @@ class TestBuildPrefillPackMmFullPrompt:
         assert full[: pack[0].prompt_len] == [1, 2, 3]
         assert full[pack[0].prompt_len :] == [9, 8]
 
-    def test_mm_start_pos_zero_falls_back_to_new_req(self) -> None:
+    def test_mm_first_admission_carries_full_prompt_before_sampling(self) -> None:
         runner = make_stub_runner(encoder_cache=EncoderCache())
         runner.encoder_cache.add_request("req-0", [_feature("img-0")])
-        # No RequestState yet — first time we see this request.
         entry = _make_prefill_entry(
             "req-0", token_ids=[1, 99], prompt_len=4, start_pos=0
         )
-        batch = self._make_batch([entry], [_new_req("req-0", [1, 99, 99, 2])])
+        batch = self._make_batch(runner, [entry], [_new_req("req-0", [1, 99, 99, 2])])
 
         pack = runner._build_prefill_pack(batch)
 
         assert pack[0].full_prompt_token_ids == [1, 99, 99, 2]
 
-    def test_mm_raises_when_state_and_new_req_both_missing(self) -> None:
+    def test_mm_raises_when_request_state_is_missing(self) -> None:
         runner = make_stub_runner(encoder_cache=EncoderCache())
         runner.encoder_cache.add_request("req-0", [_feature("img-0")])
         entry = _make_prefill_entry("req-0", token_ids=[1], prompt_len=4, start_pos=0)
-        batch = self._make_batch([entry], [])
+        batch = self._make_batch(runner, [entry])
 
         with pytest.raises(RuntimeError, match="state tracking bug"):
             runner._build_prefill_pack(batch)
-
-    def test_mm_raises_when_new_req_prompt_token_ids_missing(self) -> None:
-        runner = make_stub_runner(encoder_cache=EncoderCache())
-        runner.encoder_cache.add_request("req-0", [_feature("img-0")])
-        entry = _make_prefill_entry("req-0", token_ids=[1], prompt_len=4, start_pos=0)
-        batch = self._make_batch([entry], [_new_req("req-0", None)])
-
-        with pytest.raises(RuntimeError, match="scheduler contract bug"):
-            runner._build_prefill_pack(batch)
-
-    def test_text_only_continuation_chunk_carries_the_whole_sequence(self) -> None:
-        runner = make_stub_runner(encoder_cache=EncoderCache())
-        runner._request_states["req-0"] = RequestState(
-            token_ids=[1, 2, 3, 4, 5, 6, 7],
-            prompt_len=5,
-            sampling_params=SamplingParams(),
-        )
-        entry = _make_prefill_entry(
-            "req-0", token_ids=[3, 4, 5], prompt_len=5, start_pos=2
-        )
-        batch = self._make_batch([entry], [])
-
-        pack = runner._build_prefill_pack(batch)
-
-        assert pack[0].full_prompt_token_ids == [1, 2, 3, 4, 5, 6, 7]

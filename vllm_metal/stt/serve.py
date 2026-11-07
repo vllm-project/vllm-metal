@@ -27,7 +27,7 @@ class VLLMSTTRequestAdapter:
     def from_vllm_request(cls, request: Any) -> STTRequestInput:
         """Normalize a vLLM request object for the STT runtime path.
 
-        Note: This adapter is used on the v1 runner path where vLLM already
+        The Metal STT runner receives requests from vLLM, which already
         provides a typed request shape (e.g. NewRequestData). We trust vLLM's
         field-level contracts (req_id/prompt_token_ids/mm_features) and only
         validate STT-specific invariants (e.g. presence of input_features).

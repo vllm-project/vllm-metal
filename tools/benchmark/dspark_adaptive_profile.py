@@ -428,6 +428,9 @@ def main() -> None:
         parser.error(
             "Collect profiles with fixed-width DSpark, before enabling adaptive verification"
         )
+    additional = config.get("additional_config", {})
+    if isinstance(additional, dict) and "dspark_adaptive_profile" in additional:
+        parser.error("Remove dspark_adaptive_profile when collecting a new profile")
     if spec.get("num_speculative_tokens_per_batch_size") is not None:
         parser.error(
             "Collect a complete full-width profile without a batch-size draft schedule"

@@ -266,7 +266,7 @@ class TestSpecDecodePolicy:
             decode_token_ids=[],
             prefill_reqs=[SimpleNamespace(req_id="r0")],
             prefill_token_ids=[token_id],
-            prefill_result_modes=["new_final"],
+            prefill_result_modes=["final"],
             request_states={"r0": state},
         )
         assert result == ([("r0", state)] if eligible else [])
@@ -466,8 +466,8 @@ class TestGemma4MTPDraftSeeds:
             prefill_reqs=[final_prefill, intermediate_prefill],
             prefill_token_ids=[11, 12],
             prefill_result_modes=[
-                "new_final",
-                "intermediate" if skip_reason == "intermediate" else "new_final",
+                "final",
+                "intermediate" if skip_reason == "intermediate" else "final",
             ],
             request_states={
                 "p0": _request_state(),

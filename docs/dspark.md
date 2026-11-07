@@ -76,10 +76,12 @@ generates the full configured block, then selects a prefix for each request.
 The target verifier decides which tokens to accept. A batch-size draft schedule
 sets the maximum prefix length; zero pauses drafting at that batch size.
 
-The policy maximizes expected output tokens per measured draft-plus-target
-time. Costs are interpolated by mean context length and clamped at the profile's
-endpoints. Mixed contexts, unequal request lengths and HTTP overhead can affect
-the benefit, so evaluate it on your serving workload.
+The policy chooses balanced prefixes, with lengths differing by at most one,
+to match the batch shapes measured by the profiler. It searches every feasible
+token budget for the highest expected output tokens per draft-plus-target time.
+Costs are interpolated by mean context length and clamped at the profile's
+endpoints. Mixed contexts and HTTP overhead can affect the benefit, so evaluate
+it on your serving workload.
 
 ### Collect a profile
 
@@ -140,23 +142,20 @@ controls, and all timing samples and warmups.
 
 ### Serve with the profile
 
-Use the same engine settings and add these entries to the existing
-configurations:
+Use the same engine settings and add the profile path to `additional_config`:
 
 ```json
 {
-  "speculative_config": {
-    "enable_adaptive_verification": true
-  },
   "additional_config": {
     "dspark_adaptive_profile": "/absolute/path/to/dspark-profile/profile.json"
   }
 }
 ```
 
-Merge these entries with the model, method and width settings above. The profile
-is loaded at startup, so restart after changing it. Adaptive verification
-supports greedy decoding.
+The profile enables native Metal adaptive verification. Leave
+`speculative_config.enable_adaptive_verification` disabled; that option selects
+vLLM's CUDA implementation. Restart the server after changing the profile.
+Adaptive verification supports greedy decoding.
 
 Compare adaptive DSpark, fixed-width DSpark and target-only serving with the
 same tokenized inputs, settings and repeated warmups. Measure latency,

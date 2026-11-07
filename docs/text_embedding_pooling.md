@@ -1,6 +1,6 @@
 # Text Pooling
 
-Metal V1 has experimental text-only `embed`, `classify`, and
+The MLX backend has experimental text-only `embed`, `classify`, and
 `token_classify` pooling support for compatible pooling models. Supported
 requests return CPU tensors through vLLM's `pooler_output` contract and do not
 sample generation tokens.
@@ -26,7 +26,7 @@ Current scope is intentionally narrow:
 - decoder-style text models that expose token hidden states through the MLX
   transformer body
 - decoder sequence embeddings from the final prompt-token hidden state with
-  LAST pooling and L2 normalization on the paged Metal V1 path
+  LAST pooling and L2 normalization on the paged MLX path
 - Qwen3 reranker cross-encoder scores from the final prompt-token hidden state,
   using `lm_head` for untied checkpoints or `embed_tokens.as_linear` when word
   embeddings are tied

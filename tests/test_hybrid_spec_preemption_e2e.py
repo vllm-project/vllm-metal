@@ -47,12 +47,15 @@ def _run_arm(case: str, enable_spec: bool, out_path: str, model: str):
     from vllm_metal.v1.spec_decode import SpeculativeDecodeController
 
     readmitted, records = [], []
-    original_readmit = MetalModelRunner._readmit_request
+    original_admit = MetalModelRunner._admit_request
     original_verify = SpeculativeDecodeController.verify_greedy
 
-    def readmit(self, batch, new_req, scheduler_output):
-        original_readmit(self, batch, new_req, scheduler_output)
-        readmitted.append(new_req.req_id)
+    def admit(self, new_req):
+        was_preempted = new_req.req_id in self._awaiting_readmission
+        state = original_admit(self, new_req)
+        if was_preempted:
+            readmitted.append(new_req.req_id)
+        return state
 
     def verify(self, logits, decode_reqs, decode_segments):
         result = original_verify(self, logits, decode_reqs, decode_segments)
@@ -62,7 +65,7 @@ def _run_arm(case: str, enable_spec: bool, out_path: str, model: str):
             )
         return result
 
-    MetalModelRunner._readmit_request = readmit
+    MetalModelRunner._admit_request = admit
     SpeculativeDecodeController.verify_greedy = verify
     llm = LLM(
         model=model,
