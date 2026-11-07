@@ -106,10 +106,12 @@ class TestNativeRandomEligibility:
             ("min tokens still pending", [_random_params(min_tokens=2)]),
         ],
     )
-    def test_ineligible_batches_fall_back(self, label, params_list) -> None:
+    def test_default_gate_rejects_extended_sampling_options(
+        self, label, params_list
+    ) -> None:
         assert not SamplingBatch.params_allow_native_random(params_list)
 
-    def test_bad_words_fall_back(self) -> None:
+    def test_bad_words_keep_deferred_decode_disabled(self) -> None:
         params = _random_params()
         params._bad_words_token_ids = [[99]]
 
@@ -650,3 +652,219 @@ def test_broadcast_logits_use_per_row_candidate_ids():
         mx.array([[1, 0, 2], [0, 2, 1]], dtype=mx.uint32),
     )
     assert tokens.tolist() == [0, 2]
+
+
+class TestNativeLogprobs:
+    @pytest.fixture(
+        params=["raw_logprobs", "raw_logits", "processed_logprobs", "processed_logits"]
+    )
+    def logprobs_mode(self, request):
+        return request.param
+
+    @pytest.fixture(
+        params=[
+            pytest.param({"temperature": 0.0}, id="greedy"),
+            pytest.param({"temperature": 0.7}, id="random"),
+            pytest.param(
+                {"temperature": 0.7, "top_k": 3, "top_p": 0.85, "min_p": 0.05},
+                id="filtered",
+            ),
+        ]
+    )
+    def sampling_kwargs(self, request):
+        return request.param
+
+    def _sample_with_reference(self, monkeypatch, mode, raw, params):
+        from vllm.v1.sample.sampler import Sampler
+
+        from vllm_metal.v1.sampling_batch import sample_from_logits
+
+        batch = SamplingBatch(
+            params, [[1]] * len(params), [[] for _ in params], vocab_size=len(raw[0])
+        )
+        metadata = batch.make_sampling_metadata()
+        metadata.max_num_logprobs = -1
+        metadata.logprob_token_ids = None
+        reference = Sampler(logprobs_mode=mode).forward(torch.tensor(raw), metadata)
+        assert reference.logprobs_tensors is not None
+        expected_scores = reference.logprobs_tensors.logprobs
+        sampler = Sampler(logprobs_mode=mode)
+        monkeypatch.setattr(
+            sampler, "forward", lambda *_: pytest.fail("torch fallback")
+        )
+        result = sample_from_logits(
+            mx.array(raw), batch, sampler, next_native_rng_key=lambda: mx.random.key(9)
+        )
+        assert result.logprobs is not None
+        return result, expected_scores
+
+    def _assert_single_row_scores(self, result, reference):
+        ids = result.logprobs.logprob_token_ids[0].tolist()
+        selected = result.token_ids[0]
+        assert ids[0] == selected
+        torch.testing.assert_close(
+            torch.tensor(result.logprobs.logprobs[0]),
+            reference[0, ids],
+            atol=2e-6,
+            rtol=2e-6,
+        )
+        assert result.logprobs.sampled_token_ranks[0] == int(
+            (reference[0] >= reference[0, selected]).sum()
+        )
+
+    def test_topk_scores_match_vllm(self, monkeypatch, logprobs_mode, sampling_kwargs):
+        params = [SamplingParams(logprobs=2, **sampling_kwargs)]
+        raw = [[1.0, 3.0, 2.0, -1.0, 0.0]]
+        result, reference = self._sample_with_reference(
+            monkeypatch, logprobs_mode, raw, params
+        )
+        assert result.logprobs.logprob_token_ids.shape == (1, 3)
+        assert (
+            result.logprobs.logprob_token_ids[0, 1:].tolist()
+            == torch.topk(reference[0], 2).indices.tolist()
+        )
+        self._assert_single_row_scores(result, reference)
+
+    def test_explicit_token_scores_match_vllm(
+        self, monkeypatch, logprobs_mode, sampling_kwargs
+    ):
+        params = [SamplingParams(logprob_token_ids=[0, 3], **sampling_kwargs)]
+        raw = [[-2.0, 0.0, 3.0, 1.0, 2.0]]
+        result, reference = self._sample_with_reference(
+            monkeypatch, logprobs_mode, raw, params
+        )
+        assert result.logprobs.logprob_token_ids.shape == (1, 3)
+        assert result.logprobs.logprob_token_ids[0, 1:].tolist() == [0, 3]
+        self._assert_single_row_scores(result, reference)
+
+    def test_mixed_score_requests_preserve_row_alignment_and_padding(self, monkeypatch):
+        params = [
+            SamplingParams(temperature=0, logprobs=2),
+            SamplingParams(
+                temperature=1.3,
+                top_k=3,
+                top_p=0.85,
+                min_p=0.05,
+                logprob_token_ids=[0, 3],
+            ),
+            SamplingParams(temperature=0.5, logprobs=0),
+        ]
+        raw = [
+            [1.0, 4.0, 2.0, -1.0, 0.0],
+            [-2.0, 0.0, 3.0, 1.0, 2.0],
+            [0.0, 2.0, 1.0, -3.0, 4.0],
+        ]
+        result, reference = self._sample_with_reference(
+            monkeypatch, "raw_logprobs", raw, params
+        )
+        expected_ids = torch.tensor(
+            [
+                [result.token_ids[0], 1, 2],
+                [result.token_ids[1], 0, 3],
+                [result.token_ids[2], 0, 0],
+            ]
+        )
+        assert result.logprobs.logprob_token_ids.shape == (3, 3)
+        assert result.logprobs.logprob_token_ids.tolist() == expected_ids.tolist()
+        expected_scores = reference.gather(1, expected_ids)
+        expected_scores[2, 1:] = -torch.inf
+        torch.testing.assert_close(
+            torch.tensor(result.logprobs.logprobs),
+            expected_scores,
+            atol=2e-6,
+            rtol=2e-6,
+        )
+        expected_ranks = (reference >= expected_scores[:, :1]).sum(dim=-1)
+        assert result.logprobs.sampled_token_ranks.tolist() == expected_ranks.tolist()
+        assert not SamplingBatch.params_allow_native_greedy(params)
+        assert not SamplingBatch.params_allow_native_random(params, allow_seed=True)
+
+    @pytest.mark.parametrize("logits_mode", [False, True])
+    def test_inclusive_ranks_ties_and_masked_targets(self, logits_mode):
+        from vllm_metal.v1.native_logprobs import gather_native_logprobs
+
+        raw = mx.array([[2.0, 2.0, 1.0, -mx.inf], [2.0, 2.0, 1.0, -mx.inf]])
+        result = gather_native_logprobs(
+            raw,
+            mx.array([0, 3]),
+            [0, 2],
+            logits_mode=logits_mode,
+        ).tolists()
+        assert result.sampled_token_ranks.tolist() == [2, 4]
+        assert result.logprob_token_ids[0].tolist() == [0, 0, 0]
+        assert set(result.logprob_token_ids[1, 1:].tolist()) == {0, 1}
+        assert result.logprobs[1, 0] == float("-inf")
+
+    def test_prompt_scoring_exports_only_gathered_rows(self, monkeypatch):
+        from vllm_metal.v1 import native_logprobs
+        from vllm_metal.v1.prompt_logprobs import gather_prompt_logprobs
+
+        shapes = []
+        bridge = native_logprobs.mlx_to_torch
+
+        def checked_bridge(value, **kwargs):
+            shapes.append(value.shape)
+            return bridge(value, **kwargs)
+
+        monkeypatch.setattr(native_logprobs, "mlx_to_torch", checked_bridge)
+        result = gather_prompt_logprobs(
+            mx.arange(64, dtype=mx.float32).reshape(2, 32), [3, 4], 2
+        )
+        assert result.selected_token_ranks.tolist() == [29, 28]
+        assert shapes == [(2, 3), (2, 3), (2,)]
+
+    def test_large_vocabulary_retains_low_probability_mass(self):
+        """FP64 reference catches loss of many tiny terms in the normalizer."""
+        import math
+
+        from vllm_metal.v1.native_logprobs import gather_native_logprobs
+
+        vocab_size = 151936
+        logits = mx.concatenate(
+            [mx.zeros((1, 1)), mx.full((1, vocab_size - 1), -18.0)], axis=-1
+        )
+        actual = gather_native_logprobs(logits, mx.array([0]), 0).tolists()
+        expected = -math.log1p((vocab_size - 1) * math.exp(-18.0))
+        assert actual.logprobs[0, 0] == pytest.approx(expected, abs=5e-6)
+
+    @pytest.mark.parametrize("logits_mode", [False, True])
+    @pytest.mark.parametrize("k", [1, 3, 17])
+    def test_large_topk_covers_tail_ties_and_few_finite_scores(self, logits_mode, k):
+        from vllm_metal.v1.native_logprobs import gather_native_logprobs
+
+        # A non-aligned vocabulary exercises the real tail. Maxima span chunks,
+        # while one row has fewer finite scores than the requested alternatives.
+        vocab = 4099
+        raw = torch.stack(
+            [
+                torch.arange(vocab, dtype=torch.float32),
+                torch.full((vocab,), -2.0),
+                torch.full((vocab,), float("-inf")),
+            ]
+        )
+        raw[1, [0, 513, 2049, vocab - 1]] = 7.0
+        raw[2, 511] = 2.0
+        targets = [vocab - 1, 0, vocab - 2]
+        reference = raw if logits_mode else raw.log_softmax(dim=-1)
+        result = gather_native_logprobs(
+            mx.array(raw.tolist()),
+            mx.array(targets),
+            k,
+            logits_mode=logits_mode,
+        ).tolists()
+        for row, target in enumerate(targets):
+            ids = result.logprob_token_ids[row].tolist()
+            assert ids[0] == target
+            assert len(set(ids[1:])) == k
+            assert all(0 <= token < vocab for token in ids)
+            torch.testing.assert_close(
+                torch.tensor(result.logprobs[row]),
+                reference[row, ids],
+            )
+            torch.testing.assert_close(
+                torch.tensor(result.logprobs[row, 1:]),
+                torch.topk(reference[row], k).values,
+            )
+            assert result.sampled_token_ranks[row] == int(
+                (reference[row] >= reference[row, target]).sum()
+            )
