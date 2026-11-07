@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""MPS tensor operations for upstream MRv2's greedy EAGLE3 path.
+"""MPS tensor operations for upstream MRv2's greedy speculative decoding.
 
 The model, auxiliary-state extraction, proposal loop, verifier bookkeeping and
 cache management remain upstream. These replace its Triton-only device helpers.
@@ -8,6 +8,102 @@ cache management remain upstream. These replace its Triton-only device helpers.
 import torch
 
 from vllm_metal.pytorch_backend.input_ops import token_rows
+
+
+def prepare_dflash_inputs(
+    buffers,
+    query_slots,
+    context_positions,
+    context_slots,
+    sample_indices,
+    sample_pos,
+    sample_mapping,
+    temperature,
+    seeds,
+    batch,
+    sampled,
+    rejected,
+    last,
+    next_prefill,
+    input_temperature,
+    input_seeds,
+    block_table,
+    block_size,
+    cp_rank,
+    cp_size,
+    cp_interleave,
+    mask_token,
+    query_width,
+    num_steps,
+    max_num_reqs,
+    max_num_tokens,
+    max_model_len,
+    sample_from_anchor=False,
+    num_reqs_override=None,
+):
+    n = batch.num_reqs if num_reqs_override is None else num_reqs_override
+    total = int(batch.num_scheduled_tokens[:n].sum())
+    cu = batch.query_start_loc[: n + 1]
+    ends = cu[1:] - rejected[:n]
+    offsets, rows = token_rows(cu, total)
+
+    def slots(positions, request_rows):
+        blocks = block_table[
+            request_rows, (positions // block_size).clamp_max(block_table.shape[1] - 1)
+        ].long()
+        return torch.where(
+            blocks != 0, blocks * block_size + positions % block_size, -1
+        )
+
+    valid = offsets < ends[rows]
+    positions = torch.where(valid, batch.positions[:total], 0)
+    context_positions[:total].copy_(positions)
+    context_slots[:total] = torch.where(valid, slots(positions, rows), -1)
+
+    request_slots = batch.idx_mapping[:n].long()
+    anchor = torch.where(
+        sampled[:n] > 0,
+        last.reshape(-1)[request_slots],
+        next_prefill.reshape(-1)[request_slots],
+    )
+    columns = torch.arange(query_width, device=cu.device)
+    query_positions = batch.positions[(ends - 1).long(), None] + 1 + columns
+    count = n * query_width
+    buffers.input_ids[:count] = torch.where(
+        columns == 0, anchor[:, None], mask_token
+    ).flatten()
+    buffers.positions[:count].copy_(
+        query_positions.clamp_max(max_model_len - 1).flatten()
+    )
+    buffers.input_ids[count:].zero_()
+    buffers.positions[count:].zero_()
+    buffers.is_padding[:count].zero_()
+    buffers.is_padding[count:].fill_(True)
+    query_slots[:count] = slots(
+        query_positions, torch.arange(n, device=cu.device)[:, None]
+    ).flatten()
+    query_slots[count:].fill_(-1)
+    buffers.query_start_loc.copy_(
+        torch.arange(max_num_reqs + 1, device=cu.device).clamp_max(n) * query_width
+    )
+    buffers.seq_lens[:n] = (query_positions[:, -1] + 1).clamp_max(max_model_len)
+    buffers.seq_lens[n:].zero_()
+
+    first = 0 if sample_from_anchor else 1
+    num_sample = n * num_steps
+    indices = torch.arange(count, device=cu.device).view(n, query_width)
+    sample_indices[:num_sample].copy_(indices[:, first:].flatten())
+    sample_pos[:num_sample].copy_(
+        (query_positions[:, first:] + sample_from_anchor).flatten()
+    )
+    sample_mapping[:num_sample].copy_(
+        request_slots[:, None].expand(n, num_steps).flatten()
+    )
+    sample_indices[num_sample:].zero_()
+    sample_pos[num_sample:].zero_()
+    sample_mapping[num_sample:].fill_(-1)
+    temperature[request_slots] = input_temperature[request_slots]
+    seeds[request_slots] = input_seeds[request_slots]
 
 
 def prepare_prefill_inputs(

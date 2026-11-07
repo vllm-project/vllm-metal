@@ -26,6 +26,80 @@ def state():
     return RequestState(4, 64, 16, 0, 64, torch.device("mps"))
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_grouped_context_normalization(dtype):
+    from vllm import _custom_ops as ops
+
+    install()
+    torch.manual_seed(19)
+    x = torch.randn(2, 5, 3, 128, dtype=dtype, device="mps")
+    weight = torch.randn(2, 128, dtype=dtype, device="mps")
+    expected = x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + 1e-6)
+    expected = (expected * weight.float()[:, None, None]).to(dtype)
+    out = torch.empty_like(x)
+    ops.rms_norm(out, x, weight, 1e-6)
+    torch.testing.assert_close(out, expected)
+
+
+def test_dflash_inputs_preserve_verified_context():
+    from vllm.v1.worker.gpu.input_batch import InputBuffers
+
+    from vllm_metal.pytorch_backend.speculative_ops import prepare_dflash_inputs
+
+    def tensor(data, dtype=torch.int64):
+        return torch.tensor(data, device="mps", dtype=dtype)
+
+    def full(size, dtype=torch.int64):
+        return torch.full((size,), 999, device="mps", dtype=dtype)
+
+    buffers = InputBuffers(3, 16, torch.device("mps"))
+    buffers.input_ids.fill_(999)
+    buffers.is_padding[0] = True
+    batch = SimpleNamespace(
+        num_reqs=2,
+        num_tokens=5,
+        num_scheduled_tokens=np.array([3, 2]),
+        query_start_loc=tensor([0, 3, 5], torch.int32),
+        positions=tensor([15, 16, 17, 30, 31]),
+        idx_mapping=tensor([2, 0], torch.int32),
+    )
+    query_slots, context_pos, context_slots = full(16), full(5), full(5)
+    sample_buffers = [full(9) for _ in range(3)]
+    temperature, seeds = torch.zeros(3, device="mps"), full(3)
+    prepare_dflash_inputs(
+        buffers,
+        query_slots,
+        context_pos,
+        context_slots,
+        *sample_buffers,
+        temperature,
+        seeds,
+        batch,
+        tensor([1, 0], torch.int32),
+        tensor([1, 0], torch.int32),
+        tensor([[0], [0], [42]]),
+        tensor([[61, 62, 63]]),
+        temperature,
+        seeds,
+        tensor([[0, 2, 3], [4, 5, 6]], torch.int32),
+        block_size=16,
+        cp_rank=0,
+        cp_size=1,
+        cp_interleave=1,
+        mask_token=99,
+        query_width=4,
+        num_steps=3,
+        max_num_reqs=3,
+        max_num_tokens=16,
+        max_model_len=48,
+    )
+    assert context_pos.tolist() == [15, 16, 0, 30, 31]
+    assert context_slots.tolist() == [-1, 32, -1, 94, 95]
+    assert query_slots.tolist() == [33, 34, 35, 36, 96, 97, 98, 99] + [-1] * 8
+    assert buffers.input_ids.tolist() == [42, 99, 99, 99, 61, 99, 99, 99] + [0] * 8
+    assert buffers.is_padding.tolist() == [False] * 8 + [True] * 8
+
+
 @pytest.mark.parametrize("num_groups", [1, 2])
 def test_request_slots_and_dummy_padding(num_groups):
     install()

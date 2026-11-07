@@ -7,6 +7,22 @@ import torch
 from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
 
 
+def rotary_embedding(positions, query, key, head_size, cos_sin_cache, is_neox):
+    """Keep the direct vLLM op's in-place contract using upstream Torch RoPE."""
+    q, k = RotaryEmbedding.forward_static(
+        positions,
+        query,
+        key,
+        head_size,
+        cos_sin_cache.shape[-1],
+        cos_sin_cache,
+        is_neox,
+    )
+    query.copy_(q)
+    if key is not None:
+        key.copy_(k)
+
+
 @cache
 def _kernel(dtype):
     from vllm_metal import envs
