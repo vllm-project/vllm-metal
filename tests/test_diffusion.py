@@ -960,6 +960,7 @@ class TestPlatformDiffusionConfig:
             ({"top_p": 0.9}, "top_p"),
             ({"logit_bias": {1: 2.0}}, "logit_bias"),
             ({"min_tokens": 2}, "min_tokens"),
+            ({"thinking_token_budget": 8}, "thinking_token_budget"),
         ],
     )
     def test_rejects_canvas_sampling_controls_while_serving_diffusion(
