@@ -33,6 +33,7 @@ from vllm_metal.utils import get_model_download_path, resolve_mlx_lm_model_path
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPAssistantLoader
 from vllm_metal.v1.mlx_lm_paths import (
     mlx_lm_compatible_model_path as _mlx_lm_compatible_model_path,
+    mlx_lm_model_type_override,
 )
 from vllm_metal.v1.mm import EncoderCache
 from vllm_metal.v1.model_adapter import ModelAdapter
@@ -420,6 +421,9 @@ class ModelLifecycle:
                 model_name,
                 lazy=lazy_weights or bool(expert_cache_bytes),
                 revision=revision,
+                model_config=mlx_lm_model_type_override(
+                    getattr(model_config, "hf_config", None)
+                ),
             )
             if expert_cache_bytes:
                 self._runner._expert_store = ExpertStore.install(
@@ -473,12 +477,15 @@ class ModelLifecycle:
         *,
         lazy: bool = False,
         revision: str | None = None,
+        model_config: dict | None = None,
     ) -> Any:
         with _mlx_lm_compatible_model_path(model_name) as compatible_model_name:
             model_path = resolve_mlx_lm_model_path(
                 str(compatible_model_name), revision=revision
             )
-            model, _ = mlx_lm_load_model(model_path, lazy=lazy)
+            model, _ = mlx_lm_load_model(
+                model_path, lazy=lazy, model_config=model_config
+            )
         return model
 
     def _install_generation_model(
