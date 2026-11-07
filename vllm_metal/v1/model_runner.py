@@ -2270,10 +2270,8 @@ class MetalModelRunner:
                     f"{seg_end - seg_start} of {len(prefill.token_ids)} chunk "
                     "rows — the selective-logits gate desynced."
                 )
-            state = self._request_states.get(prefill.req_id)
-            prompt_token_ids = (
-                full_prompt if state is None else full_prompt[: state.prompt_len]
-            )
+            state = self._request_states[prefill.req_id]
+            prompt_token_ids = full_prompt[: state.prompt_len]
             tensors = self._prompt_logprobs_tracker.observe_chunk(
                 prefill.req_id,
                 prompt_token_ids=prompt_token_ids,
