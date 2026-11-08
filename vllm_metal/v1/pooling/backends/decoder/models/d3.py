@@ -4,7 +4,9 @@
 A d3 checkpoint is a Qwen3.5 backbone plus ``readout.safetensors``: one row per
 answer code. A prompt is scored by reading the last prompt token and projecting
 it with the readout, which yields one logit per code. ``/v1/systemone`` turns
-those logits into probabilities, so the pooler returns them unnormalized.
+those logits into probabilities over the codes of a single question, so it asks
+for them unnormalized; a request that sets ``use_activation`` gets upstream's
+``PoolerClassify`` activation over the whole code space instead.
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ from typing import Any, cast
 
 import mlx.core as mx
 import torch
+from vllm.pooling_params import PoolingParams
 from vllm.tasks import PoolingTask
 
 from vllm_metal.tensor_bridge import mlx_to_torch
@@ -101,8 +104,19 @@ class D3ReadoutPooler:
                 f"{self.config.label}."
             )
 
-        tensor = mlx_to_torch(logits, device="cpu")
+        tensor = mlx_to_torch(self._activate(logits, span.pooling_params), device="cpu")
         return tensor.detach().clone()
+
+    def _activate(self, logits: mx.array, pooling_params: PoolingParams) -> mx.array:
+        """Apply upstream ``PoolerClassify`` when the request asks for it."""
+        use_activation = pooling_params.use_activation
+        if use_activation is None:
+            use_activation = self.config.pooler_config.use_activation is not False
+        if not use_activation:
+            return logits
+        if logits.shape[0] < 2:
+            return mx.sigmoid(logits)
+        return mx.softmax(logits, axis=-1)
 
     def _readout(self) -> mx.array | None:
         from vllm_metal.v1.model_adapter import _local_checkpoint_dir

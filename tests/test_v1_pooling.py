@@ -39,6 +39,7 @@ from vllm_metal.v1.pooling.backends.decoder.models.qwen3 import (  # noqa: E402
 )
 from vllm_metal.v1.pooling.backends.decoder.runtime import (  # noqa: E402
     DecoderModelView,
+    LastTokenEmbeddingPooler,
     MetalDecoderPoolingBackend,
     is_embed_pooling_architecture,
 )
@@ -771,6 +772,22 @@ class TestMetalPoolingCapabilities:
 
         assert causal.bidi_prefill() is False
         assert full_view.bidi_prefill() is True
+
+    def test_real_embed_pooler_answers_the_bidi_protocol(self) -> None:
+        """The doubles above declare the flag on their own; the real embed
+        pooler must declare it too, or every embedding step raises."""
+        config = PoolingConfigView(_pooling_model_config())
+        pooler = LastTokenEmbeddingPooler(DecoderModelView(_PoolingModel()), config)
+
+        assert pooler.is_supported()
+        assert pooler.bidi_prefill is False
+
+        backend = MetalDecoderPoolingBackend(
+            config,
+            DecoderModelView(_PoolingModel()),
+            (pooler,),
+        )
+        assert backend.bidi_prefill() is False
 
     @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
     @pytest.mark.parametrize("length", [7, 515])
@@ -1740,6 +1757,55 @@ class TestD3ReadoutPooler:
         )
 
         assert logits.tolist() == pytest.approx([1.0, 4.0, 1.5])
+
+    @pytest.mark.parametrize("use_activation", [False, True])
+    def test_use_activation_follows_upstream_classify(
+        self, tmp_path, use_activation
+    ) -> None:
+        """/v1/systemone sends False and softmaxes over one question's codes;
+        True is upstream PoolerClassify over the whole code space."""
+        pooler = D3ReadoutPooler(self._model_config(tmp_path))
+        span = DecoderPoolingSpan(
+            start_row=0,
+            num_tokens=2,
+            is_complete=True,
+            pooling_params=_pooling_params(
+                task="classify", use_activation=use_activation
+            ),
+        )
+
+        logits = pooler.pool_one(
+            mx.array([[[9.0, 9.0], [1.0, 2.0]]], dtype=mx.float32),
+            span,
+        )
+
+        if use_activation:
+            assert logits.tolist() == pytest.approx(
+                mx.softmax(mx.array([1.0, 4.0, 1.5])).tolist()
+            )
+            assert float(logits.sum()) == pytest.approx(1.0, abs=1e-6)
+        else:
+            assert logits.tolist() == pytest.approx([1.0, 4.0, 1.5])
+
+    def test_pooler_config_activation_applies_when_params_are_silent(
+        self, tmp_path
+    ) -> None:
+        config = self._model_config(
+            tmp_path, pooler_config=_pooler_config(task="classify", use_activation=True)
+        )
+        span = DecoderPoolingSpan(
+            start_row=0,
+            num_tokens=2,
+            is_complete=True,
+            pooling_params=_pooling_params(task="classify"),
+        )
+
+        logits = D3ReadoutPooler(config).pool_one(
+            mx.array([[[9.0, 9.0], [1.0, 2.0]]], dtype=mx.float32),
+            span,
+        )
+
+        assert float(logits.sum()) == pytest.approx(1.0, abs=1e-6)
 
     def test_missing_readout_is_unsupported(self, tmp_path) -> None:
         config = self._model_config(tmp_path)

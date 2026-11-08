@@ -73,6 +73,9 @@ class LastTokenEmbeddingPooler:
     """Pool decoder hidden states into normalized LAST-token embeddings."""
 
     task: PoolingTask = EMBED_TASK
+    # An embedding reads the last row and nothing else, so the prompt is not
+    # scored as a block; the declaration keeps the pooler protocol complete.
+    bidi_prefill = False
 
     def __init__(
         self,
