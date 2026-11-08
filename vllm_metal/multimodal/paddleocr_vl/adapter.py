@@ -3,11 +3,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
 
 import mlx.core as mx
-import numpy as np
 import torch
 from vllm.multimodal.inputs import MultiModalKwargsItem
 
@@ -167,40 +167,39 @@ class PaddleOCRVLMultimodalAdapter:
     ) -> tuple[mx.array, int]:
         """Return ``((3, 1, seq_len) int32 positions, mrope_position_delta)``.
 
-        Mirrors upstream vLLM's PaddleOCR-VL M-RoPE layout, placing each image
-        grid at its ``mm_position`` offset without reading token ids.
+        Delegates to upstream vLLM's PaddleOCR-VL M-RoPE method and returns an
+        MLX array shaped for ``call_lm``.
         """
         if not input_tokens:
             return mx.zeros((3, 1, 0), dtype=mx.int32), 0
 
+        from vllm.model_executor.models.paddleocr_vl import (
+            PaddleOCRVLForConditionalGeneration,
+        )
+
+        # Upstream only needs iter_mm_grid_thw from its receiver.
+        torch_positions, delta = (
+            PaddleOCRVLForConditionalGeneration.get_mrope_input_positions(
+                self, input_tokens, mm_features
+            )
+        )
+        positions = mx.array(torch_positions.numpy(), dtype=mx.int32)
+        return positions[:, None, :], int(delta)
+
+    def iter_mm_grid_thw(
+        self, mm_features: list[MultiModalFeatureSpec]
+    ) -> Iterator[tuple[int, int, int, int, float]]:
+        """Yield upstream's ``(offset, grid_t, grid_h, grid_w, t_factor)`` per image."""
         sorted_features = sorted(mm_features, key=lambda f: f.mm_position.offset)
         grids = self._validate_image_features_and_collect_grids(sorted_features)
-        llm_pos_ids_list: list[np.ndarray] = []
-        st = 0
-        for feature, (llm_grid_t, h, w) in zip(sorted_features, grids, strict=True):
-            llm_grid_h = h // self._spatial_merge_size
-            llm_grid_w = w // self._spatial_merge_size
-            offset = feature.mm_position.offset
-            text_len = offset - st
-            st_idx = llm_pos_ids_list[-1].max() + 1 if llm_pos_ids_list else 0
-            llm_pos_ids_list.append(
-                np.broadcast_to(np.arange(text_len), (3, text_len)) + st_idx
+        for feature, (t, h, w) in zip(sorted_features, grids, strict=True):
+            yield (
+                feature.mm_position.offset,
+                t,
+                h // self._spatial_merge_size,
+                w // self._spatial_merge_size,
+                1.0,
             )
-            grid_indices = np.indices((llm_grid_t, llm_grid_h, llm_grid_w))
-            llm_pos_ids_list.append(grid_indices.reshape(3, -1) + text_len + st_idx)
-            st = offset + llm_grid_t * llm_grid_h * llm_grid_w
-
-        if st < len(input_tokens):
-            st_idx = llm_pos_ids_list[-1].max() + 1 if llm_pos_ids_list else 0
-            text_len = len(input_tokens) - st
-            llm_pos_ids_list.append(
-                np.broadcast_to(np.arange(text_len), (3, text_len)) + st_idx
-            )
-
-        llm_positions = np.concatenate(llm_pos_ids_list, axis=1)
-        mrope_position_delta = int(llm_positions.max()) + 1 - len(input_tokens)
-        positions = mx.array(llm_positions, dtype=mx.int32)
-        return positions[:, None, :], mrope_position_delta
 
     def call_lm(
         self,
