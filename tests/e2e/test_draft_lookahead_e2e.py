@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Real-model draft lookahead under scheduler pressure and cancellation.
 
-Run explicitly with ``pytest -m slow tests/test_draft_lookahead_e2e.py``.
+Run explicitly with ``pytest -m slow tests/e2e/test_draft_lookahead_e2e.py``.
 Each case owns one engine in a spawned process; Metal is not fork-safe.
 """
 

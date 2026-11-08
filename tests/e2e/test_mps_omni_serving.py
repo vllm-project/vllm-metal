@@ -54,7 +54,7 @@ def speech_server(tmp_path_factory):
                 "--omni",
                 "--deploy-config",
                 str(
-                    Path(__file__).resolve().parents[1]
+                    Path(__file__).resolve().parents[2]
                     / "vllm_metal/pytorch_backend/deploy/qwen3_tts_mps.yaml"
                 ),
                 "--host",
