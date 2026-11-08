@@ -15,9 +15,10 @@ VLLM_METAL_BACKEND=mps PYTORCH_ENABLE_MPS_FALLBACK=0 \
 
 Release wheels include both native launchers and the shared Metal shaders;
 no compiler is needed. Source checkouts use the [development setup](CONTRIBUTING.md#development-setup).
-Selecting MPS defaults to MRv2. Use unquantized FP16/BF16 checkpoints and greedy
-requests (`temperature=0`). Output-token and prompt logprobs are supported;
-explicit token-ID scoring is not yet supported.
+Selecting MPS defaults to MRv2. Use unquantized FP16/BF16 checkpoints.
+Greedy decoding and seeded sampling with temperature, top-k, top-p, and min-p
+are supported. Output-token and prompt logprobs are supported; explicit token-ID
+scoring is not yet supported.
 
 For speech generation, see [Qwen3-TTS on Apple Silicon](qwen3-tts-mps.md).
 
@@ -47,6 +48,16 @@ more draft tokens do not always improve throughput.
 - Extend upstream scheduler, cache, speculative-decoding and omni contracts.
   Continuous batching and duplex are requirements for the corresponding serving
   features, not optional follow-ups to a single-request implementation.
+
+Qwen3.5 Gated DeltaNet uses the shared Metal recurrence for packed decode and
+prefill in one launch through `torch.mps.load_metallib`, like RoPE and RMSNorm,
+with unexpanded Q/K heads. Its FP32 state uses upstream
+`MambaSpec`'s `[slots, value_heads, value_dim, key_dim]` layout and physical page
+stride directly. Fresh sequences initialize their state inside the kernel;
+resumed sequences keep it, and PAD/empty rows leave state and output untouched.
+Normalization, log-gate conversion to decay, and recurrence remain FP32. The
+kernel writes output directly in the model dtype without an FP32 output scratch
+or copy back. Convolution still uses upstream Torch.
 
 ## Adding Omni models
 

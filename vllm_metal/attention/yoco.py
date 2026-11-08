@@ -337,7 +337,7 @@ def _gemma4_text_fast_prefill_call(
         )
 
     ctx = get_context()
-    if ctx is None or ctx.cu_seqlens is None:
+    if ctx is None or ctx.cu_seqlens is None or ctx.all_rows_consumed:
         return _call_original(
             original_call,
             model,

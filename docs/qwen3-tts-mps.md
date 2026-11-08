@@ -31,5 +31,6 @@ For streaming audio, add `"stream": true`, `"stream_format": "audio"`, and
 [Omni Speech API](https://docs.vllm.ai/projects/vllm-omni/en/latest/serving/speech_api/)
 for request formats and examples.
 
-This preview uses greedy decoding for both the talker and code predictor.
-Random sampling, quantized models, and distributed serving are not supported.
+The default profile uses greedy decoding for both the talker and code predictor.
+Talker sampling can be enabled through `extra_params` (`temperature`, `top_k`,
+and `top_p`). Quantized models and distributed serving are not supported.

@@ -105,7 +105,9 @@ def test_apply_model_runner_default_selects_v2_for_mlx(monkeypatch) -> None:
     assert os.environ["VLLM_USE_V2_MODEL_RUNNER"] == "1"
 
 
-def test_apply_model_runner_default_respects_explicit_opt_out(monkeypatch) -> None:
+def test_apply_model_runner_default_preserves_explicit_value_for_validation(
+    monkeypatch,
+) -> None:
     monkeypatch.setenv("VLLM_METAL_BACKEND", "mlx")
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
 

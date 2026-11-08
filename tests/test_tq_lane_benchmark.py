@@ -13,16 +13,19 @@ from tools.benchmark.tq_e2e_arm import prefix_probe_layout, validate_prefix_reus
 from vllm_metal.attention.impls import turboquant_prefill as tq_prefill
 
 
-@pytest.mark.parametrize("kv_heads", [2, 8])
+@pytest.mark.parametrize(
+    ("kv_heads", "query_len", "context_len"),
+    [(2, 32, 257), (8, 32, 257), pytest.param(8, 16, 16, id="single-page")],
+)
 def test_crossover_materializes_below_policy_threshold(
-    monkeypatch, capsys, force_tiled_prefill, kv_heads
+    monkeypatch, capsys, force_tiled_prefill, kv_heads, query_len, context_len
 ):
     monkeypatch.setenv("VLLM_METAL_TQ_PREFILL", "1")
     monkeypatch.setenv("VLLM_METAL_TQ_PREFILL_MAX_MIB", "64")
     threshold = tq_prefill.min_prefill_tokens(8, kv_heads, 128)
     bench.measure(
         "below-policy",
-        {"qlens": (32,), "context_lens": (257,), "n_kv_heads": kv_heads},
+        {"qlens": (query_len,), "context_lens": (context_len,), "n_kv_heads": kv_heads},
         reps=1,
         warmup=0,
         force_materialization=True,

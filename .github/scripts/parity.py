@@ -135,6 +135,58 @@ def finish(check_id: str, result: str) -> None:
         print(f"### Parity matrix: {conclusion}\n\n{summary}", file=output)
 
 
+def _junit_line(junit: Path, label: str) -> str:
+    """Summarize one JUnit file, or say the suite did not report."""
+    if not junit.exists():
+        return f"\n{label}: missing JUnit result; completion not confirmed."
+    try:
+        suites = ET.parse(junit).getroot().findall("testsuite")
+        totals = {
+            name: sum(int(suite.attrib[name]) for suite in suites)
+            for name in ("tests", "failures", "errors", "skipped")
+        }
+    except (ET.ParseError, KeyError, ValueError):
+        # A job killed mid-write leaves a truncated file.
+        return f"\n{label}: unreadable JUnit result; completion not confirmed."
+    return (
+        f"\n{label}: "
+        + ", ".join(f"{value} {name}" for name, value in totals.items())
+        + "."
+    )
+
+
+def _kv_offload_lines(directory: Path) -> list[str]:
+    """Rows of the KV offload restore check, or Missing where it did not report."""
+    records = [
+        json.loads(path.read_text())
+        for path in sorted((directory / "kv-offload").glob("*/restores.json"))
+        if not path.parent.is_symlink()
+    ]
+    if len(records) > 1:
+        raise ValueError("Duplicate KV offload results")
+    record = records[0] if records else {}
+    lines = [
+        f"\nKV offload: a {record.get('probe_tokens', '?')}-token probe evicted from a "
+        f"{record.get('device_blocks', '?')}-block device cache, then restored. "
+        "Output must match the probe served from the prefix cache exactly.\n",
+        "| Restore | Restored tokens | Recomputed | Disk read (MiB) | Output | Result |",
+        "|---|---:|---:|---:|---|---|",
+    ]
+    rows = {row["restore"]: row for row in record.get("restores", [])}
+    for name in ("host pool", "disk after restart"):
+        row = rows.get(name)
+        if row is None:
+            lines.append(f"| {name} | — | — | — | — | Missing |")
+            continue
+        status = "PASS" if row["passed"] else "FAIL"
+        lines.append(
+            f"| {name} | {row['restored_tokens']:g} | {row['recomputed_tokens']:g} "
+            f"| {row['disk_read_bytes'] / 2**20:.1f} | {row['output']} | {status} |"
+        )
+    lines.append(_junit_line(directory / "kv-offload.xml", "KV offload suite"))
+    return lines
+
+
 def summarize(directory: Path, *, model: str, revision: str, sha: str) -> str:
     """Render saved results in the unprivileged model job, including missing cases."""
     lines = [
@@ -227,22 +279,8 @@ def summarize(directory: Path, *, model: str, revision: str, sha: str) -> str:
         lines.append(
             "\nEAL = 1 + accepted tokens / draft rounds. Position rates use draft rounds as the denominator."
         )
-        junit = directory / "acceptance.xml"
-        if junit.exists():
-            suites = ET.parse(junit).getroot().findall("testsuite")
-            totals = {
-                name: sum(int(suite.attrib[name]) for suite in suites)
-                for name in ("tests", "failures", "errors", "skipped")
-            }
-            lines.append(
-                "\nAcceptance suite: "
-                + ", ".join(f"{value} {name}" for name, value in totals.items())
-                + "."
-            )
-        else:
-            lines.append(
-                "\nAcceptance suite: missing JUnit result; completion not confirmed."
-            )
+        lines.append(_junit_line(directory / "acceptance.xml", "Acceptance suite"))
+        lines.extend(_kv_offload_lines(directory))
     environment = directory / "environment.txt"
     if environment.exists():
         lines.append(

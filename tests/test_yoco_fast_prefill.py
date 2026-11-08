@@ -27,6 +27,11 @@ _REAL_GEMMA4_MAX_MODEL_LEN = 1024
 _REAL_GEMMA4_MAX_TOKENS = 8
 _FAST_PREFILL_ENABLED_ATTR = "_vllm_metal_yoco_fast_prefill_enabled"
 _REAL_RESULT_MARKER = "VLLM_METAL_YOCO_FAST_PREFILL_RESULT="
+_FAKE_GEMMA4_MODEL_ARGS = {
+    "model_type": "gemma4_text",
+    "num_hidden_layers": 4,
+    "num_kv_shared_layers": 2,
+}
 
 
 def _logged_call_text(log_method: Mock) -> str:
@@ -43,7 +48,7 @@ def _run_real_gemma4_paged_path(
     model_path: str,
     *,
     skip_fast_prefill_hook: bool = False,
-) -> tuple[dict[str, list[int]], bool]:
+) -> tuple[dict[str, list[int]], dict[str, list[float]], bool]:
     gpu_memory_utilization = float(
         os.environ.get("GEMMA4_FAST_PREFILL_MEMORY_FRACTION", "0.5")
     )
@@ -97,9 +102,25 @@ sp = SamplingParams(
 )
 outputs = llm.generate(prompts, sp)
 tokens = {{o.prompt: list(o.outputs[0].token_ids) for o in outputs}}
+prompt_outputs = llm.generate(
+    prompts, SamplingParams(temperature=0, max_tokens=1, prompt_logprobs=0)
+)
+prompt_logprobs = {{
+    o.prompt: [
+        entry[token_id].logprob
+        for token_id, entry in zip(o.prompt_token_ids[1:], o.prompt_logprobs[1:])
+    ]
+    for o in prompt_outputs
+}}
 print(
     {_REAL_RESULT_MARKER!r}
-    + json.dumps({{"tokens": tokens, "enabled": fast_prefill_enabled}}),
+    + json.dumps(
+        {{
+            "tokens": tokens,
+            "prompt_logprobs": prompt_logprobs,
+            "enabled": fast_prefill_enabled,
+        }}
+    ),
     flush=True,
 )
 engine = getattr(llm, "llm_engine", None)
@@ -129,7 +150,11 @@ if callable(shutdown):
     for line in output.splitlines():
         if line.startswith(_REAL_RESULT_MARKER):
             payload = json.loads(line[len(_REAL_RESULT_MARKER) :])
-            return payload["tokens"], bool(payload["enabled"])
+            return (
+                payload["tokens"],
+                payload["prompt_logprobs"],
+                bool(payload["enabled"]),
+            )
     raise AssertionError(
         f"real Gemma4 paged-path subprocess did not report result\n{output[-8000:]}"
     )
@@ -317,16 +342,9 @@ def test_reduced_context_from_empty_full_paged_metadata() -> None:
     assert meta.cu_seqlens == [0]
 
 
-def test_try_enable_gemma4_yoco_fast_prefill_reduces_shared_layer_queries() -> None:
-    import mlx.core as mx
-
-    from vllm_metal.attention.context import (
-        PagedAttentionContext,
-        PagedKVGroupContext,
-        clear_context,
-        get_context,
-        set_context,
-    )
+def _fake_gemma4_text_model():
+    """A Gemma4 text-model stand-in whose layers record what they receive."""
+    from vllm_metal.attention.context import get_context
 
     class _Config:
         num_hidden_layers = 4
@@ -399,16 +417,26 @@ def test_try_enable_gemma4_yoco_fast_prefill_reduces_shared_layer_queries() -> N
         ):
             return input_embeddings + 100
 
-    text_model = _TextModel()
+    return _TextModel()
+
+
+def test_try_enable_gemma4_yoco_fast_prefill_reduces_shared_layer_queries() -> None:
+    import mlx.core as mx
+
+    from vllm_metal.attention.context import (
+        PagedAttentionContext,
+        PagedKVGroupContext,
+        clear_context,
+        get_context,
+        set_context,
+    )
+
+    text_model = _fake_gemma4_text_model()
     top_model = type("_TopModel", (), {"model": text_model})()
 
     assert try_enable_gemma4_yoco_fast_prefill(
         top_model,
-        {
-            "model_type": "gemma4_text",
-            "num_hidden_layers": 4,
-            "num_kv_shared_layers": 2,
-        },
+        _FAKE_GEMMA4_MODEL_ARGS,
         num_paged_layers=4,
     )
 
@@ -459,6 +487,32 @@ def test_try_enable_gemma4_yoco_fast_prefill_reduces_shared_layer_queries() -> N
     assert out[0, 4, 0].item() == 10
 
 
+def test_yoco_fast_prefill_runs_full_forward_when_all_rows_are_consumed() -> None:
+    import mlx.core as mx
+
+    from vllm_metal.attention.context import clear_context, prepare_grouped
+
+    text_model = _fake_gemma4_text_model()
+    top_model = type("_TopModel", (), {"model": text_model})()
+    inputs = mx.zeros((1, 5, 2), dtype=mx.float32)
+
+    enabled = try_enable_gemma4_yoco_fast_prefill(
+        top_model,
+        _FAKE_GEMMA4_MODEL_ARGS,
+        num_paged_layers=4,
+    )
+    prepare_grouped([], [([[0, 1]], 5, 0)], (4,), all_rows_consumed=True)
+    try:
+        out = text_model(input_embeddings=inputs, cache=[object()] * 4)
+    finally:
+        clear_context()
+    mx.eval(out)
+
+    assert enabled
+    assert [layer.calls for layer in text_model.layers] == [[], [], [], []]
+    assert out[0, :, 0].tolist() == [100.0] * 5
+
+
 @pytest.mark.slow
 def test_real_gemma4_paged_path_default_fast_prefill_matches_original() -> None:
     model_path = os.environ.get(_REAL_GEMMA4_MODEL_ENV) or os.environ.get(
@@ -472,17 +526,17 @@ def test_real_gemma4_paged_path_default_fast_prefill_matches_original() -> None:
     if not os.path.isdir(model_path):
         pytest.skip(f"{model_path} is not a directory")
 
-    original_tokens, original_enabled = _run_real_gemma4_paged_path(
-        model_path,
-        skip_fast_prefill_hook=True,
+    original_tokens, original_prompt_logprobs, original_enabled = (
+        _run_real_gemma4_paged_path(model_path, skip_fast_prefill_hook=True)
     )
-    assert not original_enabled
+    fast_tokens, fast_prompt_logprobs, fast_enabled = _run_real_gemma4_paged_path(
+        model_path,
+    )
 
-    fast_tokens, fast_enabled = _run_real_gemma4_paged_path(
-        model_path,
-    )
+    assert not original_enabled
     assert fast_enabled
     assert fast_tokens == original_tokens
+    assert fast_prompt_logprobs == original_prompt_logprobs
 
 
 @pytest.mark.parametrize(

@@ -80,12 +80,14 @@ jobs:
           path: ~/.cache/huggingface/hub
           key: parity-hf-${{ runner.os }}-${{ matrix.model.name }}-${{ matrix.model.revision }}
       - name: Install the tested checkout
+        id: install
         run: |
           test "$(git rev-parse HEAD)" = "$TESTED_SHA"
           mkdir -p "$RUNNER_TEMP/parity"
           printf 'commit=%s\nmodel=%s\nrevision=%s\n' "$TESTED_SHA" "$MODEL_ID" "$MODEL_REVISION" > "$RUNNER_TEMP/parity/environment.txt"
           ./install.sh
       - name: Prepare checkpoint
+        id: checkpoint
         run: |
           source .venv-vllm-metal/bin/activate
           python - <<'PY'
@@ -132,6 +134,18 @@ jobs:
           python -m pytest tests/test_draft_stats_e2e.py -k 'same_model_acceptance or controlled_rejection' \
             -q -s --basetemp "$RUNNER_TEMP/parity/acceptance" \
             --junitxml "$RUNNER_TEMP/parity/acceptance.xml"
+      - name: Check KV offload restores
+        # Does not depend on the parity results, so it also runs when they fail.
+        if: >-
+          !cancelled() && matrix.model.name == 'qwen3-0.6b'
+          && steps.install.outcome == 'success'
+          && steps.checkpoint.outcome == 'success'
+        run: |
+          source .venv-vllm-metal/bin/activate
+          uv pip install pytest
+          QWEN3_MODEL_PATH="$MODEL_PATH" python -m pytest tests/test_kv_offload_e2e.py \
+            -q -s --basetemp "$RUNNER_TEMP/parity/kv-offload" \
+            --junitxml "$RUNNER_TEMP/parity/kv-offload.xml"
       - name: Summarize parity
         if: always()
         run: |

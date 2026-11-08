@@ -808,36 +808,6 @@ def test_omni_macos_transport_handles_long_names_and_page_padding(with_metadata)
 
 
 @pytest.mark.parametrize(
-    "length", [1, 5, 64, 65, 200], ids=["one", "short", "chunk", "chunk+1", "multi"]
-)
-def test_gdn_chunked_prefill_matches_transformers_recurrence(length):
-    from transformers.models.qwen3_5.modeling_qwen3_5 import (
-        torch_recurrent_gated_delta_rule,
-    )
-
-    from vllm_metal.pytorch_backend.models.qwen3_5 import delta_rule_chunked
-
-    heads, k_dim, v_dim = 3, 32, 16
-    q, k = (
-        torch.nn.functional.normalize(torch.randn(length, heads, k_dim), dim=-1)
-        for _ in range(2)
-    )
-    v = torch.randn(length, heads, v_dim)
-    g = -torch.rand(length, heads)
-    beta = torch.rand(length, heads)
-    state = torch.randn(heads, k_dim, v_dim) * 0.1
-    expected, expected_state = torch_recurrent_gated_delta_rule(
-        q[None], k[None], v[None], g[None], beta[None], state[None], True
-    )
-    out, final = delta_rule_chunked(
-        *(x.to("mps") for x in (q * k_dim**-0.5, k, v, g, beta, state))
-    )
-    # The chunked form reorders the recurrence's fp32 sums.
-    torch.testing.assert_close(out.cpu(), expected[0], atol=1e-5, rtol=1e-4)
-    torch.testing.assert_close(final.cpu(), expected_state[0], atol=1e-5, rtol=1e-4)
-
-
-@pytest.mark.parametrize(
     "pooled",
     [
         pytest.param(False, id="dense"),
@@ -845,10 +815,12 @@ def test_gdn_chunked_prefill_matches_transformers_recurrence(length):
     ],
 )
 def test_gdn_state_carries_across_chunked_prefill_and_decode(pooled):
-    """``pooled`` puts the caches at the start of one buffer holding more than
-    INT_MAX fp32 elements, like the shared KV buffer on a large Mac. MPSGraph
-    matmuls reject a view into it at a non-zero offset, so resumed prefill must
-    copy its slot. Metal wires that whole buffer on first use, hence slow."""
+    """Preserve #1244's resumed-prefill regression above INT_MAX fp32 elements.
+
+    The shared kernel copies the slot into private state before recurrence,
+    avoiding MPSGraph matmuls on the pooled view. Metal wires the whole buffer
+    on first use, so the large-pool case remains slow.
+    """
     from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
     from vllm_metal.pytorch_backend.models.qwen3_5 import _gdn_core
@@ -860,7 +832,7 @@ def test_gdn_state_carries_across_chunked_prefill_and_decode(pooled):
         or torch.mps.recommended_max_memory() < 2 * pool_bytes
     ):
         pytest.skip("Needs a Metal buffer past INT_MAX fp32 elements, with headroom")
-    k_heads, v_heads, k_dim, v_dim, width = 2, 4, 16, 8, 4
+    k_heads, v_heads, k_dim, v_dim, width = 2, 4, 32, 8, 4
     channels = 2 * k_heads * k_dim + v_heads * v_dim
     layer = SimpleNamespace(
         key_dim=k_heads * k_dim,
@@ -944,7 +916,7 @@ def test_gdn_state_carries_across_chunked_prefill_and_decode(pooled):
             rtol=1e-4,
         )
     torch.testing.assert_close(
-        layer.kv_cache[1][1].cpu().view(v_heads, k_dim, v_dim),
+        layer.kv_cache[1][1].cpu().transpose(-1, -2),
         state,
         atol=1e-4,
         rtol=1e-4,
@@ -952,3 +924,120 @@ def test_gdn_state_carries_across_chunked_prefill_and_decode(pooled):
     assert all(
         torch.equal(t[2], u) for t, u in zip(layer.kv_cache, untouched, strict=True)
     )
+
+
+def test_seeded_sampling_preserves_distribution_and_batch_isolation(
+    run_in_spawn_process,
+):
+    # vLLM registers overrides at worker startup, before optional libraries load.
+    run_in_spawn_process(_check_seeded_sampling)
+
+
+def _check_seeded_sampling():
+    from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+
+    from vllm_metal.pytorch_backend.bindings import register_kernel_overrides
+
+    register_kernel_overrides()
+    rows = 8192
+    # Cross a reduction-block boundary, including a partial final block.
+    token_ids = torch.tensor([0, 1023, 1024])
+    logits = torch.full((1, 1025), -float("inf"))
+    logits[:, token_ids] = torch.tensor([0.2, 0.3, 0.5]).log()
+    logits = logits.to("mps").expand(rows, -1)
+    mapping = torch.zeros(rows, dtype=torch.int32, device="mps")
+    positions = torch.arange(rows, device="mps")
+    seed = torch.tensor([42], device="mps")
+    temperature = torch.ones(1, device="mps")
+    actual = gumbel_sample(logits, mapping, temperature, seed, positions, False, False)
+    frequencies = torch.bincount(actual.cpu(), minlength=1025)[token_ids] / rows
+    torch.testing.assert_close(
+        frequencies, torch.tensor([0.2, 0.3, 0.5]), atol=0.02, rtol=0
+    )
+    # Request scheduling must not change the random stream for a given position.
+    order = torch.arange(rows - 1, -1, -1, device="mps")
+    reordered = gumbel_sample(
+        logits, mapping, temperature, seed, positions[order], False, False
+    )
+    assert torch.equal(actual[order], reordered)
+    greedy = gumbel_sample(
+        logits, mapping, temperature * 0, seed, positions, False, False
+    )
+    assert greedy.eq(1024).all()
+    with pytest.raises(NotImplementedError, match="probabilistic draft sampling"):
+        gumbel_sample(
+            logits[:1],
+            mapping[:1],
+            temperature,
+            seed,
+            positions[:1],
+            apply_temperature=True,
+            is_drafting=True,
+            logits_cache=logits[:1, None, :],
+            logits_cache_col=positions[:1],
+        )
+
+
+def test_mrv2_sampling_filters_preserve_request_mapping(run_in_spawn_process):
+    run_in_spawn_process(_check_mrv2_sampling_filters)
+
+
+def _check_mrv2_sampling_filters():
+    from vllm.sampling_params import SamplingParams
+    from vllm.v1.worker.gpu.sample.sampler import Sampler
+
+    from vllm_metal.pytorch_backend.bindings import register_kernel_overrides
+
+    register_kernel_overrides()
+    install()
+    state = RequestState(4, 64, 16, 0, 64, torch.device("mps"))
+    state.prompt_len.np[:] = 10
+    state.prompt_len.copy_to_uva()
+    sampler = Sampler(
+        SimpleNamespace(reasoning_config=None), 4, 5, torch.device("mps"), state
+    )
+    params = [
+        SamplingParams(temperature=0),
+        SamplingParams(temperature=0.5, top_k=2, top_p=0.95, seed=17),
+        SamplingParams(
+            temperature=1,
+            top_k=3,
+            top_p=0.7,
+            min_p=0.2,
+            seed=42,
+        ),
+    ]
+    for slot, param in enumerate(params):
+        sampler.add_request(slot, param)
+    sampler.apply_staged_writes()
+    slots = np.array([2, 0, 1])
+    mapping = torch.tensor(slots, device="mps", dtype=torch.int32)
+    logits = torch.tensor(
+        [
+            [2.0, 3.0, 4.0, 5.0, 1.0],
+            [0.0, 1.0, 2.0, 3.0, 4.0],
+            [0.0, 4.0, 4.0, 0.0, 0.0],
+        ],
+        device="mps",
+    )
+    zeros = torch.zeros(3, device="mps", dtype=torch.int32)
+
+    def sample(position):
+        return sampler.sample(
+            logits,
+            mapping,
+            mapping,
+            slots,
+            torch.full((3,), position, device="mps"),
+            zeros,
+            zeros,
+            np.full(3, position + 1),
+        )
+
+    first, processed = sample(10)
+    assert first[:2].tolist() == [3, 4]
+    assert first[2].item() in (1, 2)
+    assert processed[0].isfinite().tolist() == [False, False, False, True, False]
+    assert processed[2, 1:3].tolist() == [8.0, 8.0]
+    assert processed[2].isfinite().tolist() == [False, True, True, False, False]
+    assert torch.equal(sample(10)[0], first)

@@ -118,9 +118,9 @@ vllm serve meta-llama/Llama-3.2-1B-Instruct \
 Eligible TurboQuant prefills materialize the referenced KV pages and use the
 existing NAX or tiled attention kernel. `VLLM_METAL_TQ_PREFILL=auto` enables this
 when NAX is available (M5; `VLLM_METAL_DISABLE_NAX=1` makes it behave as `0`);
-`1` opts into tiled prefill on other GPUs, and `0` disables it. M5 Pro and M3
-calibration is described below; broader hardware and shape validation is still
-required before enabling tiled prefill by default on M1–M4.
+`1` opts into tiled prefill on other GPUs, and `0` disables it. The calibration
+below covers M5 Pro, M3 Air and M1 Pro. Broader hardware and shape validation
+is still required before enabling tiled prefill by default on M1–M4.
 
 Eligibility uses the **new query tokens in the current scheduler chunk**:
 The default minimum is
@@ -299,6 +299,34 @@ PYTHONPATH=. VLLM_METAL_BUILD_FROM_SOURCE=1 MLX_ENABLE_TF32=0 \
   python tools/benchmark/tq_lane_verify.py --suite crossover-hd128 --tiled --reps 31 --warmup 5
 ```
 
+### M1 Pro tiled prefill
+
+On an M1 Pro with 16 GPU cores and 32 GiB (macOS 26.6.2), the single-layer
+crossover depends on how much KV history the new tokens attend to. The table
+uses the Qwen3-4B geometry (32 query heads, 8 KV heads, head dimension 128)
+with K8/V3. Each cell gives the range across FP16 and BF16 of the median
+compressed time divided by the median tiled time. Total KV includes the new
+tokens. The benchmark forces the tiled path even below its admission threshold.
+
+| Total KV tokens | 16 new tokens | 32 | 64 | 128 | 256 |
+|---|---:|---:|---:|---:|---:|
+| Fresh prompt | 0.90–0.96× | 0.95–1.28× | 1.08–1.81× | 1.60–2.49× | 2.62–4.04× |
+| 8,192 | 1.89–3.15× | 3.63–6.15× | 4.40–5.97× | 4.91–7.87× | 5.65–8.47× |
+| 32,768 | 2.14–3.42× | 4.35–6.89× | 5.12–7.99× | 5.41–8.28× | 5.75–8.75× |
+
+```bash
+PYTHONPATH=. MLX_ENABLE_TF32=0 python tools/benchmark/tq_lane_verify.py \
+  --suite crossover-hd128 --tiled --head-pairs 32:8 --query-tokens 16 32 64 128 256 \
+  --context-tokens 0 8192 32768 --reps 31 --warmup 5
+```
+
+With Qwen3-4B-4bit and BF16 activations, the paired whole-model benchmark
+tested fresh prompts on an already loaded model. At 2,048 input tokens, median
+time to first token was 15.09 s on the compressed path and 6.53 s on the tiled
+path. Peak MLX allocation above the start of each request was 672 MiB and
+258 MiB, respectively. All three measured pairs produced the same eight greedy
+tokens.
+
 ### M3 whole-model policy comparison
 
 Qwen3-4B-4bit (32 Q / 8 KV heads, hd128, 36 layers), BF16 activations and
@@ -407,7 +435,7 @@ quantization. The reference disables only the prefill planner. Prefix caching
 is off so repeated prompts execute prefill:
 
 ```bash
-PYTHONPATH=. MLX_ENABLE_TF32=0 python tools/benchmark/tq_e2e_arm.py \
+PYTHONPATH=. MLX_ENABLE_TF32=0 VLLM_METAL_TQ_PREFILL=1 python tools/benchmark/tq_e2e_arm.py \
   --model /path/to/model --arm paired --prompt-tokens 8192 16384 \
   --max-tokens 1 --reps 3 --warmup 1 --output latency.json
 ```

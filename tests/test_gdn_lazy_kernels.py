@@ -2241,6 +2241,34 @@ class TestNativeGDNRecurrent:
         expected[2, ..., 0] = 1.5
         np.testing.assert_array_equal(np.array(state), expected)
 
+    def test_pad_and_empty_requests_leave_state_untouched(self) -> None:
+        _require_metal()
+        ops = _get_native_ops_or_skip()
+        q = mx.array(([1.0] + [0.0] * 31) * 2).reshape(2, 1, 32)
+        initial_state = np.full((3, 1, 1, 32), 3, dtype=np.float32)
+
+        out, state = ops.gdn_linear_attention(
+            q,
+            q,
+            mx.full((2, 1, 1), 2, dtype=mx.float32),
+            mx.ones((2, 1)),
+            mx.full((2, 1), 0.5),
+            mx.array(initial_state),
+            mx.array([0, 1, 2, 2], dtype=mx.int32),
+            mx.array([1, -1, 2], dtype=mx.int32),
+            1,
+            1,
+            32,
+            1,
+        )
+        mx.eval(out, state)
+
+        # Only slot 1 advances: s <- (3 + 2) / 2 in the selected column.
+        np.testing.assert_array_equal(np.array(out[0]), 2.5)
+        expected = initial_state.copy()
+        expected[1, ..., 0] = 2.5
+        np.testing.assert_array_equal(np.array(state), expected)
+
 
 class TestNativeGDNStateScatter:
     """The in-place row scatter that replaces MLX's whole-pool copy."""
