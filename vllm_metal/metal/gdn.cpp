@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // GDN state scatter and linear attention primitives.
 #include "ops_internal.h"
-#include "gdn_kernels.h"
+#include <limits>
 // ---------------------------------------------------------------------------
 // GDN linear attention — in-place paged state
 // ---------------------------------------------------------------------------
@@ -164,6 +164,40 @@ array gdn_state_scatter_primitive_fn(
       {pool, contiguous_src, contiguous_ids})[0];
 }
 
+namespace {
+
+struct GDNLinearAttentionPlan {
+  std::string kernel_name;
+  int grid_x, grid_z, threads_x;
+};
+
+void validate_gdn_key_dim(int Dk) {
+  if (Dk <= 0 || Dk > 256 || Dk % 32 != 0)
+    throw std::runtime_error(
+        "GDN kernel requires Dk to be a positive multiple of 32, at most 256. "
+        "Got Dk=" + std::to_string(Dk));
+}
+
+GDNLinearAttentionPlan make_gdn_linear_attention_plan(
+    const std::string& dtype, const std::string& state_dtype,
+    int num_requests, int Hk, int Hv, int Dk, int Dv,
+    int64_t state_stride) {
+  validate_gdn_key_dim(Dk);
+  if (num_requests < 0 || Hk <= 0 || Hv <= 0 || Hv % Hk || Dv <= 0 ||
+      int64_t(num_requests) * Hv > std::numeric_limits<int>::max() ||
+      int64_t(Hv) * Dv * Dk > std::numeric_limits<int>::max() ||
+      state_stride < int64_t(Hv) * Dv * Dk)
+    throw std::invalid_argument("Invalid GDN heads, batch size or state stride");
+  if ((dtype != "float" && dtype != "half" && dtype != "bfloat16_t") ||
+      (state_dtype != dtype && state_dtype != "float"))
+    throw std::invalid_argument("Unsupported GDN input/state dtype pair");
+  auto name = "gdn_linear_attention_" + dtype;
+  if (state_dtype != dtype) name += "_state_" + state_dtype;
+  return {name, Dv, num_requests * Hv, 32};
+}
+
+}  // namespace
+
 // TODO: Remove the Python per-request convolution once its batched replacement
 // covers the required cases and its performance is verified.
 // TODO: Once optimized recurrence covers every required case, remove the native
@@ -196,7 +230,7 @@ class GDNLinearAttentionPrimitive : public Primitive {
     auto s = stream();
     auto& d = metal::device(Device::gpu);
 
-    auto plan = vllm_metal::kernels::make_gdn_linear_attention_plan(
+    auto plan = make_gdn_linear_attention_plan(
         dtype_to_metal(q.dtype()), dtype_to_metal(state_pool.dtype()),
         num_requests, Hk_, Hv_, Dk_, Dv_, state_pool.strides()[0]);
     auto* lib = d.get_library("gdn_kern");
@@ -216,8 +250,13 @@ class GDNLinearAttentionPrimitive : public Primitive {
     enc.set_input_array(slot_mapping, 7);
     enc.set_output_array(y, 8);
 
-    vllm_metal::kernels::bind_gdn_linear_attention_params(
-        plan, [&](int index, auto value) { enc.set_bytes(value, index); });
+    enc.set_bytes(num_requests, 9);
+    enc.set_bytes(Hk_, 10);
+    enc.set_bytes(Hv_, 11);
+    enc.set_bytes(Dk_, 12);
+    enc.set_bytes(Dv_, 13);
+    int64_t state_stride = state_pool.strides()[0];
+    enc.set_bytes(state_stride, 14);
 
     // Grid: (Dv, 1, num_requests * Hv)  Threadgroup: (32, 1, 1)
     enc.dispatch_threadgroups(
@@ -242,7 +281,7 @@ std::tuple<array, array> gdn_linear_attention_primitive_fn(
     const array& g, const array& beta, const array& state_pool,
     const array& cu_seqlens, const array& slot_mapping,
     int Hk, int Hv, int Dk, int Dv) {
-  vllm_metal::kernels::validate_gdn_key_dim(Dk);
+  validate_gdn_key_dim(Dk);
   auto prim = std::make_shared<GDNLinearAttentionPrimitive>(
       default_stream(Device::gpu), Hk, Hv, Dk, Dv);
   auto outputs = array::make_arrays(

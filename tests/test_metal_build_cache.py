@@ -21,7 +21,6 @@ class _Paths:
     src: Path
     paged_attention: Path
     gdn: Path
-    gdn_kernels: Path
     sampling: Path
     mla: Path
     internal: Path
@@ -42,7 +41,6 @@ def patched(tmp_path, monkeypatch) -> _Paths:
     src = tmp_path / "mlx_bindings.cpp"
     paged_attention = tmp_path / "paged_attention.cpp"
     gdn = tmp_path / "gdn.cpp"
-    gdn_kernels = tmp_path / "gdn_kernels.h"
     sampling = tmp_path / "sampling.cpp"
     mla = tmp_path / "mla.cpp"
     internal = tmp_path / "ops_internal.h"
@@ -69,7 +67,6 @@ def patched(tmp_path, monkeypatch) -> _Paths:
     for attr, path in (
         ("_PAGED_ATTENTION", paged_attention),
         ("_GDN", gdn),
-        ("_GDN_KERNELS", gdn_kernels),
         ("_SAMPLING", sampling),
         ("_MLA", mla),
         ("_INTERNAL", internal),
@@ -93,7 +90,6 @@ def patched(tmp_path, monkeypatch) -> _Paths:
         src,
         paged_attention,
         gdn,
-        gdn_kernels,
         sampling,
         mla,
         internal,
@@ -166,7 +162,6 @@ def test_old_content_with_newer_so_mtime_still_rebuilds(patched):
         "device",
         "paged_attention",
         "gdn",
-        "gdn_kernels",
         "sampling",
         "mla",
         "internal",
