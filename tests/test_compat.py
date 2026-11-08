@@ -1016,7 +1016,7 @@ class TestQwen3FlatWeightPrefixTransform:
         fake_self = _HeadfulQwen3Self(tie_word_embeddings=False)
         assert fake_self.lm_head is not None
 
-        with compat.embedding_load_scope():
+        with compat.headless_load_scope():
             out = compat._qwen3_flat_weight_prefix(
                 fake_self, _flat_official_qwen3_weights()
             )
@@ -1141,7 +1141,7 @@ class TestQwen3FlatPrefixRealStrictLoad:
 
             # Embedding pooling never calls logits: the module is dropped, the
             # strict load passes.
-            with compat.embedding_load_scope():
+            with compat.headless_load_scope():
                 pooling = model_cls(_tiny_qwen3_args(tie_word_embeddings=False))
                 self._load_like_mlx_lm(pooling, flat)
             assert not hasattr(pooling, "lm_head")
@@ -1169,6 +1169,41 @@ class TestD3WeightLayoutTransform:
             "language_model.model.norm.weight",
         }
         assert out["language_model.model.embed_tokens.weight"] == "W-embed"
+
+    def test_headless_scope_drops_the_unused_vocabulary_head(self) -> None:
+        class _FakeLanguageModel:
+            def __init__(self) -> None:
+                self.args = SimpleNamespace(tie_word_embeddings=False)
+                self.lm_head = object()
+
+        model = SimpleNamespace(language_model=_FakeLanguageModel())
+        weights = {
+            "language_model.embed_tokens.weight": "W-embed",
+            "language_model.layers.0.self_attn.q_proj.weight": "W-q",
+        }
+
+        compat._d3_weight_layout(model, weights)
+        assert model.language_model.lm_head is not None
+
+        with compat.headless_load_scope():
+            out = compat._d3_weight_layout(model, weights)
+
+        assert not hasattr(model.language_model, "lm_head")
+        assert "language_model.model.layers.0.self_attn.q_proj.weight" in out
+
+    def test_tied_checkpoint_keeps_its_tied_head(self) -> None:
+        class _FakeLanguageModel:
+            def __init__(self) -> None:
+                self.args = SimpleNamespace(tie_word_embeddings=True)
+                self.lm_head = object()
+
+        model = SimpleNamespace(language_model=_FakeLanguageModel())
+        weights = {"language_model.embed_tokens.weight": "W-embed"}
+
+        with compat.headless_load_scope():
+            compat._d3_weight_layout(model, weights)
+
+        assert model.language_model.lm_head is not None
 
     def test_wrapper_layout_passes_through(self) -> None:
         weights = {

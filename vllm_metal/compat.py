@@ -20,8 +20,8 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 _APPLIED = False
-_EMBEDDING_LOAD_SCOPE: ContextVar[bool] = ContextVar(
-    "vllm_metal_embedding_load_scope", default=False
+_HEADLESS_LOAD_SCOPE: ContextVar[bool] = ContextVar(
+    "vllm_metal_headless_load_scope", default=False
 )
 _QWEN35_FP8_BLOCK_SIZE = 128
 _QWEN3_BACKBONE_ROOTS = frozenset({"embed_tokens", "layers", "norm", "lm_head"})
@@ -922,23 +922,24 @@ def ensure_lfm2_vl_torch_outputs(model_type: str | None) -> None:
 
 
 @contextmanager
-def embedding_load_scope(*, enabled: bool = True) -> Iterator[None]:
-    """Mark the wrapped model load as embedding-only for compat shims.
+def headless_load_scope(*, enabled: bool = True) -> Iterator[None]:
+    """Mark the wrapped model load as never reading the LM head.
 
-    The Qwen3 flat-prefix shim below drops mlx_lm's ``lm_head`` module only
-    inside this scope. Embedding pooling reads body hidden states and never
-    calls logits. Classify rerankers read ``lm_head`` logits and generation
-    needs the head tensor, so outside this scope the module stays and strict
-    load fails with the honest missing-tensor error.
+    Pooling that scores hidden states — embeddings, and d3's readout — leaves
+    mlx_lm's ``lm_head`` unused, and some checkpoints ship no tensor for it.
+    Inside this scope a compat shim may drop the module so strict load stops
+    demanding a tensor the checkpoint never wrote. Classify rerankers read
+    ``lm_head`` logits and generation needs the head, so outside the scope the
+    module stays and strict load fails with the honest missing-tensor error.
     """
     if not enabled:
         yield
         return
-    token = _EMBEDDING_LOAD_SCOPE.set(True)
+    token = _HEADLESS_LOAD_SCOPE.set(True)
     try:
         yield
     finally:
-        _EMBEDDING_LOAD_SCOPE.reset(token)
+        _HEADLESS_LOAD_SCOPE.reset(token)
 
 
 def _qwen3_flat_weight_prefix(
@@ -955,7 +956,7 @@ def _qwen3_flat_weight_prefix(
     ``lm_head.weight`` keeps its top-level name: upstream ``sanitize`` drops it
     for tied embeddings, and untied checkpoints own it there. When an untied
     checkpoint ships no head tensor at all (the official 8B embedding) and the
-    load runs inside ``embedding_load_scope()``, drop the module mlx_lm
+    load runs inside ``headless_load_scope()``, drop the module mlx_lm
     constructed: embed pooling reads body hidden states and never this
     module, and mlx ``nn.Module.__delattr__`` removes it from
     ``parameters()``, so strict load stops demanding a tensor Qwen never
@@ -971,7 +972,7 @@ def _qwen3_flat_weight_prefix(
         "lm_head.weight" not in weights
         and not model.args.tie_word_embeddings
         and getattr(model, "lm_head", None) is not None
-        and _EMBEDDING_LOAD_SCOPE.get()
+        and _HEADLESS_LOAD_SCOPE.get()
     ):
         delattr(model, "lm_head")
     return {
@@ -1038,6 +1039,18 @@ def _d3_weight_layout(model: Any, weights: Mapping[str, Any]) -> Mapping[str, An
     keys = [str(key) for key in weights]
     if not any(key.startswith(_D3_BACKBONE_PREFIXES) for key in keys):
         return weights
+    language_model = getattr(model, "language_model", None)
+    if (
+        "language_model.lm_head.weight" not in weights
+        and not getattr(
+            getattr(language_model, "args", None), "tie_word_embeddings", True
+        )
+        and getattr(language_model, "lm_head", None) is not None
+        and _HEADLESS_LOAD_SCOPE.get()
+    ):
+        # d3 scores codes with the readout, never the vocabulary head; the
+        # larger checkpoints ship no tensor for it and strict load would fail.
+        delattr(language_model, "lm_head")
     remapped = {}
     dropped = 0
     for key, value in weights.items():

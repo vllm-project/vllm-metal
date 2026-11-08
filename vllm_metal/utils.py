@@ -155,7 +155,13 @@ def get_model_download_path(
 def resolve_mlx_lm_model_path(
     model_name: str | Path, *, revision: str | None = None
 ) -> Path:
-    """Resolve a local checkpoint using mlx-lm's file filters and Hub selection."""
+    """Resolve a local checkpoint using mlx-lm's file filters and Hub selection.
+
+    The filters come from mlx_lm's text-model set plus any file a pooling
+    backend reads on top of the backbone. d3 scores prompts with
+    ``readout.safetensors``, which does not match ``model*.safetensors``; a repo
+    id served without it loads the backbone and then has no classify pooler.
+    """
     model_path = Path(model_name)
     if model_path.exists():
         return model_path
@@ -169,7 +175,9 @@ def resolve_mlx_lm_model_path(
 
     return Path(
         snapshot_download(
-            str(model_name), revision=revision, allow_patterns=DEFAULT_ALLOW_PATTERNS
+            str(model_name),
+            revision=revision,
+            allow_patterns=[*DEFAULT_ALLOW_PATTERNS, "readout.safetensors"],
         )
     )
 

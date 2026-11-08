@@ -1807,6 +1807,15 @@ class TestD3ReadoutPooler:
 
         assert float(logits.sum()) == pytest.approx(1.0, abs=1e-6)
 
+    def test_checkpoint_dir_skips_hub_resolution(self, tmp_path) -> None:
+        """The loader already resolved the dir; the pooler must not ask the Hub."""
+        config = self._model_config(tmp_path, model="vllm-sr/d3-nano")
+
+        pooler = D3ReadoutPooler(config, checkpoint_dir=tmp_path)
+
+        assert pooler.is_supported()
+        assert not D3ReadoutPooler(config).is_supported()
+
     def test_missing_readout_is_unsupported(self, tmp_path) -> None:
         config = self._model_config(tmp_path)
         (tmp_path / "readout.safetensors").unlink()

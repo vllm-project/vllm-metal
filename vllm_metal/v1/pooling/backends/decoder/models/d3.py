@@ -12,6 +12,7 @@ for them unnormalized; a request that sets ``use_activation`` gets upstream's
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, cast
 
 import mlx.core as mx
@@ -60,10 +61,10 @@ class D3ReadoutPooler:
 
     task: PoolingTask = CLASSIFY_TASK
 
-    def __init__(self, model_config: Any) -> None:
+    def __init__(self, model_config: Any, checkpoint_dir: Path | None = None) -> None:
         self.config = PoolingConfigView(model_config)
         self.d3_config = D3ConfigView(self.config)
-        self.readout = self._readout()
+        self.readout = self._readout(checkpoint_dir)
         # The checkpoint scores the prompt with the whole input in view, so the
         # runner turns each prefill segment into one bidirectional block.
         self.bidi_prefill = (
@@ -118,10 +119,14 @@ class D3ReadoutPooler:
             return mx.sigmoid(logits)
         return mx.softmax(logits, axis=-1)
 
-    def _readout(self) -> mx.array | None:
+    def _readout(self, checkpoint_dir: Path | None = None) -> mx.array | None:
         from vllm_metal.v1.model_adapter import _local_checkpoint_dir
 
-        model_path = _local_checkpoint_dir(self.config.model_config)
+        model_path = (
+            Path(checkpoint_dir)
+            if checkpoint_dir is not None
+            else _local_checkpoint_dir(self.config.model_config)
+        )
         if model_path is None:
             return None
         readout_path = model_path / D3_READOUT_FILE

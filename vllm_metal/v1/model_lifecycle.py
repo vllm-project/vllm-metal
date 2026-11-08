@@ -19,8 +19,8 @@ from vllm_metal.attention.impls.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
 from vllm_metal.attention.runtime.factory import build_hybrid_runtime_plan
 from vllm_metal.compat import (
     apply_compat_patches,
-    embedding_load_scope,
     ensure_lfm2_vl_torch_outputs,
+    headless_load_scope,
 )
 from vllm_metal.compiled_mlp import CompiledMLPBlocks
 from vllm_metal.config import get_config
@@ -39,6 +39,7 @@ from vllm_metal.v1.model_adapter import ModelAdapter
 from vllm_metal.v1.pooling.backends.decoder.factory import (
     build_decoder_pooling_backend,
 )
+from vllm_metal.v1.pooling.backends.decoder.models.d3 import D3_ARCH
 from vllm_metal.v1.pooling.backends.decoder.runtime import (
     is_embed_pooling_architecture,
 )
@@ -184,6 +185,8 @@ class ModelLifecycle:
     ) -> None:
         self._runner = runner
         self._model_adapter = model_adapter
+        # Set by ``_load_mlx_lm_text_model``; ``None`` for GGUF/AWQ/VLM loads.
+        self._resolved_model_path: Path | None = None
 
     def load(self) -> None:
         """Load the configured model and install runner runtime state."""
@@ -194,14 +197,16 @@ class ModelLifecycle:
             return
 
         request = GenerationLoadRequest.from_runner(self._runner, self._model_adapter)
-        # The headless lm_head shim is embedding-only: embedding pooling never
-        # calls logits. Pooling classify (Qwen3 reranker) reads lm_head, and
-        # generation loads must fail strict load on a headless checkpoint
-        # instead of the first forward pass.
-        with embedding_load_scope(
+        # Poolers that score hidden states never read lm_head: embeddings, and
+        # d3's code readout, whose larger checkpoints ship no head tensor at
+        # all. Pooling classify (Qwen3 reranker) reads lm_head logits, and
+        # generation needs the head, so those loads keep failing strict load on
+        # a headless checkpoint instead of the first forward pass.
+        architectures = getattr(request.hf_config, "architectures", None) or ()
+        with headless_load_scope(
             enabled=self._runner._is_pooling
-            and is_embed_pooling_architecture(
-                getattr(request.hf_config, "architectures", None) or ()
+            and (
+                is_embed_pooling_architecture(architectures) or D3_ARCH in architectures
             )
         ):
             loaded_model = self._load_generation(request)
@@ -221,6 +226,7 @@ class ModelLifecycle:
         runner._pooling_backend = build_decoder_pooling_backend(
             runner._forward_model,
             runner.model_config,
+            checkpoint_dir=self._resolved_model_path,
         )
 
     def install_decode_dispatch(self) -> None:
@@ -474,11 +480,14 @@ class ModelLifecycle:
         lazy: bool = False,
         revision: str | None = None,
     ) -> Any:
-        with _mlx_lm_compatible_model_path(model_name) as compatible_model_name:
-            model_path = resolve_mlx_lm_model_path(
-                str(compatible_model_name), revision=revision
-            )
-            model, _ = mlx_lm_load_model(model_path, lazy=lazy)
+        model_path = resolve_mlx_lm_model_path(model_name, revision=revision)
+        # Pooling backends read checkpoint files next to the weights
+        # (d3's readout), so remember the directory the loader actually used:
+        # re-resolving it from the config string needs the Hub and rejects any
+        # snapshot that is missing a file the loader never asked for.
+        self._resolved_model_path = model_path
+        with _mlx_lm_compatible_model_path(model_path) as compatible_model_name:
+            model, _ = mlx_lm_load_model(compatible_model_name, lazy=lazy)
         return model
 
     def _install_generation_model(
