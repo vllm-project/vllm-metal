@@ -106,7 +106,7 @@ def _wait_for_disk(base_url: str, nbytes: float, timeout: float = 120) -> None:
         time.sleep(0.5)
 
 
-def _restore(name: str, expected: dict, output: dict, delta: dict, disk: bool):
+def _restore_result(name: str, expected: dict, output: dict, delta: dict, disk: bool):
     """One summary row. A restore loads all of the probe but its last partial
     block, through the connector, from the expected tier, with exact output."""
     status = parity_report(
@@ -205,7 +205,9 @@ def test_restores_from_the_host_pool_and_from_disk(tmp_path) -> None:
             # still fails the disk row.
             _wait_for_disk(base_url, 1)
             pool, pool_delta = _probe(base_url)
-            record(_restore("host pool", reference, pool, pool_delta, disk=False))
+            record(
+                _restore_result("host pool", reference, pool, pool_delta, disk=False)
+            )
             restored = pool_delta["external_kv_transfer"] > 0
             if restored:
                 # Every full block of the five prompts goes to disk, written
@@ -220,7 +222,7 @@ def test_restores_from_the_host_pool_and_from_disk(tmp_path) -> None:
             with _server(tmp_path, "restart", *args) as base_url:
                 disk, disk_delta = _probe(base_url)
                 record(
-                    _restore(
+                    _restore_result(
                         "disk after restart", reference, disk, disk_delta, disk=True
                     )
                 )
@@ -290,4 +292,4 @@ def test_restore_row_requires_tier_coverage_and_exact_output(
         "load_bytes": 100.0,
         "disk_read": 0.0,
     } | changes
-    assert _restore("r", expected, output, delta, disk=disk)["passed"] is passed
+    assert _restore_result("r", expected, output, delta, disk=disk)["passed"] is passed
