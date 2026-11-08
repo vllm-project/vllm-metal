@@ -1,23 +1,25 @@
 #include <metal_stdlib>
 using namespace metal;
 
-template <typename T>
+template <typename T, typename S = T, bool use_initial_state_mask = false,
+          typename O = T>
 [[kernel]] void gdn_linear_attention(
     const device T *__restrict__ q          [[buffer(0)]],
     const device T *__restrict__ k          [[buffer(1)]],
     const device T *__restrict__ v          [[buffer(2)]],
     const device T *__restrict__ g          [[buffer(3)]],
     const device T *__restrict__ beta       [[buffer(4)]],
-    device T *__restrict__ state_pool       [[buffer(5)]],
+    device S *__restrict__ state_pool       [[buffer(5)]],
     const device int *__restrict__ cu_seqlens    [[buffer(6)]],
     const device int *__restrict__ slot_mapping  [[buffer(7)]],
-    device T *__restrict__ y                [[buffer(8)]],
+    device O *__restrict__ y                [[buffer(8)]],
     constant int &num_requests              [[buffer(9)]],
     constant int &Hk                        [[buffer(10)]],
     constant int &Hv                        [[buffer(11)]],
     constant int &Dk                        [[buffer(12)]],
     constant int &Dv                        [[buffer(13)]],
     constant int64_t &state_stride [[buffer(14)]],
+    const device bool *has_initial_state    [[buffer(15)]],
     uint3 gid [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_simdgroup]])
 {
@@ -38,15 +40,18 @@ template <typename T>
 
     // State pool slot for this request: [max_seqs, Hv, Dv, Dk]
     const int slot = slot_mapping[req_idx];
-    device T *state_ptr = state_pool
+    // PAD requests own neither output nor state. Do not form a negative pointer.
+    if (slot < 0 || seq_len == 0) return;
+    device S *state_ptr = state_pool
         + int64_t(slot) * state_stride + (hv_idx * Dv + dv_idx) * Dk;
 
     // n_per_t = Dk / 32 elements per thread (supports Dk up to 256)
     const int n_per_t = Dk / 32;
+    const bool load_state = !use_initial_state_mask || has_initial_state[req_idx];
     float state[8];
     for (int i = 0; i < n_per_t; ++i) {
         int s_idx = n_per_t * dk_idx + i;
-        state[i] = (s_idx < Dk)
+        state[i] = (load_state && s_idx < Dk)
             ? static_cast<float>(state_ptr[s_idx]) : 0.0f;
     }
 
@@ -56,7 +61,7 @@ template <typename T>
     const device T *v_ = v + seq_start * Hv * Dv + hv_idx * Dv;
     const device T *g_ = g + seq_start * Hv;
     const device T *beta_ = beta + seq_start * Hv;
-    device T *y_ = y + seq_start * Hv * Dv + hv_idx * Dv;
+    device O *y_ = y + seq_start * Hv * Dv + hv_idx * Dv;
 
     // === Main recurrence loop ===
     for (int t = 0; t < seq_len; ++t) {
@@ -86,7 +91,7 @@ template <typename T>
 
         // First thread in SIMD group writes output
         if (dk_idx == 0) {
-            y_[dv_idx] = static_cast<T>(out);
+            y_[dv_idx] = static_cast<O>(out);
         }
 
         // Advance to next timestep
@@ -102,24 +107,33 @@ template <typename T>
     for (int i = 0; i < n_per_t; ++i) {
         int s_idx = n_per_t * dk_idx + i;
         if (s_idx < Dk) {
-            state_ptr[s_idx] = static_cast<T>(state[i]);
+            state_ptr[s_idx] = static_cast<S>(state[i]);
         }
     }
 }
 
 // Template instantiations — same pattern as reshape_and_cache.metal
-#define instantiate_gdn(type)                                      \
-  template [[host_name("gdn_linear_attention_" #type)]]            \
-  [[kernel]] void gdn_linear_attention<type>(                      \
+#define instantiate_gdn(type, state_type, out_type, use_initial, suffix) \
+  template [[host_name("gdn_linear_attention_" #type suffix)]]     \
+  [[kernel]] void gdn_linear_attention<type, state_type, use_initial, out_type>( \
       const device type*, const device type*,                      \
       const device type*, const device type*,                      \
-      const device type*, device type*,                            \
+      const device type*, device state_type*,                      \
       const device int*, const device int*,                        \
-      device type*,                                                \
+      device out_type*,                                            \
       constant int&, constant int&, constant int&,                 \
       constant int&, constant int&,                                \
-      constant int64_t&, uint3, uint);
+      constant int64_t&, const device bool*, uint3, uint);
 
-instantiate_gdn(float);
-instantiate_gdn(half);
-instantiate_gdn(bfloat16_t);
+// Preserve all existing MLX entry points and their state storage precision.
+instantiate_gdn(float, float, float, false, "");
+instantiate_gdn(half, half, half, false, "");
+instantiate_gdn(bfloat16_t, bfloat16_t, bfloat16_t, false, "");
+instantiate_gdn(half, float, half, false, "_state_float");
+instantiate_gdn(bfloat16_t, float, bfloat16_t, false, "_state_float");
+instantiate_gdn(float, float, float, true, "_initial");
+instantiate_gdn(half, float, half, true, "_state_float_initial");
+instantiate_gdn(bfloat16_t, float, bfloat16_t, true, "_state_float_initial");
+instantiate_gdn(float, float, half, true, "_out_half_initial");
+instantiate_gdn(float, float, bfloat16_t, true, "_out_bfloat16_t_initial");
+#undef instantiate_gdn
