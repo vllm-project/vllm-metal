@@ -730,6 +730,7 @@ class TestMetalPoolingCapabilities:
     ) -> None:
         class _SupportedEmbedPooler:
             task = "embed"
+            bidi_prefill = False
 
             def is_supported(self) -> bool:
                 return True
@@ -747,6 +748,29 @@ class TestMetalPoolingCapabilities:
                 model_view,
                 (_SupportedEmbedPooler(), _SupportedEmbedPooler()),
             )
+
+    def test_bidi_prefill_follows_the_served_pooler(self) -> None:
+        class _Pooler:
+            task = "embed"
+
+            def __init__(self, bidi: bool) -> None:
+                self.bidi_prefill = bidi
+
+            def is_supported(self) -> bool:
+                return True
+
+            def pool_one(self, hidden_states, span):
+                del hidden_states, span
+                return torch.zeros((1,), dtype=torch.float32)
+
+        config = PoolingConfigView(_pooling_model_config())
+        model_view = DecoderModelView(_PoolingModel())
+
+        causal = MetalDecoderPoolingBackend(config, model_view, (_Pooler(False),))
+        full_view = MetalDecoderPoolingBackend(config, model_view, (_Pooler(True),))
+
+        assert causal.bidi_prefill() is False
+        assert full_view.bidi_prefill() is True
 
     @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
     @pytest.mark.parametrize("length", [7, 515])

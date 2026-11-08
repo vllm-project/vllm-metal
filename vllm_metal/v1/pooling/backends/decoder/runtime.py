@@ -152,10 +152,7 @@ class MetalDecoderPoolingBackend:
         return tuple(self.poolers_by_task)
 
     def bidi_prefill(self) -> bool:
-        return any(
-            getattr(pooler, "bidi_prefill", False)
-            for pooler in self.poolers_by_task.values()
-        )
+        return any(pooler.bidi_prefill for pooler in self.poolers_by_task.values())
 
     def validate_params(self, pooling_params: PoolingParams) -> None:
         self.config.reject_unsupported_pooler_config()

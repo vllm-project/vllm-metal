@@ -1039,12 +1039,20 @@ def _d3_weight_layout(model: Any, weights: Mapping[str, Any]) -> Mapping[str, An
     if not any(key.startswith(_D3_BACKBONE_PREFIXES) for key in keys):
         return weights
     remapped = {}
+    dropped = 0
     for key, value in weights.items():
         if key.startswith("visual.") or key.startswith("vision_tower"):
+            dropped += 1
             continue
         if key.startswith(_D3_BACKBONE_PREFIXES):
             key = "language_model.model." + key[len("language_model.") :]
         remapped[key] = value
+    if dropped:
+        logger.info(
+            "Dropped %d vision tensor(s) for a text-only qwen3_5 load; "
+            "multimodal inputs are not served on this path.",
+            dropped,
+        )
     return remapped
 
 

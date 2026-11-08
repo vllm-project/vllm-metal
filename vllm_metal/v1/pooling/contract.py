@@ -62,6 +62,9 @@ class DecoderPooler(Protocol):
     """Task-specific strategy used by a decoder pooling backend."""
 
     task: PoolingTask
+    # Prefill segments must be scored with the whole input in view (code-readout
+    # models). Full-attention layers get one bidirectional block per segment.
+    bidi_prefill: bool
 
     def is_supported(self) -> bool: ...
 
