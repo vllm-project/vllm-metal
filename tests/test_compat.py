@@ -1147,3 +1147,37 @@ class TestQwen3FlatPrefixRealStrictLoad:
             assert not hasattr(pooling, "lm_head")
         finally:
             _unwrap_qwen3_sanitize(model_cls)
+
+
+class TestD3WeightLayoutTransform:
+    """Unit tests for the remap applied before mlx_lm's Qwen3.5 sanitize."""
+
+    def test_flat_d3_backbone_gets_wrapper_prefix(self) -> None:
+        weights = {
+            "language_model.embed_tokens.weight": "W-embed",
+            "language_model.layers.0.self_attn.q_proj.weight": "W-q",
+            "language_model.norm.weight": "W-norm",
+            "visual.patch_embed.proj.weight": "W-patch",
+            "visual.blocks.0.attn.qkv.weight": "W-visual",
+        }
+
+        out = compat._d3_weight_layout(None, weights)
+
+        assert set(out) == {
+            "language_model.model.embed_tokens.weight",
+            "language_model.model.layers.0.self_attn.q_proj.weight",
+            "language_model.model.norm.weight",
+        }
+        assert out["language_model.model.embed_tokens.weight"] == "W-embed"
+
+    def test_wrapper_layout_passes_through(self) -> None:
+        weights = {
+            "language_model.model.layers.0.self_attn.q_proj.weight": "W-q",
+        }
+
+        assert compat._d3_weight_layout(None, weights) == weights
+
+    def test_other_layouts_pass_through(self) -> None:
+        weights = {"model.embed_tokens.weight": "W-embed", "lm_head.weight": "W-head"}
+
+        assert compat._d3_weight_layout(None, weights) == weights

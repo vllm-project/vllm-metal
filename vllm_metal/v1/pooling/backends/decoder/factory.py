@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from vllm_metal.v1.pooling.backends.decoder.models.d3 import D3ReadoutPooler
 from vllm_metal.v1.pooling.backends.decoder.models.qwen3 import (
     Qwen3RerankerPooler,
 )
@@ -32,5 +33,6 @@ def build_decoder_pooling_backend(
             model_config,
             tokenizer,
         ),
+        D3ReadoutPooler(model_config),
     )
     return MetalDecoderPoolingBackend(config, model_view, poolers)

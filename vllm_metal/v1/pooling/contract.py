@@ -79,6 +79,10 @@ class DecoderPoolingBackend(PoolingBackend, Protocol):
         offset_caches: list[OffsetCache] | None,
     ) -> mx.array: ...
 
+    def bidi_prefill(self) -> bool:
+        """Whether prefill segments must be scored with the whole input in view."""
+        ...
+
     def pool_packed(
         self,
         hidden_states: mx.array,

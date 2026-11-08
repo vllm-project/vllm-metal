@@ -1660,6 +1660,16 @@ class MetalModelRunner:
                     DecoderPoolingBackend,
                     self._pooling_backend,
                 )
+                # A code-readout model scores the prompt with the whole input in
+                # view: one bidirectional block per prefill segment. Linear
+                # (GDN) layers keep their recurrence, so only full-attention
+                # layers take the block.
+                if ctx is not None and decoder_pooling_backend.bidi_prefill():
+                    ctx.bidi_layer_kinds = frozenset({"full"})
+                    ctx.segment_bidi_ranges = [
+                        [(pr.start_pos, pr.start_pos + len(pr.token_ids))]
+                        for pr in prefill_reqs
+                    ]
                 pooling_hidden_states = decoder_pooling_backend.forward_packed(
                     input_ids,
                     offset_caches,

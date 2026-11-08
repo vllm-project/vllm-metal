@@ -31,6 +31,9 @@ from vllm_metal.v1.model_lifecycle import (  # noqa: E402
     LoadedGenerationModel,
     ModelLifecycle,
 )
+from vllm_metal.v1.pooling.backends.decoder.models.d3 import (  # noqa: E402
+    D3ReadoutPooler,
+)
 from vllm_metal.v1.pooling.backends.decoder.models.qwen3 import (  # noqa: E402
     Qwen3RerankerPooler,
 )
@@ -1670,3 +1673,60 @@ class TestMetalPoolingProfileWarmup:
         assert sequence_model.calls == 1
         runner._extract_logits.assert_not_called()
         set_cache_limit.assert_called_once_with(80)
+
+
+class TestD3ReadoutPooler:
+    def _model_config(self, readout_dir, **overrides):
+        readout = mx.array(
+            [[1.0, 0.0], [0.0, 2.0], [0.5, 0.5]],
+            dtype=mx.float32,
+        )
+        mx.save_safetensors(
+            str(readout_dir / "readout.safetensors"), {"weight": readout}
+        )
+        hf_config = _hf_config(
+            architectures=["D3ForSequenceClassification"],
+            decision_config={
+                "codes": ["A", "B", "C"],
+                "attention_mode": "noncausal_full_attention",
+            },
+        )
+        values = {
+            "model": str(readout_dir),
+            "hf_config": hf_config,
+            "pooler_config": _pooler_config(task="classify", use_activation=False),
+        }
+        values.update(overrides)
+        return _pooling_model_config(**values)
+
+    def test_scores_last_token_against_the_readout(self, tmp_path) -> None:
+        pooler = D3ReadoutPooler(self._model_config(tmp_path))
+        span = DecoderPoolingSpan(
+            start_row=0,
+            num_tokens=2,
+            is_complete=True,
+            pooling_params=_pooling_params(task="classify", use_activation=False),
+        )
+
+        assert pooler.is_supported()
+        assert pooler.bidi_prefill
+        logits = pooler.pool_one(
+            mx.array([[[9.0, 9.0], [1.0, 2.0]]], dtype=mx.float32),
+            span,
+        )
+
+        assert logits.tolist() == pytest.approx([1.0, 4.0, 1.5])
+
+    def test_missing_readout_is_unsupported(self, tmp_path) -> None:
+        config = self._model_config(tmp_path)
+        (tmp_path / "readout.safetensors").unlink()
+
+        assert not D3ReadoutPooler(config).is_supported()
+
+    def test_other_architectures_leave_d3_disabled(self, tmp_path) -> None:
+        config = self._model_config(
+            tmp_path,
+            hf_config=_hf_config(architectures=["Qwen3ForCausalLM"]),
+        )
+
+        assert not D3ReadoutPooler(config).is_supported()

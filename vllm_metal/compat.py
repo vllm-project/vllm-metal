@@ -71,6 +71,7 @@ def apply_compat_patches() -> None:
     _apply_bytelevel_patch_during_registration()
     _patch_mlx_lm_qwen35_fp8_sanitize()
     _patch_mlx_lm_qwen3_flat_weight_prefix()
+    _patch_mlx_lm_d3_weight_layout()
     _patch_mlx_lm_minicpm4_model_type()
     _patch_transformers_exaone4_config()
 
@@ -977,6 +978,74 @@ def _qwen3_flat_weight_prefix(
         key if key.startswith("lm_head.") else f"model.{key}": value
         for key, value in weights.items()
     }
+
+
+def _patch_mlx_lm_d3_weight_layout() -> bool:
+    """Teach mlx_lm's Qwen3.5 wrapper to load a d3 decision checkpoint.
+
+    d3 checkpoints (``vllm-sr/d3-*``) keep the Qwen3.5 backbone as
+    ``language_model.layers.*`` next to a ``visual.*`` tower. mlx_lm's
+    ``qwen3_5`` wrapper expects ``language_model.model.*`` and, on a text-only
+    load, rejects the vision tensors that come with the tower. Re-key the
+    backbone and drop the tower before upstream ``sanitize`` runs.
+
+    This is a checkpoint-layout shim, not permanent vllm-metal behavior.
+    """
+    from importlib import import_module
+    from importlib.util import find_spec
+
+    if find_spec("mlx_lm.models.qwen3_5") is None:
+        return False
+    try:
+        qwen3_5 = import_module("mlx_lm.models.qwen3_5")
+    except ImportError as exc:
+        logger.warning(
+            "Could not import mlx_lm.models.qwen3_5 while installing the d3 "
+            "weight layout compatibility patch: %s",
+            exc,
+        )
+        return False
+    model_cls = getattr(qwen3_5, "Model", None)
+    if model_cls is None:
+        logger.warning(
+            "Could not install the d3 weight layout compatibility patch: "
+            "mlx_lm.models.qwen3_5 has no Model class."
+        )
+        return False
+    patched = _wrap_model_sanitize(
+        model_cls,
+        "_vllm_metal_d3_weight_layout_patch",
+        _d3_weight_layout,
+    )
+    if patched:
+        logger.debug("Patched mlx_lm d3 weight layout compatibility")
+    return patched
+
+
+_D3_BACKBONE_PREFIXES = (
+    "language_model.layers.",
+    "language_model.embed_tokens.",
+    "language_model.norm.",
+)
+
+
+def _d3_weight_layout(model: Any, weights: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Drop d3's vision tower and re-key its flat backbone for mlx_lm.
+
+    Keys already in the wrapper layout (``language_model.model.*``, every
+    mlx-community conversion) pass through untouched.
+    """
+    keys = [str(key) for key in weights]
+    if not any(key.startswith(_D3_BACKBONE_PREFIXES) for key in keys):
+        return weights
+    remapped = {}
+    for key, value in weights.items():
+        if key.startswith("visual.") or key.startswith("vision_tower"):
+            continue
+        if key.startswith(_D3_BACKBONE_PREFIXES):
+            key = "language_model.model." + key[len("language_model.") :]
+        remapped[key] = value
+    return remapped
 
 
 def _patch_mlx_lm_minicpm4_model_type() -> None:
