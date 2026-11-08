@@ -387,11 +387,7 @@ class MetalPlatform(Platform):
             ]
             unsupported_controls += [
                 name
-                for name in (
-                    "logprob_token_ids",
-                    "prompt_logprobs",
-                    "structured_outputs",
-                )
+                for name in ("logprob_token_ids", "structured_outputs")
                 if getattr(params, name, None) is not None
             ]
         if unsupported_controls:

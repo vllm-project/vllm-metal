@@ -446,6 +446,12 @@ class TestMetalPlatform:
             with pytest.raises(VLLMValidationError, match="repetition_penalty"):
                 MetalPlatform.validate_request({}, params)
 
+    def test_mps_accepts_prompt_logprobs(self, monkeypatch):
+        monkeypatch.setattr("vllm_metal.envs.VLLM_METAL_BACKEND", "mps")
+        MetalPlatform.validate_request(
+            {}, SamplingParams(temperature=0, prompt_logprobs=5)
+        )
+
     def test_check_and_update_config_rejects_pipeline_with_tensor_parallel(
         self,
     ) -> None:

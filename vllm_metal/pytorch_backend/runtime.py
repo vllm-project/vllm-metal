@@ -85,7 +85,7 @@ def compute_topk_scores(
 ):
     from vllm.v1.sample.sampler import Sampler
 
-    # Explicit-token and prompt logprobs remain rejected by validate_request.
+    # Explicit-token logprobs remain rejected by validate_request.
     assert max_per_req_token_ids == 0
     scores = logits.float() if logits_mode else Sampler.compute_logprobs(logits)
     # Keep upstream's compiled rank helper eager on MPS.
