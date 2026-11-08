@@ -264,7 +264,7 @@ def test_primitive_vs_reference_varlen(
 
 
 @pytest.mark.parametrize(
-    "mixed_decode_floor", [False, True], ids=["m5", "pre-m5"], indirect=True
+    "pre_m5_mixed_split", [False, True], ids=["m5", "pre-m5"], indirect=True
 )
 @pytest.mark.parametrize(
     "decode_lengths,head_size",
@@ -286,11 +286,11 @@ def test_primitive_vs_reference_varlen(
 def test_mixed_batch_splits_decode_rows(
     decode_lengths: list[int],
     head_size: int,
-    mixed_decode_floor: bool,
+    pre_m5_mixed_split: bool,
     force_tiled_prefill,
 ) -> None:
     """Split decode rows take the decode kernel; prefill rows keep tiled bit-for-bit."""
-    split_decode = not mixed_decode_floor or sum(decode_lengths) >= 512
+    split_decode = not pre_m5_mixed_split or sum(decode_lengths) >= 512
     decode_rows = len(decode_lengths)
     decode_context = max(decode_lengths)
     seq_lens = [(1, length) for length in decode_lengths] + [(32, 64)]
@@ -332,7 +332,7 @@ def test_mixed_batch_splits_decode_rows(
     np.testing.assert_array_equal(mixed[decode_rows:], whole_tiled[decode_rows:])
 
 
-@pytest.mark.parametrize("mixed_decode_floor", [True], ids=["pre-m5"], indirect=True)
+@pytest.mark.parametrize("pre_m5_mixed_split", [True], ids=["pre-m5"], indirect=True)
 @pytest.mark.parametrize(
     "decode_lengths,split_decode",
     [([256, 256], False), ([512, 64], True)],
@@ -340,7 +340,7 @@ def test_mixed_batch_splits_decode_rows(
 def test_mixed_batch_without_length_plan_bounds_work_by_longest_row(
     decode_lengths: list[int],
     split_decode: bool,
-    mixed_decode_floor: bool,
+    pre_m5_mixed_split: bool,
     force_tiled_prefill,
 ) -> None:
     """Without a length plan the longest row is a lower bound on the decode work."""

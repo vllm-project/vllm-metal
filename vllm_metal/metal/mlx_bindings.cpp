@@ -124,10 +124,11 @@ NB_MODULE(_paged_ops, m) {
         &override_detected_gpu_core_count_for_test, nb::arg("cores"),
         "Test-only. A positive count replaces hardware detection; zero simulates "
         "failure and -1 restores detection. Production must not call this.");
-  m.def("_override_mixed_decode_floor_for_test",
-        &override_mixed_decode_floor_for_test, nb::arg("floor"),
-        "Test-only. 1 or 0 forces the pre-M5 mixed-split decode-work floor on "
-        "or off; -1 restores hardware detection. Returns the previous value. "
+  m.def("_override_pre_m5_mixed_split_for_test",
+        &override_pre_m5_mixed_split_for_test, nb::arg("pre_m5"),
+        "Test-only. 1 forces the pre-M5 mixed split (serialized halves and the "
+        "decode-work floor), 0 the M5 one (concurrent halves, no floor); -1 "
+        "restores hardware detection. Returns the previous value. "
         "Production must not call this.");
   m.def("_set_paged_dispatch_diagnostics", &set_paged_dispatch_diagnostics,
         nb::arg("enabled"),

@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <mutex>
+#include <optional>
 
 // ---------------------------------------------------------------------------
 // Library caching
@@ -103,8 +104,8 @@ NaxPrefillTraceResult take_nax_prefill_dispatch_trace() {
 
 // Split a mixed batch's decode rows on pre-M5 GPUs only when they carry at
 // least this much KV work (the sum of their context lengths). #1159 measured
-// it on M1 Max and M5 while the split's halves still serialized; the
-// concurrent encoding removed that overhead on M5, so M5 splits every batch.
+// it on M1 Max and M5 with the split's halves serialized, which pre-M5 GPUs
+// keep. On M5 the halves run concurrently and every batch splits.
 constexpr int64_t kMixedDecodeMinWork = 512;
 
 // Window mode for spec-decode verification (per-token kernel): query rows
@@ -284,24 +285,27 @@ static const bool nax_gqa_prefill_enabled_ = []() {
   return value == nullptr || std::string(value) == "1";
 }();
 
-// -1 follows the hardware; 0 or 1 forces the pre-M5 mixed-split floor off or
-// on. Set only by `_override_mixed_decode_floor_for_test`.
-static std::atomic<int> g_test_mixed_decode_floor{-1};
+// Pre-M5 GPUs keep #1159's mixed split: serialized halves and the
+// decode-work floor. On M2 Ultra the concurrent halves were slower than the
+// serialized split for one or two long decode rows (#1189), so they stay M5
+// only until that is understood. -1 follows the hardware; 0 or 1 forces the
+// M5 or pre-M5 split. Set only by `_override_pre_m5_mixed_split_for_test`.
+static std::atomic<int> g_test_pre_m5_mixed_split{-1};
 
-static bool mixed_decode_floor() {
-  const int override = g_test_mixed_decode_floor.load(std::memory_order_relaxed);
+static bool pre_m5_mixed_split() {
+  const int override = g_test_pre_m5_mixed_split.load(std::memory_order_relaxed);
   if (override >= 0) return override != 0;
   static const bool pre_m5 = !metal::device(Device::gpu).mtl_device()->supportsFamily(
       static_cast<MTL::GPUFamily>(hardware::kApple10));
   return pre_m5;
 }
 
-int override_mixed_decode_floor_for_test(int floor) {
-  if (floor < -1 || floor > 1)
+int override_pre_m5_mixed_split_for_test(int pre_m5) {
+  if (pre_m5 < -1 || pre_m5 > 1)
     throw std::invalid_argument(
-        "mixed decode floor override must be -1, 0 or 1 (got " +
-        std::to_string(floor) + ")");
-  return g_test_mixed_decode_floor.exchange(floor, std::memory_order_relaxed);
+        "pre-M5 mixed split override must be -1, 0 or 1 (got " +
+        std::to_string(pre_m5) + ")");
+  return g_test_pre_m5_mixed_split.exchange(pre_m5, std::memory_order_relaxed);
 }
 
 void init_nax_library_path(const std::string& path) {
@@ -697,7 +701,7 @@ struct PagedAttentionMetadata {
   bool use_sinks;
   bool nax_ready;
   bool nax_enabled;
-  bool mixed_decode_floor;
+  bool pre_m5_mixed_split;
   int num_decode_requests;
   int num_decode_tokens;
   int max_decode_context_len;
@@ -774,10 +778,10 @@ static PagedAttentionPlan select_paged_attention_route(
 
   // Split ordinary decode rows from NAX or tiled prefill: a one-row decode
   // sequence would otherwise occupy a whole BQ-row prefill tile with no
-  // KV-length parallelism. The two halves run concurrently, so on M5 the
+  // KV-length parallelism. On M5 the two halves run concurrently, so the
   // split pays no serialization cost even for short decode rows
-  // (tools/benchmark/mixed_decode_split_benchmark.py). Pre-M5 GPUs keep the
-  // decode-work floor until they are measured with concurrent halves. The
+  // (tools/benchmark/mixed_decode_split_benchmark.py). Pre-M5 GPUs serialize
+  // the halves and keep the decode-work floor (see pre_m5_mixed_split). The
   // decode-prefix length plan carries the exact work; without one, the
   // longest row is a lower bound on it, so uneven rows are never split on
   // overcounted work. Spec verify windows keep their whole-batch route.
@@ -787,7 +791,7 @@ static PagedAttentionPlan select_paged_attention_route(
   const bool split_mixed_batch = m.num_decode_requests > 0
       && m.num_decode_requests < num_seqs
       && m.num_decode_tokens == m.num_decode_requests
-      && (!m.mixed_decode_floor || decode_work >= kMixedDecodeMinWork)
+      && (!m.pre_m5_mixed_split || decode_work >= kMixedDecodeMinWork)
       && (use_nax || tile_config.has_value());
   PagedAttentionPlan plan;
   plan.total_q_tokens = total_q_tokens;
@@ -1005,10 +1009,12 @@ struct PagedAttentionEncoding {
 
 // Split-KV scratch factory shared by the split paths below: partial output
 // + softmax (max, exp-sum) stats.  Tiny (~64 KB tmp_out @ conc=1/8K).
-// add_temporary keeps them alive until the command buffer completes; MLX
-// auto-inserts a barrier between the two dispatches via input/output
-// dependency tracking (set_output here -> set_input in the reduce),
-// mirroring MLX's own sdpa_vector_2pass.
+// add_temporary keeps them alive until the command buffer completes. Outside
+// a concurrent scope, MLX inserts the barrier between the two dispatches from
+// input/output dependency tracking (set_output here -> set_input in the
+// reduce), mirroring MLX's own sdpa_vector_2pass. Inside one it tracks no
+// hazards, so the reduce adds an explicit barrier (see
+// PagedAttentionEncoding::concurrent).
 static array make_paged_attention_temp(
     metal::CommandEncoder& enc, Shape shape, Dtype dtype) {
   array a(std::move(shape), dtype, nullptr, {});
@@ -1273,7 +1279,7 @@ static void dispatch_paged_attention_v2_online(
   metadata.use_sinks = sinks != nullptr;
   metadata.nax_ready = nax_lib_ready_;
   metadata.nax_enabled = nax_enabled_;
-  metadata.mixed_decode_floor = mixed_decode_floor();
+  metadata.pre_m5_mixed_split = pre_m5_mixed_split();
   metadata.num_decode_requests = num_decode_requests;
   metadata.num_decode_tokens = num_decode_tokens;
   metadata.max_decode_context_len = max_decode_context_len;
@@ -1374,11 +1380,14 @@ static void dispatch_paged_attention_mixed(
   const bool nax = plan.route == PagedAttentionRoute::MixedNaxSplit ||
       plan.route == PagedAttentionRoute::MixedNaxUnsplit;
   // Both halves write disjoint rows of `out`. MLX's hazard tracking only sees
-  // the shared buffer and would serialize them, so encode them in one
+  // the shared buffer and would serialize them, so on M5 encode them in one
   // concurrent scope; a split-KV reduce inside it adds its own barrier.
+  // Pre-M5 GPUs keep the serialized halves (see pre_m5_mixed_split).
   auto& enc = metal::get_command_encoder(arrays.s);
+  const bool concurrent = !metadata.pre_m5_mixed_split;
   {
-    auto concurrent = enc.start_concurrent();
+    std::optional<metal::CommandEncoder::ConcurrentContext> scope;
+    if (concurrent) scope.emplace(enc);
     // Decode rows lead the batch, so the first prefill sequence starts at
     // q-block cu_seqlens_q[D] / BQ + D with D = num_decode_requests.
     if (nax) {
@@ -1418,7 +1427,7 @@ static void dispatch_paged_attention_mixed(
         metadata.max_decode_context_len,
         metadata.num_decode_tokens, metadata.gqa_disabled, 0,
         prefix_plan ? metadata.gqa_length_plan : GqaDecodeLengthPlan{},
-        -1, -1, /*concurrent=*/true);
+        -1, -1, concurrent);
     g_last_nax_split.store(nax_split, std::memory_order_relaxed);
     g_last_nax_heads_per_tg.store(nax_heads_per_tg, std::memory_order_relaxed);
   }

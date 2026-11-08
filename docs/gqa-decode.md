@@ -210,9 +210,10 @@ Mixed batches use an explicit decode sub-batch. The native split separates the
 leading ordinary decode rows from the prefill kernel (#851 for tiled prefill,
 and NAX on M5) whenever the batch carries decode metadata; pre-M5 GPUs also
 require the decode rows to hold at least 512 tokens of KV work. The two
-kernels write disjoint rows of one output, so they are encoded in one
+kernels write disjoint rows of one output, so on M5 they are encoded in one
 concurrent scope and overlap on the GPU; a split-KV reduce inside it waits on
-an explicit barrier for its producer. `sdpa_forward` passes a
+an explicit barrier for its producer. Pre-M5 GPUs encode the halves one after
+the other. `sdpa_forward` passes a
 `GqaDecodeLengthPlan` built from only those rows' context lengths (capability
 `gqa_mixed_decode_plan`); the pre-M5 work is the plan's exact sum of those
 lengths, and without a plan the longest decode row stands in for it as a lower
@@ -348,7 +349,10 @@ enablement or performance claims of this two-tier routing policy:
    measured no slower than the unsplit kernel down to one 256-token decode
    row next to a 64-token prefill
    (`tools/benchmark/mixed_decode_split_benchmark.py`). Pre-M5 GPUs keep the
-   floor until the concurrent split is measured there.
+   serialized split and the floor: on M2 Ultra the concurrent halves were
+   slower than the serialized split for one or two long decode rows (for
+   example 288 vs 210 µs/layer at a 256-token prefill with one 1024-token
+   row). Overlapping them there needs that slowdown understood first.
 3. **TurboQuant decode:** `paged_attention_gqa_decode_tq` reads packed K/V
    and their scales in place, dequantizing each lane's slice in registers with
    no per-step materialization of the history. Its partials stay in the
