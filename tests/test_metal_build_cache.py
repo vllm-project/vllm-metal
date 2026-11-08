@@ -181,7 +181,7 @@ def test_hash_changes_with_source_bytes(patched, source_name):
 
 @pytest.mark.parametrize(
     "source_name",
-    ["mps_src", "gdn_kernels", "kernels", "device", "device_src", "bld", "consts"],
+    ["mps_src", "kernels", "device", "device_src", "bld", "consts"],
 )
 def test_mps_hash_changes_with_source_bytes(
     patched, tmp_path, monkeypatch, source_name

@@ -514,7 +514,6 @@ def _mps_input_hash() -> str:
     h = hashlib.sha256(str(torch.__version__).encode())
     for path in (
         _MPS_DIR / "mps_ops.mm",
-        _GDN_KERNELS,
         _KERNELS,
         _DEVICE,
         _DEVICE_SRC,
