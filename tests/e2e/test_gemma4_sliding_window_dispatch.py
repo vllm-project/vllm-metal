@@ -18,7 +18,7 @@ Gemma4 E2B is used (not 31B) because:
 
 Run:
     GEMMA4_MODEL_PATH=/path/to/gemma-4-E2B-it \\
-        pytest tests/test_gemma4_sliding_window_dispatch.py -v -s -m slow
+        pytest tests/e2e/test_gemma4_sliding_window_dispatch.py -v -s -m slow
 """
 
 from __future__ import annotations

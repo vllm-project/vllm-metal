@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-TOOL = Path(__file__).resolve().parent.parent / "tools" / "hybrid_apc_parity_matrix.py"
+TOOL = Path(__file__).resolve().parents[2] / "tools" / "hybrid_apc_parity_matrix.py"
 
 
 @pytest.mark.slow

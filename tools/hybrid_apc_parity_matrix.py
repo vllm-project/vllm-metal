@@ -30,7 +30,7 @@ thing: the cached child must resolve to align mode with
 ``mamba_block_size == block_size`` and must admit at least one request at a
 block-aligned ``num_computed_tokens > 0`` (a genuine restore).
 
-``tests/test_hybrid_prefix_caching_e2e.py`` wraps this harness with ``--quick``.
+``tests/e2e/test_hybrid_prefix_caching_e2e.py`` wraps this harness with ``--quick``.
 The quick gate caps both cache modes at the resolved 544-token block size so
 prefill-shape rounding does not confound the one-block comparisons.
 Use the full matrix to diagnose other scheduling configurations.

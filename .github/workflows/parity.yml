@@ -131,7 +131,7 @@ jobs:
         run: |
           source .venv-vllm-metal/bin/activate
           uv pip install pytest
-          python -m pytest tests/test_draft_stats_e2e.py -k 'same_model_acceptance or controlled_rejection' \
+          python -m pytest tests/e2e/test_draft_stats_e2e.py -k 'same_model_acceptance or controlled_rejection' \
             -q -s --basetemp "$RUNNER_TEMP/parity/acceptance" \
             --junitxml "$RUNNER_TEMP/parity/acceptance.xml"
       - name: Check KV offload restores
@@ -143,7 +143,7 @@ jobs:
         run: |
           source .venv-vllm-metal/bin/activate
           uv pip install pytest
-          QWEN3_MODEL_PATH="$MODEL_PATH" python -m pytest tests/test_kv_offload_e2e.py \
+          QWEN3_MODEL_PATH="$MODEL_PATH" python -m pytest tests/e2e/test_kv_offload_e2e.py \
             -q -s --basetemp "$RUNNER_TEMP/parity/kv-offload" \
             --junitxml "$RUNNER_TEMP/parity/kv-offload.xml"
       - name: Summarize parity

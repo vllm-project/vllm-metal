@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Seeded chunked prefill with real scheduling, sampling, and draft KV writes.
 
-Run explicitly with ``pytest -m slow tests/test_chunked_prefill_sampling_e2e.py``.
+Run explicitly with ``pytest -m slow tests/e2e/test_chunked_prefill_sampling_e2e.py``.
 """
 
 import os
