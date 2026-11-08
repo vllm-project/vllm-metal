@@ -19,38 +19,16 @@ _IMAGE_GRID_THW_2X2 = (1, 4, 4)
 _IMAGE_TOKEN_COUNT_2X2 = 4
 _RAW_PATCH_COUNT_2X2 = 16
 _TEXT_TOKEN_ID = 10
-_VISION_START_TOKEN_ID = 20
-_IMAGE_PLACEHOLDER_TOKEN_ID = 30
+# PaddleOCR-VL-1.6 config.json token ids.
+_IMAGE_TOKEN_ID = 100295
+_VIDEO_TOKEN_ID = 101307
+_VISION_START_TOKEN_ID = 101305
 
 
 class _RecordingLanguageModel:
-    def __init__(self, *, scalar_delta: bool = False) -> None:
-        self._scalar_delta = scalar_delta
+    def __init__(self) -> None:
         self.model = SimpleNamespace(embed_tokens=lambda input_ids: input_ids + 1)
-        self.rope_calls: list[dict[str, Any]] = []
         self.call_lm_calls: list[dict[str, Any]] = []
-
-    def get_rope_index(
-        self,
-        input_ids: mx.array,
-        image_grid_thw: mx.array | None = None,
-        video_grid_thw: mx.array | None = None,
-        attention_mask: mx.array | None = None,
-    ) -> tuple[mx.array, mx.array]:
-        self.rope_calls.append(
-            {
-                "input_ids": input_ids,
-                "image_grid_thw": image_grid_thw,
-                "video_grid_thw": video_grid_thw,
-                "attention_mask": attention_mask,
-            }
-        )
-        seq_len = input_ids.shape[1]
-        positions = mx.arange(seq_len, dtype=mx.int32)
-        positions = mx.broadcast_to(positions[None, None, :], (3, 1, seq_len))
-        if self._scalar_delta:
-            return positions, mx.array(-2, dtype=mx.int32)
-        return positions, mx.array([[-2]], dtype=mx.int32)
 
     def __call__(
         self,
@@ -141,17 +119,12 @@ class _RealPaddleOCRVLGetRopeIndexLanguageModel:
 
         self._language_model_cls = LanguageModel
         self.config = ModelConfig(
-            text_config=TextConfig(), vision_config=VisionConfig()
+            text_config=TextConfig(),
+            vision_config=VisionConfig(spatial_merge_size=_SPATIAL_MERGE_SIZE),
+            image_token_id=_IMAGE_TOKEN_ID,
+            video_token_id=_VIDEO_TOKEN_ID,
+            vision_start_token_id=_VISION_START_TOKEN_ID,
         )
-        self.model = SimpleNamespace(embed_tokens=lambda input_ids: input_ids + 1)
-
-    @property
-    def image_token_id(self) -> int:
-        return int(self.config.image_token_id)
-
-    @property
-    def vision_start_token_id(self) -> int:
-        return int(self.config.vision_start_token_id)
 
     def get_rope_index(
         self,
@@ -211,6 +184,28 @@ def _feature(
     )
 
 
+def _prompt_with_images(
+    grids: list[tuple[int, int, int]], *, trailing_text_tokens: int
+) -> tuple[list[int], list[MultiModalFeatureSpec]]:
+    """Text, a vision start and the image tokens for each grid, then text."""
+    input_tokens: list[int] = []
+    features: list[MultiModalFeatureSpec] = []
+    for t, h, w in grids:
+        input_tokens += [_TEXT_TOKEN_ID, _TEXT_TOKEN_ID, _VISION_START_TOKEN_ID]
+        num_tokens = t * (h // _SPATIAL_MERGE_SIZE) * (w // _SPATIAL_MERGE_SIZE)
+        features.append(
+            _feature(
+                offset=len(input_tokens),
+                grid_thw=(t, h, w),
+                length=num_tokens,
+                raw_patches=t * h * w,
+            )
+        )
+        input_tokens += [_IMAGE_TOKEN_ID] * num_tokens
+    input_tokens += [_TEXT_TOKEN_ID] * trailing_text_tokens
+    return input_tokens, features
+
+
 class TestPaddleOCRVLMultimodalAdapterValidation:
     def test_invalid_spatial_merge_size_raises(self) -> None:
         with pytest.raises(ValueError, match="spatial_merge_size must be positive"):
@@ -255,43 +250,28 @@ class TestPaddleOCRVLMultimodalAdapterValidation:
             _adapter().get_mrope_input_positions([1, 2, 3], [feature])
         assert feature.identifier in str(exc_info.value)
 
-    def test_multiple_images_per_request_delegated_in_offset_order(self) -> None:
-        language_model = _RecordingLanguageModel()
-        adapter = _adapter(language_model=language_model)
+
+class TestPaddleOCRVLMultimodalAdapterPositions:
+    def test_empty_positions_carry_batch_axis(self) -> None:
+        positions, delta = _adapter().get_mrope_input_positions([], [])
+
+        assert positions.shape == (3, 1, 0)
+        assert delta == 0
+
+    def test_unsorted_features_are_placed_in_offset_order(self) -> None:
         features = [
             _feature(offset=8, grid_thw=(1, 6, 4), length=6, raw_patches=24),
             _feature(offset=2, grid_thw=(1, 4, 4), length=4, raw_patches=16),
         ]
         input_tokens = (
             [_TEXT_TOKEN_ID, _VISION_START_TOKEN_ID]
-            + [_IMAGE_PLACEHOLDER_TOKEN_ID] * _IMAGE_TOKEN_COUNT_2X2
+            + [_IMAGE_TOKEN_ID] * _IMAGE_TOKEN_COUNT_2X2
             + [_TEXT_TOKEN_ID, _VISION_START_TOKEN_ID]
-            + [_IMAGE_PLACEHOLDER_TOKEN_ID] * 6
+            + [_IMAGE_TOKEN_ID] * 6
             + [_TEXT_TOKEN_ID, _TEXT_TOKEN_ID]
         )
 
-        adapter.get_mrope_input_positions(input_tokens, features)
-
-        call = language_model.rope_calls[0]
-        assert call["input_ids"].tolist() == [input_tokens]
-        assert call["image_grid_thw"].tolist() == [[1, 4, 4], [1, 6, 4]]
-
-    def test_multiple_images_exercise_real_mlx_vlm_rope_index(self) -> None:
-        language_model = _RealPaddleOCRVLGetRopeIndexLanguageModel()
-        adapter = _adapter(language_model=language_model)
-        features = [
-            _feature(offset=8, grid_thw=(1, 6, 4), length=6, raw_patches=24),
-            _feature(offset=2, grid_thw=(1, 4, 4), length=4, raw_patches=16),
-        ]
-        input_tokens = (
-            [_TEXT_TOKEN_ID, language_model.vision_start_token_id]
-            + [language_model.image_token_id] * _IMAGE_TOKEN_COUNT_2X2
-            + [_TEXT_TOKEN_ID, language_model.vision_start_token_id]
-            + [language_model.image_token_id] * 6
-            + [_TEXT_TOKEN_ID, _TEXT_TOKEN_ID]
-        )
-
-        positions, delta = adapter.get_mrope_input_positions(input_tokens, features)
+        positions, delta = _adapter().get_mrope_input_positions(input_tokens, features)
 
         assert positions.shape == (3, 1, 16)
         assert delta == -5
@@ -301,38 +281,81 @@ class TestPaddleOCRVLMultimodalAdapterValidation:
             [0, 1, 2, 3, 2, 3, 4, 5, 6, 7, 6, 7, 6, 7, 9, 10],
         ]
 
-
-class TestPaddleOCRVLMultimodalAdapterPositions:
-    def test_empty_positions_carry_batch_axis(self) -> None:
-        positions, delta = _adapter().get_mrope_input_positions([], [])
-
-        assert positions.shape == (3, 1, 0)
-        assert delta == 0
-
-    def test_delegates_rope_index_to_language_model(self) -> None:
-        language_model = _RecordingLanguageModel()
-        adapter = _adapter(language_model=language_model)
-        features = [_feature(offset=1, grid_thw=(1, 4, 4), length=4, raw_patches=16)]
-
-        positions, delta = adapter.get_mrope_input_positions([1] * 12, features)
-
-        assert positions.shape == (3, 1, 12)
-        assert delta == -2
-        call = language_model.rope_calls[0]
-        assert call["input_ids"].tolist() == [[1] * 12]
-        assert call["image_grid_thw"].tolist() == [[1, 4, 4]]
-        assert call["video_grid_thw"] is None
-        assert call["attention_mask"] is None
-
-    def test_accepts_scalar_rope_delta_from_real_mlx_vlm(self) -> None:
-        language_model = _RecordingLanguageModel(scalar_delta=True)
-        adapter = _adapter(language_model=language_model)
-
-        _positions, delta = adapter.get_mrope_input_positions(
-            [1] * 8,
-            [_feature(offset=1)],
+    @pytest.mark.parametrize(
+        "grids",
+        [[(1, 4, 4)], [(1, 4, 4), (1, 6, 4), (1, 4, 6)]],
+        ids=["one-image", "three-images"],
+    )
+    @pytest.mark.parametrize(
+        "trailing_text_tokens", [3, 0], ids=["text-after", "image-last"]
+    )
+    def test_well_formed_prompts_match_real_mlx_vlm_rope_index(
+        self, grids: list[tuple[int, int, int]], trailing_text_tokens: int
+    ) -> None:
+        input_tokens, features = _prompt_with_images(
+            grids, trailing_text_tokens=trailing_text_tokens
+        )
+        expected_positions, expected_delta = (
+            _RealPaddleOCRVLGetRopeIndexLanguageModel().get_rope_index(
+                mx.array([input_tokens], dtype=mx.int32),
+                mx.array(grids, dtype=mx.int32),
+            )
         )
 
+        positions, delta = _adapter().get_mrope_input_positions(input_tokens, features)
+
+        assert positions.tolist() == expected_positions.astype(mx.int32).tolist()
+        assert delta == expected_delta.reshape(-1)[0].item()
+
+    @pytest.mark.parametrize(
+        ("input_tokens", "offset", "expected_positions"),
+        [
+            pytest.param(
+                [_TEXT_TOKEN_ID, _VISION_START_TOKEN_ID]
+                + [_IMAGE_TOKEN_ID] * _IMAGE_TOKEN_COUNT_2X2
+                + [_TEXT_TOKEN_ID, _VISION_START_TOKEN_ID, _IMAGE_TOKEN_ID]
+                + [_TEXT_TOKEN_ID],
+                2,
+                [
+                    [0, 1, 2, 2, 2, 2, 4, 5, 6, 7],
+                    [0, 1, 2, 2, 3, 3, 4, 5, 6, 7],
+                    [0, 1, 2, 3, 2, 3, 4, 5, 6, 7],
+                ],
+                id="image-token-in-text",
+            ),
+            pytest.param(
+                [_TEXT_TOKEN_ID, _VISION_START_TOKEN_ID]
+                + [_IMAGE_TOKEN_ID] * _IMAGE_TOKEN_COUNT_2X2
+                + [_TEXT_TOKEN_ID, _VISION_START_TOKEN_ID, _VIDEO_TOKEN_ID]
+                + [_TEXT_TOKEN_ID],
+                2,
+                [
+                    [0, 1, 2, 2, 2, 2, 4, 5, 6, 7],
+                    [0, 1, 2, 2, 3, 3, 4, 5, 6, 7],
+                    [0, 1, 2, 3, 2, 3, 4, 5, 6, 7],
+                ],
+                id="video-token-in-text",
+            ),
+            pytest.param(
+                [_IMAGE_TOKEN_ID] * _IMAGE_TOKEN_COUNT_2X2
+                + [_TEXT_TOKEN_ID, _TEXT_TOKEN_ID],
+                0,
+                [[0, 0, 0, 0, 2, 3], [0, 0, 1, 1, 2, 3], [0, 1, 0, 1, 2, 3]],
+                id="image-without-vision-start",
+            ),
+        ],
+    )
+    def test_positions_follow_feature_offsets_not_token_ids(
+        self,
+        input_tokens: list[int],
+        offset: int,
+        expected_positions: list[list[int]],
+    ) -> None:
+        features = [_feature(offset=offset)]
+
+        positions, delta = _adapter().get_mrope_input_positions(input_tokens, features)
+
+        assert positions[:, 0, :].tolist() == expected_positions
         assert delta == -2
 
 
