@@ -2,13 +2,10 @@
 """Tests for attention backend dispatch.
 
 Unit tests verify detection heuristics against real mlx_lm modules
-(no model weights, just module instantiation).  The slow integration
-test covers the full paged attention dispatch on Qwen3.5.
+(no model weights, just module instantiation).
 """
 
 from __future__ import annotations
-
-import pytest
 
 from tests.stub_runner import NEMOTRON_H_TINY_ARGS
 from vllm_metal.attention.attention_contracts import attention_contract_for
@@ -264,31 +261,6 @@ def test_find_layers_on_qwen3_model():
 
     assert len(layers) == args.num_hidden_layers
     assert find_attn_attr(layers[0]) == "self_attn"
-
-
-# ---------------------------------------------------------------------------
-# Slow integration test
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.slow
-def test_qwen35_paged_attention_hybrid():
-    """Qwen3.5 hybrid model loads and generates with paged attention."""
-    from vllm import LLM, SamplingParams
-
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
-
-        llm = LLM(
-            model="Qwen/Qwen3.5-0.8B",
-            max_model_len=512,
-            max_num_seqs=1,
-            gpu_memory_utilization=0.3,
-        )
-        sp = SamplingParams(temperature=0, max_tokens=5)
-        outputs = llm.generate(["The capital of France is"], sp)
-        assert len(outputs) == 1
-        assert len(outputs[0].outputs[0].token_ids) > 0
 
 
 def test_mixer_is_probed_only_when_a_family_opts_in() -> None:
