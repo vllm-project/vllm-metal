@@ -43,8 +43,9 @@ def _kv_dtype_bytes(cache_dtype: str, model_dtype: Any) -> int:
 
 
 # Measured in #1037: two full-length requests is the smallest pool with no
-# store retries on Mistral-7B and Qwen3-32B at concurrency 4. A full pool
-# loses nothing, the scheduler retries the store on the next step.
+# store retries on Mistral-7B and Qwen3-32B at concurrency 4. A store that
+# does not fit is retried on the next step. In a pool smaller than one request
+# every retry can fail, so the tiering spec warns at startup.
 _DEFAULT_POOL_REQUESTS = 2
 
 # Copy of MLA_DEFAULT_QK_ROPE_HEAD_DIM. Its module imports mlx.
@@ -59,15 +60,16 @@ AUTO_POOL_KEY = "_metal_auto_pool"
 def default_host_pool_bytes(vllm_config: VllmConfig) -> int:
     """Host pool bytes for two ``max_model_len`` requests of KV.
 
-    The pool stages blocks for the disk tier. A full pool does not lose a
-    block: the scheduler retries the store on the next step. Two full-length
-    requests is the smallest pool with no retries at concurrency 4 in the
-    #1037 measurements, where every size from half a request to four stored
-    the same bytes. Offloading serves only uniform full-attention models, whose
-    KV is ``2 * kv_heads * head_size`` elements per token and layer. MLA keeps
-    one latent row of ``kv_lora_rank + qk_rope_head_dim``. A compressed layout
-    only lets the same bytes hold more blocks. The token count rounds up to
-    whole blocks once the block size is known.
+    The pool stages blocks for the disk tier. A store that does not fit is
+    retried on the next step. Two full-length requests is the smallest pool
+    with no retries at concurrency 4 in the #1037 measurements, where every
+    size from half a request to four stored the same bytes. Prompts there
+    were shorter than each pool. Offloading serves only uniform
+    full-attention models, whose KV is ``2 * kv_heads * head_size`` elements
+    per token and layer. MLA keeps one latent row of
+    ``kv_lora_rank + qk_rope_head_dim``. A compressed layout only lets the
+    same bytes hold more blocks. The token count rounds up to whole blocks
+    once the block size is known.
     """
     model_config = vllm_config.model_config
     parallel_config = vllm_config.parallel_config
