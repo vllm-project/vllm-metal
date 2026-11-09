@@ -1891,6 +1891,42 @@ class TestMetalPlatform:
         assert vllm_config.model_config.tokenizer == "openai/whisper-tiny"
         assert vllm_config.scheduler_config.async_scheduling is False
 
+    @pytest.mark.parametrize("mode", ["auto", "multimodal-native", "text-only"])
+    def test_check_and_update_config_keeps_audio_for_stt(
+        self, monkeypatch: pytest.MonkeyPatch, mode: str
+    ) -> None:
+        """STT models keep their audio in every multimodal mode; the STT
+        runner, not a multimodal adapter, consumes it."""
+        self._patch_stt_resolution(monkeypatch, is_stt=True)
+        monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", mode)
+        multimodal_config = MultiModalConfig(limit_per_prompt={"audio": 1})
+        model_config = SimpleNamespace(
+            quantization=None,
+            enable_sleep_mode=False,
+            model="openai/whisper-tiny",
+            tokenizer=None,
+            max_model_len=128,
+            multimodal_config=multimodal_config,
+            hf_config=SimpleNamespace(
+                model_type="whisper",
+                architectures=["WhisperForConditionalGeneration"],
+            ),
+            is_hybrid=False,
+        )
+        reset_config()
+        try:
+            vllm_config = self._platform_config(
+                model_config=model_config,
+                cache_config=SimpleNamespace(enable_prefix_caching=False),
+            )
+
+            MetalPlatform.check_and_update_config(vllm_config)
+        finally:
+            reset_config()
+
+        assert model_config.multimodal_config is multimodal_config
+        assert multimodal_config.get_limit_per_prompt("audio") == 1
+
     def test_check_and_update_config_preserves_existing_tokenizer_for_stt(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
