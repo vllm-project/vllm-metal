@@ -1206,6 +1206,9 @@ class TestYocoCacheIntegration:
         runner = make_stub_runner(model_args=args)
         runner.num_layers = self._NUM_HIDDEN
         runner.num_kv_cache_layers = self._NUM_UNIQUE
+        runner._yoco_cache_mapping = DefaultModelAdapter().build_yoco_cache_mapping(
+            args
+        )
         runner.num_kv_heads = self._NUM_KV_HEADS
         runner.head_dim = self._HEAD_DIM
         runner.kv_cache_dtype = mx.float16

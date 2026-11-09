@@ -1362,7 +1362,7 @@ class MetalModelRunner:
             block_size=block_size,
         )
 
-    def install_drafter(self, *, num_blocks: int, block_size: int) -> None:
+    def install_drafter(self) -> None:
         """Install or bind the configured drafter after cache planning."""
         spec = self.vllm_config.speculative_config
         if spec is None:
@@ -1386,8 +1386,7 @@ class MetalModelRunner:
         elif spec.method == "ngram":
             from vllm_metal.v1.ngram_proposer import NgramProposer
 
-            # N-gram drafts from token history alone — no model, no KV cache, so
-            # num_blocks/block_size are unused here.
+            # N-gram drafts from token history alone.
             self._drafter = NgramProposer.build(
                 vllm_config=self.vllm_config,
                 controller=self._spec_decode_controller,

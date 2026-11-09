@@ -294,9 +294,7 @@ def _sdpa_runtime():
 def _mla_runtime():
     from vllm_metal.attention.runtime.mla import MLAPagedAttentionRuntime
 
-    return MLAPagedAttentionRuntime(
-        num_layers=1, latent_dim=4, block_size=4, dtype=mx.float32
-    )
+    return MLAPagedAttentionRuntime()
 
 
 @pytest.mark.parametrize("runtime_factory", [_sdpa_runtime, _mla_runtime])

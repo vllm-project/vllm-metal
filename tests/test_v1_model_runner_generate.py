@@ -139,7 +139,7 @@ def test_gemma4_mtp_config_installs_gemma4_proposer() -> None:
         ),
     )
 
-    runner.install_drafter(num_blocks=1, block_size=16)
+    runner.install_drafter()
 
     assert isinstance(runner._drafter, Gemma4MTPProposer)
 
@@ -176,7 +176,7 @@ def test_draft_model_loads_before_cache_binding(
 
     # install_drafter leaves the draft bind to _initialize_upstream_storage,
     # which hands the proposer the target's shared KV storage.
-    runner.install_drafter(num_blocks=9, block_size=32)
+    runner.install_drafter()
     proposer.bind_paged_cache.assert_not_called()
 
 

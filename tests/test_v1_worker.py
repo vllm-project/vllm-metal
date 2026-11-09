@@ -1011,7 +1011,6 @@ class TestCommitProbeBudget:
         plan = self._plan(monkeypatch, free_bytes=8 << 30)
 
         assert plan.kv_budget == _PLANNED_KV_BUDGET
-        assert plan.num_blocks == 2_900
         assert "increase --gpu-memory-utilization" in plan.format_mitigations()
 
     def test_busy_machine_keeps_the_capacity_it_was_given(
@@ -1028,7 +1027,6 @@ class TestCommitProbeBudget:
         plan = self._plan(monkeypatch, free_bytes=2 << 30)
 
         assert plan.kv_budget == _PLANNED_KV_BUDGET
-        assert plan.num_blocks == 2_900
         assert "larger than this machine's free memory" in caplog.text
 
     def test_a_machine_that_pages_is_charged_to_capacity(
@@ -1047,8 +1045,6 @@ class TestCommitProbeBudget:
         # Free memory less the reserve, kept to the byte: vLLM picks its own
         # grouped layout from the budget it is handed.
         assert plan.kv_budget == (2 << 30) - _PROBE_RESERVE
-        # The count-based path still gets whole blocks of the dense estimate.
-        assert plan.num_blocks == 1_073
         assert plan.per_block_bytes == 1_000_000
         assert plan.fraction == 0.5
         assert "sized down" in caplog.text
@@ -1109,7 +1105,6 @@ class TestCommitProbeBudget:
         )
 
         assert plan.kv_budget == (2 << 30) - _PROBE_RESERVE
-        assert plan.num_blocks == 0
 
     def test_engine_workspace_is_carved_out_of_the_cap(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1161,7 +1156,6 @@ class TestCommitProbeBudget:
         plan = planner._paged_attention_plan(overhead=100_000_000)
 
         assert plan.kv_budget == _PLANNED_KV_BUDGET
-        assert plan.num_blocks == 2_900
 
 
 class TestKvPoolBytesAfterProbe:
