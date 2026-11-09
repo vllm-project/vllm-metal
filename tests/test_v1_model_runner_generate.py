@@ -122,6 +122,9 @@ class PoolingForwardBackendStub:
     def __init__(self, hidden_states: mx.array) -> None:
         self.hidden_states = hidden_states
 
+    def bidi_prefill(self) -> bool:
+        return False
+
     def forward_packed(self, input_ids, offset_caches):
         del input_ids, offset_caches
         return self.hidden_states
