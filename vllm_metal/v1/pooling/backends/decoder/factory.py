@@ -6,9 +6,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from vllm.logger import init_logger
-
-from vllm_metal.v1.pooling.backends.decoder.models.d3 import D3_ARCH, D3ReadoutPooler
+from vllm_metal.v1.pooling.backends.decoder.models.d3 import (
+    D3_READOUT_FILE,
+    D3ReadoutPooler,
+)
 from vllm_metal.v1.pooling.backends.decoder.models.qwen3 import (
     Qwen3RerankerPooler,
 )
@@ -19,8 +20,6 @@ from vllm_metal.v1.pooling.backends.decoder.runtime import (
 )
 from vllm_metal.v1.pooling.contract import DecoderPoolingBackend
 from vllm_metal.v1.pooling.validation import PoolingConfigView
-
-logger = init_logger(__name__)
 
 
 def build_decoder_pooling_backend(
@@ -42,13 +41,12 @@ def build_decoder_pooling_backend(
         ),
         d3_pooler,
     )
-    backend = MetalDecoderPoolingBackend(config, model_view, poolers)
-    if D3_ARCH in config.architectures and not d3_pooler.is_supported():
-        # Without this the only symptom is a bare 501 from /v1/systemone.
-        logger.warning(
-            "d3 checkpoint %s loaded without readout.safetensors in %s: no "
-            "classify pooler is installed and /v1/systemone will answer 501.",
-            config.label,
-            checkpoint_dir if checkpoint_dir is not None else "<unresolved>",
+    if d3_pooler.d3_config.is_supported and d3_pooler.readout is None:
+        # Without the readout the server would start and answer 501 on every
+        # decision request; the checkpoint is unusable as served.
+        raise ValueError(
+            f"d3 checkpoint {config.label} is missing {D3_READOUT_FILE} in "
+            f"{checkpoint_dir if checkpoint_dir is not None else '<unresolved>'}: "
+            "the classify head cannot score prompts without it."
         )
-    return backend
+    return MetalDecoderPoolingBackend(config, model_view, poolers)

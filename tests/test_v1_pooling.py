@@ -31,6 +31,9 @@ from vllm_metal.v1.model_lifecycle import (  # noqa: E402
     LoadedGenerationModel,
     ModelLifecycle,
 )
+from vllm_metal.v1.pooling.backends.decoder.factory import (  # noqa: E402
+    build_decoder_pooling_backend,
+)
 from vllm_metal.v1.pooling.backends.decoder.models.d3 import (  # noqa: E402
     D3ReadoutPooler,
 )
@@ -39,7 +42,6 @@ from vllm_metal.v1.pooling.backends.decoder.models.qwen3 import (  # noqa: E402
 )
 from vllm_metal.v1.pooling.backends.decoder.runtime import (  # noqa: E402
     DecoderModelView,
-    LastTokenEmbeddingPooler,
     MetalDecoderPoolingBackend,
     is_embed_pooling_architecture,
 )
@@ -731,7 +733,6 @@ class TestMetalPoolingCapabilities:
     ) -> None:
         class _SupportedEmbedPooler:
             task = "embed"
-            bidi_prefill = False
 
             def is_supported(self) -> bool:
                 return True
@@ -749,45 +750,6 @@ class TestMetalPoolingCapabilities:
                 model_view,
                 (_SupportedEmbedPooler(), _SupportedEmbedPooler()),
             )
-
-    def test_bidi_prefill_follows_the_served_pooler(self) -> None:
-        class _Pooler:
-            task = "embed"
-
-            def __init__(self, bidi: bool) -> None:
-                self.bidi_prefill = bidi
-
-            def is_supported(self) -> bool:
-                return True
-
-            def pool_one(self, hidden_states, span):
-                del hidden_states, span
-                return torch.zeros((1,), dtype=torch.float32)
-
-        config = PoolingConfigView(_pooling_model_config())
-        model_view = DecoderModelView(_PoolingModel())
-
-        causal = MetalDecoderPoolingBackend(config, model_view, (_Pooler(False),))
-        full_view = MetalDecoderPoolingBackend(config, model_view, (_Pooler(True),))
-
-        assert causal.bidi_prefill() is False
-        assert full_view.bidi_prefill() is True
-
-    def test_real_embed_pooler_answers_the_bidi_protocol(self) -> None:
-        """The doubles above declare the flag on their own; the real embed
-        pooler must declare it too, or every embedding step raises."""
-        config = PoolingConfigView(_pooling_model_config())
-        pooler = LastTokenEmbeddingPooler(DecoderModelView(_PoolingModel()), config)
-
-        assert pooler.is_supported()
-        assert pooler.bidi_prefill is False
-
-        backend = MetalDecoderPoolingBackend(
-            config,
-            DecoderModelView(_PoolingModel()),
-            (pooler,),
-        )
-        assert backend.bidi_prefill() is False
 
     @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
     @pytest.mark.parametrize("length", [7, 515])
@@ -1750,7 +1712,6 @@ class TestD3ReadoutPooler:
         )
 
         assert pooler.is_supported()
-        assert pooler.bidi_prefill
         logits = pooler.pool_one(
             mx.array([[[9.0, 9.0], [1.0, 2.0]]], dtype=mx.float32),
             span,
@@ -1821,6 +1782,17 @@ class TestD3ReadoutPooler:
         (tmp_path / "readout.safetensors").unlink()
 
         assert not D3ReadoutPooler(config).is_supported()
+
+    def test_factory_refuses_a_d3_checkpoint_without_its_readout(
+        self, tmp_path
+    ) -> None:
+        """A server that starts without the readout answers 501 on every
+        decision request; the load must fail instead."""
+        config = self._model_config(tmp_path)
+        (tmp_path / "readout.safetensors").unlink()
+
+        with pytest.raises(ValueError, match="readout.safetensors"):
+            build_decoder_pooling_backend(_PoolingModel(), config)
 
     def test_other_architectures_leave_d3_disabled(self, tmp_path) -> None:
         config = self._model_config(

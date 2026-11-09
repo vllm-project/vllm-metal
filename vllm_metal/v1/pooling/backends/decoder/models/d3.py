@@ -27,7 +27,6 @@ from vllm_metal.v1.pooling.validation import PoolingConfigView
 D3_ARCH = "D3ForSequenceClassification"
 D3_READOUT_FILE = "readout.safetensors"
 D3_READOUT_KEY = "weight"
-D3_ATTENTION_MODE = "noncausal_full_attention"
 D3_TASKS: tuple[PoolingTask | None, ...] = (None, CLASSIFY_TASK)
 
 
@@ -64,12 +63,10 @@ class D3ReadoutPooler:
     def __init__(self, model_config: Any, checkpoint_dir: Path | None = None) -> None:
         self.config = PoolingConfigView(model_config)
         self.d3_config = D3ConfigView(self.config)
-        self.readout = self._readout(checkpoint_dir)
-        # The checkpoint scores the prompt with the whole input in view, so the
-        # runner turns each prefill segment into one bidirectional block.
-        self.bidi_prefill = (
-            self.readout is not None
-            and self.d3_config.attention_mode == D3_ATTENTION_MODE
+        # Only a d3 checkpoint reads the readout; every other decoder pooling
+        # model must not touch the filesystem for it.
+        self.readout = (
+            self._readout(checkpoint_dir) if self.d3_config.is_supported else None
         )
 
     def is_supported(self) -> bool:

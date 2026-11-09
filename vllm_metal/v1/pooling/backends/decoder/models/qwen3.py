@@ -62,7 +62,6 @@ class Qwen3RerankerPooler:
     """Pool Qwen3 reranker hidden states as yes-minus-no scores."""
 
     task: PoolingTask = CLASSIFY_TASK
-    bidi_prefill = False
 
     def __init__(
         self,
