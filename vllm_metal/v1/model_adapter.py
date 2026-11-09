@@ -25,7 +25,9 @@ logger = init_logger(__name__)
 BackboneMode = Literal["native", "text_sidecar", "text_only"]
 """How a multimodal checkpoint is served.
 
-- ``native``: the mlx-vlm composite runs both towers (Qwen3-VL family).
+- ``native``: the mlx-vlm composite runs both towers for the families
+  ``build_multimodal_adapter`` has an adapter for; other checkpoints load the
+  same way with their media inputs refused.
 - ``text_sidecar``: the mlx_lm text model serves text, a
   :class:`Gemma4VisionSidecar` serves images (Gemma 4).
 - ``text_only``: ``multimodal_config`` is cleared and images are refused.
@@ -466,9 +468,8 @@ class DefaultModelAdapter(ModelAdapter):
         Gemma4: mlx_vlm forward currently produces garbled output; remove this
         override once mlx_vlm Gemma4 parity is fixed upstream.
 
-        Mistral 3 and Muse Glimmer: no multimodal adapter yet. The text backbone
-        clears ``multimodal_config``, so the frontend rejects image input
-        instead of the runner raising on it.
+        Mistral 3 and Muse Glimmer: no multimodal adapter yet. They serve text
+        on mlx_lm, the backbone ``tools/check_parity.py`` uses as its reference.
 
         Qwen3.5/Qwen3.6 conditional-generation wrappers: these configs are
         marked multimodal even when served text-only, and the FP8 family fails
@@ -619,9 +620,11 @@ class DefaultModelAdapter(ModelAdapter):
         setup. When the mode is ``text_sidecar`` (Gemma 4), the config is
         kept but audio is turned off unless the checkpoint has an audio
         encoder, and video is turned off on prefix-LM checkpoints, so the
-        frontend rejects inputs the sidecar cannot serve. ``native`` leaves the
-        config untouched. :meth:`multimodal_backbone_mode` is the single
-        source of truth for which mode applies.
+        frontend rejects inputs the sidecar cannot serve. ``native`` keeps the
+        config but turns every modality off when no native adapter serves
+        the checkpoint, so the frontend rejects media the runner cannot
+        encode. :meth:`multimodal_backbone_mode` is the single source of
+        truth for which mode applies.
         """
         if model_config.multimodal_config is None:
             return
@@ -650,6 +653,7 @@ class DefaultModelAdapter(ModelAdapter):
             keep_video = not getattr(model_config, "is_mm_prefix_lm", False)
             self._restrict_modalities(
                 model_config.multimodal_config,
+                keep_image=True,
                 keep_audio=keep_audio,
                 keep_video=keep_video,
             )
@@ -659,18 +663,48 @@ class DefaultModelAdapter(ModelAdapter):
                 keep_audio,
                 keep_video,
             )
+            return
+        if self._native_multimodal_family(hf_config) is None:
+            self._restrict_modalities(
+                model_config.multimodal_config,
+                keep_image=False,
+                keep_audio=False,
+                keep_video=False,
+            )
+            logger.warning(
+                "Metal: no native multimodal adapter for model_type=%s "
+                "(architectures=%s, multimodal_mode=%s); image, video and "
+                "audio inputs are refused",
+                getattr(hf_config, "model_type", "unknown"),
+                getattr(hf_config, "architectures", None),
+                self._multimodal_mode(),
+            )
 
     @staticmethod
     def _restrict_modalities(
-        multimodal_config: Any, *, keep_audio: bool, keep_video: bool
+        multimodal_config: Any,
+        *,
+        keep_image: bool,
+        keep_audio: bool,
+        keep_video: bool,
     ) -> None:
-        """Set the limits of modalities the sidecar cannot serve to 0 so the
+        """Set the limits of modalities Metal cannot serve to 0 so the
         frontend rejects them (idempotent)."""
-        from vllm.config.multimodal import AudioDummyOptions, VideoDummyOptions
+        from vllm.config.multimodal import (
+            AudioDummyOptions,
+            BaseDummyOptions,
+            ImageDummyOptions,
+            VideoDummyOptions,
+        )
 
         refused: list[tuple[str, type]] = []
+        if not keep_image:
+            refused.append(("image", ImageDummyOptions))
         if not keep_video:
             refused.append(("video", VideoDummyOptions))
+        if not (keep_image or keep_video):
+            # Kimi-K2.5 takes images and videos as one ``vision_chunk`` modality.
+            refused.append(("vision_chunk", BaseDummyOptions))
         if not keep_audio:
             refused.append(("audio", AudioDummyOptions))
         limits = multimodal_config.limit_per_prompt
@@ -678,7 +712,7 @@ class DefaultModelAdapter(ModelAdapter):
             current = limits.get(modality)
             if current is not None and int(getattr(current, "count", 0)) > 0:
                 logger.warning(
-                    "Metal: %s inputs are unsupported on the Gemma 4 sidecar path; "
+                    "Metal: %s inputs are unsupported for this model; "
                     "overriding --limit-mm-per-prompt %s=%s with 0",
                     modality,
                     modality,
