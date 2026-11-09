@@ -72,6 +72,7 @@ def apply_compat_patches() -> None:
     _patch_mlx_lm_qwen35_fp8_sanitize()
     _patch_mlx_lm_qwen3_flat_weight_prefix()
     _patch_mlx_lm_minicpm4_model_type()
+    _patch_mlx_lm_qwen35_text_model_type()
     _patch_transformers_exaone4_config()
 
 
@@ -997,6 +998,26 @@ def _patch_mlx_lm_minicpm4_model_type() -> None:
         return
 
     MODEL_REMAPPING.setdefault("minicpm4", "minicpm")
+
+
+def _patch_mlx_lm_qwen35_text_model_type() -> None:
+    """Load text-only Qwen3.5 checkpoints that declare ``*_text`` model types.
+
+    HF's ``*_text`` split names the language-only members of the Qwen3.5
+    family ``qwen3_5_text`` and ``qwen3_5_moe_text``, but mlx_lm runs both on
+    the shared ``qwen3_5`` / ``qwen3_5_moe`` modules and ships no ``*_text``
+    modules, so loading fails before any weight is read.
+
+    TODO: remove when the pinned mlx_lm maps them (ml-explore/mlx-lm#1963).
+    """
+    try:
+        from mlx_lm.utils import MODEL_REMAPPING
+    except ImportError as exc:
+        logger.warning("Could not install the Qwen3.5 text model type mapping: %s", exc)
+        return
+
+    MODEL_REMAPPING.setdefault("qwen3_5_text", "qwen3_5")
+    MODEL_REMAPPING.setdefault("qwen3_5_moe_text", "qwen3_5_moe")
 
 
 def _patch_mlx_lm_qwen3_flat_weight_prefix() -> bool:
