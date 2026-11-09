@@ -45,7 +45,7 @@ generates tokens.
 | --- | --- | --- | --- | --- |
 | Qwen3-Embedding | 🔵 | | `pooling` / `embed` (paged) | `mlx-community/Qwen3-Embedding-0.6B-8bit` |
 | Qwen3-Reranker | 🔵 | | `pooling` / `classify` (paged) | `mku64/Qwen3-Reranker-0.6B-mlx-8Bit` |
-| d3 (Decision 3.0) | 🔵 | | `pooling` / `classify` + `/v1/systemone` | `vllm-sr/d3-nano` (`--language-model-only`) |
+| d3 (Decision 3.0) | 🔵 | | `pooling` / `classify` + `/v1/systemone` (text-only) | `vllm-sr/d3-nano` |
 | BGE-M3 | 🔵 | | `pooling` / `embed`, `token_classify` (encoder) | `BAAI/bge-m3` |
 | Multilingual E5 Base | 🔵 | | `pooling` / `embed` (encoder) | `intfloat/multilingual-e5-base` |
 | EmbeddingGemma 2 | 🔵 | | `pooling` / `embed` (text encoder, `--language-model-only`) | `google/embeddinggemma-2` |

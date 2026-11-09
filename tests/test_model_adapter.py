@@ -119,6 +119,16 @@ class TestShouldForceTextBackbone:
         assert adapter.should_force_text_backbone(hf_config) is True
         assert adapter.build_multimodal_adapter(object(), hf_config) is None
 
+    def test_d3_decision_checkpoint_keeps_text_backbone(self) -> None:
+        # The checkpoint ships a vision tower but the pooling runner scores
+        # text only, so the multimodal load path has nothing to serve.
+        hf_config = SimpleNamespace(
+            model_type="qwen3_5",
+            architectures=["D3ForSequenceClassification"],
+            vision_config={"depth": 24},
+        )
+        assert DefaultModelAdapter().should_force_text_backbone(hf_config) is True
+
     def test_unquantized_muse_glimmer_keeps_text_backbone(self) -> None:
         # No multimodal adapter, so a native load would let image requests
         # reach the runner and raise there, whatever the quantization.

@@ -1768,13 +1768,27 @@ class TestD3ReadoutPooler:
 
         assert float(logits.sum()) == pytest.approx(1.0, abs=1e-6)
 
-    def test_checkpoint_dir_skips_hub_resolution(self, tmp_path) -> None:
+    def test_checkpoint_dir_skips_hub_resolution(self, tmp_path, monkeypatch) -> None:
         """The loader already resolved the dir; the pooler must not ask the Hub."""
         config = self._model_config(tmp_path, model="vllm-sr/d3-nano")
 
-        pooler = D3ReadoutPooler(config, checkpoint_dir=tmp_path)
+        def _refuse(*args, **kwargs):
+            raise AssertionError("checkpoint_dir must skip Hub resolution")
 
-        assert pooler.is_supported()
+        monkeypatch.setattr(
+            "vllm_metal.v1.model_adapter._local_checkpoint_dir", _refuse
+        )
+
+        assert D3ReadoutPooler(config, checkpoint_dir=tmp_path).is_supported()
+
+    def test_unresolvable_checkpoint_dir_is_unsupported(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        config = self._model_config(tmp_path, model="vllm-sr/d3-nano")
+        monkeypatch.setattr(
+            "vllm_metal.v1.model_adapter._local_checkpoint_dir", lambda *a, **k: None
+        )
+
         assert not D3ReadoutPooler(config).is_supported()
 
     def test_missing_readout_is_unsupported(self, tmp_path) -> None:

@@ -486,6 +486,10 @@ class DefaultModelAdapter(ModelAdapter):
             return text_type in _MISTRAL3_TEXT_BACKBONE_TEXT_TYPES
 
         architectures_from_hf = tuple(hf_config.architectures or ())
+        # d3 decision checkpoints keep a vision tower the pooling runner cannot
+        # serve yet (#1296): score the text backbone instead.
+        if "D3ForSequenceClassification" in architectures_from_hf:
+            return True
         has_text_backbone_architecture = any(
             arch in _TEXT_BACKBONE_OVERRIDE_ARCHITECTURES
             for arch in architectures_from_hf
