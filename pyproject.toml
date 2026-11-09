@@ -71,7 +71,7 @@ dependencies = [
 
 [project.optional-dependencies]
 omni = [
-    "vllm-omni @ git+https://github.com/vllm-project/vllm-omni@c4ac0642bd3254b3aac9050a6aadeaf0c225633e",
+    "vllm-omni @ git+https://github.com/vllm-project/vllm-omni@4b63581cf6527dc5c964558650e996c0a36e027a",
 ]
 build = [
     # Native Metal extension source builds
