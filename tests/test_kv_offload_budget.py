@@ -652,8 +652,10 @@ def test_explicit_budget_probe_accounts_for_host_pool_and_workspace(
     _paging_probe(monkeypatch, free=_RESERVE + 3 * _GB + pool + workspace + free_delta)
 
     if free_delta < 0:
-        with pytest.raises(ValueError, match="Refusing to silently shrink"):
+        with pytest.raises(ValueError, match="Refusing to silently shrink") as err:
             planner.determine_available_memory()
+        hint = "or --kv-offloading-size" in str(err.value)
+        assert hint == (pool_mode == "explicit")
     else:
         assert planner.determine_available_memory() == 3 * _GB
     if config is not None:

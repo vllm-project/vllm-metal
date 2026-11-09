@@ -271,6 +271,14 @@ class _PagedAttentionPlan:
     sized_down_by_probe: bool = False
     explicit_kv_budget: int | None = None
 
+    @property
+    def user_sized_pool(self) -> bool:
+        """True when the user sized the pool, so it is theirs to lower.
+
+        An automatic pool was sized for the user, who never set the flag.
+        """
+        return bool(self.kv_offload_pool) and not self.kv_offload_pool_auto
+
     def format_breakdown(self) -> str:
         if self.explicit_kv_budget is not None:
             return (
@@ -311,8 +319,7 @@ class _PagedAttentionPlan:
                 f"increase --gpu-memory-utilization (currently {self.fraction})",
                 "use a smaller or more quantized model",
             ]
-        # An automatic pool was sized for the user, who never set the flag.
-        if self.kv_offload_pool and not self.kv_offload_pool_auto:
+        if self.user_sized_pool:
             mitigations.insert(0, "lower --kv-offloading-size")
         return "Mitigations: " + "; ".join(mitigations) + "."
 
@@ -1481,11 +1488,15 @@ class WorkerCachePlanner:
             return plan, None
 
         if plan.explicit_kv_budget is not None:
+            # The pool is held back above, so a smaller one makes room.
+            lower = "Lower that value"
+            if plan.user_sized_pool:
+                lower += " or --kv-offloading-size"
             raise ValueError(
                 "KV commit probe: the machine paged memory out while testing "
                 f"--kv-cache-memory-bytes={plan.explicit_kv_budget} "
                 f"({plan.explicit_kv_budget / 1e9:.2f}GB). Refusing to "
-                "silently shrink an explicit budget. Lower that value or free "
+                f"silently shrink an explicit budget. {lower}, or free "
                 f"memory before retrying. {probe.describe()}"
             )
 
