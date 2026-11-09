@@ -198,29 +198,57 @@ class TestRingHosts:
 
 
 class TestBootstrapRing:
+    @pytest.mark.parametrize(
+        ("ibv_devices", "coordinator", "expected"),
+        [
+            (None, None, ("ring", None)),
+            ("devices.json", None, ("jaccl", "10.0.0.5:32323")),
+            ("devices.json", "10.0.1.1:5000", ("jaccl", "10.0.1.1:5000")),
+        ],
+        ids=["ring", "jaccl-default-coordinator", "jaccl-explicit-coordinator"],
+    )
     def test_restores_bootstrap_state_after_success(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        ibv_devices: str | None,
+        coordinator: str | None,
+        expected: tuple[str, str | None],
     ) -> None:
+        """MLX's device file selects JACCL; the coordinator defaults to rank 0."""
         _use_ring_temp_dir(monkeypatch, tmp_path)
+        monkeypatch.delenv("VLLM_METAL_RING_BASE_PORT", raising=False)
         monkeypatch.setenv("MLX_RANK", "original-rank")
         monkeypatch.setenv("MLX_HOSTFILE", "original-hostfile")
+        for name, value in (
+            ("MLX_IBV_DEVICES", ibv_devices),
+            ("MLX_JACCL_COORDINATOR", coordinator),
+        ):
+            if value is None:
+                monkeypatch.delenv(name, raising=False)
+            else:
+                monkeypatch.setenv(name, value)
         hostfile: Path | None = None
+        seen: tuple[str, str | None] | None = None
 
         def fake_init(*, backend: str) -> _FakeGroup:
-            nonlocal hostfile
+            nonlocal hostfile, seen
             hostfile = Path(os.environ["MLX_HOSTFILE"])
             assert hostfile.exists()
             assert os.environ["MLX_RANK"] == "1"
+            seen = (backend, os.environ.get("MLX_JACCL_COORDINATOR"))
             return _FakeGroup(rank=1, size=2)
 
         monkeypatch.setattr(mx.distributed, "init", fake_init)
 
         PipelineGroup.bootstrap_ring(rank=1, peer_ips=["10.0.0.5", "10.0.0.6"])
 
+        assert seen == expected
         assert hostfile is not None
         assert not hostfile.exists()
         assert os.environ["MLX_RANK"] == "original-rank"
         assert os.environ["MLX_HOSTFILE"] == "original-hostfile"
+        assert os.environ.get("MLX_JACCL_COORDINATOR") == coordinator
 
     def test_cleans_bootstrap_state_and_preserves_init_error(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

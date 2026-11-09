@@ -110,6 +110,10 @@ class TestMetalPlatform:
             if parallel_config is not None:
                 for field, value in vars(parallel_config).items():
                     setattr(parallel, field, value)
+            # Derived in __post_init__, which ran before the overrides.
+            parallel.world_size = (
+                parallel.pipeline_parallel_size * parallel.tensor_parallel_size
+            )
         scheduler = (
             scheduler_config
             if isinstance(scheduler_config, SchedulerConfig)
@@ -471,7 +475,7 @@ class TestMetalPlatform:
             model_config=None,
         )
         with pytest.raises(
-            NotImplementedError, match="alone or combined with pipeline"
+            NotImplementedError, match="combining pipeline and tensor parallelism"
         ):
             MetalPlatform.check_and_update_config(vllm_config)
 
@@ -508,14 +512,17 @@ class TestMetalPlatform:
         ],
         ids=["safetensors", "text-awq", "text-gguf", "multimodal-awq"],
     )
+    @pytest.mark.parametrize(("pp", "tp"), [(2, 1), (1, 2)], ids=["pp", "tp"])
     def test_check_and_update_config_handles_pipeline_loader_routes(
         self,
         monkeypatch: pytest.MonkeyPatch,
         quantization: str | None,
         multimodal_config: MultiModalConfig | None,
         rejects_pp: bool,
+        pp: int,
+        tp: int,
     ) -> None:
-        """PP admits lazy loaders and rejects proven eager text loaders."""
+        """PP and TP admit lazy loaders and reject proven eager text loaders."""
         self._patch_stt_resolution(monkeypatch, is_stt=False)
         reset_config()
         try:
@@ -523,8 +530,8 @@ class TestMetalPlatform:
                 parallel_config=SimpleNamespace(
                     worker_cls="auto",
                     distributed_executor_backend="auto",
-                    pipeline_parallel_size=2,
-                    tensor_parallel_size=1,
+                    pipeline_parallel_size=pp,
+                    tensor_parallel_size=tp,
                     disable_custom_all_reduce=False,
                 ),
                 cache_config=SimpleNamespace(
@@ -560,9 +567,7 @@ class TestMetalPlatform:
             )
 
             if rejects_pp:
-                with pytest.raises(
-                    NotImplementedError, match=r"AWQ or GGUF.*pipeline_parallel_size=1"
-                ):
+                with pytest.raises(NotImplementedError, match="AWQ or GGUF"):
                     MetalPlatform.check_and_update_config(vllm_config)
                 return
 
@@ -607,7 +612,7 @@ class TestMetalPlatform:
             ),
             model_config=None,
         )
-        with pytest.raises(ValueError, match="too high for pipeline_parallel_size"):
+        with pytest.raises(ValueError, match="too high for world_size"):
             MetalPlatform.check_and_update_config(vllm_config)
 
     @pytest.mark.parametrize("watermark", [False, True])
@@ -625,22 +630,23 @@ class TestMetalPlatform:
         ):
             VllmConfig(watermark_config=WatermarkConfig(key=0) if watermark else None)
 
+    @pytest.mark.parametrize(("pp", "tp"), [(2, 1), (1, 2)], ids=["pp", "tp"])
     def test_check_and_update_config_rejects_pipeline_with_speculative_decoding(
-        self,
+        self, pp: int, tp: int
     ) -> None:
-        """PP>1 with speculative decoding is rejected at config time.
+        """PP>1 or TP>1 with speculative decoding is rejected at config time.
 
         The PP forward path produces no target hidden states and draft proposal
-        runs only on the sampling (last) stage, so no speculative method is
-        implemented under PP. Reject loudly rather than run it unvalidated.
+        runs only on the sampling (last) stage; under TP the draft model is not
+        sharded. Reject loudly rather than run either unvalidated.
         """
         vllm_config = self._platform_config(
             cache_config=SimpleNamespace(kv_cache_dtype_skip_layers=[]),
             parallel_config=SimpleNamespace(
                 worker_cls="auto",
                 distributed_executor_backend="auto",
-                pipeline_parallel_size=2,
-                tensor_parallel_size=1,
+                pipeline_parallel_size=pp,
+                tensor_parallel_size=tp,
                 disable_custom_all_reduce=False,
             ),
             model_config=None,
@@ -696,13 +702,14 @@ class TestMetalPlatform:
         with pytest.raises(NotImplementedError, match="speech-to-text"):
             MetalPlatform.check_and_update_config(vllm_config)
 
+    @pytest.mark.parametrize(("pp", "tp"), [(2, 1), (1, 2)], ids=["pp", "tp"])
     def test_check_and_update_config_rejects_uni_executor_with_pipeline_parallel(
-        self,
+        self, pp: int, tp: int
     ) -> None:
-        """The single-process 'uni' executor cannot host PP's per-stage workers.
+        """The single-process 'uni' executor cannot host PP/TP's per-rank workers.
 
         vLLM's UniProcExecutor builds only rank 0, so without this guard the lone
-        worker hangs in gloo/ring rendezvous waiting for a stage that never
+        worker hangs in gloo/ring rendezvous waiting for a rank that never
         spawns. Reject the explicit combination rather than flip it silently.
         """
         vllm_config = self._platform_config(
@@ -711,8 +718,8 @@ class TestMetalPlatform:
             parallel_config=SimpleNamespace(
                 worker_cls="auto",
                 distributed_executor_backend="uni",
-                pipeline_parallel_size=2,
-                tensor_parallel_size=1,
+                pipeline_parallel_size=pp,
+                tensor_parallel_size=tp,
                 disable_custom_all_reduce=False,
             ),
             model_config=None,
@@ -796,9 +803,20 @@ class TestMetalPlatform:
         ):
             VllmConfig(watermark_config=WatermarkConfig(key=0))
 
+    @pytest.mark.parametrize(
+        "context_parallel",
+        [
+            {"prefill_context_parallel_size": 2},
+            {"tensor_parallel_size": 2, "decode_context_parallel_size": 2},
+        ],
+        ids=["prefill", "decode"],
+    )
     @pytest.mark.parametrize("backend", ["mlx", "mps"])
-    def test_metal_rejects_prefill_context_parallelism(
-        self, monkeypatch: pytest.MonkeyPatch, backend: str
+    def test_metal_rejects_context_parallelism(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        backend: str,
+        context_parallel: dict[str, int],
     ) -> None:
         monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
         monkeypatch.setenv("VLLM_METAL_BACKEND", backend)
@@ -806,11 +824,11 @@ class TestMetalPlatform:
 
         with pytest.raises(
             NotImplementedError,
-            match=r"prefill_context_parallel_size > 1.*not supported on Metal",
+            match=r"context_parallel_size > 1.*not supported on Metal",
         ):
             VllmConfig(
                 parallel_config=ParallelConfig(
-                    prefill_context_parallel_size=2,
+                    **context_parallel,
                     distributed_executor_backend="mp",
                 )
             )
@@ -829,23 +847,6 @@ class TestMetalPlatform:
                 "MetalModelRunner does not return routed experts."
             ),
         ):
-            MetalPlatform.check_and_update_config(vllm_config)
-
-    def test_check_and_update_config_rejects_tensor_parallel(self) -> None:
-        """Tensor parallelism is unsupported on Metal yet; reject it at config time."""
-        vllm_config = self._platform_config(
-            speculative_config=None,
-            cache_config=SimpleNamespace(kv_cache_dtype_skip_layers=[]),
-            parallel_config=SimpleNamespace(
-                worker_cls="auto",
-                distributed_executor_backend="uni",
-                pipeline_parallel_size=1,
-                tensor_parallel_size=2,
-                disable_custom_all_reduce=False,
-            ),
-            model_config=None,
-        )
-        with pytest.raises(NotImplementedError, match="tensor parallelism"):
             MetalPlatform.check_and_update_config(vllm_config)
 
     def _dp_parallel_config(
@@ -875,6 +876,9 @@ class TestMetalPlatform:
         parallel = ParallelConfig()
         for field, value in base.items():
             setattr(parallel, field, value)
+        parallel.world_size = (
+            parallel.pipeline_parallel_size * parallel.tensor_parallel_size
+        )
         return parallel
 
     def _dp_vllm_config(
@@ -1053,13 +1057,18 @@ class TestMetalPlatform:
                 self._dp_vllm_config(parallel={"data_parallel_hybrid_lb": True})
             )
 
-    def test_check_and_update_config_rejects_dp_with_pipeline_parallel(self) -> None:
-        """DP combined with PP is not validated (per-replica ring scoping/ports)."""
+    @pytest.mark.parametrize(
+        "field", ["pipeline_parallel_size", "tensor_parallel_size"]
+    )
+    def test_check_and_update_config_rejects_dp_with_pipeline_parallel(
+        self, field: str
+    ) -> None:
+        """DP combined with PP or TP is not validated (per-replica groups/ports)."""
         with pytest.raises(
             NotImplementedError, match="combining data parallelism with"
         ):
             MetalPlatform.check_and_update_config(
-                self._dp_vllm_config(parallel={"pipeline_parallel_size": 2})
+                self._dp_vllm_config(parallel={field: 2})
             )
 
     def test_check_and_update_config_rejects_dp_speculative_decoding(self) -> None:

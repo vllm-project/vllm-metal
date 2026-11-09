@@ -439,6 +439,7 @@ _LFM2_VL_ARCHITECTURES: frozenset[str] = frozenset({"Lfm2VlForConditionalGenerat
 # d1 checkpoints also declare ``lfm3_vl`` but add decision heads, so match the
 # generative architecture only.
 _LFM3_VL_ARCHITECTURES: frozenset[str] = frozenset({"Lfm3VlForConditionalGeneration"})
+_GLM5_NEXT_MODEL_TYPES: frozenset[str] = frozenset({"glm5_next"})
 
 
 class DefaultModelAdapter(ModelAdapter):
@@ -638,6 +639,16 @@ class DefaultModelAdapter(ModelAdapter):
                 keep_audio,
                 keep_video,
             )
+        elif getattr(hf_config, "model_type", None) in _GLM5_NEXT_MODEL_TYPES:
+            # No vision adapter: zero modality limits turn an image/video
+            # request into a per-request validation error. Not text_only: that
+            # routes the load to mlx_lm, which has no glm5_next.
+            from vllm.config.multimodal import ImageDummyOptions, VideoDummyOptions
+
+            model_config.multimodal_config.limit_per_prompt.update(
+                image=ImageDummyOptions(count=0), video=VideoDummyOptions(count=0)
+            )
+            logger.info("Metal: GLM-5-Next serves text; image and video are refused")
 
     @staticmethod
     def _restrict_modalities(
@@ -923,6 +934,12 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
         lm_head = getattr(text_model, "lm_head", None)
         if lm_head is not None:
             logits = lm_head(hidden_states)
+            # mlx-lm's shard() splits an untied head by vocab and gathers it in
+            # the model's own forward.
+            if (group := getattr(text_model, "sharding_group", None)) is not None:
+                from mlx_lm.models.base import gather_last_axis
+
+                logits = gather_last_axis(logits, group)
             return self._apply_target_logit_postprocessing(text_model, logits)
 
         # Some Gemma4-compatible MLX loaders expose tied embedding projection

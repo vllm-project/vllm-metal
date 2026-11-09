@@ -416,9 +416,10 @@ class TestModelLifecycle:
             GenerationLoadRequest.from_runner(runner, _mode_adapter("native"))
 
     def test_model_load_request_marks_pipeline_stage_lazy(self) -> None:
-        # A pipeline-parallel stage (pp.size > 1) loads weights lazily so it can
-        # prune its non-owned layers before the first eval; a single-stage load
-        # stays eager. lazy_weights is the typed contract the mlx_lm loader reads.
+        # A pipeline-parallel stage (pp.size > 1) or tensor-parallel rank loads
+        # weights lazily so it can prune or shard them before the first eval; a
+        # single-rank load stays eager. lazy_weights is the typed contract the
+        # mlx_lm loader reads.
         class _FakeGroup:
             def __init__(self, size: int) -> None:
                 self._size = size
@@ -429,10 +430,11 @@ class TestModelLifecycle:
             def size(self) -> int:
                 return self._size
 
-        def _lazy_for(pp: PipelineGroup | None) -> bool:
+        def _lazy_for(pp: PipelineGroup | None, tp_group: object = None) -> bool:
             runner = make_stub_runner(
                 model_config=_runner_model_config(),
                 pp=pp,
+                tp_group=tp_group,
             )
             request = GenerationLoadRequest.from_runner(runner, _mode_adapter("native"))
             return request.lazy_weights
@@ -440,6 +442,7 @@ class TestModelLifecycle:
         assert _lazy_for(None) is False
         assert _lazy_for(PipelineGroup(_FakeGroup(1))) is False
         assert _lazy_for(PipelineGroup(_FakeGroup(2))) is True
+        assert _lazy_for(None, tp_group=_FakeGroup(2)) is True
 
     def test_load_mlx_lm_text_model_forwards_lazy_flag(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1473,6 +1476,20 @@ class TestResolveModelDims:
                     "kv_lora_rank": 256,
                 },
                 256 + MLA_DEFAULT_QK_ROPE_HEAD_DIM,
+            ),
+            (
+                # GLM-5-Next: the NoPE latent alone; the pooled indexer keys
+                # sit in the page padding.
+                {
+                    "num_hidden_layers": 45,
+                    "num_attention_heads": 64,
+                    "hidden_size": 4096,
+                    "kv_lora_rank": 512,
+                    "qk_rope_head_dim": 0,
+                    "index_head_dim": 128,
+                    "index_kpool": 4,
+                },
+                512,
             ),
         ],
     )

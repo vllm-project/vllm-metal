@@ -173,6 +173,25 @@ class TestGdnPlanDecision:
         assert plan.geometry.value_head_dim == 16
         assert plan.geometry.key_head_dim == 32
 
+    def test_tensor_parallel_shapes_match_vllm_gdn_calculator(self) -> None:
+        plan = build_gdn_hybrid_plan(GDN_ARGS, 8, STATE_DTYPES).for_tensor_parallel(2)
+        expected = MambaStateShapeCalculator.gated_delta_net_state_shape(
+            tp_world_size=2,
+            num_k_heads=2,
+            num_v_heads=4,
+            head_k_dim=32,
+            head_v_dim=16,
+            conv_kernel_size=3,
+        )
+
+        spec = plan.state_cache_spec(
+            mamba_block_size=2048,
+            page_size_padded=None,
+            mamba_cache_mode="none",
+        )
+
+        assert spec.shapes == expected
+
 
 class TestGdnPlanRejection:
     @pytest.mark.parametrize(
@@ -253,6 +272,27 @@ class TestStateFamilyFactory:
 
         assert plan.family.label == "kda"
         assert plan.layers.attention_indices == (1, 3, 4)
+        assert plan.layers.state_indices == (0, 2)
+        assert plan.geometry.state_shapes == ((2, 24), (2, 4, 4))
+
+    @pytest.mark.parametrize(
+        "sparse_layer_type", ["deepseek_sparse_attention", "indexed_attention"]
+    )
+    def test_routes_glm5_next_layer_types_to_the_kda_family(
+        self, sparse_layer_type: str
+    ) -> None:
+        args = {
+            "model_type": "glm5_next_text",
+            "layer_types": ["linear_attention", sparse_layer_type, "linear_attention"],
+            "linear_num_heads": 2,
+            "linear_head_dim": 4,
+            "linear_conv_kernel_dim": 3,
+        }
+
+        plan = build_hybrid_runtime_plan(args, 3, STATE_DTYPES)
+
+        assert plan.family.label == "kda"
+        assert plan.layers.attention_indices == (1,)
         assert plan.layers.state_indices == (0, 2)
         assert plan.geometry.state_shapes == ((2, 24), (2, 4, 4))
 

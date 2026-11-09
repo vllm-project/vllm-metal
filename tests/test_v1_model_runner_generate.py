@@ -2929,11 +2929,13 @@ class TestHybridDraftCaps:
 
 
 class TestLoadModelPipelineSplitOrdering:
-    def test_split_runs_before_lora_setup_on_pp_stage(self) -> None:
-        # The pipeline split must run adjacent to the (lazy) load and before LoRA
-        # setup, so the stage's non-owned layers are pruned before anything
-        # materializes them. Pin the order so a future edit cannot move the split
-        # back after LoRA and silently reintroduce the full-model peak.
+    @pytest.mark.parametrize("parallelism", ["pp", "tp"])
+    def test_split_runs_before_lora_setup_on_pp_stage(self, parallelism: str) -> None:
+        # The pipeline split (or tensor-parallel shard) must run adjacent to the
+        # (lazy) load and before LoRA setup, so the rank's non-owned weights are
+        # dropped before anything materializes them. Pin the order so a future
+        # edit cannot move it back after LoRA and silently reintroduce the
+        # full-model peak.
         events: list[str] = []
 
         class _FakeGroup:
@@ -2944,7 +2946,8 @@ class TestLoadModelPipelineSplitOrdering:
                 return 2
 
         runner = make_stub_runner(
-            pp=PipelineGroup(_FakeGroup()),
+            pp=PipelineGroup(_FakeGroup()) if parallelism == "pp" else None,
+            tp_group=_FakeGroup() if parallelism == "tp" else None,
             model_config=SimpleNamespace(runner_type="generate", hf_config=None),
             metal_config=SimpleNamespace(),
             scheduler_config=SimpleNamespace(max_num_seqs=1, max_num_batched_tokens=1),
@@ -2955,7 +2958,10 @@ class TestLoadModelPipelineSplitOrdering:
             install_decode_dispatch=lambda: events.append("install"),
         )
         runner.apply_pipeline_split = lambda pp: events.append("split")
-        runner._lora = SimpleNamespace(setup=lambda **kwargs: events.append("lora"))
+        runner.apply_tensor_parallel = lambda group: events.append("split")
+        runner._lora = SimpleNamespace(
+            enabled=False, setup=lambda **kwargs: events.append("lora")
+        )
 
         runner.load_model()
 
@@ -2963,6 +2969,14 @@ class TestLoadModelPipelineSplitOrdering:
         # come after the split prunes non-owned layers, and the split itself
         # stays adjacent to the (lazy) load before LoRA setup.
         assert events == ["load", "split", "install", "lora"]
+
+
+class TestApplyTensorParallel:
+    def test_model_without_shard_is_rejected(self) -> None:
+        runner = make_stub_runner(model=object())
+
+        with pytest.raises(NotImplementedError, match=r"implements shard\(\)"):
+            runner.apply_tensor_parallel(object())
 
 
 class TestSelectiveLogitsLoRAGate:
