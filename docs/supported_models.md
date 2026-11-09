@@ -195,7 +195,8 @@ and TurboQuant are not validated.
 
 LFM3 support covers text generation with BF16 and MLX-quantized checkpoints.
 LFM3-VL image input and LFM3-Audio audio input are listed under multimodal models.
-Omni and d1 variants require separate integrations.
+LFM3-Omni image/audio input with text output is under validation on MLX.
+Video, speech output and d1 variants require separate integrations.
 
 LFM3-Audio accepts waveform input through the offline API and audio chat
 requests, resampled to 16 kHz mono. Clips must be nonempty and at most
