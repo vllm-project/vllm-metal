@@ -45,7 +45,12 @@ def rms_norm(
     epsilon: float,
     variance_size: int | None = None,
 ) -> torch.Tensor:
-    if weight is not None and weight.dtype == torch.float32:
+    # Omni also calls this function directly, bypassing the registry filter.
+    if (
+        weight is not None
+        and weight.dtype == torch.float32
+        and _supports_rms_norm(x, weight, epsilon, variance_size)
+    ):
         if (
             x.is_contiguous()
             and weight.is_contiguous()
