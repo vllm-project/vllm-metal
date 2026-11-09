@@ -432,6 +432,12 @@ class TestMetalPlatform:
         with pytest.raises(NotImplementedError, match="MLX backend only"):
             MetalPlatform.check_and_update_config(vllm_config)
 
+    def test_check_and_update_config_accepts_mps_config_without_model(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("vllm_metal.envs.VLLM_METAL_BACKEND", "mps")
+        MetalPlatform.check_and_update_config(self._platform_config())
+
     def test_validate_request_accepts_min_p(self) -> None:
         MetalPlatform.validate_request({}, SamplingParams(min_p=0.2))
 
