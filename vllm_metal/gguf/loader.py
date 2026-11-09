@@ -116,6 +116,13 @@ class GGUFModelLoader:
         )
         self._preflight(reader, arch)
 
+        # llama.cpp computes logits from output.weight whenever the file has one,
+        # and llama-quantize stores that table at the output qtype (e.g. Q6_K)
+        # even when token_embd sits at the base qtype, so a tied config still
+        # builds an untied head to read it.
+        if self._has_loadable_output(reader):
+            config = self._untied_config(config)
+
         # Build the mlx-lm skeleton lazily; the GGUF replaces every parameter of
         # its text model, so the skeleton's own weights are never materialized.
         model = self._build_skeleton(config)
@@ -207,15 +214,34 @@ class GGUFModelLoader:
             model, _ = load_model(Path(config_only_dir), lazy=True, strict=False)
         return model
 
-    def _preflight_deferred_output(self, reader: Any, *, tied: bool) -> None:
-        """Validate ``output.weight`` after the live model resolves weight tying.
-
-        A tied model never reads the redundant table, so its qtype is irrelevant.
-        """
-        output = next(
+    @staticmethod
+    def _output_tensor(reader: Any) -> Any | None:
+        return next(
             (tensor for tensor in reader.tensors if tensor.name == "output.weight"),
             None,
         )
+
+    @classmethod
+    def _has_loadable_output(cls, reader: Any) -> bool:
+        output = cls._output_tensor(reader)
+        return output is not None and output.tensor_type in _ALLOWED_WEIGHT_TYPES
+
+    @staticmethod
+    def _untied_config(config: dict[str, Any]) -> dict[str, Any]:
+        """Return ``config`` with weight tying off, in ``text_config`` too."""
+        untied = {**config, "tie_word_embeddings": False}
+        text_config = config.get("text_config")
+        if isinstance(text_config, dict):
+            untied["text_config"] = {**text_config, "tie_word_embeddings": False}
+        return untied
+
+    def _preflight_deferred_output(self, reader: Any, *, tied: bool) -> None:
+        """Validate ``output.weight`` after the live model resolves weight tying.
+
+        The head stays tied only when ``output.weight`` is absent or in a qtype
+        the loader cannot run, and a tied head never reads that table.
+        """
+        output = self._output_tensor(reader)
         if output is None or tied or output.tensor_type in _ALLOWED_WEIGHT_TYPES:
             return
         raise GGUFLoadError(
@@ -258,7 +284,7 @@ class GGUFModelLoader:
             if translated is None:
                 continue
             if tied and translated == "lm_head.weight":
-                continue  # tie-redundant output table; the tied head uses as_linear
+                continue  # unloadable output table; the tied head uses as_linear
 
             module_path, _, param_name = translated.rpartition(".")
 
