@@ -114,16 +114,16 @@ struct GqaDecodeLengthPlan {
   }
 };
 
-// CPU lengths are shared across layers; kernel execution still reads its
-// device metadata. This plan affects cost estimation, not row ownership.
+// For a single request these bounds are its exact Q/KV lengths. Multi-request
+// plans can be validated at the binding but cannot enable grouped dispatch.
 struct NaxPrefillPlan {
-  std::shared_ptr<const std::vector<kernels::NaxSequence>> sequences;
+  int num_requests = 0;
   int query_tokens = 0;
   int max_length = 0;
 
   bool operator==(const NaxPrefillPlan& other) const {
-    return sequences == other.sequences ||
-        (sequences && other.sequences && *sequences == *other.sequences);
+    return num_requests == other.num_requests && query_tokens == other.query_tokens
+        && max_length == other.max_length;
   }
 };
 
@@ -131,17 +131,14 @@ inline NaxPrefillPlan nax_prefill_plan(
     const std::vector<int>& cu_seqlens, const std::vector<int>& kv_lengths) {
   if (cu_seqlens.size() != kv_lengths.size() + 1 || cu_seqlens.front() != 0)
     throw std::invalid_argument("NAX prefill lengths require cumulative Q starting at zero");
-  auto sequences = std::make_shared<std::vector<kernels::NaxSequence>>();
-  sequences->reserve(kv_lengths.size());
   int max_length = 0;
   for (size_t i = 0; i < kv_lengths.size(); ++i) {
     const int64_t q = int64_t(cu_seqlens[i + 1]) - cu_seqlens[i];
     if (q <= 0 || kv_lengths[i] < q)
       throw std::invalid_argument("NAX prefill lengths require 0 < Q <= KV per sequence");
-    sequences->push_back({static_cast<int>(q), kv_lengths[i]});
     max_length = std::max(max_length, kv_lengths[i]);
   }
-  return {std::move(sequences), cu_seqlens.back(), max_length};
+  return {static_cast<int>(kv_lengths.size()), cu_seqlens.back(), max_length};
 }
 
 extern std::atomic<PagedDispatch> g_last_dispatch;

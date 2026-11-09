@@ -261,12 +261,13 @@ def _grouped_cases() -> list[Case]:
             256,
             32,
             "grouped-required-h4",
-            seqs=((64, 31681),),
+            seqs=((128, 31681),),
             poison_padding=True,
             q_heads=16,
             kv_heads=2,
             cache_page=544,
             expected_widths=(4, 1),
+            planning_cores=10,
         )
     )
     cases.extend(
@@ -325,7 +326,7 @@ def _grouped_cases() -> list[Case]:
                 page,
                 "grouped-fallback",
                 sliding_window=window,
-                seqs=((64, 31681),),
+                seqs=((128, 31681),),
                 poison_padding=True,
                 q_heads=16,
                 kv_heads=2,

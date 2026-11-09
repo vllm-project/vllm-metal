@@ -14,17 +14,107 @@ from vllm_metal.attention.nax_split import (
 )
 
 
+# Each fixture describes the translated dispatch, compact dispatch and shader.
 @pytest.fixture(
     params=[
-        pytest.param((144, 3, 0, (24, 4, 256, 16), 784, 31360, 40), id="gqa6-h3"),
-        pytest.param((1328, 6, 1, (24, 4, 256, 16), 784, 31360, 40), id="gqa6-h6"),
-        pytest.param((64, 4, 0, (16, 2, 256, 32), 544, 31680, 40), id="gqa8-h4-q64"),
         pytest.param(
-            (128, 4, 0, (16, 2, 256, 32), 544, 31681, 40), id="gqa8-h4-kv-tail"
+            (
+                144,
+                0,
+                (24, 4, 256, 16),
+                784,
+                31360,
+                40,
+                ("nax_gqa6_prefill", 3),
+                ("nax_gqa6_prefill", 3),
+                "_gqa6_sub_full",
+            ),
+            id="gqa6-h3",
         ),
-        pytest.param((64, 2, 0, (24, 4, 256, 16), 784, 31360, 20), id="gqa6-h2"),
-        pytest.param((16, 2, 0, (16, 2, 256, 32), 1056, 31680, 40), id="gqa8-h2"),
-        pytest.param((1024, 8, 1, (64, 8, 256, 32), 1056, 17, 10), id="gqa8-h8"),
+        pytest.param(
+            (
+                1328,
+                1,
+                (24, 4, 256, 16),
+                784,
+                31360,
+                40,
+                ("nax_gqa6_prefill", 6),
+                ("nax_gqa6_prefill", 6),
+                "_gqa6_full",
+            ),
+            id="gqa6-h6",
+        ),
+        pytest.param(
+            (
+                64,
+                0,
+                (16, 2, 256, 32),
+                544,
+                31680,
+                40,
+                ("nax_gqa8_prefill", 2),
+                ("nax_prefill", 1),
+                "_gqa8_h2_full",
+            ),
+            id="gqa8-q64",
+        ),
+        pytest.param(
+            (
+                128,
+                0,
+                (16, 2, 256, 32),
+                544,
+                31681,
+                10,
+                ("nax_gqa8_prefill", 4),
+                ("nax_prefill", 1),
+                "_gqa8_full",
+            ),
+            id="gqa8-h4-kv-tail",
+        ),
+        pytest.param(
+            (
+                64,
+                0,
+                (24, 4, 256, 16),
+                784,
+                31360,
+                20,
+                ("nax_gqa6_prefill", 2),
+                ("nax_prefill", 1),
+                "_gqa6_h2_full",
+            ),
+            id="gqa6-h2",
+        ),
+        pytest.param(
+            (
+                16,
+                0,
+                (16, 2, 256, 32),
+                1056,
+                31680,
+                40,
+                ("nax_gqa8_prefill", 2),
+                ("nax_prefill", 1),
+                "_gqa8_h2_full",
+            ),
+            id="gqa8-h2",
+        ),
+        pytest.param(
+            (
+                1024,
+                1,
+                (64, 8, 256, 32),
+                1056,
+                17,
+                10,
+                ("nax_gqa8_prefill", 8),
+                ("nax_prefill", 1),
+                "_gqa8_h8_full",
+            ),
+            id="gqa8-h8",
+        ),
     ]
 )
 def grouped_prefill_inputs(nax_prefill, request):
@@ -34,34 +124,27 @@ def grouped_prefill_inputs(nax_prefill, request):
     if os.environ.get("VLLM_METAL_NAX_GQA_PREFILL", "1") != "1":
         pytest.skip("Grouped layout coverage requires GQA prefill enabled")
     ops = nax_prefill
-    query_tokens, width, hint, geometry, cache_page, prefix, cores = request.param
+    q, hint, geometry, cache_page, prefix, cores, route, compact, suffix = request.param
     heads, _, head_size, _ = geometry
-    # Fix host planning to cover every layout on each NAX-capable test host.
-    # This override tests route/output correctness, not hardware performance.
     ops._override_detected_gpu_core_count_for_test(cores)
     try:
         inputs = _mixed_inputs(
             [1],
-            prefill_kv=prefix + query_tokens,
+            prefill_kv=prefix + q,
             geometry=geometry,
             cache_block=cache_page,
         )
         inputs.update(
-            query=mx.random.normal((query_tokens, heads, head_size)).astype(
-                mx.bfloat16
-            ),
+            query=mx.random.normal((q, heads, head_size)).astype(mx.bfloat16),
             block_tables=inputs["block_tables"][-1:],
-            seq_lens=mx.array([prefix + query_tokens], mx.int32),
-            cu_seqlens_q=mx.array([0, query_tokens], mx.int32),
+            seq_lens=mx.array([prefix + q], mx.int32),
+            cu_seqlens_q=mx.array([0, q], mx.int32),
             num_decode_requests=0,
             num_decode_tokens=0,
             max_decode_context_len=0,
+            nax_work_plan=ops.nax_prefill_plan([0, q], [prefix + q]),
         )
-        if width in (2, 8):
-            inputs["nax_work_plan"] = ops.nax_prefill_plan(
-                [0, query_tokens], [prefix + query_tokens]
-            )
-        yield ops, inputs, width, hint
+        yield ops, inputs, hint, route, compact, suffix
     finally:
         mx.synchronize()
         ops._override_detected_gpu_core_count_for_test(-1)
@@ -69,14 +152,12 @@ def grouped_prefill_inputs(nax_prefill, request):
 
 def test_nax_grouped_translated_pages_match_compact_cache(grouped_prefill_inputs):
     """Each selected width must execute and preserve logical-page attention."""
-    ops, inputs, width, hint = grouped_prefill_inputs
-    heads, head_size = inputs["query"].shape[1:]
+    ops, inputs, hint, route, compact_route, _ = grouped_prefill_inputs
+    head_size = inputs["query"].shape[2]
     kv_heads, page = inputs["num_kv_heads"], inputs["block_size"]
-    family = f"nax_gqa{heads // kv_heads}_prefill"
     assert inputs["key_cache"].shape[1] > page
     translated = _mixed_call(inputs, nax_split_hint=hint)
-    assert ops.last_paged_dispatch() == family
-    assert ops.last_nax_heads_per_threadgroup() == width
+    assert (ops.last_paged_dispatch(), ops.last_nax_heads_per_threadgroup()) == route
 
     # Independent contiguous kernel-page storage removes physical-page and
     # interleaved-head strides while preserving logical tokens/block IDs.
@@ -89,9 +170,10 @@ def test_nax_grouped_translated_pages_match_compact_cache(grouped_prefill_inputs
         ),
     }
     direct = _mixed_call(compact, nax_split_hint=hint)
-    compact_width = 1 if width in (2, 8) else width
-    assert ops.last_paged_dispatch() == (family if compact_width > 1 else "nax_prefill")
-    assert ops.last_nax_heads_per_threadgroup() == compact_width
+    assert (
+        ops.last_paged_dispatch(),
+        ops.last_nax_heads_per_threadgroup(),
+    ) == compact_route
     assert mx.array_equal(translated, direct)
 
     ops._override_detected_gpu_core_count_for_test(0)
@@ -147,7 +229,7 @@ def test_grouped_prefill_uses_exact_lengths_under_a_loose_kv_bound(
     grouped_prefill_inputs,
 ):
     """An allocation bound is not an exact prefix length for cost selection."""
-    ops, inputs, width, hint = grouped_prefill_inputs
+    ops, inputs, hint, (_, width), _, _ = grouped_prefill_inputs
     q = inputs["query"].shape[0]
     kv = inputs["max_seq_len"]
     plan = ops.nax_prefill_plan([0, q], [kv])
@@ -271,8 +353,8 @@ def test_mixed_benchmark_reuses_exact_plans_for_each_execution_view(
 
     from tools.benchmark import mixed_decode_split_benchmark as bench
 
-    whole, prefill = object(), object()
-    ops = Mock(nax_prefill_plan=Mock(side_effect=[whole, prefill]))
+    prefill = object()
+    ops = Mock(nax_prefill_plan=Mock(return_value=prefill))
     monkeypatch.setattr(bench, "get_ops", lambda: ops)
     monkeypatch.setattr(
         bench,
@@ -295,15 +377,13 @@ def test_mixed_benchmark_reuses_exact_plans_for_each_execution_view(
         arms.unsplit()
         arms.split_native()
         arms.split_emulated()
-    expected = [whole, whole, None, prefill] * 2 if supports_plan else [None] * 8
+    expected = [None, None, None, prefill] * 2 if supports_plan else [None] * 8
     assert [
         c.kwargs.get("nax_work_plan")
         for c in ops.paged_attention_primitive.call_args_list
     ] == expected
     assert ops.nax_prefill_plan.call_args_list == (
-        [call([0, 1, 2, 67], [512, 512, 4161]), call([0, 65], [4161])]
-        if supports_plan
-        else []
+        [call([0, 65], [4161])] if supports_plan else []
     )
 
 
@@ -432,7 +512,7 @@ def test_native_prefill_hint_only_applies_after_decode_separation(
 
 def test_nax_trace_reports_executed_layout(grouped_prefill_inputs):
     """Trace fields describe the encoded layout without changing its output."""
-    ops, inputs, width, hint = grouped_prefill_inputs
+    ops, inputs, hint, (family, width), _, suffix = grouped_prefill_inputs
     query_tokens = inputs["query"].shape[0]
     ops._take_nax_prefill_dispatch_trace()
     plain = _mixed_call(inputs, nax_split_hint=hint)
@@ -448,12 +528,8 @@ def test_nax_trace_reports_executed_layout(grouped_prefill_inputs):
         assert trace["dispatch_count"] == len(trace["events"]) == 1
         event = trace["events"][0]
         heads = inputs["query"].shape[1]
-        ratio = heads // inputs["num_kv_heads"]
-        suffix = f"_gqa{ratio}"
-        suffix += f"_h{width}" if width in (2, 8) else ("_sub" if width == 3 else "")
-        suffix += "_full"
         assert event["function"].endswith(suffix)
-        assert event["family"] == f"nax_gqa{ratio}_prefill"
+        assert event["family"] == family
         assert event["HEADS_PER_TG"] == width and event["threads"] == width * 32
         assert (event["gridx"], event["gridy"], event["BQ"]) == (
             heads // width,

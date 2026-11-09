@@ -185,9 +185,8 @@ class Arms:
         self.work_prefill = nax_tile_work(cu[d:], shape.kv_lens[d:])
         prefill_cu = [c - cu[d] for c in cu[d:]]
         self.work_prefill_only = nax_tile_work(prefill_cu, shape.kv_lens[d:])
-        self.plan_all = self.plan_prefill = None
+        self.plan_prefill = None
         if capabilities.get("nax_work_plan", False):
-            self.plan_all = self.ops.nax_prefill_plan(cu, shape.kv_lens)
             self.plan_prefill = self.ops.nax_prefill_plan(prefill_cu, shape.kv_lens[d:])
         x = inputs
         self.decode_x = Inputs(
@@ -237,7 +236,7 @@ class Arms:
 
     def unsplit(self) -> list[mx.array]:
         kwargs: dict[str, object] = {"num_decode_requests": 0, "num_decode_tokens": 0}
-        kwargs.update(self._nax(self.work_all, plan=self.plan_all))
+        kwargs.update(self._nax(self.work_all))
         return [self._call(self.x, max(self.shape.kv_lens), **kwargs)]
 
     def split_native(self) -> list[mx.array]:
@@ -248,7 +247,7 @@ class Arms:
             "max_decode_context_len": max(self.decode_lens),
             "gqa_length_plan": self.ops.gqa_decode_length_plan(self.decode_lens),
         }
-        kwargs.update(self._nax(self.work_all, self.work_prefill, plan=self.plan_all))
+        kwargs.update(self._nax(self.work_all, self.work_prefill))
         return [self._call(self.x, max(self.shape.kv_lens), **kwargs)]
 
     def _decode_only(self, gqa_disabled: bool) -> mx.array:

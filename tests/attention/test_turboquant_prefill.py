@@ -230,6 +230,35 @@ def test_nax_hint_describes_only_the_dequantized_prefill(recorded_ops):
     assert prefill[0]["nax_split_hint"] == 1
 
 
+def test_dequantized_gqa6_uses_its_own_plan_and_compact_route(
+    recorded_ops, nax_prefill
+):
+    case = build_case(
+        qlens=(144, 1),
+        context_lens=(400, 32),
+        n_heads=24,
+        n_kv_heads=4,
+        head_dim=256,
+        block_size=16,
+    )
+    ops = nax_prefill
+    ops._override_detected_gpu_core_count_for_test(40)
+    try:
+        ops._start_nax_prefill_dispatch_trace()
+        assert_parity(case)
+        events = ops._take_nax_prefill_dispatch_trace()["events"]
+    finally:
+        ops._take_nax_prefill_dispatch_trace()
+        ops._override_detected_gpu_core_count_for_test(-1)
+    (_, prefill), (_, compressed) = recorded_ops
+    plan = prefill["nax_work_plan"]
+    assert (plan.query_tokens, plan.max_length) == (144, 400)
+    assert compressed["use_turboquant"] and "nax_work_plan" not in compressed
+    assert [(e["family"], e["HEADS_PER_TG"], e["key_head_stride"]) for e in events] == [
+        ("nax_gqa6_prefill", 3, 256)
+    ]
+
+
 @pytest.mark.parametrize("qlen", [1, 2, 32, 127, 128])
 def test_short_suffix_crossover(recorded_ops, qlen):
     case = build_case(qlens=(qlen,), context_lens=(2049,))

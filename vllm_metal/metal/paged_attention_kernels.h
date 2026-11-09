@@ -78,12 +78,11 @@ inline constexpr std::array<NaxConfig, 3> nax_grouped_configs(int ratio) {
 // A shared source-work score for compiled grouped layouts. Complete SG work
 // supplies a capacity budget; whole Q tails and isolated KV edges are separate.
 // Coefficients are conservative empirical weights, not predicted milliseconds.
-// Calibration terms, measured counterexamples and hardware scope are recorded
-// in docs/gqa-prefill.md; keep kernel and serving evidence separate.
+// The original GQA6 policy and its calibration are recorded in PR #1225.
 // In particular, idle cores cannot amplify the baseline tail-work credit.
 inline NaxPrefillWork nax_prefill_work(int q, int prefix, int heads, int groups, int bq, bool split) {
   return nax_sequence_work({q, prefix + q}, heads,
-      {bq, 32, bq == 64 ? 1 : heads / groups, bq == 64 ? 128 : 32 * heads / groups}, split);
+      {bq, 32, bq == 64 ? 1 : heads / groups}, split);
 }
 
 struct NaxGqaScore {
@@ -167,29 +166,6 @@ inline double nax_gqa_critical_savings(
       * heads_per_group * grouped.tail_stream;
 }
 
-inline NaxGqaScore nax_gqa8_work_score(
-    int q, int prefix, int heads, int cores, bool upstream_split) {
-  constexpr int kHeadsPerGroup = 4;
-  constexpr double kAdmissionMargin = .5;
-  constexpr double kTailReserveWeight = 8;
-  // The four-head layout was calibrated against the guarded upstream loop.
-  if (upstream_split) return {true, false, 0, kHeadsPerGroup};
-  const auto baseline = nax_prefill_work(q, prefix, heads, heads / 8, kNaxBQ, false);
-  const auto grouped = nax_prefill_work(q, prefix, heads, heads / kHeadsPerGroup, 16, true);
-  // Keep at least as many useful groups available to fill this GPU.
-  if (std::min(int64_t(cores), grouped.groups) <
-      std::min(int64_t(cores), baseline.groups))
-    return {true, false, 0, kHeadsPerGroup};
-  const double critical_savings = nax_gqa_critical_savings(
-      q, heads, cores, kHeadsPerGroup, baseline, grouped);
-  // h4 has no extra group state; the capacity veto above makes lost-grid cost zero.
-  const double value = nax_gqa_guarded_score(
-      baseline, grouped, heads, cores, 0, critical_savings, 0);
-  const double threshold = kAdmissionMargin + kTailReserveWeight * cores
-      * kHeadsPerGroup * grouped.tail_stream / baseline.issued;
-  return {true, value > threshold, value, kHeadsPerGroup};
-}
-
 inline NaxGqaScore nax_gqa_work_score(
     int q, int prefix, int heads, int kv_heads, int page,
     int cores, bool upstream_split) {
@@ -210,8 +186,6 @@ inline NaxGqaScore nax_gqa_work_score(
   if (q <= 1 || prefix < 0 || heads <= 0 || kv_heads <= 0 ||
       heads % kv_heads || cores <= 0) return {false, false, 0, 0};
   const int ratio = heads / kv_heads;
-  if (ratio == 8 && page == 32)
-    return nax_gqa8_work_score(q, prefix, heads, cores, upstream_split);
   if (ratio != kSupportedRatio || page != kSupportedPageSize)
     return {false, false, 0, 0};
   const auto baseline = nax_prefill_work(
@@ -285,18 +259,12 @@ inline NaxConfig select_nax_config(
       : kNaxBaseline;
 }
 
-// Exact CPU lengths permit adaptive replacement of the retained h3/h6/h4
-// route. Without them, the overload above preserves the established policy.
-// Batch/mixed resource counting is shared, but automatic admission remains
-// single-sequence until those layouts have independent performance evidence.
+// Compare every compiled width with the route main would actually dispatch:
+// ordinary NAX for GQA8, and the established h1/h3/h6 policy for GQA6.
 inline NaxConfig select_nax_config(
-    NaxGeometry geometry, NaxSequences sequences, int query_offset,
-    bool grouped_enabled, bool bf16, bool unmasked, bool upstream_split,
-    int gpu_cores) {
-  if (!sequences.first || sequences.last - sequences.first != 1 || query_offset != 0)
-    return kNaxBaseline;
-  const auto sequence = *sequences.first;
-  auto incumbent = select_nax_config(
+    NaxGeometry geometry, NaxSequence sequence, bool grouped_enabled,
+    bool bf16, bool unmasked, bool upstream_split, int gpu_cores) {
+  const auto upstream = select_nax_config(
       geometry.heads, geometry.kv_heads, geometry.qk_dim, geometry.kernel_page,
       sequence.query_tokens, 1, sequence.kv_tokens, 0,
       grouped_enabled, bf16, unmasked, upstream_split, gpu_cores);
@@ -304,41 +272,41 @@ inline NaxConfig select_nax_config(
       geometry.value_dim != 256 || gpu_cores <= 0 || sequence.query_tokens <= 1 ||
       sequence.kv_tokens < sequence.query_tokens || geometry.heads <= 0 ||
       geometry.kv_heads <= 0 || geometry.heads % geometry.kv_heads)
-    return incumbent;
+    return upstream;
   const int ratio = geometry.heads / geometry.kv_heads;
   if (!((ratio == 6 && geometry.kernel_page == 16) ||
-        (ratio == 8 && geometry.kernel_page == 32))) return incumbent;
-  // The additional calibration uses dense interleaved K/V views. Other valid
-  // strides retain the existing route; physical pages may translate to either
-  // kernel page size without requiring a complete final physical page.
+        (ratio == 8 && geometry.kernel_page == 32))) return upstream;
   if (geometry.physical_page < geometry.kernel_page ||
       geometry.physical_page % geometry.kernel_page ||
       geometry.key_head_stride != 2 * geometry.qk_dim ||
       geometry.key_token_stride != geometry.kv_heads * geometry.key_head_stride)
-    return incumbent;
-  auto resources_for = [&](NaxConfig cfg) {
-    return nax_prefill_resources(sequences, geometry,
-        {cfg.BQ, 32, cfg.HEADS_PER_TG, cfg.NUM_THREADS},
-        cfg.HEADS_PER_TG > 1 || upstream_split);
+    return upstream;
+
+  const auto resources = [&](NaxConfig cfg) {
+    return nax_prefill_resources(sequence, geometry, {cfg.BQ, 32, cfg.HEADS_PER_TG},
+                                 cfg.HEADS_PER_TG > 1 || upstream_split);
   };
-  auto cost_for = [&](NaxConfig cfg, const NaxPrefillResources& resources) {
-    return nax_prefill_cost(resources, geometry,
-        {cfg.BQ, 32, cfg.HEADS_PER_TG, cfg.NUM_THREADS}, gpu_cores,
-        cfg.HEADS_PER_TG > 1 || upstream_split);
+  const auto cost = [&](NaxConfig cfg, const NaxPrefillResources& work) {
+    return nax_prefill_cost(work, geometry, {cfg.BQ, 32, cfg.HEADS_PER_TG},
+                            gpu_cores, cfg.HEADS_PER_TG > 1 || upstream_split);
   };
-  const auto baseline = resources_for(kNaxBaseline);
-  const double incumbent_cost = cost_for(incumbent, resources_for(incumbent));
-  auto best = kNaxBaseline;
-  double best_cost = cost_for(best, baseline);
-  for (const auto cfg : nax_grouped_configs(ratio)) {
-    const double cost = cost_for(cfg, resources_for(cfg));
-    if (cost < best_cost) {
+  const auto reference = resources(upstream);
+  const double reference_cost = cost(upstream, reference);
+  auto best = upstream;
+  double best_cost = reference_cost;
+  const auto consider = [&](NaxConfig cfg) {
+    if (cfg.HEADS_PER_TG == upstream.HEADS_PER_TG) return;
+    const auto work = resources(cfg);
+    const double score = cost(cfg, work);
+    const double margin = nax_admission_margin(reference.work, work.work, gpu_cores);
+    if (score < best_cost && score < (1. - margin) * reference_cost) {
       best = cfg;
-      best_cost = cost;
+      best_cost = score;
     }
-  }
-  return best_cost < (1 - nax_replacement_margin(baseline, geometry.heads, gpu_cores))
-      * incumbent_cost ? best : incumbent;
+  };
+  if (upstream.HEADS_PER_TG > 1) consider(kNaxBaseline);
+  for (const auto cfg : nax_grouped_configs(ratio)) consider(cfg);
+  return best;
 }
 
 inline constexpr NaxConfig nax_config_for_pipeline(

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -173,6 +174,7 @@ class _AttentionBatch:
     max_seq_len: int
     # KV-tile counts for the NAX pipeline choice (dequantized prefill only).
     nax_work: NaxTileWork | None = None
+    nax_work_plan: object | None = None
 
 
 @dataclass(frozen=True, eq=False)
@@ -196,6 +198,7 @@ def _turboquant_prefill_plan(
     *,
     key_quant_type: str | None = None,
     value_bits: int | None = None,
+    make_nax_plan: Callable[[list[int], list[int]], object] | None = None,
 ) -> _TurboQuantPrefillPlan | None:
     """Plan bounded materialization using the existing CPU scheduler metadata.
 
@@ -239,6 +242,7 @@ def _turboquant_prefill_plan(
         num_kv_heads,
         head_dim,
         workspace_limit,
+        make_nax_plan is not None,
         *min_tokens,
     )
     if key in meta.tq_prefill_plans:
@@ -325,36 +329,44 @@ def _turboquant_prefill_plan(
     fallback_ids = [i for i in range(len(lengths)) if i not in selected]
     query_order: list[int] = []
 
-    def batch(ids: list[int], tables: mx.array) -> _AttentionBatch:
-        if not fallback_ids:
-            # The whole batch keeps its original query order and metadata.
-            return _AttentionBatch(
-                None,
-                tables,
-                meta.seq_lens,
-                meta.cu_seqlens_q,
-                meta.max_seq_len,
-                nax_tile_work(cu_seqlens, ctx.context_lens),
-            )
-        indices = [q for i in ids for q in range(cu_seqlens[i], cu_seqlens[i + 1])]
-        query_order.extend(indices)
-        cu = [0]
-        for i in ids:
-            cu.append(cu[-1] + lengths[i])
-        kv_lens = [ctx.context_lens[i] for i in ids]
+    def batch(
+        ids: list[int], tables: mx.array, *, dequantized: bool
+    ) -> _AttentionBatch:
+        if fallback_ids:
+            indices = [q for i in ids for q in range(cu_seqlens[i], cu_seqlens[i + 1])]
+            query_order.extend(indices)
+            cu = [0]
+            for i in ids:
+                cu.append(cu[-1] + lengths[i])
+            kv_lens = [ctx.context_lens[i] for i in ids]
+            query_indices = mx.array(indices, dtype=mx.int32)
+            seq_lens = mx.array(kv_lens, dtype=mx.int32)
+            cu_q = mx.array(cu, dtype=mx.int32)
+            max_len = max(kv_lens)
+        else:
+            cu, kv_lens = cu_seqlens, ctx.context_lens
+            query_indices, seq_lens = None, meta.seq_lens
+            cu_q, max_len = meta.cu_seqlens_q, meta.max_seq_len
         return _AttentionBatch(
-            mx.array(indices, dtype=mx.int32),
+            query_indices,
             tables,
-            mx.array(kv_lens, dtype=mx.int32),
-            mx.array(cu, dtype=mx.int32),
-            max(kv_lens),
-            nax_tile_work(cu, kv_lens),
+            seq_lens,
+            cu_q,
+            max_len,
+            nax_tile_work(cu, kv_lens) if dequantized else None,
+            make_nax_plan(cu, kv_lens)
+            if dequantized and len(ids) == 1 and make_nax_plan is not None
+            else None,
         )
 
     tables = mx.array([row + [0] * (table_width - len(row)) for row in rows], mx.int32)
-    prefill = batch(prefill_ids, tables)
+    prefill = batch(prefill_ids, tables, dequantized=True)
     fallback = (
-        batch(fallback_ids, meta.block_tables[mx.array(fallback_ids, mx.int32)])
+        batch(
+            fallback_ids,
+            meta.block_tables[mx.array(fallback_ids, mx.int32)],
+            dequantized=False,
+        )
         if fallback_ids
         else None
     )

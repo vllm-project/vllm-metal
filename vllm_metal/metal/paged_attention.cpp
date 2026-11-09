@@ -450,14 +450,12 @@ static void dispatch_paged_attention_nax(
   const bool ordinary_causal = sliding_window < 0 && softcap <= 0.0f && sinks == nullptr;
   const int gpu_cores = detected_gpu_core_count();
   auto cfg = kernels::kNaxBaseline;
-  if (work_plan.sequences) {
-    const auto& sequences = *work_plan.sequences;
+  if (work_plan.num_requests == 1 && first_sequence == 0) {
     const kernels::NaxGeometry geometry{
         num_heads, num_kv_heads, head_size, head_size, block_size,
         static_cast<int>(key_cache.shape(1)), key_cache.strides()[2], key_cache.strides()[1]};
     cfg = kernels::select_nax_config(geometry,
-        {sequences.data() + first_sequence, sequences.data() + sequences.size()},
-        first_sequence, nax_gqa_prefill_enabled_, query.dtype() == bfloat16,
+        {work_plan.query_tokens, work_plan.max_length}, nax_gqa_prefill_enabled_, query.dtype() == bfloat16,
         ordinary_causal, split_full, gpu_cores);
   } else {
     cfg = kernels::select_nax_config(
@@ -1566,10 +1564,9 @@ array paged_attention_primitive_fn(
     throw std::invalid_argument("nax_split_hint must be -1, 0 or 1");
   if (nax_prefill_split_hint < -1 || nax_prefill_split_hint > 1)
     throw std::invalid_argument("nax_prefill_split_hint must be -1, 0 or 1");
-  if (nax_work_plan && (!nax_work_plan->sequences ||
-      query.ndim() != 3 || seq_lens.ndim() != 1 || cu_seqlens_q.ndim() != 1 ||
+  if (nax_work_plan && (query.ndim() != 3 || seq_lens.ndim() != 1 || cu_seqlens_q.ndim() != 1 ||
       nax_work_plan->query_tokens != query.shape(0) ||
-      nax_work_plan->sequences->size() != static_cast<size_t>(seq_lens.shape(0)) ||
+      nax_work_plan->num_requests != seq_lens.shape(0) ||
       cu_seqlens_q.shape(0) != seq_lens.shape(0) + 1 ||
       nax_work_plan->max_length > max_seq_len))
     throw std::invalid_argument("NAX prefill plan does not match query/sequence bounds");
