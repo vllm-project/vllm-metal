@@ -19,6 +19,7 @@ import vllm_metal.envs as envs
 import vllm_metal.v1.model_adapter as model_adapter_module
 from vllm_metal.config import reset_config
 from vllm_metal.multimodal.lfm2_vl import Lfm2VlMultimodalAdapter
+from vllm_metal.multimodal.lfm3_audio import Lfm3AudioMultimodalAdapter
 from vllm_metal.multimodal.lfm3_vl import Lfm3VlMultimodalAdapter
 from vllm_metal.multimodal.paddleocr_vl import PaddleOCRVLMultimodalAdapter
 from vllm_metal.multimodal.qwen3_vl import Qwen3VLMultimodalAdapter
@@ -1079,6 +1080,22 @@ class TestBuildMultimodalAdapter:
         adapter = DefaultModelAdapter().build_multimodal_adapter(model, hf_config)
 
         assert isinstance(adapter, Lfm2VlMultimodalAdapter)
+
+    def test_builds_lfm3_audio_adapter_from_architecture(self) -> None:
+        language_model = _Lfm2VlLanguageModelStub()
+        language_model._placeholder_ids = [4, 5]
+        model = SimpleNamespace(
+            language_model=language_model,
+            config=SimpleNamespace(audio_start_token_id=2, mixed_start_token_id=3),
+        )
+        hf_config = SimpleNamespace(
+            model_type="custom",
+            architectures=["Lfm3AudioForConditionalGeneration"],
+        )
+
+        adapter = DefaultModelAdapter().build_multimodal_adapter(model, hf_config)
+
+        assert isinstance(adapter, Lfm3AudioMultimodalAdapter)
 
     @pytest.mark.parametrize(
         ("architecture", "expected"),

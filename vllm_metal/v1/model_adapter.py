@@ -439,6 +439,10 @@ _LFM2_VL_ARCHITECTURES: frozenset[str] = frozenset({"Lfm2VlForConditionalGenerat
 # d1 checkpoints also declare ``lfm3_vl`` but add decision heads, so match the
 # generative architecture only.
 _LFM3_VL_ARCHITECTURES: frozenset[str] = frozenset({"Lfm3VlForConditionalGeneration"})
+# Families ``build_multimodal_adapter`` has a native adapter for.
+_NativeMultimodalFamily = Literal[
+    "qwen3_vl", "paddleocr_vl", "lfm3_audio", "lfm3_vl", "lfm2_vl"
+]
 
 
 class DefaultModelAdapter(ModelAdapter):
@@ -497,17 +501,34 @@ class DefaultModelAdapter(ModelAdapter):
             return True
 
         # MLX affine wrappers stay native only when their family has an adapter.
-        return self._has_mlx_quantized_weights(
-            hf_config
-        ) and not self._is_qwen3_vl_family(hf_config)
+        return (
+            self._has_mlx_quantized_weights(hf_config)
+            and self._native_multimodal_family(hf_config) is None
+        )
 
-    def _is_qwen3_vl_family(self, hf_config: Any) -> bool:
-        """Whether ``build_multimodal_adapter`` has a native adapter for this."""
+    def _native_multimodal_family(
+        self, hf_config: Any
+    ) -> _NativeMultimodalFamily | None:
+        """Return the family whose native adapter serves ``hf_config``, if any."""
         model_type = getattr(hf_config, "model_type", "")
         architectures = getattr(hf_config, "architectures", ()) or ()
-        return model_type in _QWEN3_VL_MODEL_TYPES or any(
+        if model_type in _QWEN3_VL_MODEL_TYPES or any(
             arch in _QWEN3_VL_ARCHITECTURES for arch in architectures
-        )
+        ):
+            return "qwen3_vl"
+        if model_type in _PADDLEOCR_VL_MODEL_TYPES or any(
+            arch in _PADDLEOCR_VL_ARCHITECTURES for arch in architectures
+        ):
+            return "paddleocr_vl"
+        if "Lfm3AudioForConditionalGeneration" in architectures:
+            return "lfm3_audio"
+        if any(arch in _LFM3_VL_ARCHITECTURES for arch in architectures):
+            return "lfm3_vl"
+        if model_type in _LFM2_VL_MODEL_TYPES or any(
+            arch in _LFM2_VL_ARCHITECTURES for arch in architectures
+        ):
+            return "lfm2_vl"
+        return None
 
     def _has_mlx_quantized_weights(self, hf_config: Any) -> bool:
         mlx_quantization_from_hf = getattr(hf_config, "quantization", None)
@@ -1010,12 +1031,8 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
                     ),
                 ),
             )
-        if hf_config is None:
-            return None
-
-        model_type = getattr(hf_config, "model_type", "")
-        architectures = getattr(hf_config, "architectures", ()) or ()
-        if self._is_qwen3_vl_family(hf_config):
+        family = self._native_multimodal_family(hf_config)
+        if family == "qwen3_vl":
             from vllm_metal.multimodal.qwen3_vl import Qwen3VLMultimodalAdapter
 
             return cast(
@@ -1023,9 +1040,7 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
                 Qwen3VLMultimodalAdapter.from_loaded_model(model, hf_config),
             )
 
-        if model_type in _PADDLEOCR_VL_MODEL_TYPES or any(
-            arch in _PADDLEOCR_VL_ARCHITECTURES for arch in architectures
-        ):
+        if family == "paddleocr_vl":
             from vllm_metal.multimodal.paddleocr_vl import (
                 PaddleOCRVLMultimodalAdapter,
             )
@@ -1035,7 +1050,7 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
                 PaddleOCRVLMultimodalAdapter.from_loaded_model(model),
             )
 
-        if "Lfm3AudioForConditionalGeneration" in architectures:
+        if family == "lfm3_audio":
             from vllm_metal.multimodal.lfm3_audio import Lfm3AudioMultimodalAdapter
 
             return cast(
@@ -1043,7 +1058,7 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
                 Lfm3AudioMultimodalAdapter.from_loaded_model(model),
             )
 
-        if any(arch in _LFM3_VL_ARCHITECTURES for arch in architectures):
+        if family == "lfm3_vl":
             from vllm_metal.multimodal.lfm3_vl import Lfm3VlMultimodalAdapter
 
             return cast(
@@ -1051,9 +1066,7 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
                 Lfm3VlMultimodalAdapter.from_loaded_model(model),
             )
 
-        if model_type in _LFM2_VL_MODEL_TYPES or any(
-            arch in _LFM2_VL_ARCHITECTURES for arch in architectures
-        ):
+        if family == "lfm2_vl":
             from vllm_metal.multimodal.lfm2_vl import Lfm2VlMultimodalAdapter
 
             return cast(
