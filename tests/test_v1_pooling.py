@@ -1801,3 +1801,20 @@ class TestD3ReadoutPooler:
         )
 
         assert not D3ReadoutPooler(config).is_supported()
+
+    def test_non_d3_pooling_never_reads_the_readout(self, tmp_path, monkeypatch):
+        """A Qwen3 pooling load must not touch the readout: the d3 file reader
+        only runs once the checkpoint declares the d3 contract."""
+
+        def _refuse(*args, **kwargs):
+            raise AssertionError("readout read for a non-d3 checkpoint")
+
+        config = _pooling_model_config(
+            model=str(tmp_path),
+            hf_config=_hf_config(architectures=["Qwen3ForCausalLM"]),
+        )
+        monkeypatch.setattr(D3ReadoutPooler, "_readout", _refuse)
+
+        backend = build_decoder_pooling_backend(_PoolingModel(), config)
+
+        assert backend.supported_tasks() == ("embed",)

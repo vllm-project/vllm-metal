@@ -40,11 +40,6 @@ class D3ConfigView:
         return value if isinstance(value, dict) else {}
 
     @property
-    def attention_mode(self) -> str | None:
-        mode = self.decision_config.get("attention_mode")
-        return str(mode) if mode is not None else None
-
-    @property
     def is_supported(self) -> bool:
         return (
             self.config.is_text_only
