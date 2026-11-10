@@ -133,16 +133,44 @@ class WhisperTranscriber:
         total_duration = audio_duration(audio, SAMPLE_RATE)
 
         chunks = self._prepare_audio_chunks(audio)
+        durations = [audio_duration(chunk, SAMPLE_RATE) for chunk, _ in chunks]
+        # Compare sample positions to keep rounding from inventing an overlap.
+        overlaps = [
+            max(
+                0,
+                round(start * SAMPLE_RATE)
+                + chunk.shape[0]
+                - round(next_start * SAMPLE_RATE),
+            )
+            / SAMPLE_RATE
+            for (chunk, start), (_, next_start) in zip(
+                chunks[:-1], chunks[1:], strict=True
+            )
+        ]
+        merge_overlaps = any(overlaps)
+        chunk_outputs: list[dict[str, object]] = []
 
         all_segments: list[TranscriptionSegment] = []
         all_text_parts: list[str] = []
         seg_id_offset = 0
 
-        for chunk_audio, chunk_start in chunks:
+        for index, (chunk_audio, chunk_start) in enumerate(chunks):
             features = self._encode_chunk(chunk_audio)
             output_tokens = self._greedy_decode(
                 features, language, task, prompt, with_timestamps=with_timestamps
             )
+
+            if merge_overlaps:
+                # Split shared audio equally between the adjacent chunks' strides.
+                left = overlaps[index - 1] / 2 if index else 0.0
+                right = overlaps[index] / 2 if index < len(overlaps) else 0.0
+                chunk_outputs.append(
+                    {
+                        "tokens": np.array([output_tokens], dtype=np.int64),
+                        "stride": (durations[index], left, right),
+                    }
+                )
+                continue
 
             if with_timestamps:
                 segments = self._extract_segments(
@@ -162,6 +190,34 @@ class WhisperTranscriber:
                 text = self.tokenizer.decode(output_tokens, skip_special_tokens=True)
                 if text.strip():
                     all_text_parts.append(text.strip())
+
+        if merge_overlaps:
+            text, merged = self.tokenizer._decode_asr(
+                chunk_outputs,
+                return_timestamps=with_timestamps,
+                return_language=False,
+                time_precision=0.02,
+            )
+            all_text_parts = [text]
+            for piece in merged.get("chunks", []):
+                start, end = piece["timestamp"]
+                if start is None:
+                    continue
+                end = total_duration if end is None else min(end, total_duration)
+                if not piece["text"].strip() or start >= end:
+                    continue
+                all_segments.append(
+                    TranscriptionSegment(
+                        id=len(all_segments),
+                        seek=int(start * SEEK_MULTIPLIER),
+                        start=start,
+                        end=end,
+                        text=piece["text"],
+                        tokens=self.tokenizer.encode(
+                            piece["text"], add_special_tokens=False
+                        ),
+                    )
+                )
 
         return TranscriptionResult(
             text=" ".join(all_text_parts).strip(),

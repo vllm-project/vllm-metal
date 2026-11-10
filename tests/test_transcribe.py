@@ -289,6 +289,88 @@ class TestResolveDecodeOptions:
 
 
 class TestChunkingPolicy:
+    def test_adjacent_chunk_rounding_preserves_repeated_speech(
+        self, transcriber, monkeypatch
+    ) -> None:
+        """0.1 + 0.2 exceeds 0.3 in float arithmetic, but these clips are disjoint."""
+        chunks = [
+            (mx.zeros(SAMPLE_RATE // 10), 0.0),
+            (mx.zeros(SAMPLE_RATE // 5), 0.1),
+            (mx.zeros(SAMPLE_RATE // 5), 0.3),
+        ]
+        tokens = transcriber.tokenizer.encode(
+            " Turn left here.", add_special_tokens=False
+        )
+        monkeypatch.setattr(transcriber, "_prepare_audio_chunks", lambda _: chunks)
+        monkeypatch.setattr(transcriber, "_encode_chunk", lambda _: mx.zeros((1, 1, 1)))
+        monkeypatch.setattr(transcriber, "_greedy_decode", lambda *a, **k: tokens)
+
+        result = transcriber.transcribe(mx.zeros(SAMPLE_RATE // 2))
+
+        assert result.text == "Turn left here. Turn left here. Turn left here."
+
+    @pytest.mark.parametrize("with_timestamps", [False, True])
+    @pytest.mark.parametrize("overlap", [False, True])
+    def test_transcribe_reconciles_only_overlapping_chunk_text(
+        self, transcriber, monkeypatch, with_timestamps, overlap
+    ) -> None:
+        """Shared audio is emitted once; repeated speech in disjoint clips remains."""
+        first = " We turn left at the old bridge."
+        shared = " at the old bridge."
+        last = " Then continue straight."
+
+        def encode(text):
+            return transcriber.tokenizer.encode(text, add_special_tokens=False)
+
+        def timestamp(value):
+            return transcriber._get_token_id(f"<|{value:.2f}|>")
+
+        outputs = [encode(first), encode(shared + last)]
+        if with_timestamps:
+            outputs = [
+                [timestamp(8), *encode(first), timestamp(10)],
+                [
+                    timestamp(0),
+                    *encode(shared),
+                    timestamp(1),
+                    timestamp(1),
+                    *encode(last),
+                    timestamp(5),
+                ],
+            ]
+        outputs = iter(outputs)
+        second_start = 9 if overlap else 10
+        first_chunk = mx.zeros(10 * SAMPLE_RATE)
+        final_chunk = mx.zeros(5 * SAMPLE_RATE)
+        monkeypatch.setattr(
+            transcriber,
+            "_prepare_audio_chunks",
+            lambda _: [(first_chunk, 0), (final_chunk, second_start)],
+        )
+        monkeypatch.setattr(transcriber, "_encode_chunk", lambda _: mx.zeros((1, 1, 1)))
+        monkeypatch.setattr(
+            transcriber, "_greedy_decode", lambda *a, **k: next(outputs)
+        )
+
+        result = transcriber.transcribe(
+            mx.zeros((second_start + 5) * SAMPLE_RATE), with_timestamps=with_timestamps
+        )
+
+        expected = first + last if overlap else first + shared + last
+        assert " ".join(result.text.split()) == expected.strip()
+        if with_timestamps:
+            assert (
+                " ".join(" ".join(s.text for s in result.segments).split())
+                == expected.strip()
+            )
+            assert [s.id for s in result.segments] == list(range(len(result.segments)))
+            expected_times = (
+                [(8, 10), (10, 14)] if overlap else [(8, 10), (10, 11), (11, 15)]
+            )
+            assert [(s.start, s.end) for s in result.segments] == expected_times
+            for segment in result.segments:
+                assert transcriber.tokenizer.decode(segment.tokens) == segment.text
+
     @pytest.mark.parametrize(
         "config",
         [
