@@ -2092,6 +2092,38 @@ class TestMetalPlatform:
         mm_config = config.model_config.get_multimodal_config()
         assert mm_config.get_limit_per_prompt("image") == 0
 
+    @pytest.mark.parametrize(
+        "exported",
+        [
+            {},
+            {"PYTORCH_MPS_LOW_WATERMARK_RATIO": "1.2"},
+            {"PYTORCH_MPS_HIGH_WATERMARK_RATIO": "1.0"},
+        ],
+        ids=["unset", "low-exported", "high-exported"],
+    )
+    def test_mps_reclaims_cached_heaps_at_the_memory_budget(
+        self, tmp_path, monkeypatch, exported
+    ) -> None:
+        from transformers import Qwen3Config
+
+        Qwen3Config(
+            architectures=["Qwen3ForCausalLM"], hidden_size=64, head_dim=64
+        ).save_pretrained(tmp_path)
+        environ = {k: v for k, v in os.environ.items() if "WATERMARK" not in k}
+        monkeypatch.setattr(os, "environ", environ | exported)
+        monkeypatch.setitem(vars(platform_module.envs), "VLLM_METAL_BACKEND", "mps")
+        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+        EngineArgs(
+            model=str(tmp_path),
+            dtype="bfloat16",
+            skip_tokenizer_init=True,
+            max_model_len=128,
+            gpu_memory_utilization=0.5,
+        ).create_engine_config()
+        watermarks = {k: v for k, v in os.environ.items() if "WATERMARK" in k}
+        # An exported watermark always wins.
+        assert watermarks == (exported or {"PYTORCH_MPS_LOW_WATERMARK_RATIO": "0.5"})
+
     def test_kept_multimodal_config_normalizes_pixels_on_the_host(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
