@@ -69,29 +69,25 @@ def test_batch_planner_requires_known_cores(cores):
 
 
 @pytest.mark.parametrize(
-    "lengths,cores,architecture,eligible",
+    "lengths,cores,nax,eligible",
     [
-        ([128] * 20, 20, "applegpu_g17s", False),
-        ([128] * 21, 20, "applegpu_g17s", True),
-        ([256] * 64, 20, "applegpu_g17s", True),
-        ([256] * 65, 20, "applegpu_g17s", False),
-        ([127] + [256] * 20, 20, "applegpu_g17s", False),
-        ([128] + [256] * 20, 20, "applegpu_g17s", True),
-        ([128] * 20 + [257], 20, "applegpu_g17s", False),
-        ([], 20, "applegpu_g17s", False),
-        ([0] + [128] * 20, 20, "applegpu_g17s", False),
-        ([128] * 21, 0, "applegpu_g17s", False),
-        ([128] * 21, 19, "applegpu_g17s", False),
-        ([128] * 21, 21, "applegpu_g17s", False),
-        ([128] * 21, 20, "applegpu_g16g", False),
-        ([128] * 21, 20, "applegpu_g17g", False),
-        ([128] * 21, 20, "unknown", False),
+        ([128] * 20, 20, True, False),
+        ([128] * 21, 20, True, True),
+        ([256] * 64, 20, True, True),
+        ([256] * 65, 20, True, False),
+        ([127] + [256] * 20, 20, True, False),
+        ([128] * 20 + [257], 20, True, False),
+        ([], 20, True, False),
+        ([128] * 21, 21, True, False),  # The batch floor scales with cores.
+        ([128] * 42, 40, True, True),
+        ([128] * 21, 0, True, False),
+        ([128] * 21, 20, False, False),
     ],
 )
-def test_nosplit_policy_boundaries(lengths, cores, architecture, eligible):
+def test_nosplit_policy_boundaries(lengths, cores, nax, eligible):
     assert (
         get_ops()._gqa_decode_no_split_eligible_for_test(
-            32, 8, 128, lengths, cores, gpu_arch=architecture
+            32, 8, 128, lengths, cores, nax
         )
         is eligible
     )
@@ -102,7 +98,7 @@ def test_nosplit_policy_boundaries(lengths, cores, architecture, eligible):
 )
 def test_nosplit_policy_keeps_unmeasured_geometries_off(q, kv, head, block):
     assert not get_ops()._gqa_decode_no_split_eligible_for_test(
-        q, kv, head, [128] * 32, 20, block, gpu_arch="applegpu_g17s"
+        q, kv, head, [128] * 32, 20, True, block
     )
 
 
@@ -130,7 +126,7 @@ def test_nosplit_default_and_forced_routes_remain_distinct(dtype, partition):
         gqa_lengths=lengths,
         test_partition=partition,
     )
-    if partition is None and mx.device_info()["architecture"] != "applegpu_g17s":
+    if partition is None and not ops.nax_supported():
         _assert_fallback()
         assert ops.last_gqa_num_requests() == 0
     else:
@@ -204,7 +200,7 @@ def test_nosplit_minimum_length_is_captured_by_each_deferred_forward():
     mx.eval(excluded)
     _assert_fallback()
     mx.eval(admitted)
-    if mx.device_info()["architecture"] == "applegpu_g17s":
+    if ops.nax_supported():
         assert _dispatch_family() == "gqa_decode_nosplit"
     else:
         _assert_fallback()

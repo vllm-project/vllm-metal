@@ -56,12 +56,6 @@ static int min_decode_grid() {
   return gpu_core_count() * kernels::kDecodeGroupsPerCore;
 }
 
-static bool nax_hardware_supported() {
-  auto* device = metal::device(Device::gpu).mtl_device();
-  return hardware::nax_supported(
-      device->supportsFamily(static_cast<MTL::GPUFamily>(hardware::kApple10)));
-}
-
 // ---------------------------------------------------------------------------
 // nanobind module
 // ---------------------------------------------------------------------------
@@ -185,16 +179,15 @@ NB_MODULE(_paged_ops, m) {
         "engages on this machine.");
   m.def("_gqa_decode_no_split_eligible_for_test",
         [](int num_heads, int num_kv_heads, int head_size,
-           const std::vector<int>& context_lens, int gpu_cores, int block_size,
-           const std::string& gpu_arch) {
+           const std::vector<int>& context_lens, int gpu_cores, bool nax,
+           int block_size) {
           return gqa_decode_no_split_eligible(
               num_heads, num_kv_heads, head_size,
-              gqa_decode_length_plan(context_lens), gpu_cores, block_size, gpu_arch);
+              gqa_decode_length_plan(context_lens), gpu_cores, block_size, nax);
         }, nb::arg("num_heads"), nb::arg("num_kv_heads"), nb::arg("head_size"),
-        nb::arg("context_lens"), nb::arg("gpu_cores"), nb::arg("block_size") = 16,
-        nb::arg("gpu_arch") = "",
-        "Private read-only no-split policy query. Empty gpu_arch uses the executing "
-        "GPU; explicit hardware inputs simulate planning without changing dispatch. "
+        nb::arg("context_lens"), nb::arg("gpu_cores"), nb::arg("nax"),
+        nb::arg("block_size") = 16,
+        "Private read-only no-split policy query for explicit hardware inputs. "
         "Dtype, feature and decode-row eligibility are checked separately.");
   m.def("_gqa_decode_config_for_test", []() {
     nb::dict config;
@@ -207,18 +200,6 @@ NB_MODULE(_paged_ops, m) {
     for (int partition : kGqaPartitionSizes) partitions.append(nb::int_(partition));
     config["geometries"] = geometries;
     config["partitions"] = partitions;
-    nb::list no_split_geometries;
-    no_split_geometries.append(nb::make_tuple(
-        kGqaNoSplitGeometry.num_heads, kGqaNoSplitGeometry.num_kv_heads,
-        kGqaNoSplitGeometry.head_size, kGqaNoSplitGeometry.block_size));
-    config["no_split_geometries"] = no_split_geometries;
-    nb::dict no_split_policy;
-    no_split_policy["architecture"] = kGqaNoSplitArchitecture;
-    no_split_policy["gpu_cores"] = kGqaNoSplitGpuCores;
-    no_split_policy["min_context"] = kGqaNoSplitMinContext;
-    no_split_policy["max_context"] = kGqaNoSplitMaxContext;
-    no_split_policy["max_requests"] = kGqaNoSplitMaxRequests;
-    config["no_split_policy"] = no_split_policy;
     config["simd_groups_per_core"] = kGqaSimdGroupsPerCore;
     config["max_scratch_bytes"] = kGqaMaxScratchBytes;
     nb::dict m3;

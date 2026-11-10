@@ -63,9 +63,7 @@ constexpr GqaDecodeGeometry kGqaNoSplitGeometry = {32, 8, 128, 16};
 // to this distinct value, which is also captured in lazy-node equivalence.
 constexpr int kGqaNoSplitTestPartition = -1;
 constexpr int64_t kGqaSimdGroupsPerCore = 33;
-// Measured on the 20-core M5 Pro; other devices retain split-KV selection.
-constexpr const char* kGqaNoSplitArchitecture = "applegpu_g17s";
-constexpr int kGqaNoSplitGpuCores = 20;
+// Direct-output admission measured on NAX GPUs; others keep split-KV selection.
 constexpr int kGqaNoSplitMinContext = 128;
 constexpr int kGqaNoSplitMaxContext = 256;
 constexpr int kGqaNoSplitMaxRequests = 64;
@@ -155,8 +153,7 @@ bool gqa_decode_no_split_geometry_supported(int num_heads, int num_kv_heads,
                                             int head_size, int block_size);
 bool gqa_decode_no_split_eligible(
     int num_heads, int num_kv_heads, int head_size,
-    const GqaDecodeLengthPlan& plan, int gpu_cores, int block_size,
-    const std::string& gpu_arch = "");
+    const GqaDecodeLengthPlan& plan, int gpu_cores, int block_size, bool nax);
 std::string gqa_decode_kernel_name(
     const std::string& dtype, int head_size, int block_size, int partition_size);
 std::string gqa_decode_tq_kernel_name(
@@ -168,6 +165,7 @@ int gqa_decode_plan_for_lengths(
     const std::string& gpu_arch = "", int max_seq_len = 0, bool turboquant = false);
 void init_library_path(const std::string& name, const std::string& path);
 void init_nax_library_path(const std::string& path);
+bool nax_hardware_supported();
 std::string dtype_to_metal(Dtype dt);
 array paged_attention_primitive_fn(
     const array& query,

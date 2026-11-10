@@ -21,26 +21,26 @@ best efficiency; this implementation does not adopt its wave-efficiency model.
 
 ## Direct-output decode
 
-On the measured 20-core M5 Pro (`applegpu_g17s`), ordinary decode uses one
-threadgroup per KV head and request, sharing the existing grouped producer's
-page walk and online softmax. It writes the final output directly, without
-partial-output buffers, statistics buffers or a reducer.
+On NAX-capable GPUs (Apple GPU family 10, M5 generation), ordinary decode
+can use one threadgroup per KV head and request, sharing the existing grouped
+producer's page walk and online softmax. It writes the final output directly,
+without partial-output buffers, statistics buffers or a reducer.
 
 Automatic selection is limited to FP16/BF16 `32/8/128` geometry with kernel
 block16, **every request's post-append KV length between 128 and 256**, and
 `B * Q >= 33 * C` with `B <= 64`, where B counts requests, Q query heads and
-C GPU cores. For the measured device this is 21–64
-requests. The per-forward CPU length plan records the minimum as well as the
-maximum length; a long row does not admit a batch of short rows. The ordinary
-decode, cache dtype and feature guards below, including the disable switch,
-still apply. Other architectures, core counts and workloads keep their
-existing split-KV or per-token selection.
+C detected GPU cores (21–64 requests on a 20-core M5 Pro). The per-forward
+CPU length plan records the minimum as well as the maximum length; a long row
+does not admit a batch of short rows. The ordinary decode, cache dtype and
+feature guards below, including the disable switch, still apply. GPUs without
+NAX, or with an unknown core count, keep their existing split-KV or per-token
+selection.
 
-These are measured admission bounds, not the shader's numerical limits or
-a claim of a speedup on other devices. Single requests and severely ragged
-batches can lose to existing kernels. The private test entry accepts
-`partition_size=0` for this geometry on other devices and lengths, bypassing
-the performance policy while retaining the kernel's input contract.
+These are measured admission bounds, not the shader's numerical limits.
+Single requests and severely ragged batches can lose to existing kernels.
+The private test entry accepts `partition_size=0` for this geometry on any
+device and length, bypassing the performance policy while retaining the
+kernel's input contract.
 
 ## Split-KV eligibility and partition selection
 

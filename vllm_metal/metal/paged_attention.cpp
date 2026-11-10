@@ -160,19 +160,14 @@ bool gqa_decode_no_split_geometry_supported(int num_heads, int num_kv_heads,
 
 bool gqa_decode_no_split_eligible(
     int num_heads, int num_kv_heads, int head_size,
-    const GqaDecodeLengthPlan& plan, int gpu_cores, int block_size,
-    const std::string& gpu_arch) {
-  if (gpu_cores != kGqaNoSplitGpuCores ||
-      !gqa_decode_no_split_geometry_supported(
-          num_heads, num_kv_heads, head_size, block_size) ||
-      plan.min_length < kGqaNoSplitMinContext ||
-      plan.max_length > kGqaNoSplitMaxContext ||
-      plan.num_requests > kGqaNoSplitMaxRequests ||
-      int64_t(plan.num_requests) * num_heads < kGqaSimdGroupsPerCore * gpu_cores)
-    return false;
-  const auto& architecture = gpu_arch.empty()
-      ? metal::device(Device::gpu).get_architecture() : gpu_arch;
-  return architecture == kGqaNoSplitArchitecture;
+    const GqaDecodeLengthPlan& plan, int gpu_cores, int block_size, bool nax) {
+  return nax && gpu_cores > 0 &&
+      gqa_decode_no_split_geometry_supported(
+          num_heads, num_kv_heads, head_size, block_size) &&
+      plan.min_length >= kGqaNoSplitMinContext &&
+      plan.max_length <= kGqaNoSplitMaxContext &&
+      plan.num_requests <= kGqaNoSplitMaxRequests &&
+      int64_t(plan.num_requests) * num_heads >= kGqaSimdGroupsPerCore * gpu_cores;
 }
 
 std::string gqa_decode_kernel_name(
@@ -312,6 +307,13 @@ static const bool nax_gqa_prefill_enabled_ = []() {
 void init_nax_library_path(const std::string& path) {
   init_library_path("paged_attention_nax_kern", path);
   nax_lib_ready_ = true;
+}
+
+bool nax_hardware_supported() {
+  static const bool supported = hardware::nax_supported(
+      metal::device(Device::gpu).mtl_device()->supportsFamily(
+          static_cast<MTL::GPUFamily>(hardware::kApple10)));
+  return supported;
 }
 
 // Match the instantiated NAX shapes; other shapes retain the tiled path.
@@ -909,13 +911,13 @@ static PagedAttentionPlan select_paged_attention_route(
           m.head_size, m.block_size);
 
   if (gqa_supported && !m.use_turboquant &&
-      gqa_decode_no_split_geometry_supported(
-          m.num_heads, m.num_kv_heads, m.head_size, m.block_size) &&
-      (m.gqa_test_partition == kGqaNoSplitTestPartition ||
-       (m.gqa_test_partition == 0 && m.gqa_length_plan.num_requests == num_seqs &&
-        gqa_decode_no_split_eligible(
-            m.num_heads, m.num_kv_heads, m.head_size, m.gqa_length_plan,
-            get_detected_gpu_cores(), m.block_size, get_architecture())))) {
+      (m.gqa_test_partition == kGqaNoSplitTestPartition
+           ? gqa_decode_no_split_geometry_supported(
+                 m.num_heads, m.num_kv_heads, m.head_size, m.block_size)
+           : m.gqa_test_partition == 0 &&
+             gqa_decode_no_split_eligible(
+                 m.num_heads, m.num_kv_heads, m.head_size, m.gqa_length_plan,
+                 get_detected_gpu_cores(), m.block_size, nax_hardware_supported()))) {
     plan.route = PagedAttentionRoute::GqaDecodeNoSplit;
     plan.gqa_partitions = 1;
     return plan;
