@@ -281,6 +281,7 @@ _METADATA_ARCHS = frozenset(
         "Lfm3ForCausalLM",
         "Lfm3VlForConditionalGeneration",
         "Lfm3AudioForConditionalGeneration",
+        "Lfm3OmniForConditionalGeneration",
     }
 )
 

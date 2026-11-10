@@ -1035,6 +1035,14 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
                 PaddleOCRVLMultimodalAdapter.from_loaded_model(model),
             )
 
+        if "Lfm3OmniForConditionalGeneration" in architectures:
+            from vllm_metal.multimodal.lfm3_omni import Lfm3OmniMultimodalAdapter
+
+            return cast(
+                MultimodalRuntimeAdapter,
+                Lfm3OmniMultimodalAdapter.from_loaded_model(model),
+            )
+
         if "Lfm3AudioForConditionalGeneration" in architectures:
             from vllm_metal.multimodal.lfm3_audio import Lfm3AudioMultimodalAdapter
 
