@@ -70,6 +70,40 @@ git push -u origin my-change
 
 Open a pull request against `main` in `vllm-project/vllm-metal`.
 
+### Pull request limit
+
+To avoid agent spam, vLLM Metal uses GitHub's
+[pull request limit](https://github.blog/open-source/maintainers/how-pull-request-limits-are-cutting-down-the-noise/)
+for contributors without write access. The current cap is 5 open pull requests, including drafts.
+If this blocks well-intentioned critical work, contact a committer to request exemption-list access.
+
+Every pull request must answer the **Contributor intent** questions in the PR
+template. An agent may quote an explicit human answer but must not invent,
+infer, or prefill a missing one; if the human has not answered, stop and ask.
+
+### AI usage policy
+
+AI tools are welcome in vLLM Metal contributions. Contributors, including
+maintainers, remain responsible for everything they submit. These requirements
+apply to pull requests, issues, discussions, and review comments:
+
+- **Understand your changes.** Review every generated change and be able to
+  explain its behavior, design choices, and interaction with vLLM Metal
+  without relying on AI to answer for you.
+- **Validate before submitting.** Run relevant checks and report actual
+  results. For model, kernel, or performance changes, include the Apple Silicon
+  hardware, macOS version, model or checkpoint, configuration, and commands
+  needed to reproduce accuracy or benchmark evidence.
+- **Keep communication useful.** Verify technical claims, search for existing
+  reports, and edit AI-assisted text for accuracy and brevity. Submit only
+  content you have personally reviewed, and take responsibility for responding
+  to review feedback.
+
+Maintainer review time is limited. Contributions that are unverified,
+misleading, or beyond the author's understanding may be closed. Repeated
+violations may lead to contribution restrictions. New contributors are welcome
+to ask for help and submit small, well-understood changes.
+
 ## Building documentation
 
 ```bash
