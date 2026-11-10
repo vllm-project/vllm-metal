@@ -93,7 +93,6 @@ def test_offload_off_matches_upstream() -> None:
 
     # 10GB * 0.5 - 1GB weights - 1GB overhead.
     assert plan.kv_budget == 3 * _GB
-    assert plan.num_blocks == 3000
     assert plan.kv_offload_pool == 0
     assert plan.format_breakdown() == (
         "metal_limit=10.00GB, fraction=0.5, usable_metal=5.00GB, "
@@ -113,7 +112,6 @@ def test_pool_comes_out_of_the_reported_budget() -> None:
 
     assert plan.kv_offload_pool == _POOL
     assert plan.kv_budget == without.kv_budget - _POOL
-    assert plan.num_blocks == without.num_blocks - _POOL // _PER_BLOCK
     assert "kv_offload_pool=2.00GB, kv_budget=1.00GB" in plan.format_breakdown()
     assert plan.format_mitigations().startswith(
         "Mitigations: lower --kv-offloading-size; "

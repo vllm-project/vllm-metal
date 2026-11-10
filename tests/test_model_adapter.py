@@ -1206,6 +1206,9 @@ class TestYocoCacheIntegration:
         runner = make_stub_runner(model_args=args)
         runner.num_layers = self._NUM_HIDDEN
         runner.num_kv_cache_layers = self._NUM_UNIQUE
+        runner._yoco_cache_mapping = DefaultModelAdapter().build_yoco_cache_mapping(
+            args
+        )
         runner.num_kv_heads = self._NUM_KV_HEADS
         runner.head_dim = self._HEAD_DIM
         runner.kv_cache_dtype = mx.float16
@@ -1246,9 +1249,11 @@ class TestYocoCacheIntegration:
             num_kv_cache_layers=yoco[0],
         )
 
-        backend = runner.build_paged_attention_runtime(block_size=self._BLOCK_SIZE)
+        backend = runner._cache_policy._build_sdpa_backend(block_size=self._BLOCK_SIZE)
 
-        assert backend._num_layers == self._NUM_UNIQUE
+        assert runner._cache_policy._attention_layer_names() == tuple(
+            f"layers.{i}.self_attn" for i in range(self._NUM_UNIQUE)
+        )
         assert backend._cache_idx_map is not None
         # Shared layers map to a unique layer of same type
         for i in range(self._NUM_UNIQUE, self._NUM_HIDDEN):

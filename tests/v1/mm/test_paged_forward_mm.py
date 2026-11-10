@@ -139,11 +139,7 @@ def _runner(adapter: _MmAdapter, *, num_layers: int = 1):
         encoder_cache=EncoderCache(),
         _is_vlm=True,
         _paged_attention_runtime=SDPAPagedAttentionRuntime(
-            num_layers=num_layers,
-            num_kv_heads=1,
-            head_dim=4,
-            block_size=16,
-            dtype=mx.float32,
+            block_size=16, dtype=mx.float32
         ),
         _paged_block_size=16,
         num_layers=num_layers,

@@ -1,17 +1,47 @@
 # SPDX-License-Identifier: Apache-2.0
 """Compare real paged draft KV with an independent native MLX-LM forward."""
 
+import gc
+
 import mlx.core as mx
 import numpy as np
 import pytest
+import torch
 from mlx.utils import tree_flatten
 from mlx_lm.models import llama, qwen3
 from mlx_lm.models.cache import make_prompt_cache
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    KVCacheTensor,
+)
 
 from tests.test_draft_model_proposer import _context, _request_state
-from vllm_metal.attention.runtime.sdpa import SDPAPagedAttentionRuntime
-from vllm_metal.v1.draft_model_proposer import DraftModelProposer
+from vllm_metal.attention.caches.storage import KVCacheStorage
+from vllm_metal.v1.draft_model_proposer import DraftDims, DraftModelProposer
 from vllm_metal.v1.spec_decode import SpeculativeDecodeController
+
+
+def _draft_kv_cache_config(num_blocks: int) -> KVCacheConfig:
+    """The scheduler-visible config ``_draft_layer_specs`` registers."""
+    spec = FullAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=64, dtype=torch.float32
+    )
+    names = ["draft_layers.0.self_attn", "draft_layers.1.self_attn"]
+    return KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_groups=[KVCacheGroupSpec(layer_names=names, kv_cache_spec=spec)],
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=2 * num_blocks * spec.page_size_bytes,
+                layers=names,
+                layer_stride=num_blocks * spec.page_size_bytes,
+                block_stride=spec.page_size_bytes,
+            )
+        ],
+        kv_cache_layout="LBNHC",
+    )
 
 
 @pytest.mark.parametrize("family", [llama, qwen3], ids=["llama", "qwen3"])
@@ -41,11 +71,6 @@ def test_draft_kv_matches_native_after_rejection_and_recompute(
     native, paged = family.Model(args), family.Model(args)
     mx.eval(native.parameters())
     paged.load_weights(tree_flatten(native.parameters()))
-    runtime = SDPAPagedAttentionRuntime(
-        num_layers=2, num_kv_heads=1, head_dim=64, block_size=16, dtype=mx.float32
-    )
-    runtime.initialize(9)
-    assert runtime.patch_model(paged) == 2
     proposer = DraftModelProposer(
         model=paged,
         block_size=16,
@@ -56,7 +81,31 @@ def test_draft_kv_matches_native_after_rejection_and_recompute(
         merge_ingest_windows=windowed,
         allow_deferred_zero_k_ingest=True,
     )
-    proposer.adopt_scheduler_group(0, 128)
+    proposer._dims = DraftDims(num_layers=2, num_kv_heads=1, head_dim=64)
+    # Bind the draft views into the shared storage, as serving does, and NaN
+    # the whole backing first: every slot the asserts read must be written by
+    # the proposer, never inherited from allocation.
+    config = _draft_kv_cache_config(num_blocks=9)
+    storage = KVCacheStorage(config)
+    for tensor in storage.tensors.values():
+        tensor.fill_(torch.nan)
+    proposer.bind_paged_cache(
+        storage=storage,
+        kv_cache_config=config,
+        dtype=mx.float32,
+        target_max_model_len=128,
+    )
+    assert proposer._scheduler_group_index == 0
+    # An independent reader binding over the same storage: the cache asserts
+    # below must see the proposer's writes through the shared backing.
+    from vllm_metal.attention.runtime.sdpa import SDPAPagedAttentionRuntime
+
+    runtime = SDPAPagedAttentionRuntime(block_size=16, dtype=mx.float32)
+    runtime.initialize_from_config(
+        config,
+        ("draft_layers.0.self_attn", "draft_layers.1.self_attn"),
+        storage=storage,
+    )
     blocks = [5, 1, 7, 3, 6, 2, 8, 4]
     # Include the target's just-sampled token, making the first lookahead
     # write land at the start of a new physical page.
@@ -117,4 +166,17 @@ def test_draft_kv_matches_native_after_rejection_and_recompute(
     # Recompute on reassigned, already-used pages after preemption.
     proposer.release_requests({"r"})
     blocks[0], blocks[1] = blocks[1], blocks[0]
+    check_round()
+
+    # Sleep frees the one backing the draft shares; the engine recomputes the
+    # request after wake. Draft reads and writes must follow the new backing.
+    gc.collect()
+    before = mx.get_active_memory()
+    storage.release()
+    gc.collect()
+    assert before - mx.get_active_memory() >= storage.nbytes
+    storage.reallocate()
+    for tensor in storage.tensors.values():
+        tensor.fill_(torch.nan)
+    proposer.release_requests({"r"})
     check_round()

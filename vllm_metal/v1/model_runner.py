@@ -149,7 +149,6 @@ logger = init_logger(__name__)
 
 SchedulerMemoryReportingMode: TypeAlias = Literal[
     "stt_nominal",
-    "paged_attention_capacity",
     "paged_attention_layout_budget",
     "pooling_no_kv",
 ]
@@ -1304,12 +1303,6 @@ class MetalModelRunner:
             return None
         return mx.arange(rows - max_sampled_rows, rows, dtype=mx.int32)
 
-    def build_paged_attention_runtime(
-        self, *, block_size: int
-    ) -> PagedAttentionRuntime:
-        """Build the paged-attention backend for the loaded model."""
-        return self._cache_policy.build_paged_attention_runtime(block_size=block_size)
-
     @property
     def paged_attention_runtime(self) -> PagedAttentionRuntime | None:
         """Return the installed paged-attention backend, if any."""
@@ -1369,7 +1362,7 @@ class MetalModelRunner:
             block_size=block_size,
         )
 
-    def install_drafter(self, *, num_blocks: int, block_size: int) -> None:
+    def install_drafter(self) -> None:
         """Install or bind the configured drafter after cache planning."""
         spec = self.vllm_config.speculative_config
         if spec is None:
@@ -1387,17 +1380,13 @@ class MetalModelRunner:
                     f"{spec.method} was not loaded and bound to scheduler KV"
                 )
         elif spec.uses_draft_model():
-            drafter = cast(DraftModelProposer, self._drafter)
-            drafter.bind_paged_cache(
-                num_blocks=num_blocks,
-                block_size=block_size,
-                dtype=cast(mx.Dtype, self.kv_cache_dtype),
-            )
+            # Bound to the shared KV storage by _initialize_upstream_storage,
+            # immediately before this call.
+            pass
         elif spec.method == "ngram":
             from vllm_metal.v1.ngram_proposer import NgramProposer
 
-            # N-gram drafts from token history alone — no model, no KV cache, so
-            # num_blocks/block_size are unused here.
+            # N-gram drafts from token history alone.
             self._drafter = NgramProposer.build(
                 vllm_config=self.vllm_config,
                 controller=self._spec_decode_controller,
