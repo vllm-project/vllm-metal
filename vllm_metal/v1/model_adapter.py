@@ -445,6 +445,19 @@ _LFM3_VL_ARCHITECTURES: frozenset[str] = frozenset({"Lfm3VlForConditionalGenerat
 _NativeMultimodalFamily = Literal[
     "qwen3_vl", "paddleocr_vl", "lfm3_audio", "lfm3_vl", "lfm2_vl"
 ]
+_NATIVE_MM_RULES: dict[
+    _NativeMultimodalFamily,
+    tuple[frozenset[str], frozenset[str]],
+] = {
+    "qwen3_vl": (_QWEN3_VL_MODEL_TYPES, _QWEN3_VL_ARCHITECTURES),
+    "paddleocr_vl": (_PADDLEOCR_VL_MODEL_TYPES, _PADDLEOCR_VL_ARCHITECTURES),
+    "lfm3_audio": (
+        frozenset(),
+        frozenset({"Lfm3AudioForConditionalGeneration"}),
+    ),
+    "lfm3_vl": (frozenset(), _LFM3_VL_ARCHITECTURES),
+    "lfm2_vl": (_LFM2_VL_MODEL_TYPES, _LFM2_VL_ARCHITECTURES),
+}
 
 
 class DefaultModelAdapter(ModelAdapter):
@@ -513,22 +526,11 @@ class DefaultModelAdapter(ModelAdapter):
         """Return the family whose native adapter serves ``hf_config``, if any."""
         model_type = getattr(hf_config, "model_type", "")
         architectures = getattr(hf_config, "architectures", ()) or ()
-        if model_type in _QWEN3_VL_MODEL_TYPES or any(
-            arch in _QWEN3_VL_ARCHITECTURES for arch in architectures
-        ):
-            return "qwen3_vl"
-        if model_type in _PADDLEOCR_VL_MODEL_TYPES or any(
-            arch in _PADDLEOCR_VL_ARCHITECTURES for arch in architectures
-        ):
-            return "paddleocr_vl"
-        if "Lfm3AudioForConditionalGeneration" in architectures:
-            return "lfm3_audio"
-        if any(arch in _LFM3_VL_ARCHITECTURES for arch in architectures):
-            return "lfm3_vl"
-        if model_type in _LFM2_VL_MODEL_TYPES or any(
-            arch in _LFM2_VL_ARCHITECTURES for arch in architectures
-        ):
-            return "lfm2_vl"
+
+        for family, (model_types, arch_names) in _NATIVE_MM_RULES.items():
+            if model_type in model_types or arch_names.intersection(architectures):
+                return family
+
         return None
 
     def _has_mlx_quantized_weights(self, hf_config: Any) -> bool:
