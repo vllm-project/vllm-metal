@@ -146,7 +146,10 @@ class WhisperTranscriber:
 
             if with_timestamps:
                 segments = self._extract_segments(
-                    output_tokens, chunk_start, seg_id_offset
+                    output_tokens,
+                    chunk_start,
+                    seg_id_offset,
+                    chunk_duration=audio_duration(chunk_audio, SAMPLE_RATE),
                 )
                 for seg in segments:
                     all_segments.append(seg)
@@ -349,6 +352,8 @@ class WhisperTranscriber:
         token_ids: list[int],
         time_offset: float = 0.0,
         segment_id_offset: int = 0,
+        *,
+        chunk_duration: float = DEFAULT_SEGMENT_DURATION,
     ) -> list[TranscriptionSegment]:
         raw_tokens = [self.tokenizer.convert_ids_to_tokens(tid) for tid in token_ids]
 
@@ -360,7 +365,7 @@ class WhisperTranscriber:
         for tid, text in zip(token_ids, raw_tokens, strict=True):
             m = TIMESTAMP_RE.match(text)
             if m:
-                ts = float(m.group(1))
+                ts = min(float(m.group(1)), chunk_duration)
                 if seg_start is None:
                     seg_start = ts
                     seg_tokens = []
@@ -368,7 +373,7 @@ class WhisperTranscriber:
                     seg_text = self.tokenizer.decode(
                         seg_tokens, skip_special_tokens=True
                     )
-                    if seg_text.strip():
+                    if seg_text.strip() and seg_start < ts:
                         segments.append(
                             TranscriptionSegment(
                                 id=seg_id,
@@ -387,15 +392,13 @@ class WhisperTranscriber:
 
         if seg_start is not None and seg_tokens:
             seg_text = self.tokenizer.decode(seg_tokens, skip_special_tokens=True)
-            if seg_text.strip():
+            if seg_text.strip() and seg_start < chunk_duration:
                 segments.append(
                     TranscriptionSegment(
                         id=seg_id,
                         seek=int((seg_start + time_offset) * SEEK_MULTIPLIER),
                         start=round(seg_start + time_offset, 2),
-                        end=round(
-                            seg_start + time_offset + DEFAULT_SEGMENT_DURATION, 2
-                        ),
+                        end=round(time_offset + chunk_duration, 2),
                         text=seg_text,
                         tokens=list(seg_tokens),
                     )

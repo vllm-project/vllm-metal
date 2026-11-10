@@ -83,6 +83,44 @@ def transcriber(whisper_tokenizer: WhisperTokenizer) -> WhisperTranscriber:
 
 
 class TestExtractSegments:
+    @pytest.mark.parametrize(
+        "chunk_start,chunk_duration,segment_start,closed",
+        [(0, 30, 20, False), (0, 5, 2, False), (30, 5, 2, False), (0, 5, 2, True)],
+        ids=[
+            "full-window",
+            "short-clip",
+            "final-chunk",
+            "closing-timestamp-in-padding",
+        ],
+    )
+    def test_transcribe_bounds_segment_to_chunk_audio(
+        self,
+        transcriber,
+        monkeypatch,
+        chunk_start,
+        chunk_duration,
+        segment_start,
+        closed,
+    ) -> None:
+        """Padding and a missing closing timestamp must not extend the recording."""
+        chunk = mx.zeros(chunk_duration * SAMPLE_RATE)
+        tokens = [transcriber._get_token_id(f"<|{segment_start:.2f}|>"), 2425]
+        if closed:
+            tokens.append(transcriber._get_token_id("<|30.00|>"))
+        monkeypatch.setattr(
+            transcriber, "_prepare_audio_chunks", lambda _: [(chunk, chunk_start)]
+        )
+        monkeypatch.setattr(transcriber, "_encode_chunk", lambda _: mx.zeros((1, 1, 1)))
+        monkeypatch.setattr(transcriber, "_greedy_decode", lambda *a, **k: tokens)
+
+        result = transcriber.transcribe(
+            mx.zeros((chunk_start + chunk_duration) * SAMPLE_RATE), with_timestamps=True
+        )
+
+        assert len(result.segments) == 1
+        assert result.segments[0].start == chunk_start + segment_start
+        assert result.segments[0].end == result.duration
+
     def _make_tokens(
         self, transcriber: WhisperTranscriber, start_ts: str, end_ts: str
     ) -> list[int]:
