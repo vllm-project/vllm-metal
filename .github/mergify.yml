@@ -1,0 +1,19 @@
+pull_request_rules:
+- name: add 'needs-rebase' label on conflicts
+  conditions:
+    - label != stale
+    - conflict
+    - -closed
+  actions:
+    label:
+      add:
+        - needs-rebase
+
+- name: remove 'needs-rebase' label when conflict is resolved
+  conditions:
+    - -conflict
+    - -closed
+  actions:
+    label:
+      remove:
+        - needs-rebase
