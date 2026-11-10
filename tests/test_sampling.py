@@ -9,7 +9,6 @@ import pytest
 import torch
 from vllm.outputs import RequestOutput
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
-from vllm.utils.torch_utils import make_tensor_with_pad
 from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
 from vllm.v1.engine.output_processor import OutputProcessor
 from vllm.v1.outputs import LogprobsLists
@@ -24,6 +23,7 @@ from vllm_metal.v1.model_runner import (
     _ExecutionBatch,
 )
 from vllm_metal.v1.sampling import Sampler, SamplingMetadata
+from vllm_metal.v1.sampling.torch_utils import make_tensor_with_pad
 from vllm_metal.v1.sampling_batch import (
     SamplingBatch,
     create_request_generator,
@@ -1463,10 +1463,10 @@ class TestV1PenaltyTokenAccounting:
 
 
 def test_vllm_metal_no_longer_imports_removed_v1_sampling_modules() -> None:
-    """The switchover is complete: nothing under ``vllm_metal`` imports the
-    V1 sampling modules that vllm-project/vllm#63373 removes. The vendored
-    stack lives in ``vllm_metal.v1.sampling``; ``ops.topk_topp_sampler``
-    stays upstream (not removed)."""
+    """The switchover is complete: nothing under ``vllm_metal``, ``tests`` or
+    ``tools`` imports the V1 sampling modules or names that
+    vllm-project/vllm#63373 removes. The vendored stack lives in
+    ``vllm_metal.v1.sampling``."""
     import ast
     from pathlib import Path
 
@@ -1480,18 +1480,32 @@ def test_vllm_metal_no_longer_imports_removed_v1_sampling_modules() -> None:
         "vllm.v1.sample.ops.bad_words",
         "vllm.v1.sample.ops.logprobs",
     }
+    # Names #63373 removes from modules it keeps.
+    removed_names = {
+        "vllm.v1.sample.ops.topk_topp_sampler": {"TopKTopPSampler", "random_sample"},
+        "vllm.utils.torch_utils": {"make_tensor_with_pad"},
+    }
 
-    def hits(module: str) -> bool:
+    def hits(module: str, names: set[str]) -> bool:
         # Submodule paths (e.g. logits_processor.state) count as the package.
-        return any(module == name or module.startswith(name + ".") for name in removed)
+        if any(module == name or module.startswith(name + ".") for name in removed):
+            return True
+        return bool(names & removed_names.get(module, set()))
 
     offenders = []
-    for path in (repo / "vllm_metal").rglob("*.py"):
+    paths = [
+        path
+        for package in ("vllm_metal", "tests", "tools")
+        for path in (repo / package).rglob("*.py")
+    ]
+    for path in paths:
         for node in ast.walk(ast.parse(path.read_text())):
-            if isinstance(node, ast.ImportFrom) and hits(node.module or ""):
+            if isinstance(node, ast.ImportFrom) and hits(
+                node.module or "", {alias.name for alias in node.names}
+            ):
                 offenders.append(f"{path.relative_to(repo)}:{node.lineno}")
             elif isinstance(node, ast.Import) and any(
-                hits(alias.name) for alias in node.names
+                hits(alias.name, set()) for alias in node.names
             ):
                 offenders.append(f"{path.relative_to(repo)}:{node.lineno}")
     assert offenders == []

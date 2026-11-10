@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Vendored from vllm b46907cce0f7 (== v0.33.0), Apache-2.0:
-# vllm/v1/sample/logits_processor/{interface,builtin}.py,
+# vllm/v1/sample/logits_processor/builtin.py,
 # which vllm-project/vllm#63373 removes. Local modifications:
-#   * only the pieces SamplingBatch drives: BatchUpdate (+ MoveDirectionality),
-#     LogitBiasLogitsProcessor, MinTokensLogitsProcessor, process_dict_updates.
+#   * only the pieces SamplingBatch drives: LogitBiasLogitsProcessor,
+#     MinTokensLogitsProcessor and process_dict_updates; BatchUpdate and
+#     MoveDirectionality live with the interface in
+#     vllm_metal.v1.logits_processors.
 #   * the processors drop the LogitsProcessor ABC base; they satisfy the
 #     vllm_metal.v1.logits_processors.LogitsProcessor protocol structurally.
 #   * MinTokensLogitsProcessor.apply_with_spec_decode is omitted (unused here).
@@ -12,59 +14,16 @@
 """Built-in logit-bias and min-tokens processors for the vendored sampler."""
 
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
-from enum import Enum, auto
 from typing import TYPE_CHECKING
 
 import torch
 from vllm import SamplingParams
 from vllm.utils.torch_utils import async_tensor_h2d
 
+from vllm_metal.v1.logits_processors import BatchUpdate, MoveDirectionality
+
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
-
-
-class MoveDirectionality(Enum):
-    # One-way i1->i2 req move within batch
-    UNIDIRECTIONAL = auto()
-    # Two-way i1<->i2 req swap within batch
-    SWAP = auto()
-
-
-# Batch indices of any removed requests.
-RemovedRequest = int
-
-# (index, params, prompt_tok_ids, output_tok_ids) tuples for new
-# requests added to the batch.
-AddedRequest = tuple[int, SamplingParams, list[int] | None, list[int]]
-
-# (index 1, index 2, directionality) tuples representing
-# one-way moves or two-way swaps of requests in batch
-MovedRequest = tuple[int, int, MoveDirectionality]
-
-
-@dataclass(frozen=True)
-class BatchUpdate:
-    """Persistent batch state change info for logitsprocs."""
-
-    batch_size: int  # Current num reqs in batch
-
-    # Metadata for requests added to, removed from, and moved
-    # within the persistent batch.
-    #
-    # Key assumption: the `output_tok_ids` list (which is an element of each
-    # tuple in `added`) is a reference to the request's running output tokens
-    # list; via this reference, the logits processors always see the latest
-    # list of generated output tokens.
-    #
-    # NOTE:
-    # * Added or moved requests may replace existing requests with the same
-    #   index.
-    # * Operations should be processed in the following order:
-    #   - removed, added, moved
-    removed: Sequence[RemovedRequest]
-    added: Sequence[AddedRequest]
-    moved: Sequence[MovedRequest]
 
 
 class LogitBiasLogitsProcessor:

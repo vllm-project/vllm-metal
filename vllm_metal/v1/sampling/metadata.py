@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# Vendored from vllm v0.32.0 vllm/v1/sample/metadata.py (Apache-2.0),
+# Vendored from vllm b46907cce0f7 (== v0.33.0), Apache-2.0:
+# vllm/v1/sample/metadata.py,
 # which vllm-project/vllm#63373 removes. Local modifications:
 #   * LogitsProcessors type comes from vllm_metal.v1.logits_processors.
 #   * thinking_budget_state_holder is typed as the local ThinkingBudgetState

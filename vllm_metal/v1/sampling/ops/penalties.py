@@ -1,12 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# Vendored verbatim from vllm v0.32.0 vllm/v1/sample/ops/penalties.py (Apache-2.0),
-# which vllm-project/vllm#63373 removes. No local modifications beyond
-# import grouping by the repo formatter.
+# Vendored from vllm b46907cce0f7 (== v0.33.0), Apache-2.0:
+# vllm/v1/sample/ops/penalties.py,
+# which vllm-project/vllm#63373 removes. Local modifications:
+#   * make_tensor_with_pad (also removed by #63373) comes from the vendored
+#     vllm_metal.v1.sampling.torch_utils; imports regrouped by the formatter.
 
 import torch
 from vllm.model_executor.layers.utils import apply_penalties
-from vllm.utils.torch_utils import PIN_MEMORY, make_tensor_with_pad
+from vllm.utils.torch_utils import PIN_MEMORY
+
+from vllm_metal.v1.sampling.torch_utils import make_tensor_with_pad
 
 
 def apply_all_penalties(

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# Vendored verbatim from vllm v0.32.0 vllm/v1/sample/ops/bad_words.py (Apache-2.0),
+# Vendored verbatim from vllm b46907cce0f7 (== v0.33.0), Apache-2.0:
+# vllm/v1/sample/ops/bad_words.py,
 # which vllm-project/vllm#63373 removes. No local modifications.
 
 import torch

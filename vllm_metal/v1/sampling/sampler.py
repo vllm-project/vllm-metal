@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# Vendored from vllm v0.32.0 vllm/v1/sample/sampler.py (Apache-2.0),
+# Vendored from vllm b46907cce0f7 (== v0.33.0), Apache-2.0:
+# vllm/v1/sample/sampler.py,
 # which vllm-project/vllm#63373 removes. Local modifications:
-#   * metadata / ops.penalties / ops.bad_words / ops.logprobs import from
-#     the sibling vendored copies; ops.topk_topp_sampler stays upstream
-#     (not removed by #63373).
+#   * metadata / ops.penalties / ops.bad_words / ops.logprobs /
+#     ops.topk_topp_sampler import from the sibling vendored copies.
+#   * the ROCm-only aiter fused sample path (mixed_sample_eligible /
+#     _aiter_raw_fused_sample) is omitted; it never triggers on Metal.
 #   * zip() calls carry an explicit strict=False (default semantics) to
 #     satisfy the repo linter; imports regrouped by the repo formatter.
 """A layer that samples the next tokens from the model's outputs."""
@@ -16,12 +18,12 @@ from vllm.platforms import current_platform
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.outputs import LogprobsTensors, SamplerOutput
-from vllm.v1.sample.ops.topk_topp_sampler import TopKTopPSampler
 
 from vllm_metal.v1.sampling.metadata import SamplingMetadata
 from vllm_metal.v1.sampling.ops.bad_words import apply_bad_words
 from vllm_metal.v1.sampling.ops.logprobs import batched_count_greater_than
 from vllm_metal.v1.sampling.ops.penalties import apply_all_penalties
+from vllm_metal.v1.sampling.ops.topk_topp_sampler import TopKTopPSampler
 
 _SAMPLING_EPS = 1e-5
 

@@ -13,21 +13,21 @@ import mlx.core as mx
 import numpy as np
 import torch
 from vllm.sampling_params import SamplingParams
-from vllm.utils.torch_utils import make_tensor_with_pad
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors, SamplerOutput
 
 from vllm_metal.tensor_bridge import mlx_to_torch
 from vllm_metal.v1.logits_processors import (
     BatchMinPLogitsProcessor,
+    BatchUpdate,
     LogitsProcessor,
     LogitsProcessors,
 )
 from vllm_metal.v1.sampling import Sampler, SamplingMetadata
 from vllm_metal.v1.sampling.builtin_logits_processors import (
-    BatchUpdate,
     LogitBiasLogitsProcessor,
     MinTokensLogitsProcessor,
 )
+from vllm_metal.v1.sampling.torch_utils import make_tensor_with_pad
 
 GREEDY_TEMPERATURE_EPS = 1e-5
 _EMPTY_LOGITSPROCS = LogitsProcessors()
