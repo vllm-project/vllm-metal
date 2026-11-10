@@ -21,3 +21,10 @@ query work adds a capacity reserve when the candidate has fewer independent
 groups than detected GPU cores. Compact KV and calls without exact lengths retain
 upstream selection, including established GQA6 h3/h6 routes. Unknown GPU
 capacity or an insufficient pipeline thread limit falls back to ordinary NAX.
+
+For long split-prefill calls the score includes the KV scan that the last
+partially filled query tile must finish after the busy part of the launch.
+For example, 1,056 new rows fill 66 grouped tiles of 16. Ordinary NAX fills
+16 tiles of 64, then uses a guarded KV scan for its remaining 32 rows.
+For each KV head, the score limits how far additional query tiles can reduce
+the estimated cost of a wide group's state.

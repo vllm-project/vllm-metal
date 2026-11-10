@@ -288,7 +288,7 @@ inline NaxConfig select_nax_config(
   };
   const auto cost = [&](NaxConfig cfg, const NaxPrefillResources& work) {
     return nax_prefill_cost(work, geometry, {cfg.BQ, 32, cfg.HEADS_PER_TG},
-                            gpu_cores, cfg.HEADS_PER_TG > 1 || upstream_split);
+                            gpu_cores, upstream_split);
   };
   const auto reference = resources(upstream);
   const double reference_cost = cost(upstream, reference);

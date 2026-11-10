@@ -125,7 +125,7 @@ inline constexpr NaxPageRates kNaxPage32Rates{
 
 inline double nax_prefill_cost(
     const NaxPrefillResources& resources, NaxGeometry geometry,
-    NaxLayout layout, int cores, bool split) {
+    NaxLayout layout, int cores, bool upstream_split) {
   const auto& w = resources.work;
   const auto& rates = geometry.kernel_page == 16 ? kNaxPage16Rates : kNaxPage32Rates;
   const int ratio = geometry.heads / geometry.kv_heads;
@@ -156,8 +156,15 @@ inline double nax_prefill_cost(
   // Total matrix work and the deepest serial KV scan constrain different grids.
   double bulk = dimension * (w.fast + rates.guarded_tile * guarded
       + tail_cost * tail + kInactiveTile * inactive) / (kTilesPerCore * cores);
-  bulk *= rate * (1 + kWideStatePenalty * wide * wide
-      * std::min(1., kStateGroupsPerCore * cores / w.groups));
+  // Extra Q blocks can hide a wide group's state cost only up to the
+  // calibrated limit on concurrent streams per independent KV head.
+  constexpr double kGroupsPerKvHead = 512.;
+  const double state_groups = std::min(
+      double(w.groups), kGroupsPerKvHead * geometry.kv_heads);
+  rate *= 1 + kWideStatePenalty * wide * wide
+      * std::min(1., kStateGroupsPerCore * cores / state_groups);
+  bulk *= rate;
+  const bool split = width > 1 || upstream_split;
   double critical = dimension * std::max(
       resources.full_stream * (split ? 1. : rates.guarded_stream), w.tail_stream * tail_cost);
   critical *= 1 + kStreamStatePenalty * std::max(0., state - kCriticalStateFloor);
@@ -180,7 +187,13 @@ inline double nax_prefill_cost(
   constexpr double kGroupLaunch = .00033546262790716194;
   const double roof = std::sqrt(std::sqrt(
       std::pow(bulk, 4) + std::pow(critical, 4) + std::pow(stream, 4)));
-  return kLaunch + roof + kGroupLaunch * resources.launched_groups / cores;
+  // When full tiles saturate the grid, the last guarded Q tile still has
+  // to finish its KV scan. A scan-limited launch already pays for that tail
+  // in critical. A complete Q tile has no drain.
+  constexpr double kTailDrain = .25;
+  const double drain = upstream_split
+      ? kTailDrain * std::min(w.tail_stream, std::max(0., bulk - critical)) : 0.;
+  return kLaunch + roof + drain + kGroupLaunch * resources.launched_groups / cores;
 }
 
 inline double nax_admission_margin(const NaxPrefillWork& upstream,
