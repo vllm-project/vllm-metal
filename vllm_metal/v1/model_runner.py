@@ -1726,13 +1726,11 @@ class MetalModelRunner:
                     and self._intermediate_forward_supported
                     and not needs_prompt_logprob_rows
                 ):
-                    capture = (
-                        {"aux_capture": self._aux_capture}
-                        if self._aux_capture is not None
-                        else {}
-                    )
                     intermediate = self._model_adapter.intermediate_forward(
-                        self._forward_model, input_ids, cache=offset_caches, **capture
+                        self._forward_model,
+                        input_ids,
+                        cache=offset_caches,
+                        aux_capture=self._aux_capture,
                     )
                     intermediate_hidden = intermediate.hidden_states
                     target_aux_hidden_states = intermediate.aux_hidden_states
