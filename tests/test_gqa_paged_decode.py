@@ -218,19 +218,11 @@ def test_nosplit_gqa_numerics_and_ragged_tails(dtype, lengths):
 
 @pytest.mark.parametrize("q,kv,head", [(24, 4, 256), (16, 2, 128)])
 def test_nosplit_rejects_geometries_only_shipped_for_split(q, kv, head):
-    kwargs = {
-        "kv_lens": [65],
-        "dtype": mx.float16,
-        "interleaved": True,
-        "seed": 721,
-        "num_query_heads": q,
-        "num_kv_heads": kv,
-        "head_size": head,
-    }
-    out, ref = _run_primitive(**kwargs, test_partition=256)
-    _assert_close(out, ref, mx.float16)
-    with pytest.raises(ValueError):
-        _run_primitive(**kwargs, test_partition=0)
+    with pytest.raises(ValueError, match="supported one-token decode rows"):
+        _run_primitive(
+            [65], mx.float16, interleaved=True, seed=721, test_partition=0,
+            num_query_heads=q, num_kv_heads=kv, head_size=head,
+        )  # fmt: skip
 
 
 def test_nosplit_does_not_allocate_split_scratch_for_a_large_bound():

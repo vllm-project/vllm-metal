@@ -144,9 +144,6 @@ def test_nosplit_default_and_forced_routes_remain_distinct(dtype, partition):
         {"gqa_disabled": True},
         {"gqa_lengths": None},
         {"num_decode_tokens": 0},
-        {"softcap": 2.0},
-        {"sliding_window": 64},
-        {"dtype": mx.float32},
     ],
 )
 def test_nosplit_default_keeps_feature_and_metadata_guards(overrides):

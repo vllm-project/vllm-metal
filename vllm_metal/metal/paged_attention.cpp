@@ -1087,8 +1087,7 @@ static void dispatch_paged_attention_gqa_decode(
             name, encoding.library, hash,
             {{&plan.compact, MTL::DataType::DataTypeBool, NS::UInteger(130)}});
 
-  std::optional<array> g_tmp_out, g_exp_sums, g_max_logits;
-  std::optional<array> g_offsets;
+  std::optional<array> g_tmp_out, g_exp_sums, g_max_logits, g_offsets;
   enc.set_compute_pipeline_state(gkernel);
   if (no_split) {
     enc.set_output_array(arrays.out, 2);

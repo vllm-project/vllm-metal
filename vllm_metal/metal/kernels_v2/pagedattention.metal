@@ -2267,8 +2267,7 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE, int PARTITION_SIZE>
   if constexpr (USE_PARTITIONING) {
     pidx = (use_compact_scratch
         ? paged_attention_compact_offset(seq_idx, head_idx, num_heads, partition_offsets)
-        : (static_cast<int64_t>(seq_idx) * num_heads + head_idx) *
-            max_num_partitions) + partition_idx;
+        : pidx * max_num_partitions) + partition_idx;
     if (lane == 0) {
       max_logits[pidx] = m;
       exp_sums[pidx] = l;

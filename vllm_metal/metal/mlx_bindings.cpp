@@ -225,8 +225,8 @@ NB_MODULE(_paged_ops, m) {
           auto* lib = d.get_library("paged_attention_v2_kern");
           // Check every layout admitted by the dispatch table. Duplicate
           // layouts reuse the same cached pipelines.
+          bool no = false;
           for (const char* dtype : {"half", "bfloat16_t"}) {
-            bool no = false;
             const auto direct = gqa_decode_kernel_name(
                 dtype, kGqaNoSplitGeometry.head_size,
                 kGqaNoSplitGeometry.block_size, 0);
@@ -237,7 +237,6 @@ NB_MODULE(_paged_ops, m) {
               for (const auto& layout : kGqaDecodeGeometries) {
                 const auto reducer = kernels::paged_reduce_kernel_name(
                     dtype, layout.head_size, part);
-                bool no = false;
                 if (d.get_kernel(reducer, lib, reducer + "_gqa_check",
                     {{&no, MTL::DataType::DataTypeBool, NS::UInteger(40)},
                      {&no, MTL::DataType::DataTypeBool, NS::UInteger(50)},
