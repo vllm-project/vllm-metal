@@ -12,6 +12,7 @@ import mlx.core as mx
 import torch
 from vllm.logger import init_logger
 from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
@@ -41,7 +42,6 @@ from vllm_metal.attention.runtime.protocol import PagedAttentionRuntime
 from vllm_metal.attention.runtime.sdpa import SDPAPagedAttentionRuntime
 from vllm_metal.attention.yoco import try_enable_gemma4_yoco_fast_prefill
 from vllm_metal.config import (
-    PAGED_ATTENTION_MIN_BLOCKS,
     MetalConfig,
     get_config,
 )
@@ -255,7 +255,6 @@ def uses_metal_offloading(vllm_config: VllmConfig) -> bool:
 
 @dataclass(frozen=True)
 class _PagedAttentionPlan:
-    block_size: int
     fraction: float
     metal_limit: int
     usable_metal: int
@@ -263,14 +262,31 @@ class _PagedAttentionPlan:
     overhead: int
     per_block_bytes: int
     kv_budget: int
-    num_blocks: int
     # KV offload host pool. Pageable, but the same physical RAM as the wired
-    # cache on unified memory, so it comes out of the same budget.
+    # cache on unified memory. Additional to an explicit cache byte budget.
     kv_offload_pool: int = 0
     kv_offload_pool_auto: bool = False
     sized_down_by_probe: bool = False
+    explicit_kv_budget: int | None = None
+
+    @property
+    def user_sized_pool(self) -> bool:
+        """True when the user sized the pool, so it is theirs to lower.
+
+        An automatic pool was sized for the user, who never set the flag.
+        """
+        return bool(self.kv_offload_pool) and not self.kv_offload_pool_auto
 
     def format_breakdown(self) -> str:
+        if self.explicit_kv_budget is not None:
+            return (
+                f"kv_cache_memory_bytes={self.explicit_kv_budget} "
+                f"({self.explicit_kv_budget / 1e9:.2f}GB), "
+                f"model_memory={self.model_memory / 1e9:.2f}GB, "
+                f"overhead={self.overhead / 1e9:.2f}GB, "
+                f"kv_offload_pool={self.kv_offload_pool / 1e9:.2f}GB, "
+                f"kv_budget={self.kv_budget / 1e9:.2f}GB"
+            )
         parts = [
             f"metal_limit={self.metal_limit / 1e9:.2f}GB",
             f"fraction={self.fraction}",
@@ -284,6 +300,11 @@ class _PagedAttentionPlan:
         return ", ".join(parts)
 
     def format_mitigations(self) -> str:
+        if self.explicit_kv_budget is not None:
+            return (
+                "Increase --kv-cache-memory-bytes or unset it to use automatic "
+                "sizing; --gpu-memory-utilization does not change an explicit budget."
+            )
         if self.sized_down_by_probe:
             mitigations = [
                 "close other applications to free memory (the startup probe "
@@ -296,8 +317,7 @@ class _PagedAttentionPlan:
                 f"increase --gpu-memory-utilization (currently {self.fraction})",
                 "use a smaller or more quantized model",
             ]
-        # An automatic pool was sized for the user, who never set the flag.
-        if self.kv_offload_pool and not self.kv_offload_pool_auto:
+        if self.user_sized_pool:
             mitigations.insert(0, "lower --kv-offloading-size")
         return "Mitigations: " + "; ".join(mitigations) + "."
 
@@ -428,7 +448,6 @@ class ModelCachePolicy:
     def scheduler_memory_reporting_mode(
         self,
     ) -> Literal[
-        "paged_attention_capacity",
         "paged_attention_layout_budget",
         "pooling_no_kv",
     ]:
@@ -439,9 +458,7 @@ class ModelCachePolicy:
             and not pooling_backend.capabilities.uses_kv_cache
         ):
             return "pooling_no_kv"
-        if self._uses_upstream_storage():
-            return "paged_attention_layout_budget"
-        return "paged_attention_capacity"
+        return "paged_attention_layout_budget"
 
     def _hybrid_plan(self) -> HybridRuntimePlan:
         """Return the resolved hybrid plan, failing fast if lifecycle skipped it."""
@@ -452,9 +469,6 @@ class ModelCachePolicy:
                 "ModelLifecycle.resolve_model_dims must run before cache sizing"
             )
         return plan
-
-    def _uses_upstream_storage(self) -> bool:
-        return self._runner.is_hybrid or self._runner._draft_dims is None
 
     def _uses_grouped_attention(self) -> bool:
         """Return whether the scheduler keeps distinct attention-window groups."""
@@ -571,12 +585,7 @@ class ModelCachePolicy:
                 k_quant=config.k_quant,
                 v_quant=config.v_quant,
             )
-        # MLA caches a single latent tensor per layer, not separate K and V
-        # (see ``MLAPagedLatentCache``), which is why ``_kv_factor`` bills it
-        # at 1.  ``FullAttentionSpec`` bakes the 2x K/V factor into
-        # ``page_size_bytes`` (head_size + head_size_v), so describing MLA with
-        # it makes the engine halve the block count it plans against relative
-        # to the pool actually allocated.
+        # MLA stores one latent vector per token; its spec encodes that shape.
         if self._runner.is_mla:
             return MLAAttentionSpec(
                 block_size=block_size,
@@ -648,12 +657,7 @@ class ModelCachePolicy:
         )
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
-        """Bind layout-driven caches from the final engine configuration.
-
-        Count-initialized draft-model runtimes adopt the engine's groups;
-        other runtimes bind the engine's shared backing here.
-        """
-        self._adopt_draft_scheduler_group(kv_cache_config)
+        """Bind layout-driven caches from the final engine configuration."""
         runtime = self._runner.paged_attention_runtime
         pooling_backend = self._runner._pooling_backend
         if (
@@ -668,32 +672,14 @@ class ModelCachePolicy:
             logger.info("Encoder pooling: no KV cache initialized.")
             return
 
-        if self._uses_upstream_storage():
-            if runtime is not None:
-                raise RuntimeError(
-                    "upstream storage must be initialized after cache planning"
-                )
-            self._initialize_upstream_storage(kv_cache_config)
-            logger.info(
-                "KV cache config received: %d grouped blocks "
-                "(MLX layout initialized from vLLM config)",
-                kv_cache_config.num_blocks,
-            )
-            return
-
-        if runtime is not None and kv_cache_config.num_blocks > runtime.num_blocks():
-            raise ValueError(
-                f"Engine KV cache config requests {kv_cache_config.num_blocks} "
-                f"blocks but the Metal paged pool was allocated with "
-                f"{runtime.num_blocks()}. vllm-metal sizes its pool from "
-                "available Metal memory and cannot grow it afterwards. If "
-                "--num-gpu-blocks-override is set, lower or remove it; "
-                "otherwise this is a capacity-accounting bug, please report it."
-            )
         if runtime is not None:
-            self._adopt_scheduler_groups(runtime, kv_cache_config)
+            raise RuntimeError(
+                "upstream storage must be initialized after cache planning"
+            )
+        self._initialize_upstream_storage(kv_cache_config)
         logger.info(
-            "KV cache config received: %d blocks (MLX manages cache internally)",
+            "KV cache config received: %d grouped blocks "
+            "(MLX layout initialized from vLLM config)",
             kv_cache_config.num_blocks,
         )
 
@@ -706,14 +692,11 @@ class ModelCachePolicy:
             self._runner.install_paged_attention_runtime(
                 runtime, block_size=self._runner.cache_config.block_size
             )
-            self._runner.install_drafter(
-                num_blocks=kv_cache_config.num_blocks,
-                block_size=self._runner.cache_config.block_size,
-            )
+            self._runner.install_drafter()
             return
         model_layer_names = self._attention_layer_names()
         runtime = (
-            self._build_mla_backend(self._runner.cache_config.block_size)
+            self._build_mla_backend()
             if self._runner.is_mla
             else self._build_sdpa_backend(
                 block_size=self._runner.cache_config.block_size
@@ -724,8 +707,17 @@ class ModelCachePolicy:
         block_size = runtime.kv_group_block_sizes()[0]
         self.install_gemma4_mtp_kv_sharing(runtime, block_size=block_size)
         self._runner.install_paged_attention_runtime(runtime, block_size=block_size)
+        from vllm_metal.v1.draft_model_proposer import DraftModelProposer
+
         drafter = self._runner._drafter
-        if drafter is not None and (drafter_specs := drafter.kv_specs(block_size)):
+        if isinstance(drafter, DraftModelProposer):
+            drafter.bind_paged_cache(
+                storage=runtime.storage,
+                kv_cache_config=kv_cache_config,
+                dtype=self._require_kv_cache_dtype(),
+                target_max_model_len=self._runner.model_config.max_model_len,
+            )
+        elif drafter is not None and (drafter_specs := drafter.kv_specs(block_size)):
             groups = self._scheduler_group_indices_for_layers(
                 kv_cache_config, tuple(drafter_specs)
             )
@@ -738,67 +730,11 @@ class ModelCachePolicy:
                 group_index=groups[0],
                 max_model_len=self._runner.model_config.max_model_len,
             )
-        self._runner.install_drafter(
-            num_blocks=kv_cache_config.num_blocks, block_size=block_size
-        )
+        self._runner.install_drafter()
         try_enable_gemma4_yoco_fast_prefill(
             self._runner.model,
             self._runner.model_args,
             num_paged_layers=n_patched,
-        )
-
-    def _adopt_scheduler_groups(
-        self,
-        runtime: PagedAttentionRuntime,
-        kv_cache_config: KVCacheConfig,
-    ) -> None:
-        if isinstance(runtime, SDPAPagedAttentionRuntime):
-            runtime.adopt_scheduler_groups(
-                kv_cache_config, self._attention_layer_names()
-            )
-            self._runner.install_paged_attention_runtime(
-                runtime, block_size=runtime.kv_group_block_sizes()[0]
-            )
-
-    def _adopt_draft_scheduler_group(self, kv_cache_config: KVCacheConfig) -> None:
-        """Pass the scheduler KV group and final context limit to the drafter.
-
-        The draft model's own physical backend is already built by this
-        point (``install_drafter``, called from ``determine_available_memory``
-        -- before the engine has computed ``kv_cache_config``, so it cannot
-        know its group index at construction time). This runs after, once
-        ``kv_cache_config.kv_cache_groups`` exists, and resolves which group
-        the synthetic ``draft_layers.*`` names from
-        ``ModelCachePolicy._draft_layer_specs`` landed in -- mirroring
-        ``_adopt_scheduler_groups``'s resolution for the target. No-op without a
-        draft model configured.
-        """
-        draft_dims = self._runner._draft_dims
-        if draft_dims is None:
-            return
-        layer_names = tuple(
-            f"draft_layers.{layer_idx}.self_attn"
-            for layer_idx in range(draft_dims.num_layers)
-        )
-        group_indices = self._scheduler_group_indices_for_layers(
-            kv_cache_config, layer_names
-        )
-        if len(group_indices) != 1:
-            raise NotImplementedError(
-                "draft-model speculative decoding requires all draft layers "
-                "to share one scheduler KV cache group"
-            )
-
-        from vllm_metal.v1.draft_model_proposer import DraftModelProposer
-
-        drafter = self._runner._drafter
-        if not isinstance(drafter, DraftModelProposer):
-            raise RuntimeError(
-                "draft KV-cache spec registered but no DraftModelProposer is "
-                f"installed (got {type(drafter).__name__})"
-            )
-        drafter.adopt_scheduler_group(
-            group_indices[0], self._runner.model_config.max_model_len
         )
 
     def _scheduler_group_indices_for_layers(
@@ -826,66 +762,18 @@ class ModelCachePolicy:
         return tuple(f"layers.{layer_idx}.self_attn" for layer_idx in range(num_layers))
 
     def get_cache_block_size_bytes(self) -> int:
-        """Return the byte size of one cache block.
-
-        For per-layer shapes, sums each layer's contribution individually.
-        For uniform shapes, reduces to the existing product formula. Adds the
-        draft model's own per-block bytes when one is configured (see
-        ``_draft_cache_block_size_bytes``), so every caller of this method --
-        scheduler capacity reporting and the local budget-to-num_blocks
-        division alike -- sizes against the true combined cost of one block
-        index, which now has real storage in both the target's and the
-        draft's KV-cache groups.
-        """
-        self._require_supported_per_layer_shapes()
-        block_size = self._runner.cache_config.block_size
-        dtype_size = self._require_kv_cache_dtype().size
-        num_kv_layers = self._num_kv_cache_layers()
-
-        # TurboQuant uses quantized KV cache with different byte layout
-        config = get_config()
-        if self._use_turboquant(config):
-            return (
-                num_kv_layers
-                * turboquant_page_size_bytes(
-                    block_size=block_size,
-                    num_kv_heads=self._runner.num_kv_heads,
-                    head_dim=self._runner.head_dim,
-                    k_quant=config.k_quant,
-                    v_quant=config.v_quant,
-                )
-                + self._draft_cache_block_size_bytes()
-            )
-
-        return (
-            self._kv_factor() * block_size * dtype_size * self._kv_layer_size_sum()
-            + self._draft_cache_block_size_bytes()
+        """Return target and ordinary draft attention bytes per logical block."""
+        specs = self.get_kv_cache_spec()
+        drafter = self._runner._drafter
+        if drafter is not None:
+            # Preserve the estimate's exclusion of block-drafter storage.
+            for name in drafter.kv_specs(self._runner.cache_config.block_size):
+                del specs[name]
+        return sum(
+            spec.page_size_bytes
+            for spec in specs.values()
+            if isinstance(spec, AttentionSpec)
         )
-
-    def _draft_cache_block_size_bytes(self) -> int:
-        """Byte size of one draft-model cache block, or 0 without a draft.
-
-        Derived from the same ``FullAttentionSpec`` objects
-        ``_draft_layer_specs`` registers with the scheduler
-        (``page_size_bytes``), rather than a parallel hand-rolled
-        formula, so the two cannot drift apart. Naturally 0 when no draft is
-        configured, since ``_draft_layer_specs`` returns ``{}`` in that case.
-        """
-        block_size = self._runner.cache_config.block_size
-        torch_dtype = MLX_TO_TORCH_DTYPE[self._require_kv_cache_dtype()]
-        specs = self._draft_layer_specs(block_size=block_size, torch_dtype=torch_dtype)
-        return sum(spec.page_size_bytes for spec in specs.values())
-
-    def build_paged_attention_runtime(
-        self, *, block_size: int
-    ) -> PagedAttentionRuntime:
-        """Create the paged-attention backend for the loaded model."""
-        self._require_supported_per_layer_shapes()
-        if self._runner.is_hybrid:
-            return self._build_hybrid_backend()
-        if self._runner.is_mla:
-            return self._build_mla_backend(block_size)
-        return self._build_sdpa_backend(block_size)
 
     def install_gemma4_mtp_kv_sharing(
         self,
@@ -920,14 +808,9 @@ class ModelCachePolicy:
             mamba_cache_mode=self._runner.cache_config.mamba_cache_mode,
         )
 
-    def _build_mla_backend(self, block_size: int) -> MLAPagedAttentionRuntime:
+    def _build_mla_backend(self) -> MLAPagedAttentionRuntime:
         self._reject_turboquant_for_mla()
-        return MLAPagedAttentionRuntime(
-            num_layers=self._runner.num_layers,
-            latent_dim=self._runner.mla_latent_dim,
-            block_size=block_size,
-            dtype=self._require_kv_cache_dtype(),
-        )
+        return MLAPagedAttentionRuntime()
 
     def _reject_turboquant_for_mla(self) -> None:
         if self._runner.is_mla and get_config().turboquant:
@@ -939,8 +822,6 @@ class ModelCachePolicy:
 
     def _build_sdpa_backend(self, block_size: int) -> SDPAPagedAttentionRuntime:
         num_layers, cache_idx_map = self._cache_layer_mapping()
-        config = get_config()
-        kv_heads, head_dims = self._cache_layer_shapes(num_layers)
         # YOCO's ``build_yoco_cache_mapping`` assigns the first
         # ``num_cache_layers`` model layers identity-style (``mapping[i] = i``),
         # so slicing the first ``num_cache_layers`` entries of the full
@@ -950,17 +831,9 @@ class ModelCachePolicy:
         sw = self._runner.sliding_window_per_layer
         sw_list = sw[:num_layers] if sw is not None else None
         return SDPAPagedAttentionRuntime(
-            num_layers=num_layers,
-            num_kv_heads=self._runner.num_kv_heads,
-            head_dim=self._runner.head_dim,
             block_size=block_size,
             dtype=self._require_kv_cache_dtype(),
-            turboquant=config.turboquant,
-            k_quant=config.k_quant if config.turboquant else None,
-            v_quant=config.v_quant if config.turboquant else None,
             cache_idx_map=cache_idx_map,
-            kv_heads_per_layer=kv_heads,
-            head_dim_per_layer=head_dims,
             sliding_window_per_layer=sw_list,
         )
 
@@ -1001,31 +874,11 @@ class ModelCachePolicy:
                 "SDPA-layer index remapping, which is not yet implemented."
             )
 
-    def _kv_layer_size_sum(self) -> int:
-        """Sum of ``kv_heads × head_dim`` across KV cache layers.
-
-        For uniform models this equals ``num_kv_layers × kv_heads × head_dim``.
-        """
-        num_kv_layers = self._num_kv_cache_layers()
-        kv_heads = self._runner.kv_heads_per_layer
-        head_dims = self._runner.head_dim_per_layer
-        if kv_heads is not None and head_dims is not None:
-            return sum(kv_heads[i] * head_dims[i] for i in range(num_kv_layers))
-        return num_kv_layers * self._runner.num_kv_heads * self._runner.head_dim
-
-    def _num_kv_cache_layers(self) -> int:
-        if self._runner.is_hybrid:
-            return self._hybrid_plan().layers.num_attention
-        return self._runner.num_kv_cache_layers
-
     def _use_turboquant(self, config: MetalConfig) -> bool:
         # Hybrid models with standard attention compress their SDPA layers too,
         # so every sizing path must agree with the runtime layout. Hybrid MLA
         # is excluded here and rejected when its backend is built.
         return bool(config.turboquant and not self._runner.is_mla)
-
-    def _kv_factor(self) -> int:
-        return 1 if self._runner.is_mla else 2
 
     def _cache_layer_mapping(self) -> tuple[int, dict[int, int] | None]:
         if self._runner._yoco_cache_mapping is None:
@@ -1051,80 +904,6 @@ class WorkerCachePlanner:
     def __init__(self, worker: MetalWorker) -> None:
         self._worker = worker
 
-    def setup_paged_attention(self, *, overhead: int) -> None:
-        """Allocate paged KV cache and patch the loaded model."""
-        self._worker.model_runner.validate_paged_attention_support()
-        plan = self._paged_attention_plan(overhead=overhead)
-        self._validate_paged_attention_plan(plan, require_min_blocks=True)
-        num_blocks = plan.num_blocks
-        override = self._worker.vllm_config.cache_config.num_gpu_blocks_override
-        if override is not None:
-            if override <= 0:
-                raise ValueError("--num-gpu-blocks-override must be positive")
-            if override > num_blocks:
-                raise ValueError(
-                    f"--num-gpu-blocks-override={override} exceeds the planned "
-                    f"Metal cache capacity of {num_blocks} blocks. "
-                    "Lower or remove the override."
-                )
-            num_blocks = override
-        logger.info(
-            "Paged attention memory breakdown: "
-            "%s, per_block_bytes=%d, "
-            "num_blocks=%d, max_tokens_cached=%d",
-            plan.format_breakdown(),
-            plan.per_block_bytes,
-            num_blocks,
-            num_blocks * plan.block_size,
-        )
-
-        backend = self._worker.model_runner.build_paged_attention_runtime(
-            block_size=plan.block_size
-        )
-        # Only draft-model speculation still sizes its pool here
-        # (``ModelCachePolicy._uses_upstream_storage``), so only the SDPA and
-        # MLA target runtimes, which own ``initialize``, reach this path.
-        if not isinstance(
-            backend, (SDPAPagedAttentionRuntime, MLAPagedAttentionRuntime)
-        ):
-            raise RuntimeError(
-                "Paged attention: the capacity path initializes only the SDPA "
-                f"and MLA runtimes; {type(backend).__name__} sizes its cache "
-                "from vLLM's KV cache config"
-            )
-        backend.initialize(num_blocks)
-        self._worker.model_runner.install_gemma4_mtp_kv_sharing(
-            backend,
-            block_size=plan.block_size,
-        )
-        n_patched = backend.patch_model(self._worker.model_runner.model)
-        self._worker.model_runner.install_drafter(
-            num_blocks=num_blocks,
-            block_size=plan.block_size,
-        )
-        config = get_config()
-
-        try_enable_gemma4_yoco_fast_prefill(
-            self._worker.model_runner.model,
-            self._worker.model_runner.model_args,
-            num_paged_layers=n_patched,
-        )
-        logger.info(
-            "Paged attention enabled: %d layers patched, "
-            "%d blocks allocated (block_size=%d, mla=%s, turboquant=%s, k_quant=%s)",
-            n_patched,
-            num_blocks,
-            plan.block_size,
-            self._worker.model_runner.is_mla,
-            config.turboquant,
-            config.k_quant if config.turboquant else "N/A",
-        )
-
-        self._worker.model_runner.install_paged_attention_runtime(
-            backend,
-            block_size=plan.block_size,
-        )
-
     def get_model_memory_usage(self) -> int:
         """Return current model memory usage in bytes."""
         mx.eval(mx.array([0]))
@@ -1138,33 +917,11 @@ class WorkerCachePlanner:
             logger.info("STT model: reporting nominal memory for scheduler")
             return STT_SCHED_AVAILABLE_BYTES
 
-        if mode == "paged_attention_capacity":
-            overhead = self._worker.model_runner.profile_run()
-            self.setup_paged_attention(overhead=overhead)
-            backend = self._worker.model_runner.paged_attention_runtime
-            if backend is None:
-                raise RuntimeError(
-                    "Paged attention backend not initialized for capacity reporting"
-                )
-            block_size_bytes = self._worker.get_cache_block_size_bytes()
-            available = backend.num_blocks() * block_size_bytes
-            logger.info(
-                "Paged attention: reporting MPS cache capacity "
-                "(%d blocks × %d bytes = %.2f GB)",
-                backend.num_blocks(),
-                block_size_bytes,
-                available / 1e9,
-            )
-            return available
-
         if mode == "paged_attention_layout_budget":
             overhead = self._worker.model_runner.profile_run()
             plan = self._paged_attention_plan(overhead=overhead)
             if self._worker.vllm_config.cache_config.num_gpu_blocks_override is None:
-                self._validate_paged_attention_plan(
-                    plan,
-                    require_min_blocks=False,
-                )
+                self._validate_paged_attention_plan(plan)
             budget = plan.kv_budget
             logger.info(
                 "Upstream cache layout: reporting %.2f GB KV budget; "
@@ -1192,8 +949,16 @@ class WorkerCachePlanner:
 
     def _paged_attention_plan(self, *, overhead: int) -> _PagedAttentionPlan:
         """Build the memory plan without applying caller-specific validation."""
-        block_size = self._worker.vllm_config.cache_config.block_size
-        fraction = self._memory_fraction()
+        explicit = getattr(
+            self._worker.vllm_config.cache_config, "kv_cache_memory_bytes", None
+        )
+        if explicit is not None and explicit <= 0:
+            raise ValueError("--kv-cache-memory-bytes must be positive")
+        fraction = (
+            self._memory_fraction()
+            if explicit is None
+            else self._worker.vllm_config.cache_config.gpu_memory_utilization
+        )
         metal_limit = self._metal_limit_bytes()
         model_memory = self.get_model_memory_usage()
         per_block_bytes = self._worker.get_cache_block_size_bytes()
@@ -1221,17 +986,31 @@ class WorkerCachePlanner:
             overhead += expert_bytes
             future_reserved_bytes += expert_bytes
         usable_metal = int(metal_limit * fraction)
-        base_kv_budget = self.base_kv_budget_bytes(
-            metal_limit,
-            model_memory,
-            fraction,
-            overhead,
+        kv_budget = (
+            explicit
+            if explicit is not None
+            else self.base_kv_budget_bytes(
+                metal_limit,
+                model_memory,
+                fraction,
+                overhead,
+            )
         )
-        kv_offload_pool = self._resolve_kv_offload_pool(base_kv_budget, per_block_bytes)
-        kv_budget = base_kv_budget - kv_offload_pool
+        kv_offload_pool = self._resolve_kv_offload_pool(kv_budget, per_block_bytes)
+        # Explicit bytes budget the paged storage alone. The offload host pool
+        # and other future allocations still count in the physical commit probe.
+        if explicit is None:
+            kv_budget -= kv_offload_pool
+        if explicit is not None:
+            logger.info(
+                "Paged attention: using --kv-cache-memory-bytes=%d (%.2fGB), overriding "
+                "--gpu-memory-utilization. Weights, activations and the offload "
+                "host pool need additional memory.",
+                explicit,
+                explicit / 1e9,
+            )
         plan, room = self._probe_committed_pool(
             _PagedAttentionPlan(
-                block_size=block_size,
                 fraction=fraction,
                 metal_limit=metal_limit,
                 usable_metal=usable_metal,
@@ -1239,9 +1018,9 @@ class WorkerCachePlanner:
                 overhead=overhead,
                 per_block_bytes=per_block_bytes,
                 kv_budget=kv_budget,
-                num_blocks=max(0, kv_budget // per_block_bytes),
                 kv_offload_pool=kv_offload_pool,
                 kv_offload_pool_auto=self._auto_pool_extra() is not None,
+                explicit_kv_budget=explicit,
             ),
             future_reserved_bytes=future_reserved_bytes,
         )
@@ -1255,7 +1034,6 @@ class WorkerCachePlanner:
                 plan = replace(
                     plan,
                     kv_budget=room - pool,
-                    num_blocks=(room - pool) // per_block_bytes,
                     kv_offload_pool=pool,
                 )
         return plan
@@ -1291,6 +1069,7 @@ class WorkerCachePlanner:
         if (
             getattr(model_config, "original_max_model_len", None) != -1
             and cache_config.num_gpu_blocks_override is None
+            and getattr(cache_config, "kv_cache_memory_bytes", None) is None
         ):
             request_blocks = -(-model_config.max_model_len // block_size) + 1
             request = request_blocks * per_block_bytes
@@ -1302,10 +1081,11 @@ class WorkerCachePlanner:
     def _resolve_kv_offload_pool(self, kv_budget: int, per_block_bytes: int) -> int:
         """Host pool bytes of the Metal offloading connector, else 0.
 
-        The pool is the same physical RAM as the wired cache, so it comes out
-        of the same budget. An automatic pool is at most a quarter of the
-        budget, or one host chunk if that is larger, and leaves room for one
-        full-length request. Writes a changed size back to cpu_bytes_to_use.
+        The pool shares physical RAM with the cache. It comes out of an
+        automatic budget, but is additional to explicit cache bytes. An
+        automatic pool is at most a quarter of the budget, or one host chunk
+        if larger. Automatic cache sizing also leaves room for one full-length
+        request. Writes a changed size back to cpu_bytes_to_use.
         Offloading uses the uni executor, so the connector and scheduler share
         this config and read it after planning.
         """
@@ -1438,10 +1218,22 @@ class WorkerCachePlanner:
                 )
             return plan, None
 
+        if plan.explicit_kv_budget is not None:
+            # The pool is held back above, so a smaller one makes room.
+            lower = "Lower that value"
+            if plan.user_sized_pool:
+                lower += " or --kv-offloading-size"
+            raise ValueError(
+                "KV commit probe: the machine paged memory out while testing "
+                f"--kv-cache-memory-bytes={plan.explicit_kv_budget} "
+                f"({plan.explicit_kv_budget / 1e9:.2f}GB). Refusing to "
+                f"silently shrink an explicit budget. {lower}, or free "
+                f"memory before retrying. {probe.describe()}"
+            )
+
         # Keep the unrounded fit as the budget: vLLM picks its own grouped
         # layout from the bytes it is handed, so rounding here to the dense
         # per-block estimate would throw away capacity the layout can use.
-        # ``num_blocks`` is the count-based path's allocation size.
         num_blocks = fit // plan.per_block_bytes
         logger.warning(
             "Paged attention: KV cache sized down from %.2f GB to %.2f GB "
@@ -1458,28 +1250,15 @@ class WorkerCachePlanner:
         # the pool alone fills it.
         room = probe.available_before - reserve_bytes - other_reserved_bytes
         return (
-            replace(
-                plan, kv_budget=fit, num_blocks=num_blocks, sized_down_by_probe=True
-            ),
+            replace(plan, kv_budget=fit, sized_down_by_probe=True),
             max(0, room),
         )
 
-    def _validate_paged_attention_plan(
-        self, plan: _PagedAttentionPlan, *, require_min_blocks: bool
-    ) -> None:
+    def _validate_paged_attention_plan(self, plan: _PagedAttentionPlan) -> None:
         if plan.kv_budget <= 0:
             raise ValueError(
                 "Paged attention: not enough Metal memory for KV cache. "
                 f"{plan.format_breakdown()}. {plan.format_mitigations()}"
-            )
-
-        if require_min_blocks and plan.num_blocks < PAGED_ATTENTION_MIN_BLOCKS:
-            raise ValueError(
-                "Paged attention: computed num_blocks too low "
-                f"({plan.num_blocks} < minimum {PAGED_ATTENTION_MIN_BLOCKS}). "
-                f"{plan.format_breakdown()}, "
-                f"per_block_bytes={plan.per_block_bytes}. "
-                f"{plan.format_mitigations()}"
             )
 
     def _memory_fraction(self) -> float:

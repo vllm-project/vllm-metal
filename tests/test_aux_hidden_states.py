@@ -267,7 +267,7 @@ def test_capture_preserves_paged_writes_and_packed_row_order(family):
     """Exercise the shared storage and real Metal kernels across a page boundary."""
     import torch
     from vllm.config import VllmConfig
-    from vllm.v1.core.kv_cache_utils import get_kv_cache_config_from_groups
+    from vllm.v1.core.kv_cache_planning import get_kv_cache_config_from_groups
     from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec
 
     from vllm_metal.attention.context import (
@@ -294,13 +294,7 @@ def test_capture_preserves_paged_writes_and_packed_row_order(family):
     kv_config.kv_cache_layout = "LBNHC"
     runtimes = []
     for model in models:
-        runtime = SDPAPagedAttentionRuntime(
-            num_layers=6,
-            num_kv_heads=2,
-            head_dim=64,
-            block_size=16,
-            dtype=mx.float32,
-        )
+        runtime = SDPAPagedAttentionRuntime(block_size=16, dtype=mx.float32)
         runtime.initialize_from_config(kv_config, names)
         assert runtime.patch_model(model) == 6
         runtimes.append(runtime)

@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Temporary Torch replacements for vLLM 0.32 MRv2 input/state kernels on MPS.
+"""Temporary Torch replacements for vLLM MRv2 input/state kernels on MPS.
 
 Upstream launches Triton kernels without a Torch fallback at these entry points.
-These implementations cover the supported non-speculative path. Replace the
-private bindings in install() as upstream kernel/component hooks become usable
+Replace the private bindings in bindings.install() as upstream kernel/component
+hooks become usable
 (vllm-project/vllm#43048 and #51212). Registration alone does not remove these
 implementations; prefer shared device-neutral fallbacks when they are available.
 """
@@ -35,6 +35,22 @@ def prepare_prefill_inputs(ids, lookahead, mapping, cu, all_ids, prefill, comput
         )
 
 
+def prompt_logprobs_token_ids(
+    ids,
+    cu,
+    mapping,
+    computed,
+    all_ids,
+    all_ids_stride,
+    BLOCK_SIZE,  # noqa: N803 - upstream kernel launch keyword
+):
+    # Each prompt row scores the token after it.
+    offsets, rows = token_rows(cu, ids.numel())
+    slots = mapping[rows].long()
+    positions = computed[slots].long() + 1 + offsets - cu[rows]
+    ids.copy_(all_ids[slots, positions.clamp_max(all_ids.shape[1] - 1)])
+
+
 def prepare_pos_seq_lens(mapping, cu, computed, pos, seq_lens):
     offsets, rows = token_rows(cu, pos.numel())
     pos.copy_(computed[mapping[rows].long()].long() + offsets - cu[rows])
@@ -55,8 +71,22 @@ def combine_sampled_and_draft_tokens(
     num_logits,
     num_new_sampled_tokens=1,
 ):
-    if drafts.shape[1] or num_new_sampled_tokens != 1:
-        raise NotImplementedError("MPS draft-token input kernels are not implemented")
+    if drafts.shape[1]:
+        offsets, rows = token_rows(cu_logits, num_logits)
+        local = offsets - cu_logits[rows]
+        widths = cu_logits.diff()
+        starts = cu[1:] - widths
+        indices = (starts[rows] + local).long()
+        slots = mapping[rows].long()
+        first_pos = lengths[rows] - widths[rows]
+        is_draft = local >= num_new_sampled_tokens
+        draft_col = (local - num_new_sampled_tokens).clamp(0, drafts.shape[1] - 1)
+        values = torch.where(is_draft, drafts[slots, draft_col], last[slots, 0])
+        generated = (lengths[rows] > prefill[slots]) & (
+            is_draft | (first_pos >= prefill[slots])
+        )
+        ids[indices] = torch.where(generated, values.to(ids.dtype), ids[indices])
+        return indices
     indices = (cu[1:] - 1).long()
     slots = mapping.long()
     ids[indices] = torch.where(
@@ -77,10 +107,19 @@ def get_num_sampled_and_rejected(count, lengths, cu_logits, mapping, prefill):
 
 
 def post_update(
-    mapping, computed, last, bins, tokens, count, rejected, cu, all_ids, total
+    mapping,
+    computed,
+    last,
+    bins,
+    tokens,
+    count,
+    rejected,
+    cu,
+    all_ids,
+    total,
+    draft_tokens=None,
+    draft_tokens_out=None,
 ):
-    if tokens.shape[1] != 1:
-        raise NotImplementedError("MPS speculative writeback is not implemented")
     valid_rows = cpu_mirror(mapping).numpy() >= 0
     if not valid_rows.all():
         keep = torch.tensor(valid_rows.nonzero()[0], device=mapping.device)
@@ -88,39 +127,71 @@ def post_update(
             return
         mapping, tokens = mapping[keep], tokens[keep]
         count, rejected = count[keep], rejected[keep]
+        if draft_tokens is not None:
+            draft_tokens = draft_tokens[keep]
         if cu is not None:
             lengths = (cu[1:] - cu[:-1])[keep]
             cu = torch.cat((cu.new_zeros(1), lengths.cumsum(0)))
     slots = mapping.long()
     valid = slots >= 0
     slots = slots.clamp_min(0)
+    if draft_tokens is not None:
+        draft_tokens_out[slots] = draft_tokens.to(draft_tokens_out.dtype)
     active = valid & (count > 0)
     old_total = total[slots].long()
-    ids = tokens[:, 0]
-    # A request has at most one row in the ordinary decode batch.
+    ids = tokens.gather(1, (count.long() - 1).clamp_min(0)[:, None]).flatten()
+    # Each request occupies one output row.
     last[slots, 0] = torch.where(active, ids, last[slots, 0])
-    write_pos = old_total.clamp_max(all_ids.shape[1] - 1)
-    all_ids[slots, write_pos] = torch.where(
-        active, ids.to(all_ids.dtype), all_ids[slots, write_pos]
-    )
+    for i in range(tokens.shape[1]):
+        write = valid & (count > i)
+        # Only unused columns get a safe index; real writes must fit the row.
+        write_pos = torch.where(write, old_total + i, 0)
+        all_ids[slots, write_pos] = torch.where(
+            write,
+            tokens[:, i].to(all_ids.dtype),
+            all_ids[slots, write_pos],
+        )
+        if bins is not None:
+            bins[slots, tokens[:, i].clamp_min(0)] += write.to(bins.dtype)
     total[slots] = (old_total + torch.where(active, count, 0)).to(total.dtype)
     delta = -rejected if cu is None else cu[1:] - cu[:-1] - rejected
     computed[slots] += torch.where(valid, delta, 0).to(computed.dtype)
-    if bins is not None:
-        bins[slots, ids] += active.to(bins.dtype)
 
 
 def post_update_num_computed_tokens(mapping, computed, cu):
     computed[mapping.long()] += (cu[1:] - cu[:-1]).to(computed.dtype)
 
 
-def gather_block_tables(self, mapping, num_reqs_padded, out=None, out_ptrs=None):
+def gather_block_tables(
+    self, mapping, num_reqs_padded, out=None, out_ptrs=None, num_computed_tokens=None
+):
     padded = num_reqs_padded
-    out = self.input_block_tables if out is None else out
+    rows = padded
     n = mapping.numel()
-    for src, dst in zip(self.block_tables, out, strict=True):
-        dst[:n].copy_(src.gpu.index_select(0, mapping.long()))
-        dst[n:padded].zero_()
+    if out is None:
+        out = self.input_block_tables
+        # Also clear rows left by a larger batch in the shared buffer.
+        rows = max(rows, self._num_dirty_rows)
+        self._num_dirty_rows = n
+    slots = mapping.long()
+    if self.has_sliding_window_groups and num_computed_tokens is not None:
+        first_positions = num_computed_tokens[slots].long()
+    else:
+        first_positions = None
+    for src, dst, block_size, reach in zip(
+        self.block_tables,
+        out,
+        self.block_sizes,
+        self._sliding_window_reach,
+        strict=True,
+    ):
+        dst[:n].copy_(src.gpu.index_select(0, slots))
+        if first_positions is not None and reach > 0:
+            # Null the blocks below the window; they may be freed and reused.
+            num_null = (first_positions - reach).clamp_min(0) // block_size
+            columns = torch.arange(dst.shape[1], device=dst.device)
+            dst[:n].masked_fill_(columns < num_null[:, None], 0)
+        dst[n:rows].zero_()
     return tuple(t[:padded] for t in out)
 
 
@@ -135,6 +206,10 @@ def compute_slot_mappings(self, mapping, cu, positions, num_tokens_padded, out=N
     out = self.slot_mappings if out is None else out
     offsets, rows = token_rows(cu, positions.numel())
     slots = mapping[rows].long()
+    active = (offsets < cu[-1]) & (slots >= 0)
+    # Mask dummy and padded lanes before indexing, as the Triton load does.
+    slots = torch.where(active, slots, 0)
+    positions = torch.where(active, positions, 0)
     for i, table in enumerate(self.block_tables):
         if not self._slot_mapping_enabled[i]:
             out[i, :padded].fill_(-1)
@@ -142,7 +217,7 @@ def compute_slot_mappings(self, mapping, cu, positions, num_tokens_padded, out=N
         block_size = self.block_sizes[i]
         physical = table.gpu[slots, (positions // block_size).long()]
         values = physical.long() * block_size + positions % block_size
-        out[i, : positions.numel()] = torch.where(offsets < cu[-1], values, -1)
+        out[i, : positions.numel()] = torch.where(active, values, -1)
         out[i, positions.numel() : padded].fill_(-1)
     return out[:, :padded]
 
@@ -178,31 +253,25 @@ def preprocess_state(self, input_batch, block_tables, kv_cache_config, computed)
 
 
 def postprocess_state(self, idx_mapping, num_sampled, num_computed_tokens=None):
-    # Speculation is rejected at configuration time. The upstream state starts
+    # Hybrid speculation is rejected at configuration time. Upstream starts
     # with the neutral acceptance count (1), including unsampled prefill steps.
     pass
 
 
-def install():
-    from vllm.v1.worker.gpu import block_table, input_batch, model_runner
-    from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
-    from vllm.v1.worker.gpu.sample import sampler
-
-    for name in (
-        "prepare_prefill_inputs",
-        "prepare_pos_seq_lens",
-        "combine_sampled_and_draft_tokens",
-        "expand_idx_mapping",
-        "post_update",
-        "post_update_num_computed_tokens",
-    ):
-        setattr(input_batch, name, globals()[name])
-        setattr(model_runner, name, globals()[name])
-    input_batch.get_num_sampled_and_rejected = get_num_sampled_and_rejected
-    sampler.get_num_sampled_and_rejected = get_num_sampled_and_rejected
-    block_table.BlockTables.gather_block_tables = gather_block_tables
-    block_table.BlockTables.apply_staged_writes = apply_block_table_writes
-    block_table.BlockTables.compute_slot_mappings = compute_slot_mappings
-    block_table.BlockTables._make_ptr_tensor = make_block_pointer_tensor
-    MambaHybridModelState.preprocess_state = preprocess_state
-    MambaHybridModelState.postprocess_state = postprocess_state
+def prepare_rope_positions(self, mapping, cu, prefill, computed):
+    offsets, rows = token_rows(cu, self.positions.shape[1] - 1)
+    slots = mapping[rows].long()
+    original = computed[slots].long() + offsets - cu[rows]
+    channels = (
+        slots[None, :] * self.num_dims
+        + torch.arange(self.num_dims, device=mapping.device)[:, None]
+    )
+    cached = self.prefill_positions.gpu[
+        channels, original.clamp(0, self.max_model_len - 1)[None, :]
+    ]
+    positions = torch.where(
+        (computed[slots] < prefill[slots])[None, :],
+        cached,
+        (original + self.prefill_delta.gpu[slots])[None, :],
+    )
+    self.positions[:, :-1].copy_(torch.where(offsets[None, :] < cu[-1], positions, 0))

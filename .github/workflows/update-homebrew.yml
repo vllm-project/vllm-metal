@@ -57,9 +57,13 @@ jobs:
           version = tag.removeprefix("v")
           metadata = api(f"repos/{repo}/contents/.github/vllm-release-tag.commit?ref={tag}")
           core_tag = base64.b64decode(metadata["content"]).decode().strip()
-          core_name = f"vllm-{core_tag.removeprefix('v')}+cpu-cp38-abi3-macosx_11_0_arm64.whl"
+          core_version = core_tag.removeprefix("v")
+          core_name = f"vllm-{core_version}+cpu-cp38-abi3-macosx_11_0_arm64.whl"
           plugin_url, plugin_sha = wheel(release, f"vllm_metal-{version}-cp312-cp312-macosx_15_0_arm64.whl")
-          core_url, core_sha = wheel(api(f"repos/vllm-project/vllm/releases/tags/{core_tag}"), core_name)
+          # SCAFFOLDING: remove when .github/vllm-release-tag.commit moves past v0.33.0.
+          # vLLM published v0.33.0 on tag v0.33.0rc3 (same commit); the wheel is 0.33.0.
+          core_release_tag = "v0.33.0rc3" if core_tag == "v0.33.0" else core_tag
+          core_url, core_sha = wheel(api(f"repos/vllm-project/vllm/releases/tags/{core_release_tag}"), core_name)
 
           formula = Path("Formula/vllm-metal.rb")
           text = formula.read_text()
@@ -68,6 +72,8 @@ jobs:
               r'^  version ".*"$': f'  version "{version}"',
               r'^  sha256 ".*"$': f'  sha256 "{plugin_sha}"',
               r'^    url ".*"$': f'    url "{core_url}"',
+              # Declare the vLLM version instead of letting Homebrew parse it from the URL.
+              r'^    version ".*"$': f'    version "{core_version}"',
               r'^    sha256 ".*"$': f'    sha256 "{core_sha}"',
           }
           for pattern, replacement in replacements.items():

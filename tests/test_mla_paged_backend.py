@@ -17,6 +17,7 @@ from tests.stub_runner import (
     initialize_hybrid_runtime,
     initialize_mla_runtime,
     make_bailing_hybrid_plan,
+    make_mla_runtime,
 )
 from vllm_metal.attention import context as pac
 from vllm_metal.attention.caches.mla_cache import MLAPagedLatentCache
@@ -69,10 +70,13 @@ class TestMLAPagedLatentCache:
 
 
 class TestMLAPagedAttentionRuntime:
-    def _make_backend(self) -> MLAPagedAttentionRuntime:
-        return MLAPagedAttentionRuntime(
+    def _make_backend(self, num_blocks: int | None = None) -> MLAPagedAttentionRuntime:
+        if num_blocks is None:
+            return MLAPagedAttentionRuntime()
+        return make_mla_runtime(
             num_layers=4,
             latent_dim=_LATENT_DIM,
+            num_blocks=num_blocks,
             block_size=16,
             dtype=mx.float16,
         )
@@ -101,26 +105,14 @@ class TestMLAPagedAttentionRuntime:
             backend.patch_model(object())
 
     def test_num_blocks_after_initialize(self) -> None:
-        backend = self._make_backend()
-        backend.initialize(50)
+        backend = self._make_backend(num_blocks=50)
 
         assert backend.num_blocks() == 50
 
     def test_warm_up_after_initialize_does_not_raise(self) -> None:
-        backend = self._make_backend()
-        backend.initialize(10)
+        backend = self._make_backend(num_blocks=10)
 
         backend.warm_up()
-
-    def test_initialize_allocates_cache_with_correct_shape(self) -> None:
-        backend = self._make_backend()
-
-        backend.initialize(20)
-
-        assert backend._cache is not None
-        assert backend._cache.num_blocks == 20
-        assert backend._cache.latent_dim == _LATENT_DIM
-        assert backend._cache.num_layers == 4
 
 
 class _FakeAttn(nn.Module):
@@ -141,14 +133,13 @@ class _FakeModel:
 
 class TestPatchModelAttentionMla:
     def _make_backend(self, num_layers: int) -> MLAPagedAttentionRuntime:
-        backend = MLAPagedAttentionRuntime(
+        return make_mla_runtime(
             num_layers=num_layers,
             latent_dim=_LATENT_DIM,
+            num_blocks=5,
             block_size=16,
             dtype=mx.float16,
         )
-        backend.initialize(5)
-        return backend
 
     def test_replaces_all_attention_layers(self) -> None:
         model = _FakeModel(num_layers=3)
@@ -703,13 +694,13 @@ class TestDecodePathLog:
             inner.kv_lora_rank = kv_lora_rank
         layers = [SimpleNamespace(self_attn=inner) for inner in inners]
         model = SimpleNamespace(model=SimpleNamespace(layers=layers))
-        backend = MLAPagedAttentionRuntime(
+        backend = make_mla_runtime(
             num_layers=2,
             latent_dim=_KERNEL_KV_RANK + _KERNEL_ROPE_DIM,
+            num_blocks=4,
             block_size=16,
             dtype=mx.float16,
         )
-        backend.initialize(4)
         for _ in range(patches):
             backend.patch_model(model)
         info = MagicMock()
@@ -926,6 +917,27 @@ class TestSharedStorageRuntime:
         rebound = MLAPagedLatentCache.from_upstream(backend.storage, names)
         for layer in range(2):
             assert bool(mx.array_equal(rebound.latent_caches[layer][4], rows + layer))
+
+    def test_sleep_frees_the_backing_and_wake_rebinds_the_views(self) -> None:
+        backend = self._make_backend()
+        cache = backend._cache
+        before = mx.get_active_memory()
+
+        backend.release_kv_memory()
+
+        assert backend.storage.released
+        assert before - mx.get_active_memory() >= backend.storage.nbytes
+
+        backend.restore_kv_memory()
+        rows = mx.random.normal((16, _LATENT_DIM)).astype(mx.float16)
+        cache.write_slots(1, mx.arange(16, 32), rows)  # block 1
+        outputs: list[mx.array] = []
+        backend.extend_forward_eval_outputs(outputs)
+        mx.eval(*outputs)
+
+        names = ["layers.0.self_attn", "layers.1.self_attn"]
+        rebound = MLAPagedLatentCache.from_upstream(backend.storage, names)
+        assert bool(mx.array_equal(rebound.latent_caches[1][1], rows))
 
 
 class TestMLAPerForwardMetadata:

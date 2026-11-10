@@ -11,6 +11,10 @@ from vllm_metal.v1.pooling.backends.encoder.models.bge_m3 import (
     load_bge_m3_backend,
     supports_bge_m3_encoder,
 )
+from vllm_metal.v1.pooling.backends.encoder.models.embedding_gemma2 import (
+    load_embedding_gemma2_backend,
+    supports_embedding_gemma2_encoder,
+)
 from vllm_metal.v1.pooling.backends.encoder.models.xlm_roberta import (
     load_xlm_roberta_backend,
     supports_xlm_roberta_encoder,
@@ -30,6 +34,10 @@ _ENCODER_BACKEND_LOADERS = (
     # has model-family-owned loaders because it does not use the generation
     # loader, paged attention, or KV cache.
     EncoderBackendLoader(
+        supports=supports_embedding_gemma2_encoder,
+        load=load_embedding_gemma2_backend,
+    ),
+    EncoderBackendLoader(
         supports=supports_bge_m3_encoder,
         load=load_bge_m3_backend,
     ),
@@ -41,11 +49,10 @@ _ENCODER_BACKEND_LOADERS = (
 
 
 def supports_encoder_pooling_backend(model_config: Any) -> bool:
+    """Identify encoder pooling models; validate input mode during loading."""
     config = PoolingConfigView(model_config)
-    return (
-        config.runner_type == "pooling"
-        and config.is_text_only
-        and any(loader.supports(model_config) for loader in _ENCODER_BACKEND_LOADERS)
+    return config.runner_type == "pooling" and any(
+        loader.supports(model_config) for loader in _ENCODER_BACKEND_LOADERS
     )
 
 
@@ -54,6 +61,11 @@ def load_encoder_pooling_backend(
 ) -> LoadedEncoderBackend:
     for loader in _ENCODER_BACKEND_LOADERS:
         if loader.supports(model_config):
+            if not PoolingConfigView(model_config).is_text_only:
+                raise NotImplementedError(
+                    "Metal encoder pooling supports only text inputs. "
+                    "Use --language-model-only."
+                )
             return loader.load(model_config)
 
     config = PoolingConfigView(model_config)

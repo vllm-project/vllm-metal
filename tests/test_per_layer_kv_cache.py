@@ -16,7 +16,8 @@ from vllm import SamplingParams
 from vllm.config import VllmConfig
 from vllm.v1.attention.backends.utils import record_kv_cache_layout
 from vllm.v1.core.kv_cache_manager import KVCacheManager
-from vllm.v1.core.kv_cache_utils import (
+from vllm.v1.core.kv_cache_planning import (
+    get_global_kv_cache_groups,
     get_kv_cache_config_from_groups,
     get_kv_cache_configs,
     get_kv_cache_groups,
@@ -75,6 +76,7 @@ def _make_uniform_olmo3_runner(*, disable_hybrid_manager: bool = False):
     config.model_config = SimpleNamespace(
         max_model_len=512,
         original_max_model_len=512,
+        supports_kv_cache_grouping=False,
     )
     config.scheduler_config.disable_hybrid_kv_cache_manager = disable_hybrid_manager
     config.scheduler_config.max_num_batched_tokens = 16
@@ -113,7 +115,12 @@ def test_uniform_olmo3_geometry_uses_window_groups(monkeypatch) -> None:
     assert sum(type(spec) is FullAttentionSpec for spec in specs.values()) == 2
     assert runner.scheduler_memory_reporting_mode() == "paged_attention_layout_budget"
     budget = runner.get_cache_block_size_bytes() * 64
-    grouped = get_kv_cache_configs(runner.vllm_config, [specs], [budget])[0]
+    grouped = get_kv_cache_configs(
+        runner.vllm_config,
+        [specs],
+        [budget],
+        get_global_kv_cache_groups(runner.vllm_config, [specs]),
+    )[0]
     grouped.kv_cache_layout = runner.cache_config.kv_cache_layout
     assert runner.paged_attention_runtime is None
     runner.initialize_kv_cache(grouped)
@@ -147,7 +154,12 @@ def test_uniform_olmo3_window_groups_release_old_blocks(monkeypatch) -> None:
     )
     specs = runner.get_kv_cache_spec()
     budget = runner.get_cache_block_size_bytes() * 64
-    grouped = get_kv_cache_configs(runner.vllm_config, [specs], [budget])[0]
+    grouped = get_kv_cache_configs(
+        runner.vllm_config,
+        [specs],
+        [budget],
+        get_global_kv_cache_groups(runner.vllm_config, [specs]),
+    )[0]
     grouped.kv_cache_layout = runner.cache_config.kv_cache_layout
     manager = KVCacheManager(
         grouped,
@@ -319,30 +331,6 @@ class TestMetalPagedKVCachePerLayer:
         assert "4.7 MB" not in messages[0]
 
 
-class TestSDPARuntimePerLayer:
-    """SDPAPagedAttentionRuntime passes per-layer shapes to cache."""
-
-    def test_backend_propagates_per_layer_shapes(self) -> None:
-        kv_heads = [16, 4]
-        head_dims = [256, 512]
-
-        backend = SDPAPagedAttentionRuntime(
-            num_layers=2,
-            num_kv_heads=kv_heads[0],
-            head_dim=head_dims[0],
-            block_size=16,
-            dtype=mx.bfloat16,
-            kv_heads_per_layer=kv_heads,
-            head_dim_per_layer=head_dims,
-        )
-        backend.initialize(num_blocks=4)
-
-        cache = backend._cache
-        assert cache is not None
-        assert cache.key_caches[0].shape[-2:] == (16, 256)
-        assert cache.key_caches[1].shape[-2:] == (4, 512)
-
-
 class TestCachePolicyPerLayerBytes:
     """Block-size-bytes and one-sequence-bytes with per-layer shapes."""
 
@@ -437,7 +425,7 @@ class TestCachePolicyPerLayerBytes:
         with pytest.raises(
             NotImplementedError, match="Per-layer KV shapes with hybrid models"
         ):
-            runner.build_paged_attention_runtime(block_size=self._BLOCK_SIZE)
+            runner.validate_paged_attention_support()
 
     def test_turboquant_per_layer_shapes_raise_early(
         self, monkeypatch: pytest.MonkeyPatch
@@ -560,13 +548,7 @@ class TestUpstreamAttentionStorage:
             kv_cache_dtype=mx.bfloat16,
             cache_config=SimpleNamespace(block_size=32),
         )
-        backend = SDPAPagedAttentionRuntime(
-            num_layers=4,
-            num_kv_heads=4,
-            head_dim=512,
-            block_size=32,
-            dtype=mx.bfloat16,
-        )
+        backend = SDPAPagedAttentionRuntime(block_size=32, dtype=mx.bfloat16)
         monkeypatch.setattr(
             runner._cache_policy, "_build_sdpa_backend", lambda **_: backend
         )
@@ -600,7 +582,7 @@ class TestUpstreamAttentionStorage:
             kv_heads_per_layer=[16, 16, 4, 4],
             head_dim_per_layer=[256, 256, 512, 512],
         )
-        backend = runner.build_paged_attention_runtime(block_size=16)
+        backend = runner._cache_policy._build_sdpa_backend(block_size=16)
         monkeypatch.setattr(
             runner._cache_policy, "_build_sdpa_backend", lambda **_: backend
         )
@@ -617,12 +599,14 @@ class TestUpstreamAttentionStorage:
             (30, 8, 2),
         ),
     )
+    @pytest.mark.parametrize("explicit", [False, True])
     def test_cache_policy_initializes_gemma4_grouped_layout_from_budget(
         self,
         monkeypatch,
         num_layers: int,
         sliding_kv_heads: int,
         full_kv_heads: int,
+        explicit: bool,
     ) -> None:
         runner = self.gemma4_mixed_runner(
             num_layers=num_layers,
@@ -641,6 +625,11 @@ class TestUpstreamAttentionStorage:
         # dense blocks no longer serve one max_model_len request.
         reported_dense_blocks = 3
         dense_block_bytes = runner.get_cache_block_size_bytes()
+        if explicit:
+            runner.cache_config.gpu_memory_utilization = 0.1
+            runner.cache_config.kv_cache_memory_bytes = (
+                dense_block_bytes * reported_dense_blocks + 17
+            )
         worker = SimpleNamespace(
             model_runner=runner,
             metal_config=metal_config,
@@ -657,9 +646,16 @@ class TestUpstreamAttentionStorage:
         )
 
         available = planner.determine_available_memory()
+        if explicit:
+            assert available == runner.cache_config.kv_cache_memory_bytes
 
         specs = runner.get_kv_cache_spec()
-        config = get_kv_cache_configs(runner.vllm_config, [specs], [available])[0]
+        config = get_kv_cache_configs(
+            runner.vllm_config,
+            [specs],
+            [available],
+            get_global_kv_cache_groups(runner.vllm_config, [specs]),
+        )[0]
         config.kv_cache_layout = runner.cache_config.kv_cache_layout
 
         assert runner.paged_attention_runtime is None
@@ -675,6 +671,8 @@ class TestUpstreamAttentionStorage:
 
         backend = runner.paged_attention_runtime
         assert isinstance(backend, SDPAPagedAttentionRuntime)
+        # Group descriptors alias one allocation; count its backing only once.
+        assert backend.storage.nbytes <= available
         assert backend.num_blocks() == config.num_blocks
         assert runner._paged_scheduler_group_indices == (0, 1, 2, 3, 4, 5)
         assert runner._paged_group_block_sizes == (16, 16, 16, 16, 16, 32)
@@ -723,7 +721,12 @@ class TestUpstreamAttentionStorage:
 
         available = planner.determine_available_memory()
         specs = runner.get_kv_cache_spec()
-        config = get_kv_cache_configs(runner.vllm_config, [specs], [available])[0]
+        config = get_kv_cache_configs(
+            runner.vllm_config,
+            [specs],
+            [available],
+            get_global_kv_cache_groups(runner.vllm_config, [specs]),
+        )[0]
         config.kv_cache_layout = runner.cache_config.kv_cache_layout
         runner.initialize_kv_cache(config)
 
@@ -732,7 +735,10 @@ class TestUpstreamAttentionStorage:
         assert runner.paged_attention_runtime is not None
         assert runner.paged_attention_runtime.num_blocks() == config.num_blocks
 
-    def test_block_override_uses_engine_block_count(self, monkeypatch) -> None:
+    @pytest.mark.parametrize("explicit", [False, True])
+    def test_block_override_uses_engine_block_count(
+        self, monkeypatch, explicit
+    ) -> None:
         runner = self.gemma4_mixed_runner(
             num_layers=6,
             sliding_kv_heads=2,
@@ -748,6 +754,8 @@ class TestUpstreamAttentionStorage:
             lambda: metal_config,
         )
         dense_block_bytes = runner.get_cache_block_size_bytes()
+        if explicit:
+            runner.cache_config.kv_cache_memory_bytes = dense_block_bytes
         worker = SimpleNamespace(
             model_runner=runner,
             metal_config=metal_config,
@@ -768,10 +776,18 @@ class TestUpstreamAttentionStorage:
 
         available = planner.determine_available_memory()
         specs = runner.get_kv_cache_spec()
-        config = get_kv_cache_configs(runner.vllm_config, [specs], [available])[0]
+        config = get_kv_cache_configs(
+            runner.vllm_config,
+            [specs],
+            [available],
+            get_global_kv_cache_groups(runner.vllm_config, [specs]),
+        )[0]
         config.kv_cache_layout = runner.cache_config.kv_cache_layout
 
-        assert available < 0
+        if explicit:
+            assert available == dense_block_bytes
+        else:
+            assert available < 0
         assert config.num_blocks == 100
         runner.initialize_kv_cache(config)
         assert runner.paged_attention_runtime.num_blocks() == 100

@@ -80,13 +80,16 @@ def load_peft_adapter(
     mx.eval(raw)
 
     pairs: dict[str, dict[str, mx.array]] = {}
+    peft_modules: dict[str, str] = {}
     for name, tensor in raw.items():
         try:
             module, is_a = parse_fine_tuned_lora_name(name, weights_mapper)
+            peft_module, _ = parse_fine_tuned_lora_name(name)
         except ValueError:
             logger.debug("Skipping unrecognized LoRA tensor: %s", name)
             continue
         pairs.setdefault(module, {})["lora_a" if is_a else "lora_b"] = tensor
+        peft_modules[module] = peft_module
 
     weights: dict[str, LoRALayerWeightsMLX] = {}
     for module, pair in pairs.items():
@@ -102,12 +105,14 @@ def load_peft_adapter(
                 f"('base_model.model.<module>.{peft_key}.weight'). "
                 "Both lora_a and lora_b are required per adapted module."
             )
+        # PEFT patterns match checkpoint names, before weights mapping.
+        _, scaling = helper.get_rank_and_scaling(peft_modules[module])
         weights[module] = LoRALayerWeightsMLX(
             module_name=module,
             rank=int(pair["lora_a"].shape[0]),
             lora_a=pair["lora_a"],
             lora_b=pair["lora_b"],
-            scaling=helper.vllm_lora_scaling_factor,
+            scaling=scaling,
         )
 
     if not weights:

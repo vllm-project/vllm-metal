@@ -588,8 +588,23 @@ def test_recorded_batch_size_clears_with_diagnostics():
     assert ops.last_gqa_num_requests() == 0
 
 
-@pytest.mark.parametrize("dtype,turboquant", [(mx.float32, False), (mx.float16, True)])
-def test_unsupported_batch_cache_retains_fallback(dtype, turboquant):
+def test_float32_batch_uses_fallback():
+    lengths = [10752, 11009]
+    out, ref = _run_primitive(
+        lengths,
+        mx.float32,
+        interleaved=True,
+        seed=1011,
+        num_decode_requests=2,
+        num_decode_tokens=2,
+        gqa_lengths=lengths,
+    )
+    _assert_fallback()
+    _assert_close(out, ref, mx.float32)
+
+
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+def test_turboquant_batch_uses_p256_gqa_decode(dtype):
     lengths = [10752, 11009]
     out, ref = _run_primitive(
         lengths,
@@ -599,9 +614,12 @@ def test_unsupported_batch_cache_retains_fallback(dtype, turboquant):
         num_decode_requests=2,
         num_decode_tokens=2,
         gqa_lengths=lengths,
-        turboquant=turboquant,
+        turboquant=True,
     )
-    _assert_fallback()
+    ops = get_ops()
+    assert _dispatch_family() == "gqa_decode"
+    assert ops.last_gqa_partition_size() == 256
+    assert ops.last_gqa_num_requests() == 2
     _assert_close(out, ref, dtype)
 
 

@@ -15,8 +15,8 @@ new file.
   the AWQ-transform output buffers, no regular `bias` parameter.
 
 No parametrized vLLM `LLM.generate` smoke test in this file, by design:
-the 1.5B file already exercises the AWQ + Metal paged runner combination
-end-to-end on `Qwen/Qwen2.5-1.5B-Instruct-AWQ`. Adding the same smoke
+`tests/e2e/test_awq_e2e_qwen25_15b.py` exercises the AWQ + Metal paged
+runner combination end-to-end on `Qwen/Qwen2.5-1.5B-Instruct-AWQ`. Adding the same smoke
 test for three more 7-8B models in the same pytest process leaks wired
 Metal allocations between LLM instances (mx.clear_cache releases the
 cache but not wired memory), so the second model load SIGABRTs in the
@@ -143,14 +143,13 @@ def test_awq_load_aligns_non_quant_dtypes_to_runner_target(
     runner = None
     lifecycle = None
     model = None
-    tokenizer = None
     try:
         runner = make_stub_runner(
             model_config=_runner_model_config(awq_repo, dtype=torch.bfloat16)
         )
         lifecycle = ModelLifecycle(runner, runner._model_adapter)
 
-        model, tokenizer = lifecycle._load_generation_model(awq_repo, is_vlm=False)
+        model = lifecycle._load_generation_model(awq_repo, is_vlm=False)
 
         saw_quant_layer, saw_non_quant_floating, quant_dtype_pins = (
             _collect_awq_dtype_pins(model, expected_non_quant_dtype=mx.bfloat16)
@@ -203,5 +202,5 @@ def test_awq_load_aligns_non_quant_dtypes_to_runner_target(
         # for the next parametrized row. ``del`` here forces the
         # refcount to drop so ``gc.collect()`` + ``mx.clear_cache()``
         # actually reclaim the memory.
-        del model, tokenizer, lifecycle, runner
+        del model, lifecycle, runner
         _release_metal_state()

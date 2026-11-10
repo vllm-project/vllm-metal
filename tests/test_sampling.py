@@ -1,17 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for Metal sampling with vLLM Sampler integration."""
 
+from unittest.mock import Mock
+
 import mlx.core as mx
 import numpy as np
 import pytest
 import torch
 from vllm.outputs import RequestOutput
-from vllm.sampling_params import SamplingParams
+from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.utils.torch_utils import make_tensor_with_pad
 from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
 from vllm.v1.engine.output_processor import OutputProcessor
 from vllm.v1.outputs import LogprobsLists
 
+from tests.stub_runner import make_stub_runner
 from vllm_metal.tensor_bridge import mlx_to_torch
 from vllm_metal.v1 import sampling_batch
 from vllm_metal.v1.logits_processors import LogitsProcessors
@@ -347,10 +350,21 @@ class TestSamplerDevicePolicy:
         assert generator is not None
         assert generator.device.type == "cpu"
 
-    def test_bridged_logits_reach_sampler_on_cpu(self) -> None:
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            None,
+            {"repetition_penalty": 1.1},
+            {"logprobs": 1},
+            {"logprob_token_ids": [1, 2]},
+            {"presence_penalty": 0.5},
+            {"allowed_token_ids": [1, 2]},
+        ],
+    )
+    def test_bridged_logits_reach_sampler_on_cpu(self, overrides) -> None:
         logits = mx.array([[0.0, 1.0, 4.0, 2.0]], dtype=mx.float32)
         batch = SamplingBatch(
-            [SamplingParams(temperature=0.8, top_k=2)],
+            [SamplingParams(temperature=0.8, top_k=2, **(overrides or {}))],
             [[1]],
             [[]],
             vocab_size=4,
@@ -362,10 +376,15 @@ class TestSamplerDevicePolicy:
                 seen_devices.append(logits_torch.device)
                 return super().forward(logits_torch, sampling_metadata)
 
-        result = sample_from_logits(logits, batch, SpySampler())
+        runner = make_stub_runner(_native_sampling_enabled=True)
+        next_native_rng_key = runner._next_native_sample_key if overrides else None
+        result = sample_from_logits(
+            logits, batch, SpySampler(), next_native_rng_key=next_native_rng_key
+        )
 
         assert [d.type for d in seen_devices] == ["cpu"]
         assert 0 <= result.token_ids[0] < 4
+        assert runner._native_sampling_step == 0
 
 
 class TestV1SamplingBatch:
@@ -377,6 +396,79 @@ class TestV1SamplingBatch:
             [[]] * len(params_list),
             vocab_size=VOCAB_SIZE,
         )
+
+    @pytest.mark.parametrize("temperatures", [(0.0, 0.0), (0.7, 1.0), (0.0, 1.0)])
+    def test_enabled_native_sampling_advances_counter_only_for_random_rows(
+        self, temperatures
+    ) -> None:
+        all_greedy = all(t == 0.0 for t in temperatures)
+        # Dominant padding must never enter the random path's candidate set.
+        padding = -mx.inf if all_greedy else 100.0
+        logits = mx.array(
+            [[0.0, 3.0, 2.0, 1.0, padding], [1.0, 2.0, 3.0, 0.0, padding]]
+        )
+        batch = SamplingBatch(
+            [SamplingParams(temperature=t, top_k=3, top_p=0.8) for t in temperatures],
+            [[1], [2]],
+            [[], []],
+            vocab_size=4,
+        )
+        runner = make_stub_runner(_native_sampling_enabled=True)
+        sampler = Mock(spec=Sampler)
+        sampler.forward.side_effect = AssertionError("Native sampling must skip torch")
+
+        result = sample_from_logits(
+            logits, batch, sampler, next_native_rng_key=runner._next_native_sample_key
+        )
+
+        assert len(result.token_ids) == 2
+        for row, temperature in enumerate(temperatures):
+            if temperature == 0.0:
+                assert result.token_ids[row] == int(mx.argmax(logits[row, :4]).item())
+            else:
+                assert result.token_ids[row] in {1, 2}
+        assert result.logprobs is None
+        assert runner._native_sampling_step == (0 if all_greedy else 1)
+        sampler.forward.assert_not_called()
+
+    @pytest.mark.parametrize("prompt_logprobs", [0, 1])
+    def test_native_random_allows_prompt_logprobs(self, prompt_logprobs) -> None:
+        assert SamplingBatch.params_allow_native_random(
+            [SamplingParams(temperature=0.8, prompt_logprobs=prompt_logprobs)]
+        )
+
+    def test_native_random_rejects_structured_outputs(self) -> None:
+        assert not SamplingBatch.params_allow_native_random(
+            [
+                SamplingParams(
+                    temperature=0.8,
+                    structured_outputs=StructuredOutputsParams(choice=["yes", "no"]),
+                )
+            ]
+        )
+
+    def test_explicit_generator_uses_torch_without_advancing_native_counter(
+        self,
+    ) -> None:
+        logits = mx.array([[0.0, 1.0, 4.0, 2.0]], dtype=mx.float32)
+        batch = SamplingBatch(
+            [SamplingParams(temperature=0.8)],
+            [[1]],
+            [[]],
+            vocab_size=4,
+            generators={0: torch.Generator().manual_seed(7)},
+        )
+        runner = make_stub_runner(_native_sampling_enabled=True)
+        sampler = Mock(spec=Sampler)
+        sampler.forward.side_effect = Sampler().forward
+
+        result = sample_from_logits(
+            logits, batch, sampler, next_native_rng_key=runner._next_native_sample_key
+        )
+
+        assert 0 <= result.token_ids[0] < 4
+        sampler.forward.assert_called_once()
+        assert runner._native_sampling_step == 0
 
     def test_prefill_requests_share_one_sampler_batch(self, monkeypatch) -> None:
         logits = mx.arange(24, dtype=mx.float16).reshape(1, 6, 4)
@@ -395,6 +487,7 @@ class TestV1SamplingBatch:
             logits_2d: mx.array,
             batch: SamplingBatch,
             *_args: object,
+            **_kwargs: object,
         ) -> sampling_batch._SamplingResult:
             sampler_calls.append((logits_2d, batch))
             return sampling_batch._SamplingResult([7] * len(batch.sampling_params_list))
@@ -434,6 +527,41 @@ class TestV1SamplingBatch:
         )
 
         assert result == sampling_batch._SamplingResult([])
+
+    @pytest.mark.parametrize("has_final", [False, True])
+    def test_native_prefill_samples_only_completed_chunks(self, has_final) -> None:
+        requests = [
+            PrefillRequest(
+                "p0", [1, 2], SamplingParams(seed=7), [[0]], None, None, 0, None
+            ),
+            PrefillRequest(
+                "p1",
+                [2, 3],
+                SamplingParams(temperature=0.7, top_k=1),
+                [[1]],
+                None,
+                2 if has_final else None,
+                0,
+                None,
+            ),
+        ]
+        runner = make_stub_runner(_native_sampling_enabled=True)
+        sampler = Mock(spec=Sampler)
+        sampler.forward.side_effect = AssertionError("Native sampling must skip torch")
+
+        result = sampling_batch.sample_prefill_tokens(
+            10.0 * mx.eye(4)[None],
+            requests,
+            cu_seqlens=[0, 2, 4],
+            num_decode=0,
+            sampler=sampler,
+            vocab_size=4,
+            next_native_rng_key=runner._next_native_sample_key,
+        )
+
+        assert result == sampling_batch._SamplingResult([0, 3 if has_final else 0])
+        assert runner._native_sampling_step == int(has_final)
+        sampler.forward.assert_not_called()
 
     @pytest.mark.parametrize("selective_logits", [False, True])
     @pytest.mark.parametrize("logprobs_mode", ["raw_logprobs", "processed_logprobs"])
@@ -587,6 +715,67 @@ class TestV1SamplingBatch:
         bad_sp = SamplingParams(temperature=0.0)
         bad_sp._bad_words_token_ids = [[99]]
         assert not self._batch([bad_sp]).can_use_native_greedy()
+        assert not self._batch(
+            [SamplingParams(temperature=0.0, logit_bias={1: 5.0})]
+        ).can_use_native_greedy()
+        assert not self._batch(
+            [SamplingParams(temperature=0.0, min_tokens=2)]
+        ).can_use_native_greedy()
+
+    @pytest.mark.parametrize(
+        "params",
+        [
+            SamplingParams(temperature=1.0, logit_bias={1: 5.0}),
+            SamplingParams(temperature=1.0, min_tokens=2),
+        ],
+        ids=["logit-bias", "min-tokens"],
+    )
+    def test_logits_processor_controls_leave_native_random(
+        self, params: SamplingParams
+    ) -> None:
+        assert not SamplingBatch.params_allow_native_random([params])
+
+    def test_min_tokens_leaves_native_paths_only_until_reached(self) -> None:
+        params = [
+            SamplingParams(temperature=0.0, min_tokens=2),
+            SamplingParams(temperature=0.0),
+        ]
+        assert not SamplingBatch.params_allow_native_greedy(params, [1, 0])
+        assert not SamplingBatch.params_allow_native_random(params, [1, 0])
+        assert SamplingBatch.params_allow_native_greedy(params, [2, 0])
+        assert SamplingBatch.params_allow_native_random(params, [2, 0])
+        assert not SamplingBatch(
+            params, [[1], [1]], [[5], []], vocab_size=VOCAB_SIZE
+        ).can_use_native_greedy()
+        assert SamplingBatch(
+            params, [[1], [1]], [[5, 6], []], vocab_size=VOCAB_SIZE
+        ).can_use_native_greedy()
+
+    def test_logit_bias_changes_greedy_token_for_its_row_only(self) -> None:
+        logits = mx.array([[10.0, 1.0, 5.0, 1.0]] * 2, dtype=mx.float32)
+        batch = SamplingBatch(
+            [
+                SamplingParams(temperature=0.0, logit_bias={2: 6.0}),
+                SamplingParams(temperature=0.0),
+            ],
+            [[1], [1]],
+            [[], []],
+            vocab_size=4,
+        )
+        assert sample_from_logits(logits, batch, Sampler()).token_ids == [2, 0]
+
+    def test_min_tokens_blocks_stop_tokens_until_reached(self) -> None:
+        sp = SamplingParams(temperature=0.0, min_tokens=2, stop_token_ids=[0])
+        sampler = Sampler()
+
+        def sample(output_token_ids: list[int]) -> int:
+            logits = mx.array([[10.0, 1.0, 5.0, 1.0]], dtype=mx.float32)
+            batch = SamplingBatch([sp], [[1]], [output_token_ids], vocab_size=4)
+            return sample_from_logits(logits, batch, sampler).token_ids[0]
+
+        assert sample([]) == 2
+        assert sample([2]) == 2
+        assert sample([2, 2]) == 0
 
     def test_allowed_token_ids_constrains_greedy_sampling(self) -> None:
         """Greedy with allowed_token_ids must fall back and the constraint works."""
@@ -660,11 +849,12 @@ class TestV1SamplingBatch:
         keys = iter([mx.random.key(seed) for seed in range(64)])
         sampled = {
             int(
-                SamplingBatch.native_decode_tokens(
+                SamplingBatch.native_sample_tokens(
                     logits,
                     params,
                     vocab_size=len(probs),
-                    next_key=lambda: next(keys),
+                    next_native_rng_key=lambda: next(keys),
+                    output_lengths=[0],
                 ).item()
             )
             for _ in range(64)

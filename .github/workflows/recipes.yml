@@ -1,0 +1,23 @@
+name: Recipes
+
+on:
+  pull_request:
+    paths:
+      - 'recipes/**'
+      - '.github/workflows/recipes.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Recipes
+    if: github.repository_owner == 'vllm-project'
+    uses: vllm-project/recipes/.github/workflows/validate-recipes.yml@main
+    with:
+      source: vllm-metal
+      path: recipes

@@ -34,6 +34,10 @@ class MetalStructuredOutputApplier:
     (e.g. xgrammar allocator caching) out of model_runner.py.
     """
 
+    def __init__(self, *, mask_stride: int) -> None:
+        # Bitmask rows each structured request owns, as vLLM lays them out.
+        self._mask_stride = mask_stride
+
     def apply_paged(
         self,
         scheduler_output: SchedulerOutput,
@@ -116,19 +120,10 @@ class MetalStructuredOutputApplier:
             num_decode,
             decode_segments=decode_segments,
         )
-        # vLLM lays out the grammar bitmask by the raw scheduled spec width, so a
-        # request the scheduler padded keeps its full bitmask span even though
-        # Metal dropped the placeholder drafts and emits one logits row for it.
-        raw_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
-        grammar_row_counts = {
-            req_id: 1 + len(raw_spec_tokens.get(req_id, ()))
-            for req_id in grammar_output.structured_output_request_ids
-        }
         constrained = self._build_constrained_rows(
             grammar_output.structured_output_request_ids,
             row_targets,
             grammar_bitmask_row_count=grammar_bitmask.shape[0],
-            grammar_row_counts=grammar_row_counts,
         )
 
         return self._apply_grammar_bitmask_to_rows(logits, grammar_bitmask, constrained)
@@ -192,23 +187,19 @@ class MetalStructuredOutputApplier:
         row_targets: dict[str, tuple[int, ...]],
         *,
         grammar_bitmask_row_count: int,
-        grammar_row_counts: dict[str, int],
     ) -> list[tuple[int, int]]:
         """Pair target logits rows with grammar bitmask rows.
 
-        vLLM emits contiguous grammar bitmask rows in
-        structured_output_request_ids order, one row per scheduled position:
-        the speculative draft rows first, then the bonus row. Each request
-        advances the bitmask cursor by its scheduled span
-        (``grammar_row_counts[req_id]``), and its existing logits rows pair with
-        that span from the front. A padded request keeps a full span but owns a
-        single logits row, so only that row is paired and the rest of the span
-        is skipped.
+        vLLM gives each request in structured_output_request_ids a block of
+        ``mask_stride`` bitmask rows: one per scheduled position, the
+        speculative draft rows first, then the bonus row. A request's logits
+        rows pair with its block from the front, and the rest of the block is
+        skipped, including the full span of a request the scheduler padded.
         """
         constrained: list[tuple[int, int]] = []
         bitmask_row = 0
+        grammar_span = self._mask_stride
         for req_id in structured_output_request_ids:
-            grammar_span = grammar_row_counts[req_id]
             rows = row_targets.get(req_id, ())
             if len(rows) > grammar_span:
                 raise ValueError(

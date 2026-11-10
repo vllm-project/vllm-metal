@@ -10,11 +10,11 @@ import mlx.nn as nn
 import numpy as np
 import pytest
 from vllm.sampling_params import SamplingParams
-from vllm.v1.core.sched.output import NewRequestData
+from vllm.v1.core.sched.output import CachedRequestData, NewRequestData
 from vllm.v1.outputs import LogprobsLists
 
-import vllm_metal.compat as compat
 import vllm_metal.v1.diffusion as diffusion
+from tests.stub_runner import make_stub_runner
 from vllm_metal.attention.context import get_context
 from vllm_metal.platform import MetalPlatform
 from vllm_metal.v1.diffusion import (
@@ -351,31 +351,22 @@ class _StubRuntime:
     def copy_blocks(self, copies) -> None:
         self.calls.append("copy")
 
+    def release_requests(self, req_ids) -> None:
+        self.calls.append("release")
+
     def materialize_pending_state(self) -> None:
         self.calls.append("materialize")
 
 
-def _stub_runner() -> SimpleNamespace:
-    runner = SimpleNamespace(
-        vllm_config=_vllm_config(),
+def _stub_runner():
+    config = _vllm_config()
+    return make_stub_runner(
+        vllm_config=config,
+        model_config=config.model_config,
         _paged_attention_runtime=_StubRuntime(),
-        _request_states={},
-        _draft_token_ids=None,
-        _paged_group_block_sizes=(16,),
-        tq_prefill_workspace_bytes=0,
+        _paged_block_size=16,
         model=None,
     )
-    runner.model_config = runner.vllm_config.model_config
-    runner._finished_req_ids = lambda so: so.finished_req_ids
-
-    def reconcile(evicted, **_kwargs):
-        for req_id in evicted:
-            runner._request_states.pop(req_id, None)
-
-    runner._reconcile_request_lifecycle = reconcile
-    runner._copy_paged_block_ids = lambda block_ids: [list(g) for g in block_ids]
-    runner._update_cached_request_blocks = lambda cached: None
-    return runner
 
 
 def _scheduler_output(
@@ -385,18 +376,23 @@ def _scheduler_output(
     scheduled: dict[str, int],
     drafts: dict[str, list[int]] | None = None,
     finished: set[str] | None = None,
+    preempted: set[str] | None = None,
 ) -> SimpleNamespace:
     cached = cached or {}
     return SimpleNamespace(
         scheduled_encoder_inputs={},
         scheduled_new_reqs=list(new_reqs),
-        scheduled_cached_reqs=SimpleNamespace(
+        scheduled_cached_reqs=CachedRequestData(
             req_ids=list(cached),
-            num_computed_tokens=list(cached.values()),
             resumed_req_ids=set(),
+            new_token_ids=[],
+            all_token_ids={},
+            new_block_ids=[None] * len(cached),
+            num_computed_tokens=list(cached.values()),
+            num_output_tokens=[0] * len(cached),
         ),
         finished_req_ids=finished or set(),
-        preempted_req_ids=set(),
+        preempted_req_ids=preempted or set(),
         num_scheduled_tokens=scheduled,
         scheduled_spec_decode_tokens=drafts or {},
         new_block_ids_to_zero=None,
@@ -775,16 +771,43 @@ class TestRuntimeStepProtocol:
         assert rt._requests == {}
         assert "r" not in rt._runner._request_states
 
-    def test_readmitted_request_prefills_its_committed_tokens(self, runtime) -> None:
+    @pytest.mark.parametrize("num_computed_tokens", [0, 2])
+    def test_readmitted_request_prefills_its_committed_tokens(
+        self, runtime, num_computed_tokens
+    ) -> None:
         rt, forwards = runtime
-        new_req = _new_req("r", prompt=[1, 2], prefill_token_ids=[1, 2, 3, 1])
+        rt.execute_model(
+            _scheduler_output(
+                new_reqs=[_new_req("r", prompt=[1, 2])], scheduled={"r": 2}
+            )
+        )
+        old_canvas = rt._requests["r"]
+        forwards.clear()
 
-        rt.execute_model(_scheduler_output(new_reqs=[new_req], scheduled={"r": 4}))
+        rt.execute_model(_scheduler_output(scheduled={}, preempted={"r"}))
+
+        assert "r" not in rt._requests
+        assert forwards == []
+        new_req = _new_req("r", prompt=[1, 2], prefill_token_ids=[1, 2, 3, 1])
+        new_req.num_computed_tokens = num_computed_tokens
+        new_req.block_ids = ([5],)
+
+        rt.execute_model(
+            _scheduler_output(
+                new_reqs=[new_req], scheduled={"r": 4 - num_computed_tokens}
+            )
+        )
 
         state = rt._runner._request_states["r"]
-        assert forwards == [(False, [(0, [1, 2, 3, 1])])]
+        assert forwards == [
+            (False, [(num_computed_tokens, [1, 2, 3, 1][num_computed_tokens:])])
+        ]
         assert state.token_ids == [1, 2, 3, 1]
         assert state.prompt_len == 2
+        assert state.block_ids == [[5]]
+        assert state.num_computed_tokens == num_computed_tokens
+        assert rt._requests["r"] is not old_canvas
+        assert "r" not in rt._runner._awaiting_readmission
 
 
 class TestEncoderHiddenStates:
@@ -856,73 +879,13 @@ class TestDecoderForwardContext:
         assert get_context() is None
 
 
-class TestV1RunnerGuardPatch:
-    def test_drops_the_diffusion_entry_for_supported_models_only(
-        self, monkeypatch
-    ) -> None:
-        from vllm.config import VllmConfig
-
-        monkeypatch.setattr(
-            VllmConfig,
-            "_get_v1_model_runner_unsupported_features",
-            lambda self: ["diffusion models", "other"],
-        )
-        compat.ensure_vllm_v1_diffusion_guard_patch()
-        unsupported = VllmConfig._get_v1_model_runner_unsupported_features
-
-        def config(model_type):
-            hf_config = SimpleNamespace(model_type=model_type)
-            return SimpleNamespace(model_config=SimpleNamespace(hf_config=hf_config))
-
-        assert unsupported(config("diffusion_gemma")) == ["other"]
-        assert unsupported(config("llada")) == ["diffusion models", "other"]
-
-    def test_shares_one_wrapper_with_the_dspark_bridge(self, monkeypatch) -> None:
-        from vllm.config import VllmConfig
-
-        from vllm_metal.patches.dspark_config import enable_dspark_for_metal_runner
-
-        def upstream(self):
-            return ["diffusion models", "dspark speculative decoding", "other"]
-
-        monkeypatch.setattr(
-            VllmConfig, "_get_v1_model_runner_unsupported_features", upstream
-        )
-        compat.ensure_vllm_v1_diffusion_guard_patch()
-        enable_dspark_for_metal_runner()
-        unsupported = VllmConfig._get_v1_model_runner_unsupported_features
-
-        assert unsupported.__wrapped__ is upstream
-        config = SimpleNamespace(
-            model_config=SimpleNamespace(
-                hf_config=SimpleNamespace(model_type="diffusion_gemma")
-            ),
-            parallel_config=SimpleNamespace(
-                worker_cls="vllm_metal.v1.worker.MetalWorker"
-            ),
-            speculative_config=SimpleNamespace(method="dspark"),
-        )
-        assert unsupported(config) == ["other"]
-
-
 class TestPlatformDiffusionConfig:
-    @pytest.fixture(autouse=True)
-    def guard_patch_calls(self, monkeypatch) -> list[bool]:
-        calls: list[bool] = []
-        monkeypatch.setattr(
-            compat, "ensure_vllm_v1_diffusion_guard_patch", lambda: calls.append(True)
-        )
-        return calls
-
-    def test_disables_async_scheduling_and_lifts_the_v1_guard(
-        self, guard_patch_calls
-    ) -> None:
+    def test_disables_async_scheduling(self) -> None:
         vllm_config = _vllm_config()
 
         MetalPlatform._check_diffusion_config(vllm_config)
 
         assert vllm_config.scheduler_config.async_scheduling is False
-        assert guard_patch_calls == [True]
 
     def test_disables_multimodal_inputs(self) -> None:
         vllm_config = _vllm_config()
@@ -1003,9 +966,14 @@ class TestPlatformDiffusionConfig:
 
     @pytest.mark.parametrize(
         ("params", "parameter"),
-        [({"top_k": 5}, "top_k"), ({"top_p": 0.9}, "top_p")],
+        [
+            ({"top_k": 5}, "top_k"),
+            ({"top_p": 0.9}, "top_p"),
+            ({"logit_bias": {1: 2.0}}, "logit_bias"),
+            ({"min_tokens": 2}, "min_tokens"),
+        ],
     )
-    def test_rejects_top_k_and_top_p_while_serving_diffusion(
+    def test_rejects_canvas_sampling_controls_while_serving_diffusion(
         self, monkeypatch, params, parameter
     ) -> None:
         from vllm.exceptions import VLLMValidationError

@@ -66,7 +66,7 @@ def _run(
     num_kv_heads: int,
     tables: list[list[int]],
     seq_lens: list[int],
-    cu_seqlens: list[int],
+    cu_seqlens: list[int] | mx.array,
     max_kv: int,
     window_seqlen_q: int,
     sliding_window: int,
@@ -401,6 +401,28 @@ def test_window_hint_contract_rejected(
             hint,
             -1,
         )
+
+
+def test_window_hint_evaluates_lazy_loaded_metadata(tmp_path) -> None:
+    """NPZ-backed cumulative lengths can be validated before attention runs."""
+    mx.random.seed(16)
+    query = mx.random.normal((4, 16, HEAD_SIZE)).astype(mx.float16)
+    args = (
+        query,
+        _cache(4, 8, mx.float16),
+        _cache(4, 8, mx.float16),
+        8,
+        [[0, 1, 2, 3]],
+        [54],
+    )
+    kwargs = {"max_kv": 54, "window_seqlen_q": 4, "sliding_window": -1}
+    expected = _run(*args, [0, 4], **kwargs)
+
+    path = tmp_path / "metadata.npz"
+    mx.savez(str(path), cu=mx.array([0, 4], dtype=mx.int32))
+    loaded_cu = mx.load(str(path))["cu"]
+    actual = _run(*args, loaded_cu, **kwargs)
+    assert mx.array_equal(actual, expected)
 
 
 def test_window_hint_rejects_non_int32_cu() -> None:

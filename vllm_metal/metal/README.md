@@ -11,6 +11,8 @@ the [vLLM project](https://github.com/vllm-project/vllm) (Apache-2.0).
 `turboquant.metal`, `pagedattention_tiled.metal`, and `mla.metal` are
 vLLM-project Apache-2.0 sources. `pagedattention_nax.metal` adapts MLX's
 `steel_attention_nax` (MIT, © 2025 Apple Inc.).
+`gdn_recurrent_prefill.metal` adapts mlx-lm's packed recurrence layout
+(MIT, © 2025 Apple Inc.).
 
 ## How the shaders are compiled
 
@@ -35,7 +37,7 @@ Source builds require the `build` extra and the Xcode Metal toolchain.
 
 ### 2. `mx.fast.metal_kernel` snippets: `attention/impls/gdn_lazy.py`
 
-The lazy GDN decode and prefill paths compile four shaders directly through
+The lazy GDN decode and prefill paths compile the following shaders directly through
 MLX, via `_read_v2_metal_source`:
 
 | Shader | Compiled kernel name |
@@ -44,6 +46,14 @@ MLX, via `_read_v2_metal_source`:
 | `gdn_conv1d_silu_prefill.metal` | `gdn_conv1d_silu_prefill_v2` |
 | `gdn_recurrent_decode.metal` | `gdn_recurrent_decode_v2` |
 | `gdn_recurrent_prefill.metal` | `gdn_recurrent_prefill_v2` |
+
+Recurrent prefill uses one source with a compile-time `Packed` parameter. Within
+the existing lazy prefill eligibility checks, key head dimension 128 and value
+head dimension divisible by eight automatically select eight value rows per
+SIMD-group. Other supported shapes retain the generic one-row layout. Both
+specializations share state access and the sequence loop, while preserving their
+respective reduction order. Selection is independent of GPU family and NAX;
+pure decode retains its existing kernel. There is no separate packed user switch.
 
 ## File reference
 

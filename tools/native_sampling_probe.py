@@ -6,7 +6,7 @@ instance N times at the given temperature and counts completions containing
 any stray CJK-range character — the visible signature of a sampler picking
 an out-of-candidate vocab id on Qwen-family vocabularies.
 
-Usage (against a server started with VLLM_METAL_NATIVE_SAMPLING=1):
+Usage (against a server with native sampling on, the default):
 
     vllm serve mlx-community/Qwen3.8-27B-4bit --max-num-seqs 8 &
     python tools/native_sampling_probe.py 60 0.7

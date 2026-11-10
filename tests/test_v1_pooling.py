@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""High-value contract tests for Metal V1 text pooling."""
+"""Contract tests for MLX text pooling."""
 
 from __future__ import annotations
 
@@ -41,6 +41,10 @@ from vllm_metal.v1.pooling.backends.decoder.runtime import (  # noqa: E402
 )
 from vllm_metal.v1.pooling.backends.encoder.factory import (  # noqa: E402
     load_encoder_pooling_backend,
+    supports_encoder_pooling_backend,
+)
+from vllm_metal.v1.pooling.backends.encoder.models.embedding_gemma2 import (  # noqa: E402
+    load_embedding_gemma2_backend,
 )
 from vllm_metal.v1.pooling.backends.encoder.models.loading import (  # noqa: E402
     load_encoder_weight_file,
@@ -215,6 +219,7 @@ def _pooling_model_config(**overrides):
         "revision": None,
         "tokenizer": "stub-pooling-model",
         "tokenizer_revision": None,
+        "tokenizer_mode": "auto",
         "get_head_size": lambda: 128,
         "is_hybrid": False,
     }
@@ -311,15 +316,7 @@ def _make_runner(
         model_config=model_config or _pooling_model_config(),
         tokenizer=tokenizer,
         _paged_attention_runtime=(
-            SDPAPagedAttentionRuntime(
-                num_layers=1,
-                num_kv_heads=1,
-                head_dim=4,
-                block_size=4,
-                dtype=mx.float32,
-            )
-            if paged
-            else None
+            SDPAPagedAttentionRuntime(block_size=4, dtype=mx.float32) if paged else None
         ),
         _paged_block_size=4,
         num_layers=1,
@@ -458,6 +455,34 @@ class TestMetalPoolingCapabilities:
         runner = _make_runner()
 
         assert runner.supported_worker_tasks() == ("embed",)
+
+    @pytest.mark.parametrize("classify", [False, True])
+    def test_only_reranking_loads_the_configured_tokenizer(self, classify) -> None:
+        config = (_classification_model_config if classify else _pooling_model_config)(
+            tokenizer="custom-tokenizer",
+            tokenizer_revision="tokenizer-revision",
+            trust_remote_code=True,
+        )
+        with patch(
+            "vllm_metal.v1.pooling.backends.decoder.models.qwen3.cached_get_tokenizer",
+            return_value=_ClassifierTokenizer(),
+        ) as load_tokenizer:
+            runner = _make_runner(
+                model=_PoolingModel(_ClassifierSequenceModel()), model_config=config
+            )
+        assert runner.supported_worker_tasks() == (
+            ("classify",) if classify else ("embed",)
+        )
+        if classify:
+            load_tokenizer.assert_called_once_with(
+                "custom-tokenizer",
+                runner_type="pooling",
+                tokenizer_mode="auto",
+                revision="tokenizer-revision",
+                trust_remote_code=True,
+            )
+        else:
+            load_tokenizer.assert_not_called()
 
     def test_supported_worker_tasks_rejects_incompatible_pooling_model(self) -> None:
         runner = make_stub_runner(
@@ -637,7 +662,6 @@ class TestMetalPoolingCapabilities:
         runner.kv_cache_dtype = None
         loaded = LoadedGenerationModel(
             model=runner.model,
-            tokenizer=runner.tokenizer,
             model_args={},
         )
 
@@ -675,7 +699,6 @@ class TestMetalPoolingCapabilities:
         runner._model_lifecycle = lifecycle
         loaded = LoadedEncoderBackend(
             model=SimpleNamespace(config=SimpleNamespace(vocab_size=16)),
-            tokenizer=object(),
             model_args={"vocab_size": 16},
             pooling_backend=pooling_backend,
         )
@@ -714,6 +737,120 @@ class TestMetalPoolingCapabilities:
                 (_SupportedEmbedPooler(), _SupportedEmbedPooler()),
             )
 
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    @pytest.mark.parametrize("length", [7, 515])
+    def test_embedding_gemma2_checkpoint_preserves_projected_mean_embeddings(
+        self, tmp_path, dtype, length
+    ) -> None:
+        """Load only text from a full checkpoint and match HF pooled embeddings."""
+        hf = pytest.importorskip("transformers.models.embedding_gemma2")
+        torch.manual_seed(0)
+        text_config = hf.EmbeddingGemma2TextConfig(
+            vocab_size=32,
+            hidden_size=8,
+            intermediate_size=16,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=4,
+            global_head_dim=8,
+            num_global_key_value_heads=1,
+            hidden_size_per_layer_input=8,
+            embedding_dim=12,
+        )
+        config = hf.EmbeddingGemma2Config(
+            text_config=text_config,
+            vision_config={
+                "hidden_size": 8,
+                "intermediate_size": 16,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 2,
+                "head_dim": 4,
+                "patch_size": 2,
+                "position_embedding_size": 16,
+            },
+            audio_config={
+                "hidden_size": 8,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 2,
+                "subsampling_conv_channels": [4, 2],
+                "output_proj_dims": 8,
+            },
+        )
+        reference = hf.EmbeddingGemma2Model(config).to(dtype).eval()
+        reference.save_pretrained(tmp_path)
+        assert reference.vision_tower is not None
+        assert reference.audio_tower is not None
+        model_config = _encoder_model_config(
+            model=str(tmp_path),
+            hf_config=config,
+            dtype=dtype,
+            pooler_config=_pooler_config(seq_pooling_type="MEAN"),
+            is_matryoshka=True,
+            matryoshka_dimensions=None,
+            embedding_size=text_config.embedding_dim,
+        )
+        backend = load_encoder_pooling_backend(model_config)
+        assert supports_encoder_pooling_backend(model_config)
+        assert backend.model.model.vision_tower is None
+        assert backend.model.model.audio_tower is None
+        assert backend.model_args["vocab_size"] == text_config.vocab_size
+
+        ids = torch.randint(3, text_config.vocab_size, (2, length))
+        ids[1, -3:] = 0
+        mask = (ids != 0).long()
+        with torch.no_grad():
+            expected = reference(input_ids=ids, attention_mask=mask).last_hidden_state
+        actual = backend.pooling_backend.forward_padded(
+            mx.array(ids.numpy()), mx.array(mask.numpy())
+        )
+        # BF16 CPU and Metal kernels can differ by a few rounding steps.
+        tolerance = 1e-5 if dtype == torch.float32 else 1e-2
+        torch.testing.assert_close(
+            mlx_to_torch(actual.astype(mx.float32), device="cpu"),
+            expected.float(),
+            atol=tolerance,
+            rtol=tolerance,
+        )
+        for dimensions in (None, 6):
+            params = _pooling_params(task="embed", dimensions=dimensions)
+            params.verify(model_config)
+            requests = [
+                _new_req(str(i), row[valid.bool()].tolist(), pooling_params=params)
+                for i, (row, valid) in enumerate(zip(ids, mask, strict=True))
+            ]
+            outputs = backend.pooling_backend.pool_scheduler_output(
+                _scheduler_output(new_reqs=requests), model_config
+            )
+            assert [output.req_id for output in outputs] == ["0", "1"]
+            for i, output in enumerate(outputs):
+                vector = expected[i, mask[i].bool(), :dimensions].float().mean(0)
+                torch.testing.assert_close(
+                    output.pooler_output,
+                    normalize(vector, dim=0),
+                    atol=1e-5 if dtype == torch.float32 else 1e-2,
+                    rtol=1e-5 if dtype == torch.float32 else 1e-2,
+                )
+                assert (
+                    torch.nn.functional.cosine_similarity(
+                        output.pooler_output, vector, dim=0
+                    )
+                    > 0.9998
+                )
+
+    @pytest.mark.parametrize("quantization", ["mlx", None])
+    def test_embedding_gemma2_rejects_quantization_before_loading(self, quantization):
+        config = _encoder_model_config(
+            hf_config=_hf_config(
+                model_type="embedding_gemma2",
+                quantization_config={} if quantization else {"bits": 4},
+            ),
+            quantization=quantization,
+        )
+        with pytest.raises(NotImplementedError, match="does not support quantization"):
+            load_embedding_gemma2_backend(config)
+
     @pytest.mark.parametrize("model_type", ["xlm-roberta", "roberta"])
     @pytest.mark.parametrize("pooling_type", ["CLS", "LAST", "MEAN"])
     @pytest.mark.parametrize("dimensions", [None, 4])
@@ -751,8 +888,7 @@ class TestMetalPoolingCapabilities:
                 return_value=str(tmp_path),
             ) as download,
             patch(
-                "vllm_metal.v1.pooling.backends.encoder.models.xlm_roberta."
-                "AutoTokenizer.from_pretrained",
+                "transformers.AutoTokenizer.from_pretrained",
                 return_value=object(),
             ) as load_tokenizer,
         ):
@@ -814,11 +950,7 @@ class TestMetalPoolingCapabilities:
         assert download.call_count == 1
         assert download.call_args.kwargs["repo_id"] == "encoder-checkpoint"
         assert download.call_args.kwargs["revision"] == "model-revision"
-        load_tokenizer.assert_called_once_with(
-            "custom-tokenizer",
-            revision="tokenizer-revision",
-            trust_remote_code=True,
-        )
+        load_tokenizer.assert_not_called()
 
     @pytest.mark.parametrize("model_type", ["xlm-roberta", "roberta"])
     @pytest.mark.parametrize(
@@ -850,8 +982,7 @@ class TestMetalPoolingCapabilities:
             dtype=torch_dtype,
         )
         with patch(
-            "vllm_metal.v1.pooling.backends.encoder.models.xlm_roberta."
-            "AutoTokenizer.from_pretrained",
+            "transformers.AutoTokenizer.from_pretrained",
             return_value=object(),
         ):
             backend = load_encoder_pooling_backend(model_config).pooling_backend
@@ -936,8 +1067,7 @@ class TestMetalPoolingCapabilities:
         )
 
         with patch(
-            "vllm_metal.v1.pooling.backends.encoder.models.xlm_roberta."
-            "AutoTokenizer.from_pretrained",
+            "transformers.AutoTokenizer.from_pretrained",
             return_value=object(),
         ):
             loaded_backend = load_encoder_pooling_backend(model_config)
@@ -970,8 +1100,7 @@ class TestMetalPoolingCapabilities:
 
         with (
             patch(
-                "vllm_metal.v1.pooling.backends.encoder.models.xlm_roberta."
-                "AutoTokenizer.from_pretrained",
+                "transformers.AutoTokenizer.from_pretrained",
                 return_value=object(),
             ),
             pytest.raises(FileNotFoundError, match="Missing BGE-M3 sparse head"),
@@ -1009,8 +1138,7 @@ class TestMetalPoolingCapabilities:
         )
 
         with patch(
-            "vllm_metal.v1.pooling.backends.encoder.models.xlm_roberta."
-            "AutoTokenizer.from_pretrained",
+            "transformers.AutoTokenizer.from_pretrained",
             return_value=object(),
         ):
             loaded_backend = load_encoder_pooling_backend(model_config)
@@ -1262,6 +1390,39 @@ class TestMetalPoolingRunnerOutput:
 
 
 class TestMetalPoolingFailFast:
+    @pytest.mark.parametrize(
+        ("model_type", "architecture"),
+        [
+            ("embedding_gemma2", "EmbeddingGemma2Model"),
+            ("xlm-roberta", "BgeM3EmbeddingModel"),
+            ("xlm-roberta", "XLMRobertaModel"),
+            ("roberta", "RobertaModel"),
+        ],
+    )
+    @pytest.mark.parametrize("entrypoint", ["factory", "lifecycle"])
+    def test_encoder_pooling_rejects_multimodal_config_before_loading(
+        self, model_type, architecture, entrypoint
+    ) -> None:
+        runner = _make_runner(
+            paged=False,
+            model_config=_encoder_model_config(
+                hf_config=_hf_config(
+                    model_type=model_type, architectures=[architecture]
+                ),
+                multimodal_config=SimpleNamespace(language_model_only=False),
+            ),
+        )
+        lifecycle = ModelLifecycle(runner, MagicMock())
+        with (
+            patch.object(lifecycle, "_load_generation") as load_generation,
+            pytest.raises(NotImplementedError, match="--language-model-only"),
+        ):
+            if entrypoint == "factory":
+                load_encoder_pooling_backend(runner.model_config)
+            else:
+                lifecycle.load()
+        load_generation.assert_not_called()
+
     def test_non_decoder_pooling_models_fail_fast_on_execute(
         self,
     ) -> None:

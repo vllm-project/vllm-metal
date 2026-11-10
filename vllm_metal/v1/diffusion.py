@@ -507,33 +507,16 @@ class DiffusionGemmaRuntime:
         runner._reconcile_request_lifecycle(
             evicted,
             preempted_req_ids=scheduler_output.preempted_req_ids,
-            resumed_req_ids=cached_reqs.resumed_req_ids,
         )
         # A preempted request re-prefills its prompt and committed tokens.
-        for req_id in (
-            evicted
-            | (scheduler_output.preempted_req_ids or set())
-            | cached_reqs.resumed_req_ids
-        ):
+        for req_id in evicted | (scheduler_output.preempted_req_ids or set()):
             self._requests.pop(req_id, None)
-
-        from vllm_metal.v1.model_runner import RequestState
 
         num_computed: dict[str, int] = {}
         for new_req in scheduler_output.scheduled_new_reqs:
-            token_ids = list(
-                new_req.prefill_token_ids or new_req.prompt_token_ids or []
-            )
-            sampling_params = new_req.sampling_params or SamplingParams()
-            _warn_ignored_sampling_params(sampling_params)
-            runner._request_states[new_req.req_id] = RequestState(
-                token_ids=token_ids,
-                prompt_len=new_req.prompt_len,
-                sampling_params=sampling_params,
-                block_ids=runner._copy_paged_block_ids(new_req.block_ids),
-                num_computed_tokens=new_req.num_computed_tokens,
-            )
-            num_computed[new_req.req_id] = new_req.num_computed_tokens
+            state = runner._admit_request(new_req)
+            _warn_ignored_sampling_params(state.sampling_params)
+            num_computed[new_req.req_id] = state.num_computed_tokens
         runner._update_cached_request_blocks(cached_reqs)
         num_computed.update(
             zip(cached_reqs.req_ids, cached_reqs.num_computed_tokens, strict=True)

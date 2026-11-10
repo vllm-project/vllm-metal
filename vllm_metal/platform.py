@@ -114,6 +114,8 @@ class MetalPlatform(Platform):
     _serves_diffusion: ClassVar[bool] = False
     # Its served canvas_length, recorded by _check_diffusion_config.
     _diffusion_canvas_length: ClassVar[int | None] = None
+    _serves_omni: ClassVar[bool] = False
+    _mps_speculative: ClassVar[bool] = False
 
     # --- Ray distributed executor support (Phase 1) ---
     # Advertise the Apple GPU as a custom Ray resource named "mlx".  Because this
@@ -140,6 +142,15 @@ class MetalPlatform(Platform):
         super().import_ir_kernels()
         if envs.VLLM_METAL_BACKEND == "mps":
             import vllm_metal.pytorch_backend.normalization  # noqa: F401
+
+    @classmethod
+    def register_triton_kernel_overrides(cls) -> None:
+        if envs.VLLM_METAL_BACKEND == "mps":
+            from vllm_metal.pytorch_backend.bindings import (
+                register_kernel_overrides,
+            )
+
+            register_kernel_overrides()
 
     @classmethod
     def get_default_ir_op_priority(
@@ -338,11 +349,15 @@ class MetalPlatform(Platform):
         if not isinstance(params, SamplingParams):
             return
 
+        if params.prompt_logprob_token_ids is not None:
+            raise VLLMValidationError(
+                "prompt_logprob_token_ids is not supported on Metal.",
+                parameter="prompt_logprob_token_ids",
+            )
+
         unsupported_controls = [
             name
             for name, enabled in (
-                ("logit_bias", bool(params.logit_bias)),
-                ("min_tokens", params.min_tokens > 0),
                 (
                     "thinking_token_budget",
                     getattr(params, "thinking_token_budget", None) is not None,
@@ -354,22 +369,25 @@ class MetalPlatform(Platform):
             unsupported_controls += [
                 name
                 for name, enabled in (
-                    ("temperature", params.temperature != 0),
+                    ("temperature", params.temperature != 0 and cls._mps_speculative),
                     ("presence_penalty", params.presence_penalty != 0),
                     ("frequency_penalty", params.frequency_penalty != 0),
-                    ("repetition_penalty", params.repetition_penalty != 1),
+                    (
+                        "repetition_penalty",
+                        params.repetition_penalty != 1 and not cls._serves_omni,
+                    ),
                     ("allowed_token_ids", bool(params.allowed_token_ids)),
                     ("bad_words", bool(params.bad_words)),
+                    # Both controls need an MPS override for MRv2's logit-bias kernel.
+                    # https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/worker/gpu/sample/logit_bias.py#L225-L246
+                    ("logit_bias", bool(params.logit_bias)),
+                    ("min_tokens", params.min_tokens > 0),
                 )
                 if enabled
             ]
             unsupported_controls += [
                 name
-                for name in (
-                    "logprob_token_ids",
-                    "prompt_logprobs",
-                    "structured_outputs",
-                )
+                for name in ("logprob_token_ids", "structured_outputs")
                 if getattr(params, name, None) is not None
             ]
         if unsupported_controls:
@@ -389,12 +407,10 @@ class MetalPlatform(Platform):
                 )
             for name, enabled in (
                 ("prompt_logprobs", params.prompt_logprobs is not None),
-                (
-                    "prompt_logprob_token_ids",
-                    params.prompt_logprob_token_ids is not None,
-                ),
                 ("top_k", params.top_k > 0),
                 ("top_p", params.top_p < 1.0),
+                ("logit_bias", bool(params.logit_bias)),
+                ("min_tokens", params.min_tokens > 0),
             ):
                 if enabled:
                     raise VLLMValidationError(
@@ -525,21 +541,19 @@ class MetalPlatform(Platform):
         """
         envs.validate_environment()
 
+        import vllm.envs as vllm_envs
+
+        backend = envs.VLLM_METAL_BACKEND
+        if backend == "mlx" and vllm_envs.VLLM_USE_V2_MODEL_RUNNER is False:
+            raise ValueError(
+                "MLX Model Runner V1 has been removed. Unset "
+                "VLLM_USE_V2_MODEL_RUNNER or set VLLM_USE_V2_MODEL_RUNNER=1."
+            )
+
         from vllm_metal.compat import ensure_vllm_bytelevel_tokenizer_patch
 
         # Retry after vLLM is fully imported, before serving tokenizers are built.
         ensure_vllm_bytelevel_tokenizer_patch()
-
-        import vllm.envs as vllm_envs
-
-        # Runs before VllmConfig validates the runner choice, so an explicit
-        # request fails with the Metal constraint, not upstream's Triton check.
-        if vllm_envs.VLLM_USE_V2_MODEL_RUNNER and envs.VLLM_METAL_BACKEND != "mps":
-            raise NotImplementedError(
-                "VLLM_USE_V2_MODEL_RUNNER=1 is not supported on Metal: "
-                "MetalWorker implements the V1 model runner contract. Unset it "
-                "(vllm-metal defaults it to 0)."
-            )
 
         # vLLM leaves AuxOutput validation to out-of-tree platforms, and
         # MetalModelRunner produces no auxiliary outputs.
@@ -552,6 +566,23 @@ class MetalPlatform(Platform):
         config = get_config()
         parallel_config = vllm_config.parallel_config
         model_config = vllm_config.model_config
+
+        if parallel_config.prefill_context_parallel_size > 1:
+            raise NotImplementedError(
+                "Prefill context parallelism (prefill_context_parallel_size > 1) "
+                "is not supported on Metal."
+            )
+        unsupported = [
+            name
+            for name in ("enable_trace_replay", "return_sampling_mask")
+            if getattr(model_config, name, False)
+        ]
+        if unsupported:
+            raise NotImplementedError(
+                f"Metal does not support {', '.join(unsupported)}."
+            )
+        if vllm_config.watermark_config is not None:
+            raise NotImplementedError("watermark_config is not supported on Metal.")
 
         add = vllm_config.additional_config
         if isinstance(add, dict) and DSPARK_DRAFT_QUANTIZATION_KEY in add:
@@ -585,7 +616,6 @@ class MetalPlatform(Platform):
 
         logger.debug("Metal config: %s", config)
 
-        backend = envs.VLLM_METAL_BACKEND
         if model_config is not None and model_config.enable_sleep_mode:
             cls._check_sleep_mode_config(vllm_config, backend)
         if config.moe_expert_cache_bytes:
@@ -595,7 +625,9 @@ class MetalPlatform(Platform):
         if backend == "mps":
             from vllm_metal.pytorch_backend.worker import configure_mps
 
-            configure_mps(vllm_config)
+            cls._serves_omni = getattr(model_config, "model_stage", None) is not None
+            cls._mps_speculative = vllm_config.speculative_config is not None
+            configure_mps(vllm_config, omni=cls._serves_omni)
         if parallel_config.worker_cls == "auto":
             parallel_config.worker_cls = (
                 "vllm_metal.pytorch_backend.worker.MPSWorker"
@@ -688,10 +720,6 @@ class MetalPlatform(Platform):
                 )
 
         speculative_config = vllm_config.speculative_config
-        if speculative_config is not None and speculative_config.method == "dspark":
-            from vllm_metal.patches.dspark_config import enable_dspark_for_metal_runner
-
-            enable_dspark_for_metal_runner()
         # Upstream skips verify_equal_vocab_size_if_draft_model() when this is set,
         # so a draft model with a different vocabulary reaches the proposer, which
         # verifies draft ids against the target vocabulary with no mapping.
@@ -730,6 +758,7 @@ class MetalPlatform(Platform):
         # default, the same downgrade shape as the STT scheduler policy.
         if (
             speculative_config is not None
+            and backend != "mps"
             and vllm_config.scheduler_config.async_scheduling
         ):
             vllm_config.scheduler_config.async_scheduling = False
@@ -922,18 +951,18 @@ class MetalPlatform(Platform):
         # sampler and rebuilds the token stream from the scheduler (see
         # MetalModelRunner._update_pp_stage_states). Async scheduling instead routes
         # those tokens through a GPU broadcast we do not implement, which leaves
-        # new_token_ids empty. Fail loud rather than silently flip the user's
-        # scheduler config.
+        # new_token_ids empty.
         if (
             parallel_config.pipeline_parallel_size > 1
             and scheduler_config.async_scheduling
         ):
-            raise NotImplementedError(
-                "Pipeline parallelism on Metal requires synchronous scheduling. "
-                "Async scheduling delivers each sampled token to the first stage "
-                "through a GPU broadcast that is not implemented, so the stage "
-                "would starve. Re-run with --no-async-scheduling."
+            # V2 auto-enables async before this hook; an explicit True is
+            # indistinguishable by now, so both must be overridden.
+            logger.warning(
+                "Pipeline parallelism on Metal requires synchronous scheduling; "
+                "disabling async scheduling for Model Runner V2."
             )
+            scheduler_config.async_scheduling = False
 
         # Speculative decoding is not implemented under pipeline parallelism:
         # the PP forward path produces no target hidden states and draft
@@ -974,15 +1003,40 @@ class MetalPlatform(Platform):
                 scheduler_config.max_num_batched_tokens,
             )
 
+        # STT model detection. Lazy imports to avoid circular import: platform.py
+        # is loaded during vllm.config init, and stt.detection imports from
+        # vllm.config.
+        from vllm_metal.stt.detection import is_stt_model
+        from vllm_metal.stt.policy import apply_stt_scheduler_policy
+        from vllm_metal.utils import get_model_download_path
+
+        resolved_model = (
+            get_model_download_path(model_config.model, revision=model_config.revision)
+            if model_config is not None
+            else None
+        )
+        serves_stt_model = resolved_model is not None and is_stt_model(
+            resolved_model, revision=model_config.revision
+        )
+
         # Let the adapter apply any model-specific normalisations (e.g. clearing
         # ``multimodal_config`` for model types served on the text-only
         # backbone — see ``DefaultModelAdapter.normalize_model_config``).
         if model_config is not None:
             from vllm_metal.v1.model_adapter import DefaultModelAdapter
 
-            DefaultModelAdapter().normalize_model_config(
-                model_config, speculative_config=vllm_config.speculative_config
-            )
+            if backend == "mlx":
+                # The STT runner owns the audio input of STT checkpoints.
+                if not serves_stt_model:
+                    DefaultModelAdapter().normalize_model_config(
+                        model_config,
+                        speculative_config=vllm_config.speculative_config,
+                    )
+            elif (
+                config.multimodal_mode == "text-only"
+                and model_config.multimodal_config is not None
+            ):
+                model_config.multimodal_config.language_model_only = True
 
             # Backbone-mode resolution below inspects hf_config fields (e.g.
             # architectures) that only genuinely multimodal checkpoints carry;
@@ -1016,21 +1070,6 @@ class MetalPlatform(Platform):
                     "(the multimodal tensor-IPC path is DP=1 only)."
                 )
 
-        # STT model detection — set tokenizer fallback if not already configured.
-        # Lazy imports to avoid circular import: platform.py is loaded during
-        # vllm.config init, and stt.detection imports from vllm.config.
-        from vllm_metal.stt.detection import is_stt_model
-        from vllm_metal.stt.policy import apply_stt_scheduler_policy
-        from vllm_metal.utils import get_model_download_path
-
-        resolved_model = (
-            get_model_download_path(model_config.model, revision=model_config.revision)
-            if model_config is not None
-            else None
-        )
-        serves_stt_model = resolved_model is not None and is_stt_model(
-            resolved_model, revision=model_config.revision
-        )
         if serves_stt_model:
             # STT checkpoints use a dedicated STTModelRunner with no pipeline-
             # split path. Reject PP here, with the other config-time PP guards,
@@ -1129,8 +1168,8 @@ class MetalPlatform(Platform):
     @classmethod
     def _check_sleep_mode_config(cls, vllm_config: "VllmConfig", backend: str) -> None:
         """Sleep mode re-creates the MLX runner's shared KV storage in place.
-        Drafters that keep their own caches or arrays derived from it are not
-        covered, and the PyTorch MPS runner has no such storage.
+        Only drafters verified to keep no KV or only views of that storage are
+        allowed, and the PyTorch MPS runner has no such storage.
         """
         if backend != "mlx":
             raise NotImplementedError(
@@ -1138,10 +1177,13 @@ class MetalPlatform(Platform):
                 f"(VLLM_METAL_BACKEND={backend!r})."
             )
         speculative_config = vllm_config.speculative_config
-        if speculative_config is not None and speculative_config.method != "ngram":
+        if speculative_config is not None and speculative_config.method not in (
+            "ngram",
+            "draft_model",
+        ):
             raise NotImplementedError(
-                "Sleep mode on Metal supports only n-gram speculative decoding, "
-                f"got method={speculative_config.method!r}."
+                "Sleep mode on Metal supports only n-gram and draft-model "
+                f"speculative decoding, got method={speculative_config.method!r}."
             )
 
     @classmethod
@@ -1153,7 +1195,6 @@ class MetalPlatform(Platform):
         through ``take_draft_token_ids()``, which only the synchronous engine
         loop calls; async scheduling would schedule placeholder drafts.
         """
-        from vllm_metal.compat import ensure_vllm_v1_diffusion_guard_patch
         from vllm_metal.v1.diffusion import SUPPORTED_DIFFUSION_MODEL_TYPES
 
         model_type = vllm_config.model_config.hf_config.model_type
@@ -1227,7 +1268,6 @@ class MetalPlatform(Platform):
                 "Diffusion models on Metal require synchronous scheduling; "
                 "disabled async_scheduling."
             )
-        ensure_vllm_v1_diffusion_guard_patch()
 
     @staticmethod
     def _disable_hybrid_prefix_caching(vllm_config: "VllmConfig", reason: str) -> None:

@@ -51,7 +51,6 @@ class STTModelRunner:
         self.device = device
 
         self.model: Any = None
-        self.tokenizer: Any = None
         self._stt_runtime_adapter: STTRuntimeAdapter | None = None
         self._sampler = Sampler()
 
@@ -72,7 +71,6 @@ class STTModelRunner:
         )
         model = load_stt_model(model_name, self.model_config.dtype)
         self.model = model
-        self.tokenizer = None
         self._stt_runtime_adapter = model.create_runtime_adapter(model_name)
 
     def warm_up(self) -> None:

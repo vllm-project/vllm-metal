@@ -60,12 +60,15 @@ def test_register_merges_metal_env_vars_into_vllm() -> None:
     assert not missing, f"metal env vars not registered with vllm: {missing}"
 
 
-def test_register_pins_v1_model_runner_when_metal_is_selected(monkeypatch) -> None:
+def test_register_defaults_to_v2_model_runner_when_metal_is_selected(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("VLLM_METAL_BACKEND", raising=False)
     monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
     monkeypatch.setattr(MetalPlatform, "is_available", classmethod(lambda cls: True))
 
     assert vm._register() == "vllm_metal.platform.MetalPlatform"
-    assert os.environ["VLLM_USE_V2_MODEL_RUNNER"] == "0"
+    assert os.environ["VLLM_USE_V2_MODEL_RUNNER"] == "1"
 
 
 def test_register_leaves_model_runner_alone_when_metal_is_unavailable(

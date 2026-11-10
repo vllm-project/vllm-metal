@@ -5,12 +5,16 @@ import json
 
 import pytest
 
-from tests.test_block_draft_serving_e2e import (
+from tests.e2e.test_block_draft_serving_e2e import (
     DRAFT_MODELS,
     DRAFT_WIDTHS,
     _block_draft_llm,
     _serve,
     _spawn_env,
+)
+from tests.scheduler_helpers import (
+    assert_v2_model_runner,
+    track_preemptions_and_resumptions,
 )
 
 
@@ -66,7 +70,6 @@ def _serve_scheduled(
         "injected_rejection": 0,
     }
     propose = proposer.propose
-    schedule = scheduler.schedule
     verify = runner._spec_decode_controller.verify_greedy
 
     def record_propose(ctx):
@@ -98,12 +101,6 @@ def _serve_scheduled(
                 stats["injected_rejection"] += 1
         return result
 
-    def record_schedule(*args, **kwargs):
-        result = schedule(*args, **kwargs)
-        stats["preemptions"] += len(result.preempted_req_ids)
-        stats["resumptions"] += len(result.scheduled_cached_reqs.resumed_req_ids)
-        return result
-
     def record_verify(logits, requests, segments):
         result = verify(logits, requests, segments)
         for segment, tokens in zip(segments, result, strict=True):
@@ -112,7 +109,8 @@ def _serve_scheduled(
         return result
 
     proposer.propose = record_propose
-    scheduler.schedule = record_schedule
+    assert_v2_model_runner(llm)
+    track_preemptions_and_resumptions(scheduler, stats)
     runner._spec_decode_controller.verify_greedy = record_verify
 
     def step_until(predicate):

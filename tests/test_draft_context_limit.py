@@ -11,7 +11,7 @@ import pytest
 from vllm import SamplingParams
 
 from tests.stub_draft_model import StubDraftModel
-from tests.stub_runner import make_stub_runner
+from tests.stub_runner import adopt_draft_group, make_stub_runner
 from tests.test_draft_model_proposer import (
     _context,
     _prefills_context,
@@ -19,7 +19,6 @@ from tests.test_draft_model_proposer import (
     _request_state,
 )
 from vllm_metal.v1 import draft_model_proposer as dmp
-from vllm_metal.v1.cache_policy import ModelCachePolicy
 from vllm_metal.v1.spec_decode import SpeculativeDecodeController
 
 
@@ -34,15 +33,8 @@ def info(monkeypatch):
 def test_smaller_final_target_limit_logs_once_and_bounds_ingest(prefill, info):
     model = StubDraftModel()
     proposer = _proposer(model, max_model_len=4096, min_speculative_tokens=3)
-    runner = SimpleNamespace(
-        _drafter=proposer,
-        _draft_dims=SimpleNamespace(num_layers=1),
-        model_config=SimpleNamespace(max_model_len=32),
-    )
-    config = SimpleNamespace(
-        kv_cache_groups=[SimpleNamespace(layer_names=["draft_layers.0.self_attn"])]
-    )
-    ModelCachePolicy(runner, Mock())._adopt_draft_scheduler_group(config)
+    # The engine's final target limit is smaller than the draft checkpoint's.
+    adopt_draft_group(proposer, 0, 32)
     if prefill:
         ctx = _prefills_context([("r", list(range(29)))], num_speculative_tokens=3)
         state = ctx.request_states["r"]
@@ -110,7 +102,7 @@ def test_dynamic_width_can_resume_after_temporary_context_skip(deferred, info):
 def test_initial_prefill_fallback_is_per_request_and_keeps_other_rows_drafting(info):
     model = StubDraftModel()
     proposer = _proposer(model, max_model_len=32, min_speculative_tokens=3)
-    proposer.adopt_scheduler_group(0, 4096)
+    adopt_draft_group(proposer, 0, 4096)
     ctx = _prefills_context(
         [
             ("fits", list(range(8))),
@@ -245,8 +237,15 @@ def test_build_uses_reachable_scheduler_widths(
         block_size=16,
         allow_deferred_zero_k_ingest=False,
     )
-    proposer.bind_paged_cache(num_blocks=3, block_size=16, dtype=mx.float32)
-    proposer.adopt_scheduler_group(0, 32)
+    backend = dmp.SDPAPagedAttentionRuntime.return_value
+    backend.kv_scheduler_group_indices.return_value = (0,)
+    backend.kv_group_block_sizes.return_value = (16,)
+    proposer.bind_paged_cache(
+        storage=Mock(),
+        kv_cache_config=Mock(),
+        dtype=mx.float32,
+        target_max_model_len=32,
+    )
     info.reset_mock()  # Ignore the separate model-load message.
     state = _request_state(scheduler_block_ids=[0, 1], token_ids=list(range(31)))
     assert (

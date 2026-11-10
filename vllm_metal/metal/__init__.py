@@ -122,6 +122,14 @@ def _build_rope_source() -> str:
     return _read_v2_metal_source("rope.metal")
 
 
+def _build_sampling_source() -> str:
+    return _read_v2_metal_source("sampling.metal")
+
+
+def _build_normalization_source() -> str:
+    return _read_v2_metal_source("normalization.metal")
+
+
 def _build_nax_source() -> str:
     """Read the self-contained NAX prefill attention source."""
     return _read_metal_source(_KERNELS_V2_DIR / "pagedattention_nax.metal")

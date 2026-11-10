@@ -21,13 +21,14 @@ from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 
 from vllm_metal.tensor_bridge import mlx_to_torch
 from vllm_metal.v1.logits_processors import BatchMinPLogitsProcessor
-from vllm_metal.v1.sampling_batch import SamplingBatch
+from vllm_metal.v1.sampling_batch import SamplingBatch, native_sampling_key
 
 VOCAB_SIZE = 151936
 TEMPERATURE = 0.7
 TOP_K = 20
 TOP_P = 0.95
 MIN_P = 0.05
+SEED = 1
 WARMUP_ITERS = 5
 TIMED_ITERS = 50
 
@@ -59,19 +60,17 @@ def _time_torch(logits_mx: mx.array, batch: int) -> float:
 
 
 def _time_native(logits: mx.array, params: list[SamplingParams]) -> float:
-    key = mx.random.key(1)
-
-    def step(step_key: mx.array) -> None:
-        tokens = SamplingBatch._native_random_tokens(logits, params, step_key)
+    def step(i: int) -> None:
+        tokens = SamplingBatch._native_random_tokens(
+            logits, params, native_sampling_key(SEED, i, domain="engine")
+        )
         mx.eval(tokens)
 
-    for _ in range(WARMUP_ITERS):
-        key, subkey = mx.random.split(key)
-        step(subkey)
+    for i in range(WARMUP_ITERS):
+        step(i)
     started = time.perf_counter()
-    for _ in range(TIMED_ITERS):
-        key, subkey = mx.random.split(key)
-        step(subkey)
+    for i in range(WARMUP_ITERS, WARMUP_ITERS + TIMED_ITERS):
+        step(i)
     return (time.perf_counter() - started) / TIMED_ITERS * 1000
 
 

@@ -57,7 +57,7 @@ from typing import TYPE_CHECKING, Any
 from weakref import WeakValueDictionary
 
 import mlx.core as mx
-from mlx_lm import load as mlx_lm_load
+from mlx_lm.utils import load_model as mlx_lm_load_model
 from vllm.logger import init_logger
 from vllm.v1.outputs import DraftTokenIds
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
@@ -70,7 +70,7 @@ from vllm_metal.attention.context import (
 )
 from vllm_metal.attention.runtime.sdpa import SDPAPagedAttentionRuntime
 from vllm_metal.metal.constants import PA_WINDOW_MAX_HEAD_SIZE
-from vllm_metal.utils import get_model_download_path
+from vllm_metal.utils import get_model_download_path, resolve_mlx_lm_model_path
 from vllm_metal.v1.mlx_lm_paths import mlx_lm_compatible_model_path
 from vllm_metal.v1.proposer import (
     _DECODE_INGEST_MAX_TOKENS,
@@ -83,7 +83,9 @@ if TYPE_CHECKING:
 
     from vllm.config import ParallelConfig
     from vllm.config.speculative import SpeculativeConfig
+    from vllm.v1.kv_cache_interface import KVCacheConfig
 
+    from vllm_metal.attention.caches.storage import KVCacheStorage
     from vllm_metal.v1.model_adapter import ModelAdapter
     from vllm_metal.v1.model_runner import (
         MetalModelRunner,
@@ -195,10 +197,9 @@ class DraftModelProposer(NoOwnKVProposer):
         # never correctness.
         self._spec_kv_writes: dict[str, dict[int, tuple[int, int]]] = {}
         # Scheduler-owned KV-cache group for committed tokens and lookahead.
-        # Unknown at construction time -- the physical backend below is
-        # built before the scheduler has decided kv_cache_config (see
-        # ModelCachePolicy._adopt_draft_scheduler_group) -- so this is set
-        # later via adopt_scheduler_group().
+        # Unknown at construction time -- the engine decides kv_cache_config
+        # after weights load -- so bind_paged_cache() sets both once the
+        # shared storage exists.
         self._scheduler_group_index: int | None = None
         self._dims: DraftDims | None = None
         self._draft_model_name: str | None = None
@@ -220,7 +221,7 @@ class DraftModelProposer(NoOwnKVProposer):
     ) -> DraftModelProposer:
         """Load draft weights without binding the paged cache."""
         model, dims = _load_draft_model(speculative_config, parallel_config)
-        # The capability probe uses a cacheless forward and must run before
+        # The capability probe uses isolated native caches and must run before
         # patch_model() installs attention wrappers that require a paged
         # context. Unsupported model heads retain the full-logits fallback.
         selective_logits_supported = model_adapter.supports_selective_logits(model)
@@ -277,36 +278,50 @@ class DraftModelProposer(NoOwnKVProposer):
     def bind_paged_cache(
         self,
         *,
-        num_blocks: int,
-        block_size: int,
+        storage: KVCacheStorage,
+        kv_cache_config: KVCacheConfig,
         dtype: mx.Dtype,
+        target_max_model_len: int,
     ) -> None:
-        """Allocate the draft KV pool and patch attention. Weights stay put."""
+        """Bind the draft KV views from the target's shared storage.
+
+        The ``draft_layers.*`` group that ``ModelCachePolicy._draft_layer_specs``
+        registered lives in the same vLLM allocation as the target's layers;
+        this resolves its views, group index, and block size, and patches the
+        draft model's attention. Weights stay put.
+        """
         dims = self._dims
         if dims is None:
             raise RuntimeError(
                 "DraftModelProposer.bind_paged_cache() requires build() first"
             )
-        self._block_size = block_size
-        backend = SDPAPagedAttentionRuntime(
-            num_layers=dims.num_layers,
-            num_kv_heads=dims.num_kv_heads,
-            head_dim=dims.head_dim,
-            block_size=block_size,
-            dtype=dtype,
+        layer_names = tuple(
+            f"draft_layers.{layer_idx}.self_attn"
+            for layer_idx in range(dims.num_layers)
         )
-        backend.initialize(num_blocks)
+        backend = SDPAPagedAttentionRuntime(block_size=self._block_size, dtype=dtype)
+        backend.initialize_from_config(kv_cache_config, layer_names, storage=storage)
+        group_indices = backend.kv_scheduler_group_indices()
+        if len(group_indices) != 1:
+            raise NotImplementedError(
+                "draft-model speculative decoding requires all draft layers "
+                "to share one scheduler KV cache group"
+            )
+        self._scheduler_group_index = group_indices[0]
+        self._block_size = backend.kv_group_block_sizes()[0]
+        # The engine may auto-fit the target limit after memory profiling.
+        self._max_model_len = min(self._max_model_len, target_max_model_len)
         n_patched = backend.patch_model(self._model)
         logger.info(
-            "Draft model paged cache bound: %s "
+            "Draft model KV bound to shared storage: %s "
             "(layers=%d, kv_heads=%d, head_dim=%d, patched=%d, "
-            "num_blocks=%d, selective_logits=%s)",
+            "scheduler_group=%d, selective_logits=%s)",
             self._draft_model_name,
             dims.num_layers,
             dims.num_kv_heads,
             dims.head_dim,
             n_patched,
-            num_blocks,
+            self._scheduler_group_index,
             self._selective_logits_supported,
         )
 
@@ -321,19 +336,6 @@ class DraftModelProposer(NoOwnKVProposer):
         if not self._merge_ingest_windows:
             return _INGEST_HEAD_MISMATCH
         return None
-
-    def adopt_scheduler_group(
-        self, group_index: int, target_max_model_len: int
-    ) -> None:
-        """Adopt the scheduler cache group and final target context limit.
-
-        Called from ``ModelCachePolicy._adopt_draft_scheduler_group`` once
-        ``kv_cache_config`` exists -- after ``bind_paged_cache``, since the
-        physical backend is sized before the scheduler has decided groups.
-        """
-        self._scheduler_group_index = group_index
-        # The engine may auto-fit the target limit after memory profiling.
-        self._max_model_len = min(self._max_model_len, target_max_model_len)
 
     def get_stats(self) -> dict[str, int]:
         """Snapshot cumulative request fallbacks and the effective draft limits."""
@@ -396,7 +398,7 @@ class DraftModelProposer(NoOwnKVProposer):
         if self._scheduler_group_index is None:
             raise RuntimeError(
                 "DraftModelProposer.propose() called before "
-                "adopt_scheduler_group() -- initialize_kv_cache() must run "
+                "bind_paged_cache() -- initialize_kv_cache() must run "
                 "before the first speculative decode step"
             )
 
@@ -508,6 +510,7 @@ class DraftModelProposer(NoOwnKVProposer):
             ctx.decode_reqs,
             ctx.decode_token_ids,
             ctx.prefill_reqs,
+            ctx.prefill_token_ids,
             ctx.prefill_result_modes,
             ctx.request_states,
         ):
@@ -967,8 +970,9 @@ def _load_draft_model(
         draft_model_config.model, revision=draft_model_config.revision
     )
     with mlx_lm_compatible_model_path(model_path) as compatible_path:
-        model, _ = mlx_lm_load(
+        resolved_path = resolve_mlx_lm_model_path(
             str(compatible_path), revision=draft_model_config.revision
         )
+        model, _ = mlx_lm_load_model(resolved_path)
 
     return model, dims

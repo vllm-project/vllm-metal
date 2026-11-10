@@ -22,6 +22,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.utils.math_utils import cdiv
 
 from tests.stub_draft_model import VOCAB_SIZE, StubDraftModel
+from tests.stub_runner import adopt_draft_group
 from vllm_metal.attention.context import OffsetCache, get_context
 from vllm_metal.v1 import draft_model_proposer
 from vllm_metal.v1.draft_model_proposer import DraftDims, DraftModelProposer
@@ -72,17 +73,24 @@ def test_bind_paged_cache_initializes_backend(monkeypatch):
         block_size=BLOCK_SIZE,
         allow_deferred_zero_k_ingest=False,
     )
-    proposer.bind_paged_cache(num_blocks=7, block_size=32, dtype=mx.float16)
-
-    runtime_cls.assert_called_once_with(
-        num_layers=1,
-        num_kv_heads=2,
-        head_dim=64,
-        block_size=32,
+    backend.kv_scheduler_group_indices.return_value = (3,)
+    backend.kv_group_block_sizes.return_value = (32,)
+    storage, config = Mock(), Mock()
+    proposer.bind_paged_cache(
+        storage=storage,
+        kv_cache_config=config,
         dtype=mx.float16,
+        target_max_model_len=2048,
     )
-    backend.initialize.assert_called_once_with(7)
+
+    runtime_cls.assert_called_once_with(block_size=BLOCK_SIZE, dtype=mx.float16)
+    backend.initialize_from_config.assert_called_once_with(
+        config, ("draft_layers.0.self_attn",), storage=storage
+    )
     backend.patch_model.assert_called_once_with(model)
+    assert proposer._scheduler_group_index == 3
+    assert proposer._block_size == 32
+    assert proposer._max_model_len == 2048
 
 
 def test_profile_warmup_clips_to_draft_context_limit() -> None:
@@ -132,11 +140,14 @@ def test_draft_load_preserves_revision(monkeypatch, revision):
     resolve_path = Mock(return_value="org/draft")
     load = Mock(return_value=(model, None))
     monkeypatch.setattr(draft_model_proposer, "get_model_download_path", resolve_path)
-    monkeypatch.setattr(draft_model_proposer, "mlx_lm_load", load)
+    download = Mock(return_value="cached-draft")
+    monkeypatch.setattr(draft_model_proposer, "resolve_mlx_lm_model_path", download)
+    monkeypatch.setattr(draft_model_proposer, "mlx_lm_load_model", load)
 
     assert draft_model_proposer._load_draft_model(config, None) == (model, dims)
     resolve_path.assert_called_once_with("org/draft", revision=revision)
-    load.assert_called_once_with("org/draft", revision=revision)
+    download.assert_called_once_with("org/draft", revision=revision)
+    load.assert_called_once_with("cached-draft")
 
 
 class _PositionEncodingDraftModel(StubDraftModel):
@@ -214,7 +225,7 @@ def _proposer(
         selective_logits_supported=selective_logits_supported,
         allow_deferred_zero_k_ingest=allow_deferred_zero_k_ingest,
     )
-    proposer.adopt_scheduler_group(SCHEDULER_GROUP_INDEX, max_model_len)
+    adopt_draft_group(proposer, SCHEDULER_GROUP_INDEX, max_model_len)
     return proposer
 
 
@@ -309,7 +320,7 @@ def _prefills_context(
     )
 
 
-def test_propose_before_adopt_scheduler_group_raises() -> None:
+def test_propose_before_bind_paged_cache_raises() -> None:
     model = StubDraftModel()
     proposer = DraftModelProposer(
         model=model,
@@ -320,7 +331,7 @@ def test_propose_before_adopt_scheduler_group_raises() -> None:
         extract_logits=lambda output: output,
     )
     state = _request_state(scheduler_block_ids=[0, 1])
-    with pytest.raises(RuntimeError, match="adopt_scheduler_group"):
+    with pytest.raises(RuntimeError, match="bind_paged_cache"):
         proposer.propose(_context("r1", state, {"r1": state}))
 
 
@@ -973,19 +984,11 @@ def test_full_attention_draft_accepted() -> None:
 
 
 def test_scheduler_adoption_uses_target_limit_after_auto_fit() -> None:
-    from vllm_metal.v1.cache_policy import ModelCachePolicy
-
     model = StubDraftModel()
     proposer = _proposer(model, max_model_len=4096)
-    runner = SimpleNamespace(
-        _drafter=proposer,
-        _draft_dims=SimpleNamespace(num_layers=1),
-        model_config=SimpleNamespace(max_model_len=32),
-    )
-    config = SimpleNamespace(
-        kv_cache_groups=[SimpleNamespace(layer_names=["draft_layers.0.self_attn"])]
-    )
-    ModelCachePolicy(runner, Mock())._adopt_draft_scheduler_group(config)
+    # The engine auto-fits the target limit after memory profiling;
+    # bind_paged_cache passes it through (see its own unit test above).
+    adopt_draft_group(proposer, 0, 32)
     state = _request_state(token_ids=list(range(31)), scheduler_block_ids=[0, 1])
     # The checkpoint's original limit would allow drafting into a third block.
     # The engine's final limit suppresses lookahead while retaining valid ingest.

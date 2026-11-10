@@ -20,7 +20,7 @@ from vllm_metal.v1.pooling.validation import PoolingConfigView
 def build_decoder_pooling_backend(
     model: Any,
     model_config: Any,
-    tokenizer: Any,
+    tokenizer: Any = None,
 ) -> DecoderPoolingBackend:
     config = PoolingConfigView(model_config)
     model_view = DecoderModelView(model)

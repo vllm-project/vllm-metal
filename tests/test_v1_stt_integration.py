@@ -525,7 +525,6 @@ class TestSTTRunnerWorkerContract:
         runner.load_model()
 
         assert runner.model is fake_model
-        assert runner.tokenizer is None
         assert runner._stt_runtime_adapter is adapter
         fake_model.create_runtime_adapter.assert_called_once_with(str(tmp_path))
         load_weights.assert_called_once_with(

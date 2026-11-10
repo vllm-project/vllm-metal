@@ -7,7 +7,11 @@ from importlib.metadata import version
 
 import pytest
 
-from tests.test_block_draft_serving_e2e import _block_draft_llm, _spawn_env
+from tests.e2e.test_block_draft_serving_e2e import _block_draft_llm, _spawn_env
+from tests.scheduler_helpers import (
+    assert_v2_model_runner,
+    track_preemptions_and_resumptions,
+)
 
 # Use the same checkpoint revisions as the serving/continuation qualification.
 CHECKPOINTS = {
@@ -87,7 +91,6 @@ def _serve(pair, verify_window, caching, path):
     reject_next = False
     propose = proposer.propose
     verify = runner._spec_decode_controller.verify_greedy
-    schedule = scheduler.schedule
 
     def record_propose(ctx):
         nonlocal reject_next
@@ -141,15 +144,10 @@ def _serve(pair, verify_window, caching, path):
                 )
         return result
 
-    def record_schedule(*args, **kwargs):
-        result = schedule(*args, **kwargs)
-        stats["preemptions"] += len(result.preempted_req_ids)
-        stats["resumed"] += len(result.scheduled_cached_reqs.resumed_req_ids)
-        return result
-
     proposer.propose = record_propose
     runner._spec_decode_controller.verify_greedy = record_verify
-    scheduler.schedule = record_schedule
+    assert_v2_model_runner(llm)
+    track_preemptions_and_resumptions(scheduler, stats, resumption_key="resumed")
     records = {}
 
     def generate(prompts, params=greedy):

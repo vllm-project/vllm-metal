@@ -4,9 +4,10 @@
 Pure functions: logits in, token IDs out.  No model runner state accessed.
 """
 
+import hashlib
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import ClassVar
+from typing import ClassVar, Literal
 
 import mlx.core as mx
 import numpy as np
@@ -16,8 +17,17 @@ from vllm.utils.torch_utils import make_tensor_with_pad
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors, SamplerOutput
 
 from vllm_metal.tensor_bridge import mlx_to_torch
-from vllm_metal.v1.logits_processors import BatchMinPLogitsProcessor, LogitsProcessors
+from vllm_metal.v1.logits_processors import (
+    BatchMinPLogitsProcessor,
+    LogitsProcessor,
+    LogitsProcessors,
+)
 from vllm_metal.v1.sampling import Sampler, SamplingMetadata
+from vllm_metal.v1.sampling.builtin_logits_processors import (
+    BatchUpdate,
+    LogitBiasLogitsProcessor,
+    MinTokensLogitsProcessor,
+)
 
 GREEDY_TEMPERATURE_EPS = 1e-5
 _EMPTY_LOGITSPROCS = LogitsProcessors()
@@ -164,21 +174,45 @@ class SamplingBatch:
             cu_num_generated_tokens=None,
         )
 
+    @property
+    def output_lengths(self) -> list[int]:
+        return [len(token_ids) for token_ids in self.output_token_id_lists]
+
+    def generators_are_seeded(self) -> bool:
+        """Whether every torch generator belongs to a seeded row.
+
+        Seeded rows get their generator from :func:`create_request_generator`;
+        on the native path the seed-derived MLX key replaces it. Any other
+        generator is an explicit caller RNG that only torch can honor.
+        """
+        return all(
+            0 <= i < len(self.sampling_params_list)
+            and self.sampling_params_list[i].seed is not None
+            for i in self.generators
+        )
+
     def can_use_native_greedy(self) -> bool:
         """Return whether MLX argmax matches the requested sampling behavior."""
-        return self.params_allow_native_greedy(self.sampling_params_list)
+        return self.params_allow_native_greedy(
+            self.sampling_params_list, self.output_lengths
+        )
 
     @staticmethod
     def params_allow_native_greedy(
         sampling_params_list: Sequence[SamplingParams],
+        output_lengths: Sequence[int] | None = None,
     ) -> bool:
         """Whether MLX argmax matches *sampling_params_list* exactly.
 
         Single source of truth for the native-greedy decision so callers that
         gate before constructing a :class:`SamplingBatch` (e.g. the decode
         pipeline) cannot drift from the sampling-time check.
+        ``output_lengths`` is each row's generated-token count; see
+        :meth:`_min_tokens_pending`.
         """
-        return all(
+        return not SamplingBatch._min_tokens_pending(
+            sampling_params_list, output_lengths
+        ) and all(
             sampling_params.temperature < GREEDY_TEMPERATURE_EPS
             and sampling_params.top_k <= 0
             and sampling_params.top_p == 1.0
@@ -188,66 +222,117 @@ class SamplingBatch:
             and sampling_params.num_logprobs is None
             and not sampling_params.allowed_token_ids
             and not sampling_params.bad_words_token_ids
+            and not sampling_params.logit_bias
             for sampling_params in sampling_params_list
         )
 
     @staticmethod
     def params_allow_native_random(
         sampling_params_list: Sequence[SamplingParams],
+        output_lengths: Sequence[int] | None = None,
+        *,
+        allow_seed: bool = False,
     ) -> bool:
-        """Whether MLX categorical sampling matches *sampling_params_list*.
+        """Whether the native MLX sampler supports *sampling_params_list*.
 
         Requests must use plain temperature/top-k/top-p/min-p sampling; the
         mask is built per row, so rows may mix greedy (temperature 0) with
-        random sampling and differ in top-k/top-p/min-p. Seeded requests
-        stay on the torch path.
+        random sampling and differ in top-k/top-p/min-p. Requests with sample
+        logprobs, structured outputs, or ``logit_bias`` stay on the torch path.
+        ``output_lengths`` is as in :meth:`params_allow_native_greedy`.
+        Sync and deferred seeded keys use the row's output length before
+        sampling (see :func:`native_sampling_key`).
         """
         if not sampling_params_list:
             return False
-        return all(
-            sp.seed is None
+        return not SamplingBatch._min_tokens_pending(
+            sampling_params_list, output_lengths
+        ) and all(
+            (allow_seed or sp.seed is None)
             and sp.frequency_penalty == 0.0
             and sp.presence_penalty == 0.0
             and sp.repetition_penalty == 1.0
             and sp.num_logprobs is None
+            and sp.structured_outputs is None
             and not sp.allowed_token_ids
             and not sp.bad_words_token_ids
+            and not sp.logit_bias
             for sp in sampling_params_list
         )
 
+    @staticmethod
+    def _min_tokens_pending(
+        sampling_params_list: Sequence[SamplingParams],
+        output_lengths: Sequence[int] | None,
+    ) -> bool:
+        """Whether any row still needs vLLM's min-tokens processor.
+
+        The processor masks stop tokens only while a row has generated fewer
+        than ``min_tokens``, so rows past the minimum can sample natively
+        again. ``None`` counts every row as having generated nothing.
+        """
+        if output_lengths is None:
+            output_lengths = [0] * len(sampling_params_list)
+        return any(
+            output_length < sampling_params.min_tokens
+            for sampling_params, output_length in zip(
+                sampling_params_list, output_lengths, strict=True
+            )
+        )
+
     @classmethod
-    def native_decode_tokens(
+    def native_sample_tokens(
         cls,
         logits_2d: mx.array,
         sampling_params_list: Sequence[SamplingParams],
         *,
         vocab_size: int,
-        next_key: Callable[[], mx.array] | None,
+        next_native_rng_key: Callable[[], mx.array] | None,
+        output_lengths: Sequence[int],
+        allow_seed: bool = False,
     ) -> mx.array:
-        """Build the lazy native token graph for a deferred decode batch.
+        """Build the lazy native token graph for an eligible batch.
 
-        Owns the sampling policy for the decode pipeline's deferred step:
-        greedy argmax when the batch allows it, otherwise the temperature/
-        top-k/top-p categorical graph over the vocab-sliced logits (unlike
-        argmax, categorical can select a padded lm_head column). The caller
-        owns evaluation and RNG state; ``next_key`` is consumed only on the
-        random path. Raises on batches neither native path admits — the
-        pipeline gate must not let those reach here.
+        ``output_lengths`` holds the tokens already generated per row. With
+        ``allow_seed`` each seeded row draws from :func:`native_sampling_key`
+        instead of the shared step key; without it, seeded rows are rejected
+        as a gate desync.
+
+        Uses greedy argmax when the batch allows it. Otherwise the shared Metal
+        sampler draws from the first ``vocab_size`` logits to exclude padded
+        LM-head columns. The caller owns evaluation and RNG state.
+        ``next_native_rng_key`` advances the engine counter only when an unseeded
+        random row needs a draw.
+        Raises on batches neither native path admits — the caller must not
+        let those reach here.
         """
-        if cls.params_allow_native_greedy(sampling_params_list):
+        if cls.params_allow_native_greedy(sampling_params_list, output_lengths):
             return mlx_greedy_tokens(logits_2d)
-        if next_key is not None and cls.params_allow_native_random(
-            sampling_params_list
-        ):
-            return cls._native_random_tokens(
-                logits_2d[..., :vocab_size], sampling_params_list, next_key()
+        random_eligible = cls.params_allow_native_random(
+            sampling_params_list, output_lengths, allow_seed=allow_seed
+        )
+        if next_native_rng_key is not None and random_eligible:
+            row_keys = None
+            if any(sp.seed is not None for sp in sampling_params_list):
+                row_keys = [
+                    None if sp.seed is None else native_sampling_key(sp.seed, n)
+                    for sp, n in zip(sampling_params_list, output_lengths, strict=True)
+                ]
+            needs_engine_key = any(
+                sp.seed is None and sp.temperature >= GREEDY_TEMPERATURE_EPS
+                for sp in sampling_params_list
             )
-        key_state = "live" if next_key is not None else "absent"
+            return cls._native_random_tokens(
+                logits_2d[..., :vocab_size],
+                sampling_params_list,
+                next_native_rng_key() if needs_engine_key else None,
+                row_keys=row_keys,
+            )
+        key_state = "live" if next_native_rng_key is not None else "absent"
         raise RuntimeError(
             "Deferred sampling requires a native-greedy or native-random "
             f"eligible batch (native sample key {key_state}, random-eligible="
-            f"{cls.params_allow_native_random(sampling_params_list)}) "
-            "— gate desync."
+            f"{random_eligible}) — gate desync."
         )
 
     @staticmethod
@@ -298,27 +383,35 @@ class SamplingBatch:
         cls,
         logits_2d: mx.array,
         sampling_params_list: Sequence[SamplingParams],
-        key: mx.array,
+        key: mx.array | None,
+        *,
+        row_keys: Sequence[mx.array | None] | None = None,
     ) -> mx.array:
         """Lazy per-row temperature/top-k/top-p/min-p token ids.
 
-        Greedy rows (temperature below ``GREEDY_TEMPERATURE_EPS``) ride along
-        as a top-1 candidate set at unit temperature so that every row of the
-        batch has a drawable distribution, and their drawn token is then
-        replaced by the argmax: top-k masks by value, so an exact tie at a
-        greedy row's maximum would otherwise leave the draw to pick between
-        the tied tokens where vLLM's greedy path is deterministic.
+        Rows with an entry in ``row_keys`` (seeded requests) draw over their
+        own row with an MLX key derived from the seed and output position.
+        Draws are reproducible for identical logits, sampling params, seed
+        and position. End-to-end tokens also require a compatible execution
+        environment and batching: batch shape can change logits numerics,
+        and native and torch-fallback paths use different random streams.
+        Other rows share one batched draw with ``key``. Its derivation is
+        stateless, but the runner keeps a global counter, so unseeded draws
+        depend on scheduling, sub-batch order and batch composition and are
+        reproducible only for a fixed request schedule.
+        ``key`` may be ``None`` if no unseeded row needs a random draw.
+        Greedy rows use zero temperature and break ties by vocabulary ID.
         """
-        greedy_rows: list[bool] = []
+        from vllm_metal.metal import get_ops
+
         temperatures: list[float] = []
         top_k: list[int] = []
         top_p: list[float] = []
         min_p: list[float] = []
         for sp in sampling_params_list:
-            greedy_rows.append(sp.temperature < GREEDY_TEMPERATURE_EPS)
             if sp.temperature < GREEDY_TEMPERATURE_EPS:
-                temperatures.append(1.0)
-                top_k.append(1)
+                temperatures.append(0.0)
+                top_k.append(0)
                 top_p.append(1.0)
                 min_p.append(0.0)
             else:
@@ -326,20 +419,36 @@ class SamplingBatch:
                 top_k.append(sp.top_k)
                 top_p.append(sp.top_p)
                 min_p.append(sp.min_p)
-        scaled = (
-            logits_2d.astype(mx.float32)
-            / mx.array(temperatures, dtype=mx.float32)[:, None]
+        # Keep request-key ownership above the lazy primitive. Seeded rows use
+        # their own key; unseeded rows retain their position in the batch draw.
+        fallback_key = key if key is not None else mx.zeros((2,), dtype=mx.uint32)
+        row_keys = row_keys if row_keys is not None else [None] * len(temperatures)
+        keys = mx.stack([k if k is not None else fallback_key for k in row_keys])
+        seeds = keys.view(mx.int64).reshape(-1)
+        positions = mx.array(
+            [0 if k is not None else i for i, k in enumerate(row_keys)], dtype=mx.int64
         )
-        sorted_desc, sorted_idx = cls._sorted_candidate_logits(
-            scaled, top_k, top_p, min_p
-        )
-        position = mx.random.categorical(sorted_desc, axis=-1, key=key)
-        tokens = mx.take_along_axis(sorted_idx, position[:, None], axis=-1)[:, 0]
-        if any(greedy_rows):
-            tokens = mx.where(
-                mx.array(greedy_rows), mlx_greedy_tokens(logits_2d), tokens
+        values = logits_2d.astype(mx.float32)
+        token_ids = None
+        if any(
+            0 < k < logits_2d.shape[1] or p != 1.0 or m != 0.0
+            for k, p, m in zip(top_k, top_p, min_p, strict=True)
+        ):
+            # Filters consume scaled logits. Preserve zero for the final greedy draw.
+            scales = mx.array(
+                [t if t != 0 else 1.0 for t in temperatures], dtype=mx.float32
             )
-        return tokens
+            values, token_ids = cls._sorted_candidate_logits(
+                values / scales[:, None], top_k, top_p, min_p
+            )
+            temperatures = [1.0 if t != 0 else 0.0 for t in temperatures]
+        return get_ops().gumbel_sample(
+            values,
+            seeds,
+            positions,
+            mx.array(temperatures, dtype=mx.float32),
+            token_ids,
+        )
 
     def _make_temperature(self) -> torch.Tensor | None:
         if self.all_greedy:
@@ -547,11 +656,10 @@ class SamplingBatch:
         return tensors
 
     def _make_logitsprocs(self) -> LogitsProcessors:
+        processors: list[LogitsProcessor] = []
         min_p_vals = [sp.min_p for sp in self.sampling_params_list]
-        if not any(min_p > 0.0 for min_p in min_p_vals):
-            return _EMPTY_LOGITSPROCS
-        return LogitsProcessors(
-            [
+        if any(min_p > 0.0 for min_p in min_p_vals):
+            processors.append(
                 BatchMinPLogitsProcessor(
                     torch.tensor(
                         min_p_vals,
@@ -559,8 +667,47 @@ class SamplingBatch:
                         device=self.SAMPLER_DEVICE,
                     )
                 )
-            ]
-        )
+            )
+        builtin_processor_classes = [
+            processor_cls
+            for processor_cls, needed in (
+                (
+                    LogitBiasLogitsProcessor,
+                    any(sp.logit_bias for sp in self.sampling_params_list),
+                ),
+                (
+                    MinTokensLogitsProcessor,
+                    self._min_tokens_pending(
+                        self.sampling_params_list, self.output_lengths
+                    ),
+                ),
+            )
+            if needed
+        ]
+        if builtin_processor_classes:
+            # These vendored vLLM processors track rows of a persistent batch; adding
+            # every row rebuilds that state for this step's batch.
+            batch_update = BatchUpdate(
+                batch_size=len(self.sampling_params_list),
+                removed=(),
+                added=list(
+                    zip(
+                        range(len(self.sampling_params_list)),
+                        self.sampling_params_list,
+                        self.prompt_token_id_lists,
+                        self.output_token_id_lists,
+                        strict=True,
+                    )
+                ),
+                moved=(),
+            )
+            for processor_cls in builtin_processor_classes:
+                processor = processor_cls(None, self.SAMPLER_DEVICE, False)
+                processor.update_state(batch_update)
+                processors.append(processor)
+        if not processors:
+            return _EMPTY_LOGITSPROCS
+        return LogitsProcessors(processors)
 
     def make_sampling_metadata(self) -> SamplingMetadata:
         """Create vLLM ``SamplingMetadata`` for this batch."""
@@ -614,6 +761,22 @@ def create_request_generator(
     return generator
 
 
+def native_sampling_key(
+    seed: int, step: int, *, domain: Literal["seed", "engine"] = "seed"
+) -> mx.array:
+    """Stateless MLX key from a seed and zero-based sampling position.
+
+    Seeded rows use the request seed and output length; unseeded rows share
+    the engine seed and runner's native sampling counter in the "engine"
+    domain. The default "seed" domain preserves seeded request keys.
+    """
+    digest = hashlib.blake2b(
+        f"vllm-metal-{domain}:{int(seed)}:{int(step)}".encode(),
+        digest_size=8,
+    ).digest()
+    return mx.random.key(int.from_bytes(digest, "little"))
+
+
 def mlx_greedy_tokens(logits_2d: mx.array) -> mx.array:
     """Lazy native-greedy token ids for pre-sliced 2D logits.
 
@@ -627,11 +790,14 @@ def sample_from_logits(
     logits_2d: mx.array,
     batch: SamplingBatch,
     sampler: Sampler,
+    *,
+    next_native_rng_key: Callable[[], mx.array] | None = None,
 ) -> _SamplingResult:
     """Sample tokens from pre-sliced 2D logits ``(batch_size, vocab)``.
 
-    Single entry point for all sampling paths.  Chooses native MLX greedy
-    when possible, otherwise bridges to the vLLM torch sampler on
+    Single entry point for all sampling paths. Chooses native MLX greedy
+    when possible, or eligible native random sampling with a live ``next_native_rng_key``.
+    Otherwise bridges to the vLLM torch sampler on
     ``SamplingBatch.SAMPLER_DEVICE``. Requests that need sample logprobs must
     use the vLLM sampler so ``ModelRunnerOutput`` can satisfy the OpenAI
     serving contract.
@@ -645,6 +811,25 @@ def sample_from_logits(
         if tokens.ndim == 0:
             return _SamplingResult([int(tokens.item())])
         return _SamplingResult(tokens.tolist())  # type: ignore[arg-type]
+
+    if (
+        next_native_rng_key is not None
+        and not batch.needs_logprobs
+        and batch.generators_are_seeded()
+        and SamplingBatch.params_allow_native_random(
+            batch.sampling_params_list, batch.output_lengths, allow_seed=True
+        )
+    ):
+        tokens = SamplingBatch.native_sample_tokens(
+            logits_2d,
+            batch.sampling_params_list,
+            vocab_size=batch.vocab_size,
+            next_native_rng_key=next_native_rng_key,
+            output_lengths=batch.output_lengths,
+            allow_seed=True,
+        )
+        mx.eval(tokens)
+        return _SamplingResult(tokens.tolist())
 
     mx.eval(logits_2d)
     logits_torch = mlx_to_torch(
@@ -668,6 +853,7 @@ def sample_decode_tokens(
     sampler: Sampler,
     *,
     vocab_size: int,
+    next_native_rng_key: Callable[[], mx.array] | None = None,
 ) -> _SamplingResult:
     """Sample one token per decode request from evaluated logits.
 
@@ -705,7 +891,9 @@ def sample_decode_tokens(
         vocab_size=vocab_size,
         generators=generators,
     )
-    return sample_from_logits(decode_logits, batch, sampler)
+    return sample_from_logits(
+        decode_logits, batch, sampler, next_native_rng_key=next_native_rng_key
+    )
 
 
 def sample_prefill_tokens(
@@ -716,6 +904,7 @@ def sample_prefill_tokens(
     sampler: Sampler,
     *,
     vocab_size: int,
+    next_native_rng_key: Callable[[], mx.array] | None = None,
 ) -> _SamplingResult:
     """Sample from the last logit position of each completed prefill.
 
@@ -764,7 +953,9 @@ def sample_prefill_tokens(
             if pr.generator is not None
         },
     )
-    result = sample_from_logits(last_logits, batch, sampler)
+    result = sample_from_logits(
+        last_logits, batch, sampler, next_native_rng_key=next_native_rng_key
+    )
     if len(final_reqs) == len(prefill_reqs):
         return result
 

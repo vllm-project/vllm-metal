@@ -7,7 +7,7 @@ Two test groups covering the public surface of the loader:
   decline, GPTQ explicit reject, ``text_config`` fallback, alias
   normalization, Hub-fetch-error propagation.
 * ``TestDtypeAlignment`` — post-load dtype alignment, driven through
-  the public ``load()`` API with a stubbed ``mlx_lm_load``: the
+  the public ``load()`` API with a stubbed ``mlx_lm_load_model``: the
   ``scales`` / ``biases`` exemption (AWQ-transform output) vs the
   ordinary ``bias`` casting (runtime dtype) on every MLX-quantize-
   protocol leaf, plus the duck-typed protocol coverage that picks up
@@ -56,7 +56,11 @@ class TestConfigDetection:
         download = Mock(return_value=str(config_dir / "config.json"))
         load = Mock(return_value=(nn.Module(), None))
         monkeypatch.setattr("vllm_metal.quant.awq_loader.hf_hub_download", download)
-        monkeypatch.setattr("vllm_metal.quant.awq_loader.mlx_lm_load", load)
+        resolve = Mock(return_value=config_dir)
+        monkeypatch.setattr(
+            "vllm_metal.quant.awq_loader.resolve_mlx_lm_model_path", resolve
+        )
+        monkeypatch.setattr("vllm_metal.quant.awq_loader.mlx_lm_load_model", load)
 
         loader = AWQQuantLoader.for_model("org/model", revision=revision)
         assert loader is not None
@@ -64,7 +68,11 @@ class TestConfigDetection:
 
         download.assert_called_once_with("org/model", "config.json", revision=revision)
         load.assert_called_once()
-        assert load.call_args.kwargs["revision"] == revision
+        resolve.assert_called_once_with("org/model", revision=revision)
+        assert load.call_args.args == (config_dir,)
+        assert load.call_args.kwargs["model_config"] == {
+            "quantization_config": _AWQ_INNER
+        }
 
     def test_returns_none_for_non_awq(self, tmp_path):
         """Non-AWQ checkpoints get None back, no exception."""
@@ -252,7 +260,7 @@ class _DuckTypedQuantized(nn.Module):
 
 @pytest.fixture
 def aligned_load(monkeypatch):
-    """Drive ``AWQQuantLoader.load()`` with a stubbed ``mlx_lm_load`` so
+    """Drive ``AWQQuantLoader.load()`` with a stubbed ``mlx_lm_load_model`` so
     each ``TestDtypeAlignment`` case asserts the post-load alignment
     contract through the public load API rather than reaching into the
     private alignment helper. The fixture returns a callable that takes
@@ -264,18 +272,20 @@ def aligned_load(monkeypatch):
 
     def _aligned_load(model: nn.Module) -> None:
         monkeypatch.setattr(
-            "vllm_metal.quant.awq_loader.mlx_lm_load",
+            "vllm_metal.quant.awq_loader.resolve_mlx_lm_model_path",
+            lambda *_, **__: Path("any/path"),
+        )
+        monkeypatch.setattr(
+            "vllm_metal.quant.awq_loader.mlx_lm_load_model",
             lambda *args, **kwargs: (model, None),
         )
-        AWQQuantLoader(_AWQ_INNER).load(
-            "any/path", target_dtype=mx.bfloat16, tokenizer_config=None
-        )
+        AWQQuantLoader(_AWQ_INNER).load("any/path", target_dtype=mx.bfloat16)
 
     return _aligned_load
 
 
 class TestDtypeAlignment:
-    """Drive ``AWQQuantLoader.load()`` with a stubbed ``mlx_lm_load``
+    """Drive ``AWQQuantLoader.load()`` with a stubbed ``mlx_lm_load_model``
     (via the ``aligned_load`` fixture) to pin the post-load dtype
     alignment contract through the public load API: AWQ-transform
     ``scales`` / ``biases`` stay at fp16, surrounding floating params

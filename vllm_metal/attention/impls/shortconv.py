@@ -50,10 +50,25 @@ class ShortConvPagedWrapper(nn.Module):
         x: mx.array,
         mask: mx.array | None = None,
         cache: nn.Module | None = None,
+        gdn_sink: list | None = None,
     ) -> mx.array:
+        """``gdn_sink`` collects pre-update conv state for speculative rollback.
+
+        mlx_vlm's LFM2 tower passes it on every layer call; mlx_lm's does not
+        take it at all, so it is only forwarded when a caller actually asks
+        for capture.
+        """
         ctx = get_context()
         if ctx is None:
-            return self._inner(x, mask=mask, cache=cache)
+            if gdn_sink is None:
+                return self._inner(x, mask=mask, cache=cache)
+            return self._inner(x, mask=mask, cache=cache, gdn_sink=gdn_sink)
+        if gdn_sink is not None:
+            raise RuntimeError(
+                "ShortConv paged state is committed in place and cannot be "
+                "rolled back, so speculative state capture is unsupported on "
+                "the paged path."
+            )
 
         cache_idx = self._cache_idx
         state_cache = self._state_cache
@@ -78,7 +93,11 @@ class ShortConvPagedWrapper(nn.Module):
         if boundaries == list(range(len(slots) + 1)):
             # One token per request: a single batched convolution.
             conv_input = mx.concatenate(
-                [pool[ids], bx.reshape(len(slots), 1, -1)], axis=1
+                [
+                    state_cache.gather_conv_rows(cache_idx, ids),
+                    bx.reshape(len(slots), 1, -1),
+                ],
+                axis=1,
             )
             updates = conv_input[:, -n_keep:, :]
             conv_out = inner.conv(conv_input).reshape(1, len(slots), -1)

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""DSpark serving alignment, admission and vLLM runner compatibility."""
+"""DSpark serving alignment and admission."""
 
 from dataclasses import replace
 from types import SimpleNamespace
@@ -10,12 +10,10 @@ import numpy as np
 import pytest
 import torch
 from vllm import SamplingParams
-from vllm.config import VllmConfig
 
 from tests.test_block_draft_proposer import _features, _prefill
 from tests.test_dspark_paged import make_cache
 from tests.test_dspark_quantization import make_model
-from vllm_metal.patches.dspark_config import enable_dspark_for_metal_runner
 from vllm_metal.v1 import dspark_proposer
 from vllm_metal.v1.dspark_proposer import DSparkProposer
 from vllm_metal.v1.model_runner import RequestState
@@ -248,53 +246,6 @@ def test_profile_materializes_dspark_owned_heads(
     proposer.profile([f[None] for f in _features(4)], 2)
     assert observed == [((2,), 7, draft_topk)]
     assert proposer.kv_specs(16)[proposer.layer_names[0]].dtype == torch.float16
-
-
-@pytest.mark.parametrize("method", [None, "dflash", "dspark"])
-@pytest.mark.parametrize(
-    "worker", ["vllm_metal.v1.worker.MetalWorker", "vllm.v1.worker.gpu_worker.Worker"]
-)
-def test_config_bridge_preserves_other_runner_rejections(monkeypatch, method, worker):
-    # Use the real upstream validator; only replace unrelated model probes.
-    original = VllmConfig._get_v1_model_runner_unsupported_features
-    original = getattr(original, "__wrapped__", original)
-    monkeypatch.setattr(
-        VllmConfig, "_get_v1_model_runner_unsupported_features", original
-    )
-    enable_dspark_for_metal_runner()
-    first = VllmConfig._get_v1_model_runner_unsupported_features
-    enable_dspark_for_metal_runner()
-    assert VllmConfig._get_v1_model_runner_unsupported_features is first
-    config = SimpleNamespace(
-        parallel_config=SimpleNamespace(
-            worker_cls=worker,
-            prefill_context_parallel_size=2,
-            pipeline_parallel_size=2,
-            enable_batch_sharded_sampling=True,
-        ),
-        scheduler_config=SimpleNamespace(async_scheduling=True),
-        speculative_config=None
-        if method is None
-        else SimpleNamespace(method=method, enable_adaptive_verification=True),
-        model_config=SimpleNamespace(is_diffusion=True),
-        _dflash_needs_multi_kv_group=lambda: True,
-        _is_dflash_candidate_draft=lambda: True,
-    )
-    before = original(config)
-    after = first(config)
-    expected = [
-        item
-        for item in before
-        if not (
-            worker == "vllm_metal.v1.worker.MetalWorker"
-            and method == "dspark"
-            and item == "dspark speculative decoding"
-        )
-    ]
-    assert after == expected
-    assert "prefill context parallel" in after
-    if method is not None:
-        assert "adaptive draft verification" in after
 
 
 def test_dspark_width_rejection_does_not_write_shared_storage():

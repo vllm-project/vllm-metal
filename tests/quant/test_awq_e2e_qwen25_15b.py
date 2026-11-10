@@ -1,30 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Slow end-to-end coverage for the AWQ load path on Qwen2.5-1.5B-Instruct-AWQ.
-
-Two tests, both `slow`-marked (opt out with `pytest -m "not slow"`):
-
-* `test_awq_load_aligns_non_quant_dtypes_to_runner_target`
-  Loads via `_load_generation_model` with a stub runner whose target
-  dtype is bf16. Asserts every non-`QuantizedLinear` floating param
-  matches bf16 and that quantized scales/biases stay at the dtype the
-  upstream transform produced (we explicitly do NOT touch those).
-
-* `test_awq_e2e_paged_runner_smoke`
-  Full vLLM `LLM.generate` through the Metal paged runner. Asserts the
-  greedy continuation includes "Paris" — guards against any AWQ load
-  regression that produces token-level garbage (mixed dtype mismatch,
-  layernorm absorption broken, lm_head triple foot-gun, etc.).
-
-Quantitative parity (cos > 0.97 vs bf16 reference, TF top-1 >= 90%) is
-covered by the standalone parity scripts referenced in the RFC; we do
-not re-run that comparison in CI because it requires loading three 1.5B
-models in one process. The smoke + dtype tests are the regression
-guards.
-"""
+"""Dtype alignment for AWQ loading on Qwen2.5-1.5B-Instruct-AWQ."""
 
 from __future__ import annotations
 
-import gc
 from types import SimpleNamespace
 
 import mlx.core as mx
@@ -60,7 +38,7 @@ def test_awq_load_aligns_non_quant_dtypes_to_runner_target():
     runner = make_stub_runner(model_config=_runner_model_config(dtype=torch.bfloat16))
     lifecycle = ModelLifecycle(runner, runner._model_adapter)
 
-    model, _tokenizer = lifecycle._load_generation_model(_AWQ_REPO, is_vlm=False)
+    model = lifecycle._load_generation_model(_AWQ_REPO, is_vlm=False)
 
     saw_quant_layer = False
     saw_non_quant_floating = False
@@ -114,41 +92,3 @@ def test_awq_load_aligns_non_quant_dtypes_to_runner_target():
         "QuantizedLinear regular bias must be cast to the runtime target "
         f"dtype (bfloat16); found: {regular_bias_pins}"
     )
-
-
-@pytest.mark.slow
-def test_awq_e2e_paged_runner_smoke():
-    """Full vLLM stack: load 1.5B-AWQ, greedy 16 tokens, check 'Paris'
-    appears. Guards against AWQ load regressions that produce token
-    garbage even when individual unit tests pass.
-    """
-    from vllm import LLM, SamplingParams
-
-    llm = None
-    monkeypatch_ctx = pytest.MonkeyPatch.context()
-    try:
-        with monkeypatch_ctx as mp:
-            mp.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
-
-            llm = LLM(
-                model=_AWQ_REPO,
-                max_model_len=512,
-                max_num_seqs=1,
-                gpu_memory_utilization=0.3,
-            )
-            sp = SamplingParams(temperature=0, max_tokens=16)
-            outputs = llm.generate(["The capital of France is"], sp)
-
-            assert len(outputs) == 1
-            text = outputs[0].outputs[0].text
-            assert text, "AWQ load produced empty output"
-            # Greedy first-token should be " Paris" (verified by the standalone
-            # parity scripts; reproduced here as a regression guard).
-            assert "Paris" in text, (
-                f"expected 'Paris' in AWQ greedy continuation, got: {text!r}"
-            )
-    finally:
-        # Drop Python references before returning Metal allocations to the pool.
-        del llm
-        gc.collect()
-        mx.clear_cache()

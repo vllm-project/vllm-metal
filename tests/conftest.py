@@ -164,7 +164,7 @@ def nax_prefill():
     """Route eligible prefill to NAX and record the dispatch family.
 
     Skips off M5: the NAX kernel cannot run there, and the tiled twin of this
-    path is covered by test_mixed_batch_dispatches_decode_by_context.
+    path is covered by test_mixed_batch_splits_decode_by_work.
     """
     import mlx.core as mx
 

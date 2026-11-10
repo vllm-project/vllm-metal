@@ -20,7 +20,7 @@ best efficiency; this implementation does not adopt its wave-efficiency model.
 ## Automatic eligibility and partition selection
 
 The supported `(query heads, KV heads, head dimension)` geometries are
-`(32,8,128)`, `(24,4,256)`, `(16,2,128)`, and `(16,2,256)`.
+`(32,8,128)`, `(24,8,128)`, `(24,4,256)`, `(16,2,128)`, and `(16,2,256)`.
 Kernel block16 is supported for each; block32 is additionally supported for
 `(24,4,256)` and `(16,2,256)`. The existing scope is not inferred from a model-name
 list.
@@ -73,7 +73,7 @@ For one request on a 40-core GPU this gives:
 | Q/KV/head dimension | Start P256 | Start P512 |
 |---|---:|---:|
 | 32/8/128 | 10,752 | 21,504 |
-| 24/4/256 | 14,080 | 28,160 |
+| 24/8/128 or 24/4/256 | 14,080 | 28,160 |
 | 16/2/128 or 256 | 21,248 | 42,496 |
 
 These values scale with the detected core count; they are not per-device or
@@ -134,7 +134,12 @@ Every eligible call additionally requires:
   `num_decode_tokens`, plus their CPU `gqa_length_plan` metadata. A mixed-batch
   decode prefix requires a plan describing exactly its rows.
 - A verification window of at most 1.
-- Matching FP16/BF16 query, key-cache and value-cache types.
+- Matching FP16/BF16 query, key-cache and value-cache types, or an FP16/BF16
+  query over a TurboQuant cache (int8/uint8 K, packed uint8 V). TurboQuant
+  takes the same work budget but only P256: its producer measured faster at
+  P256 than P512 below 64K tokens on M5 and M1 Max. A TurboQuant decode batch
+  reaches this path only as a whole batch; the compressed fallback rows of a
+  bounded TurboQuant prefill keep the established kernels.
 - At most **512 MiB total GQA scratch per attention call**. With multi-request
   length metadata, padded rows use compact scratch:
   `Q * sum(ceil(length_i / P)) * (2 * head_dim + 8) + 8 * (B + 1)` bytes for
@@ -148,7 +153,7 @@ Every eligible call additionally requires:
   This is checked before allocating GQA scratch or encoding the producer;
   an oversized `max_seq_len` allocation bound falls back even when the actual
   KV lengths pass the work budget. The reducer reuses the checked pipeline.
-- No TurboQuant, attention sinks, logit soft-capping or sliding window.
+- No attention sinks, logit soft-capping or sliding window.
 - A known, positive GPU core count.
 
 Other calls, including mixed batches without a decode-prefix plan, missing
@@ -201,19 +206,21 @@ partitions beyond its own KV length, and each reducer reads only that request's
 valid partials in the same order. Compact scratch saves allocation space without
 changing partition selection or removing empty producer workgroups.
 
-Mixed batches use an explicit decode sub-batch. When the native split
-separates the leading ordinary decode rows from the prefill kernel (#851 for
-tiled prefill, and NAX on M5), `sdpa_forward` passes a `GqaDecodeLengthPlan`
+Mixed batches use an explicit decode sub-batch. The native split separates the
+leading ordinary decode rows from the prefill kernel (#851 for tiled prefill,
+and NAX on M5) when the batch carries decode metadata and the decode rows hold
+at least 512 tokens of KV work. `sdpa_forward` passes a `GqaDecodeLengthPlan`
 built from only those rows' context lengths (capability
-`gqa_mixed_decode_plan`). The prefix call then treats rows and sequences
-`0..D-1` as a pure decode batch: the GQA grid, reducer and scratch use `D`
-requests and the plan's maximum length, not the batch-wide count or
-`max_seq_len`. Without that plan, or with GQA disabled, the prefix keeps the
-per-token kernel, whose split-KV partitions are likewise bounded by
-`max_decode_context_len` rather than `max_seq_len` (which also covers the
-prefill rows and may be an allocation bound). Admission counts only the
-decode rows: a long prefill chunk never admits a short decode prefix. The
-binding rejects a prefix plan whose request count differs from the decode
+`gqa_mixed_decode_plan`); the work is the plan's exact sum of those lengths.
+Without a plan, the longest decode row stands in for it as a lower bound. The
+prefix call then treats rows and sequences `0..D-1` as a pure decode batch: the
+GQA grid, reducer and scratch use `D` requests and the plan's maximum length,
+not the batch-wide count or `max_seq_len`. Without that plan, or with GQA
+disabled, the prefix keeps the per-token kernel, whose split-KV partitions are
+likewise bounded by `max_decode_context_len` rather than `max_seq_len` (which
+also covers the prefill rows and may be an allocation bound). Admission counts
+only the decode rows: a long prefill chunk never admits a short decode prefix.
+The binding rejects a prefix plan whose request count differs from the decode
 rows or whose maximum exceeds `max_decode_context_len`.
 
 ## Validation
@@ -330,19 +337,23 @@ enablement or performance claims of this two-tier routing policy:
 2. **Mixed prefill/decode:** the decode prefix split by
    [#851](https://github.com/vllm-project/vllm-metal/pull/851) (and its NAX
    counterpart) now uses GQA through a decode-prefix length plan (see the
-   mixed-batch paragraph above). Its threshold (`kMixedDecodeMinContext`) is still
-   the tiled-era 4096 tokens and has not been re-tuned for NAX or GQA.
+   mixed-batch paragraph above). The tiled-era 4096-token context threshold
+   for that split is now a 512-token decode-work floor (the sum of the decode
+   rows' context lengths): on M5, many short decode rows gain the most from
+   the split, while a single 256-token row next to a short NAX prefill was
+   slower split (`tools/benchmark/mixed_decode_split_benchmark.py`). M1 Max
+   kernel and serving measurements on the tiled route agree with the floor.
+   The native split's overhead at short prefills remains: fixing it would let
+   the floor come down.
 3. **TurboQuant decode:** `paged_attention_gqa_decode_tq` reads packed K/V
    and their scales in place, dequantizing each lane's slice in registers with
    no per-step materialization of the history. Its partials stay in the
    rotated V domain, and the TurboQuant reduce applies the single inverse FWHT,
-   as the split-KV TurboQuant path does. It is reachable only through the
-   private `_gqa_turboquant_paged_attention_for_test` entry; default routing
-   still sends TurboQuant decode to the established kernels. Admitting it
-   needs serving measurements across devices
-   (`tools/benchmark/tq_gqa_decode_benchmark.py` times the kernels). This
-   complements the prefill optimization in
-   [#853](https://github.com/vllm-project/vllm-metal/pull/853).
+   as the split-KV TurboQuant path does. Default routing admits it under the
+   P256 work budget (see the eligibility list above). On M1 Max the budget
+   leaves some short-context head256 shapes on the established kernels even
+   though the producer is faster there; a TurboQuant-specific budget could
+   admit them. `tools/benchmark/tq_gqa_decode_benchmark.py` times the kernels.
 4. **Sliding windows:** bound loads and split selection by the actual visible
    KV window. This is relevant to Gemma/Mistral-style attention, but their
    geometries and other features such as sinks or soft-capping must also

@@ -104,8 +104,13 @@ class MetalKVOffloadWorker(OffloadingWorker):
         return True
 
     def submit_load(
-        self, job_id: int, src_spec: LoadStoreSpec, dst_spec: GPULoadStoreSpec
+        self,
+        job_id: int,
+        src_spec: LoadStoreSpec,
+        dst_spec: GPULoadStoreSpec,
+        expedited: bool = False,
     ) -> bool:
+        # Transfers finish inside submission, so an expedited load never queues.
         if not isinstance(src_spec, CPULoadStoreSpec) or not isinstance(
             dst_spec, GPULoadStoreSpec
         ):

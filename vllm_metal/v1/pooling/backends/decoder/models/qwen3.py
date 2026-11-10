@@ -11,6 +11,7 @@ import mlx.core as mx
 import torch
 from vllm.pooling_params import PoolingParams
 from vllm.tasks import PoolingTask
+from vllm.tokenizers import cached_get_tokenizer
 
 from vllm_metal.tensor_bridge import mlx_to_torch
 from vllm_metal.v1.pooling.contract import CLASSIFY_TASK, DecoderPoolingSpan
@@ -67,11 +68,19 @@ class Qwen3RerankerPooler:
         model: Any,
         sequence_model: Any | None,
         model_config: Any,
-        tokenizer: Any,
+        tokenizer: Any = None,
     ) -> None:
         self.model = model
         self.config = PoolingConfigView(model_config)
         self.qwen_config = Qwen3RerankerConfigView(self.config)
+        if tokenizer is None and self.qwen_config.is_supported:
+            tokenizer = cached_get_tokenizer(
+                model_config.tokenizer,
+                runner_type=model_config.runner_type,
+                tokenizer_mode=model_config.tokenizer_mode,
+                revision=model_config.tokenizer_revision,
+                trust_remote_code=model_config.trust_remote_code,
+            )
         self.tokenizer = tokenizer
         self.sequence_model = sequence_model
         self.classifier_head = self._classifier_head()

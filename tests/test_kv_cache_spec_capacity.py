@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import mlx.core as mx
 import torch
 from vllm.utils.math_utils import cdiv
-from vllm.v1.core.kv_cache_utils import get_uniform_page_size
+from vllm.v1.core.kv_cache_planning import get_uniform_page_size
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec, MLAAttentionSpec
 
 from tests.stub_runner import (
@@ -61,21 +61,21 @@ def test_mla_spec_matches_single_latent_cache() -> None:
     policy = _policy(num_layers=layers, is_mla=True, head_dim=latent, num_kv_heads=1)
     specs = policy.get_kv_cache_spec()
 
-    assert all(isinstance(s, MLAAttentionSpec) for s in specs.values())
+    # Exact type: KV offloading refuses MLAAttentionSpec subclasses.
+    assert all(type(s) is MLAAttentionSpec for s in specs.values())
 
     # _kv_factor() == 1 for MLA
     metal_per_block = 1 * BLOCK_SIZE * DTYPE.itemsize * layers * 1 * latent
     assert _engine_blocks(specs, metal_per_block) == POOL_BLOCKS
 
 
-def test_mla_reports_layout_budget_unless_drafting() -> None:
-    """MLA binds vLLM's shared allocation; only draft-model speculation keeps
-    the count-based pool."""
+def test_mla_reports_layout_budget_with_and_without_drafting() -> None:
+    """Every generate config binds vLLM's shared allocation, draft included."""
     policy = _policy(num_layers=2, is_mla=True, head_dim=576, num_kv_heads=1)
     assert policy.scheduler_memory_reporting_mode() == "paged_attention_layout_budget"
 
     policy._runner._draft_dims = SimpleNamespace(num_layers=1)
-    assert policy.scheduler_memory_reporting_mode() == "paged_attention_capacity"
+    assert policy.scheduler_memory_reporting_mode() == "paged_attention_layout_budget"
 
 
 def test_yoco_shared_layers_get_no_spec() -> None:

@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 import torch
 from vllm.config import VllmConfig
-from vllm.v1.core.kv_cache_utils import get_kv_cache_config_from_groups
+from vllm.v1.core.kv_cache_planning import get_kv_cache_config_from_groups
 from vllm.v1.kv_cache_interface import KVCacheGroupSpec, MambaSpec
 
 from tools.benchmark.tq_prefill_case import build_case
@@ -198,6 +198,27 @@ def test_mixed_batch_routes_and_restores_rows(recorded_ops, prefill_backend):
     # long decode's 4097 tokens nor its rectangular padding is materialized.
     assert prefill[0][1].shape[0] == 24 + 41 - 16
     assert prefill[0][6][0, 0].item() == prefill[0][6][1, 0].item()
+
+
+@pytest.mark.parametrize("gqa_disabled", [False, True])
+def test_lone_decode_fallback_honours_the_gqa_kill_switch(
+    recorded_ops, monkeypatch, gqa_disabled
+):
+    """A decode row left compressed beside a prefill is a one-request decode
+    call, which native GQA would admit unless the kill switch reaches it."""
+    monkeypatch.setenv("VLLM_METAL_DISABLE_GQA_DECODE", str(int(gqa_disabled)))
+    case = build_case(
+        qlens=(1, 128), context_lens=(4097, 384), n_heads=16, n_kv_heads=2
+    )
+    case.ctx.num_decode_requests = 1
+    case.ctx.num_decode_tokens = 1
+    case.ctx.max_decode_context_len = 4097
+    assert_parity(case)
+    prefill, fallback = recorded_ops
+    assert not prefill[1].get("use_turboquant", False)
+    assert fallback[1]["use_turboquant"]
+    assert fallback[0][7].tolist() == [4097]
+    assert fallback[1].get("gqa_disabled", False) is gqa_disabled
 
 
 def test_nax_hint_describes_only_the_dequantized_prefill(recorded_ops):
@@ -920,10 +941,12 @@ def test_fused_materialization_matches_independent_decode(
         cache.key_zero_caches[0],
         cache.value_scale_caches[0],
     ]
+    # Read the same offsets through a stride-two view.
+    offsets = mx.repeat(plan.pool_offsets, 2)[::2]
     actual = sdpa.materialize_turboquant_pages(
         *arrays,
         plan.pool_pages,
-        plan.pool_offsets,
+        offsets,
         get_v_centroids(cache.v_bits),
         head_dim=head_dim,
         key_quant_type=k_quant,

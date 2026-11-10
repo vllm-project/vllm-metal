@@ -119,9 +119,10 @@ if TYPE_CHECKING:
     VLLM_METAL_GDN_LAZY_KERNELS: bool = True
     VLLM_METAL_DECODE_PIPELINE: bool = True
     VLLM_METAL_COMPILED_MLP: bool = False
-    VLLM_METAL_NATIVE_SAMPLING: bool = False
+    VLLM_METAL_NATIVE_SAMPLING: bool = True
     VLLM_METAL_MLA_KERNEL: bool = False
     VLLM_METAL_DISABLE_NAX: bool = False
+    VLLM_METAL_NAX_GQA_PREFILL: bool = True
     VLLM_METAL_DISABLE_GQA_DECODE: bool = False
     VLLM_METAL_TQ_PREFILL: str = "auto"
     VLLM_METAL_TQ_PREFILL_MAX_MIB: int | str = "auto"
@@ -159,23 +160,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Set to "0" to force the eager conv / C++ recurrent fallback path.
     "VLLM_METAL_GDN_LAZY_KERNELS": _bool("VLLM_METAL_GDN_LAZY_KERNELS", True),
     # One-step-ahead decode pipelining (default on). Eligible pure-decode
-    # greedy steps defer the sampling sync one step so the next step's graph
-    # build and submit overlap the in-flight GPU forward. Set to "0" to
-    # force the fully synchronous per-step sample path.
+    # native samples (including seeded requests) defer the sync one step so the
+    # next graph build and submit overlap the in-flight GPU forward.
+    # Set to "0" to force synchronous sampling.
     "VLLM_METAL_DECODE_PIPELINE": _bool("VLLM_METAL_DECODE_PIPELINE", True),
     # Compiled stateless-MLP dispatch (opt-in): decode-shaped MLP/MoE
     # block calls run through an mx.compile trace, fusing the per-layer
     # elementwise glue. Bitwise-identical on the quantized serving path;
     # set to "1" to enable, the default keeps the eager per-op dispatch.
     "VLLM_METAL_COMPILED_MLP": _bool("VLLM_METAL_COMPILED_MLP", False),
-    # MLX-native non-greedy sampling for the decode pipeline (opt-in): the
-    # pipeline's deferred sampler learns a temperature/top-k/top-p graph, so
-    # eligible non-greedy pure-decode steps defer like greedy ones instead
-    # of dropping to the synchronous torch path. Requests with seeds,
-    # penalties, logprobs, or token constraints keep the torch path
-    # unchanged. Set to "1" to enable; intended to flip default-on once the
-    # path has serve mileage, with this var remaining as the kill switch.
-    "VLLM_METAL_NATIVE_SAMPLING": _bool("VLLM_METAL_NATIVE_SAMPLING", False),
+    # MLX-native random sampling (default on); greedy behavior is unchanged.
+    # Seeded requests use per-request MLX keys in sync and deferred sampling.
+    # Penalties, sample logprobs,
+    # allowed-token IDs, bad words, structured outputs, or any speculative
+    # decoding config keep random sampling on torch. Set to "0" as the kill
+    # switch to sample every non-greedy step with the torch sampler.
+    "VLLM_METAL_NATIVE_SAMPLING": _bool("VLLM_METAL_NATIVE_SAMPLING", True),
     # Experimental MLA Metal decode kernel (RFC #360). Off by default —
     # the MLA wrapper uses the MLX SDPA per-request slow path unless
     # this opt-in is set. Set to "1" to route absorbed-MLA decode
@@ -186,6 +186,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_METAL_MLA_KERNEL": _bool("VLLM_METAL_MLA_KERNEL", False),
     # Emergency override for automatic M5 NAX prefill attention.
     "VLLM_METAL_DISABLE_NAX": _bool("VLLM_METAL_DISABLE_NAX", False),
+    # Automatic grouped NAX prefill admission; set to "0" for upstream only.
+    # The native module reads this once at load, so restart workers to change it.
+    "VLLM_METAL_NAX_GQA_PREFILL": _bool("VLLM_METAL_NAX_GQA_PREFILL", True),
     # Emergency override for the GQA-shared flash-decode dispatch gate
     # (issue #713): force long-context decode back to the established
     # per-token / split-KV kernels. Mainly a benchmarking/A-B escape

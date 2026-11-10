@@ -21,6 +21,7 @@ class _Paths:
     src: Path
     paged_attention: Path
     gdn: Path
+    sampling: Path
     mla: Path
     internal: Path
     patch: Path
@@ -40,6 +41,7 @@ def patched(tmp_path, monkeypatch) -> _Paths:
     src = tmp_path / "mlx_bindings.cpp"
     paged_attention = tmp_path / "paged_attention.cpp"
     gdn = tmp_path / "gdn.cpp"
+    sampling = tmp_path / "sampling.cpp"
     mla = tmp_path / "mla.cpp"
     internal = tmp_path / "ops_internal.h"
     patch = tmp_path / "mlx_patch.cpp"
@@ -65,6 +67,7 @@ def patched(tmp_path, monkeypatch) -> _Paths:
     for attr, path in (
         ("_PAGED_ATTENTION", paged_attention),
         ("_GDN", gdn),
+        ("_SAMPLING", sampling),
         ("_MLA", mla),
         ("_INTERNAL", internal),
     ):
@@ -87,6 +90,7 @@ def patched(tmp_path, monkeypatch) -> _Paths:
         src,
         paged_attention,
         gdn,
+        sampling,
         mla,
         internal,
         patch,
@@ -158,6 +162,7 @@ def test_old_content_with_newer_so_mtime_still_rebuilds(patched):
         "device",
         "paged_attention",
         "gdn",
+        "sampling",
         "mla",
         "internal",
         "device_src",
@@ -170,7 +175,8 @@ def test_hash_changes_with_source_bytes(patched, source_name):
 
 
 @pytest.mark.parametrize(
-    "source_name", ["mps_src", "kernels", "device", "device_src", "bld", "consts"]
+    "source_name",
+    ["mps_src", "kernels", "device", "device_src", "bld", "consts"],
 )
 def test_mps_hash_changes_with_source_bytes(
     patched, tmp_path, monkeypatch, source_name

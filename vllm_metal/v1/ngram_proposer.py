@@ -172,6 +172,7 @@ class NgramProposer(NoOwnKVProposer):
                 ctx.decode_reqs,
                 ctx.decode_token_ids,
                 ctx.prefill_reqs,
+                ctx.prefill_token_ids,
                 ctx.prefill_result_modes,
                 ctx.request_states,
             )

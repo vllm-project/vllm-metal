@@ -3,6 +3,7 @@
 
 import logging
 import mmap
+import os
 import re
 import subprocess
 import time
@@ -149,6 +150,28 @@ def get_model_download_path(
 
     # Fallback: Let mlx_lm or mlx_vlm handle the download natively from HuggingFace
     return model_repo_name
+
+
+def resolve_mlx_lm_model_path(
+    model_name: str | Path, *, revision: str | None = None
+) -> Path:
+    """Resolve a local checkpoint using mlx-lm's file filters and Hub selection."""
+    model_path = Path(model_name)
+    if model_path.exists():
+        return model_path
+
+    from mlx_lm.utils import DEFAULT_ALLOW_PATTERNS
+
+    if os.getenv("MLXLM_USE_MODELSCOPE", "False").lower() == "true":
+        from modelscope import snapshot_download
+    else:
+        from huggingface_hub import snapshot_download
+
+    return Path(
+        snapshot_download(
+            str(model_name), revision=revision, allow_patterns=DEFAULT_ALLOW_PATTERNS
+        )
+    )
 
 
 def set_wired_limit() -> None:

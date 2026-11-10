@@ -12,8 +12,6 @@ from types import ModuleType, SimpleNamespace
 
 import numpy as np
 import pytest
-from transformers import AutoConfig
-from transformers.models.auto import configuration_auto
 
 import vllm_metal.compat as compat
 
@@ -88,33 +86,6 @@ def _write_mismatched_bytelevel_tokenizer_repo(path) -> None:
         json.dumps(special_tokens_map),
         encoding="utf-8",
     )
-
-
-def _write_gemma4_assistant_config(path) -> None:
-    config = {
-        "architectures": ["Gemma4AssistantForCausalLM"],
-        "backbone_hidden_size": 1536,
-        "model_type": "gemma4_assistant",
-        "text_config": {
-            "hidden_size": 256,
-            "hidden_size_per_layer_input": 0,
-            "layer_types": [
-                "sliding_attention",
-                "sliding_attention",
-                "sliding_attention",
-                "full_attention",
-            ],
-            "model_type": "gemma4_text",
-            "num_attention_heads": 4,
-            "num_hidden_layers": 4,
-            "num_key_value_heads": 1,
-            "num_kv_shared_layers": 4,
-            "vocab_size_per_layer_input": 0,
-        },
-        "tie_word_embeddings": True,
-        "use_ordered_embeddings": True,
-    }
-    (path / "config.json").write_text(json.dumps(config), encoding="utf-8")
 
 
 class _ByteLevelBackend:
@@ -261,33 +232,7 @@ class TestByteLevelTokenizerCompatPatch:
         assert captured_kwargs["_commit_hash"] == "abc123"
 
 
-class TestGemma4MTPConfigCompatPatch:
-    def test_missing_registration_uses_compat_assistant_config(
-        self, monkeypatch, tmp_path
-    ) -> None:
-        config_mapping = configuration_auto.CONFIG_MAPPING
-        monkeypatch.setattr(config_mapping, "_mapping", dict(config_mapping._mapping))
-        monkeypatch.setattr(
-            config_mapping, "_extra_content", dict(config_mapping._extra_content)
-        )
-        config_mapping._mapping.pop("gemma4_assistant", None)
-        config_mapping._extra_content.pop("gemma4_assistant", None)
-
-        with pytest.raises(ValueError, match="gemma4_assistant"):
-            AutoConfig.for_model("gemma4_assistant")
-
-        _write_gemma4_assistant_config(tmp_path)
-        compat._patch_vllm_gemma4_mtp_config_loading()
-
-        config = AutoConfig.from_pretrained(tmp_path)
-
-        assert config.model_type == "gemma4_assistant"
-        assert config.architectures == ["Gemma4AssistantForCausalLM"]
-        assert config.backbone_hidden_size == 1536
-        assert config.text_config.model_type == "gemma4_text"
-        assert config.text_config.num_hidden_layers == 4
-        assert config.get_text_config() is config.text_config
-
+class TestApplyCompatPatches:
     def test_registration_time_failures_do_not_stop_other_patches(
         self,
         monkeypatch,
@@ -295,20 +240,6 @@ class TestGemma4MTPConfigCompatPatch:
         calls: list[str] = []
 
         monkeypatch.setattr(compat, "_APPLIED", False)
-        monkeypatch.setattr(
-            compat,
-            "_transformers_knows_gemma4_assistant",
-            lambda _auto_config: False,
-        )
-
-        def _raise_missing_gemma4_config():
-            raise ModuleNotFoundError("No module named 'transformers.models.gemma4'")
-
-        monkeypatch.setattr(
-            compat,
-            "_gemma4_assistant_config_class",
-            _raise_missing_gemma4_config,
-        )
 
         def _raise_bytelevel_import_error() -> None:
             calls.append("bytelevel")
@@ -343,6 +274,72 @@ class TestGemma4MTPConfigCompatPatch:
             "qwen3_flat_prefix",
             "minicpm4_model_type",
         ]
+
+
+_METADATA_ARCHS = frozenset(
+    {
+        "Lfm3ForCausalLM",
+        "Lfm3VlForConditionalGeneration",
+        "Lfm3AudioForConditionalGeneration",
+    }
+)
+
+
+class TestModelMetadataCompat:
+    @pytest.fixture(autouse=True)
+    def metal_mlx(self, monkeypatch):
+        import vllm.platforms as platforms
+
+        from vllm_metal.platform import MetalPlatform
+
+        monkeypatch.delenv("VLLM_METAL_BACKEND", raising=False)
+        monkeypatch.setattr(platforms, "current_platform", MetalPlatform())
+
+    @pytest.fixture
+    def without_metadata(self, monkeypatch):
+        """Hide the fallback architecture registrations."""
+        from vllm.model_executor.models import ModelRegistry
+
+        monkeypatch.setattr(ModelRegistry, "models", dict(ModelRegistry.models))
+        for arch in _METADATA_ARCHS:
+            ModelRegistry.models.pop(arch, None)
+        return ModelRegistry
+
+    def test_missing_model_metadata_loads(self, without_metadata) -> None:
+        compat.register_model_compat()
+        compat.register_model_compat()
+
+        assert _METADATA_ARCHS <= set(without_metadata.get_supported_archs())
+
+    @pytest.mark.parametrize("architecture", sorted(_METADATA_ARCHS))
+    def test_existing_registrations_are_kept(
+        self, without_metadata, architecture
+    ) -> None:
+        without_metadata.register_model(
+            architecture, "vllm.model_executor.models.llama:LlamaForCausalLM"
+        )
+
+        compat.register_model_compat()
+
+        assert without_metadata.models[architecture].class_name == "LlamaForCausalLM"
+
+    @pytest.mark.parametrize(
+        ("is_metal", "backend"),
+        [(False, "mlx"), (True, "mps")],
+    )
+    def test_other_platforms_and_backends_keep_models_unregistered(
+        self, without_metadata, monkeypatch, is_metal, backend
+    ) -> None:
+        import vllm.platforms as platforms
+        from vllm.platforms.cpu import CpuPlatform
+
+        monkeypatch.setenv("VLLM_METAL_BACKEND", backend)
+        if not is_metal:
+            monkeypatch.setattr(platforms, "current_platform", CpuPlatform())
+
+        compat.register_model_compat()
+
+        assert _METADATA_ARCHS.isdisjoint(without_metadata.get_supported_archs())
 
 
 def _install_fake_qwen35_modules(monkeypatch, *, include_moe: bool):

@@ -20,9 +20,7 @@ from pathlib import Path
 
 import pytest
 
-TOOL = (
-    Path(__file__).resolve().parent.parent / "tools" / "intermediate_prefill_parity.py"
-)
+TOOL = Path(__file__).resolve().parents[2] / "tools" / "intermediate_prefill_parity.py"
 
 
 @pytest.mark.slow

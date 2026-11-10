@@ -5,7 +5,7 @@ import torch
 from vllm.config import set_current_vllm_config
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
-from vllm_metal.pytorch_backend.runtime import install
+from vllm_metal.pytorch_backend.bindings import install
 
 
 class MPSKVBlockZeroer:

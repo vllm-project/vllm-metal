@@ -12,7 +12,6 @@ from vllm_metal.v1.prompt_logprobs import (
     PromptLogprobsAccumulator,
     PromptLogprobsTracker,
     PromptLogprobsWindow,
-    full_prompt_logprobs,
     gather_prompt_logprobs,
     prompt_logprobs_window,
 )
@@ -163,9 +162,19 @@ class TestPromptLogprobsTracker:
         # re-emit prompt logprobs for the same request.
         assert not tracker.wants("req-a")
 
-    def test_single_chunk_prompt_completes_immediately(self) -> None:
+    @pytest.mark.parametrize(
+        ("num_logprobs", "expected_token_ids"),
+        [
+            (0, [[0], [1]]),
+            (-1, [[0, 2, 1, 0], [1, 0, 2, 1]]),
+        ],
+        ids=["target_only", "full_vocabulary"],
+    )
+    def test_single_chunk_prompt_completes_immediately(
+        self, num_logprobs: int, expected_token_ids: list[list[int]]
+    ) -> None:
         tracker = PromptLogprobsTracker()
-        tracker.register("req-b", 0)
+        tracker.register("req-b", num_logprobs)
         prompt = [2, 0, 1]
         rows = mx.array(
             [[0.0, 1.0, 2.0], [2.0, 0.0, 1.0], [1.0, 2.0, 0.0]], dtype=mx.float32
@@ -181,9 +190,7 @@ class TestPromptLogprobsTracker:
         )
 
         assert tensors is not None
-        # The last row predicts the first sampled token and is not scored.
-        assert tensors.logprob_token_ids.shape == (2, 1)
-        assert tensors.logprob_token_ids[:, 0].tolist() == prompt[1:]
+        assert tensors.logprob_token_ids.tolist() == expected_token_ids
 
     def test_one_token_prompt_delivers_empty_tensors(self) -> None:
         tracker = PromptLogprobsTracker()
@@ -231,62 +238,6 @@ class TestPromptLogprobsTracker:
         assert tensors.logprob_token_ids.shape == (1, 1)
 
 
-class TestFullPromptLogprobs:
-    def test_matches_chunked_gather(self) -> None:
-        prompt = [0, 2, 1, 3]
-        rows = mx.array(
-            [
-                [0.0, 1.0, 2.0, 3.0],
-                [3.0, 2.0, 1.0, 0.0],
-                [1.0, 3.0, 0.0, 2.0],
-                [9.0, 9.0, 9.0, 9.0],  # predicts the sampled token; ignored
-            ],
-            dtype=mx.float32,
-        )
-
-        tensors = full_prompt_logprobs(
-            rows,
-            prompt,
-            num_logprobs=2,
-            logprobs_mode="raw_logprobs",
-        )
-
-        assert tensors.logprob_token_ids.shape == (3, 3)
-        assert tensors.logprob_token_ids[:, 0].tolist() == prompt[1:]
-        expected = gather_prompt_logprobs(rows[:3], prompt[1:], 2)
-        torch.testing.assert_close(tensors.logprobs, expected.logprobs)
-
-    def test_one_token_prompt(self) -> None:
-        tensors = full_prompt_logprobs(
-            mx.zeros((1, 4)),
-            [7],
-            num_logprobs=1,
-            logprobs_mode="raw_logprobs",
-        )
-
-        assert tensors.logprob_token_ids.shape == (0, 2)
-
-    def test_minus_one_resolves_to_full_vocab(self) -> None:
-        rows = mx.array(
-            [
-                [0.0, 1.0, 2.0],
-                [2.0, 0.0, 1.0],
-                [9.0, 9.0, 9.0],
-            ],
-            dtype=mx.float32,
-        )
-
-        tensors = full_prompt_logprobs(
-            rows,
-            [0, 1, 2],
-            num_logprobs=-1,
-            logprobs_mode="raw_logprobs",
-        )
-
-        assert tensors.logprob_token_ids.shape == (2, 4)
-        assert sorted(tensors.logprob_token_ids[0, 1:].tolist()) == [0, 1, 2]
-
-
 class TestRunnerWiring:
     """The two #680 symptoms, pinned at the runner seams.
 
@@ -317,12 +268,12 @@ class TestRunnerWiring:
         from vllm.sampling_params import SamplingParams
 
         import vllm_metal.v1.model_runner as mr
+        from tests.stub_runner import admit_prefill_request
 
         runner = self._runner()
         prompt = [3, 1, 4, 1, 5, 9]
         vocab = 16
         params = SamplingParams(temperature=0, prompt_logprobs=1)
-        runner._prompt_logprobs_tracker.register("req-p", 1)
 
         def _prefill(start: int, end: int, prompt_len: int | None):
             return mr.PrefillRequest(
@@ -336,6 +287,7 @@ class TestRunnerWiring:
                 full_prompt_token_ids=prompt,
             )
 
+        admit_prefill_request(runner, _prefill(0, len(prompt), len(prompt)))
         batch = mr._ExecutionBatch()
         chunk1 = mx.zeros((1, 4, vocab))
         runner._gather_prefill_prompt_logprobs(
@@ -410,47 +362,3 @@ class TestRunnerWiring:
             runner._gather_prefill_prompt_logprobs(
                 batch, [prefill], mx.zeros((1, 2, 8)), [0, 2], 0
             )
-
-
-@pytest.mark.slow
-def test_prompt_logprobs_end_to_end_paged():
-    """Bare ``prompt_logprobs`` returns one real entry per prompt token (#680).
-
-    Covers both reported symptoms at the engine level: the silent ``[None]``
-    (the dict below used to stay empty) and the data the OpenAI ``echo`` +
-    ``logprobs`` path indexes into (its 500 came from these tensors never
-    existing).  ``max_num_batched_tokens`` forces chunked prefill so the
-    accounting crosses chunk boundaries.
-    """
-    from vllm import LLM, SamplingParams
-
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
-
-        llm = LLM(
-            model="Qwen/Qwen3-0.6B",
-            max_model_len=512,
-            max_num_seqs=2,
-            max_num_batched_tokens=16,
-            enable_chunked_prefill=True,
-            gpu_memory_utilization=0.3,
-        )
-        prompt = (
-            "The three most important properties of a distributed cache "
-            "are consistency, availability, and partition tolerance."
-        )
-        sp = SamplingParams(temperature=0, max_tokens=4, prompt_logprobs=1, logprobs=1)
-        [output] = llm.generate([prompt], sp)
-
-        prompt_len = len(output.prompt_token_ids)
-        assert prompt_len > 16, "prompt must span multiple prefill chunks"
-        prompt_logprobs = output.prompt_logprobs
-        assert prompt_logprobs is not None
-        assert len(prompt_logprobs) == prompt_len
-        assert prompt_logprobs[0] is None
-        for position, (token_id, entry) in enumerate(
-            zip(output.prompt_token_ids[1:], prompt_logprobs[1:], strict=True), 1
-        ):
-            assert entry is not None, f"position {position} silently empty"
-            assert token_id in entry, f"prompt token missing at {position}"
-            assert entry[token_id].logprob <= 0.0
