@@ -839,6 +839,7 @@ class TestNormalizeModelConfig:
 
         assert model_config.multimodal_config is None
 
+    @pytest.mark.parametrize("enable_mm_embeds", [False, True])
     @pytest.mark.parametrize(
         ("multimodal_mode", "model_type", "architecture"),
         [
@@ -855,10 +856,13 @@ class TestNormalizeModelConfig:
         multimodal_mode: str,
         model_type: str,
         architecture: str,
+        enable_mm_embeds: bool,
     ) -> None:
         monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", multimodal_mode)
         reset_config()
-        multimodal_config = MultiModalConfig(limit_per_prompt={"image": 4})
+        multimodal_config = MultiModalConfig(
+            limit_per_prompt={"image": 4}, enable_mm_embeds=enable_mm_embeds
+        )
         model_config = SimpleNamespace(
             quantization=None,
             multimodal_config=multimodal_config,
@@ -874,6 +878,7 @@ class TestNormalizeModelConfig:
             multimodal_config.get_limit_per_prompt(modality)
             for modality in ("image", "video", "audio", "vision_chunk")
         ] == [0, 0, 0, 0]
+        assert multimodal_config.enable_mm_embeds is False
 
     @pytest.mark.parametrize(
         ("model_type", "architecture"),

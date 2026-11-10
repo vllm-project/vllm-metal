@@ -623,10 +623,10 @@ class DefaultModelAdapter(ModelAdapter):
         kept but audio is turned off unless the checkpoint has an audio
         encoder, and video is turned off on prefix-LM checkpoints, so the
         frontend rejects inputs the sidecar cannot serve. ``native`` keeps the
-        config but turns every modality off when no native adapter serves
-        the checkpoint, so the frontend rejects media the runner cannot
-        encode. :meth:`multimodal_backbone_mode` is the single source of
-        truth for which mode applies.
+        config but turns off every modality and ``--enable-mm-embeds`` when no
+        native adapter serves the checkpoint, so the frontend rejects inputs
+        the runner cannot serve. :meth:`multimodal_backbone_mode` is the
+        single source of truth for which mode applies.
         """
         if model_config.multimodal_config is None:
             return
@@ -673,6 +673,13 @@ class DefaultModelAdapter(ModelAdapter):
                 keep_audio=False,
                 keep_video=False,
             )
+            # vLLM lets embeddings past a 0 limit when --enable-mm-embeds is set.
+            if model_config.multimodal_config.enable_mm_embeds:
+                logger.warning(
+                    "Metal: multimodal embedding inputs are unsupported for this "
+                    "model; overriding --enable-mm-embeds with False"
+                )
+                model_config.multimodal_config.enable_mm_embeds = False
             logger.warning(
                 "Metal: no native multimodal adapter for model_type=%s "
                 "(architectures=%s, multimodal_mode=%s); image, video and "
