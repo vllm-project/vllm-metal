@@ -14,6 +14,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 from transformers import WhisperFeatureExtractor
+from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_metal.stt.audio import load_audio
@@ -472,6 +473,38 @@ class TestQwen3ASRModel:
 
 
 class TestGreedyDecodeStopping:
+    @pytest.mark.parametrize(
+        "prompt,generated,expected",
+        [
+            ([1, 8], [7, 9, 2], [7]),
+            ([1], [4, 8, 7, 9, 2], [4, 8, 7]),
+            ([8, 1], [4, 8, 7, 9, 2], [4, 8, 7]),
+        ],
+        ids=["forced-language", "detected-language", "tag-in-earlier-context"],
+    )
+    def test_budget_counts_transcript_after_prompt_or_generated_tag(
+        self, prompt, generated, expected
+    ) -> None:
+        model = MagicMock()
+        model.config.eos_token_id = 2
+        logits = [mx.eye(10)[None, token : token + 1] for token in generated]
+        model.prefill.return_value = (logits[0], None)
+        model.decode_step.side_effect = [(row, None) for row in logits[1:]]
+        transcriber = Qwen3ASRTranscriber(
+            model,
+            tokenizer=SimpleNamespace(
+                eos_token_id=3, encode=lambda *_args, **_kwargs: [8]
+            ),
+        )
+        sampling = STTSampling.from_request(
+            SamplingParams(temperature=0.0, max_tokens=1), Sampler()
+        )
+
+        tokens = transcriber.decode_tokens(mx.zeros((1, 4)), prompt, sampling)
+
+        assert tokens == expected
+        assert model.decode_step.call_count == len(expected) - 1
+
     @pytest.mark.parametrize("stop_token", [2, 3], ids=["model-eos", "tokenizer-eos"])
     @pytest.mark.parametrize("prefix", [[], [7]], ids=["prefill", "decode"])
     def test_stops_before_forwarding_eos(self, stop_token, prefix) -> None:

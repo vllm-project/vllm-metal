@@ -71,7 +71,10 @@ class Qwen3ASRTranscriber:
         mx.eval(logits)
 
         output_tokens: list[int] = []
-        transcript_len: int | None = None
+        # Forced-language prompts already open the transcript before generation.
+        transcript_len: int | None = (
+            0 if prompt_token_ids[-1] == asr_text_token else None
+        )
         for step in range(max_tokens):
             if step:
                 token_input = mx.array([[output_tokens[-1]]], dtype=mx.int32)
