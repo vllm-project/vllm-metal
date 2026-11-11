@@ -531,19 +531,21 @@ class ModelCachePolicy:
                 use_grouped_attention=use_grouped_attention,
             )
 
+        first = self._runner.first_layer_idx
         if self._runner.is_hybrid:
             hybrid_plan = self._hybrid_plan()
             state_spec = self._state_layer_spec(hybrid_plan)
             for layer_idx in range(num_spec_layers):
+                name = f"layers.{first + layer_idx}"
                 if hybrid_plan.layers.is_state_layer(layer_idx):
-                    specs[f"layers.{layer_idx}.{hybrid_plan.family.layer_name}"] = (
-                        state_spec
-                    )
+                    specs[f"{name}.{hybrid_plan.family.layer_name}"] = state_spec
                 elif hybrid_plan.layers.is_attention_layer(layer_idx):
-                    specs[f"layers.{layer_idx}.self_attn"] = attention_spec(layer_idx)
+                    specs[f"{name}.self_attn"] = attention_spec(layer_idx)
         else:
             for layer_idx in range(num_spec_layers):
-                specs[f"layers.{layer_idx}.self_attn"] = attention_spec(layer_idx)
+                specs[f"layers.{first + layer_idx}.self_attn"] = attention_spec(
+                    layer_idx
+                )
 
         specs.update(
             self._draft_layer_specs(block_size=block_size, torch_dtype=torch_dtype)
@@ -759,7 +761,10 @@ class ModelCachePolicy:
 
     def _attention_layer_names(self) -> tuple[str, ...]:
         num_layers, _ = self._cache_layer_mapping()
-        return tuple(f"layers.{layer_idx}.self_attn" for layer_idx in range(num_layers))
+        first = self._runner.first_layer_idx
+        return tuple(
+            f"layers.{first + layer_idx}.self_attn" for layer_idx in range(num_layers)
+        )
 
     def get_cache_block_size_bytes(self) -> int:
         """Return target and ordinary draft attention bytes per logical block."""
@@ -804,6 +809,7 @@ class ModelCachePolicy:
         self._reject_turboquant_for_mla()
         return HybridPagedAttentionRuntime(
             hybrid_plan=self._hybrid_plan(),
+            first_layer_idx=self._runner.first_layer_idx,
             dtype=self._require_kv_cache_dtype(),
             mamba_cache_mode=self._runner.cache_config.mamba_cache_mode,
         )
