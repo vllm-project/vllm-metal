@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the Metal n-gram speculative-decode proposer.
 
-The proposer wraps vLLM's pure-Python/Numba n-gram kernel, so these tests need no
-model or engine: a ``SimpleNamespace`` ``vllm_config`` exercises the upstream
-constructor (which reads only scalar config) and a hand-built ``ProposeContext``
-drives ``propose``. They lock in the request filtering (greedy-only, skip
-intermediate prefills) and the array marshalling into the upstream kernel.
+The proposer wraps a Numba n-gram matcher, so these tests need no model or
+engine: a ``SimpleNamespace`` ``vllm_config`` supplies the scalar config both
+read and a hand-built ``ProposeContext`` drives ``propose``. They lock in the
+request filtering (greedy-only, skip intermediate prefills), the array
+marshalling into the matcher and the matcher's lookup.
 """
 
 from __future__ import annotations
@@ -18,9 +18,9 @@ import numpy as np
 import pytest
 from vllm.sampling_params import SamplingParams
 from vllm.v1.outputs import DraftTokenIds
-from vllm.v1.spec_decode.ngram_proposer import NgramProposer as VllmNgramProposer
 
 from vllm_metal.v1 import ngram_proposer as ngram_mod
+from vllm_metal.v1.ngram_matcher import NgramMatcher
 from vllm_metal.v1.ngram_proposer import NgramProposer
 from vllm_metal.v1.proposer import ProposeContext
 from vllm_metal.v1.spec_decode import PagedDecodeSegment, SpeculativeDecodeController
@@ -126,6 +126,40 @@ def _verified_segment(req_id: str, *, has_draft: bool = True) -> PagedDecodeSegm
         cache_start_pos=0,
         block_ids=(0,),
     )
+
+
+class TestNgramMatcher:
+    @pytest.mark.parametrize(
+        ("history", "k", "max_model_len", "expected"),
+        [
+            pytest.param(
+                [1, 2, 3, 9, 5, 2, 3, 7, 1, 2, 3], 3, 64, [9, 5, 2], id="longest-match"
+            ),
+            pytest.param(
+                [1, 2, 7, 1, 2, 8, 1, 2], 3, 64, [7, 1, 2], id="earliest-equal-match"
+            ),
+            pytest.param([1, 2, 3, 1, 2], 5, 64, [3, 1, 2], id="history-end"),
+            pytest.param([1, 2, 3, 1, 2], 3, 6, [3], id="max-model-len"),
+            pytest.param([1, 2, 3, 2], 3, 64, [], id="match-below-min-n"),
+            pytest.param([1], 3, 64, [], id="history-below-min-n"),
+        ],
+    )
+    def test_drafts_tokens_after_longest_suffix_match(
+        self, history, k, max_model_len, expected
+    ) -> None:
+        matcher = _proposer(max_model_len=max_model_len)._ngram
+        token_ids = np.array([history], dtype=np.int32)
+        lengths = np.array([len(history)], dtype=np.int32)
+
+        assert matcher.propose(k, lengths, token_ids) == [expected]
+
+    def test_reads_each_row_up_to_its_own_length(self) -> None:
+        """The proposer reuses one buffer, so tokens past a row's length are stale."""
+        matcher = _proposer()._ngram
+        token_ids = np.array([[1, 2, 3, 1, 2, 0], [5, 6, 7, 8, 5, 6]], dtype=np.int32)
+        lengths = np.array([5, 4], dtype=np.int32)
+
+        assert matcher.propose(3, lengths, token_ids) == [[3, 1, 2], []]
 
 
 class TestNgramProposerProtocol:
@@ -697,12 +731,12 @@ class TestNgramMissThrottle:
 
 
 def _full_copy_drafts(
-    kernel: VllmNgramProposer,
+    kernel: NgramMatcher,
     k: int,
     histories: dict[str, list[int]],
     max_model_len: int,
 ) -> dict[str, list[int]]:
-    """Copy full histories into a fresh batch and call the upstream proposer."""
+    """Copy full histories into a fresh batch and call a separate matcher."""
     req_ids = list(histories)
     token_ids_cpu = np.zeros((len(req_ids), max_model_len), dtype=np.int32)
     for i, req_id in enumerate(req_ids):
@@ -710,7 +744,7 @@ def _full_copy_drafts(
     num_tokens_no_spec = np.array(
         [len(histories[req_id]) for req_id in req_ids], dtype=np.int32
     )
-    drafts = kernel.propose(k, [[0]] * len(req_ids), num_tokens_no_spec, token_ids_cpu)
+    drafts = kernel.propose(k, num_tokens_no_spec, token_ids_cpu)
     return {req_id: d for req_id, d in zip(req_ids, drafts, strict=True) if d}
 
 
@@ -738,9 +772,7 @@ class TestNgramIncrementalHistory:
             max_model_len=max_model_len,
             max_num_seqs=max_num_seqs,
         )
-        reference = VllmNgramProposer(
-            _vllm_config(2, 3, k, max_model_len, max_num_seqs)
-        )
+        reference = NgramMatcher(_vllm_config(2, 3, k, max_model_len, max_num_seqs))
         states: dict[str, SimpleNamespace] = {}
         for i in range(max_num_seqs):
             pattern = rng.choices(range(6), k=6)
@@ -785,10 +817,10 @@ class TestNgramIncrementalHistory:
         assert np.all(proposer._token_ids_cpu[row, 10:] == 888)
 
     @pytest.mark.parametrize(
-        "indices,expected,expected_sampled,expected_lengths",
+        "indices,expected,expected_lengths",
         [
-            ([3], {"r3": [2, 3, 1]}, [[0]], [8]),
-            ([3, 1], {"r3": [2, 3, 1], "r1": [2, 1, 1]}, [[0], [], [0]], [8, 0, 8]),
+            ([3], {"r3": [2, 3, 1]}, [8]),
+            ([3, 1], {"r3": [2, 3, 1], "r1": [2, 1, 1]}, [8, 0, 8]),
         ],
         ids=["single-row", "reordered-sparse-rows"],
     )
@@ -796,7 +828,6 @@ class TestNgramIncrementalHistory:
         self,
         indices: list[int],
         expected: dict[str, list[int]],
-        expected_sampled: list[list[int]],
         expected_lengths: list[int],
     ) -> None:
         proposer = _proposer()
@@ -811,8 +842,7 @@ class TestNgramIncrementalHistory:
 
         assert actual == expected
         assert list(actual) == list(expected)
-        _, sampled, lengths, tokens = propose.call_args.args
-        assert sampled == expected_sampled
+        _, lengths, tokens = propose.call_args.args
         assert lengths.tolist() == expected_lengths
         assert tokens.shape == (len(expected_lengths), 512)
         assert np.shares_memory(tokens, proposer._token_ids_cpu)

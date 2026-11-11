@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""N-gram drafting through vLLM's CPU matcher, with no model or KV cache.
+"""N-gram drafting through a CPU matcher, with no model or KV cache.
 
 Each resident request keeps a history row. Steps append committed tokens;
 release or list replacement causes a rebuild. The runner releases rows on
@@ -17,8 +17,8 @@ from typing import TYPE_CHECKING
 import numpy as np
 from vllm.logger import init_logger
 from vllm.v1.outputs import DraftTokenIds
-from vllm.v1.spec_decode.ngram_proposer import NgramProposer as VllmNgramProposer
 
+from vllm_metal.v1.ngram_matcher import NgramMatcher
 from vllm_metal.v1.proposer import NoOwnKVProposer
 
 if TYPE_CHECKING:
@@ -48,7 +48,7 @@ _COOLDOWN_STEPS = 8
 
 
 class NgramProposer(NoOwnKVProposer):
-    """:class:`vllm_metal.v1.proposer.MetalProposer` backed by vLLM's n-gram kernel."""
+    """:class:`vllm_metal.v1.proposer.MetalProposer` backed by :class:`NgramMatcher`."""
 
     def __init__(
         self,
@@ -71,10 +71,9 @@ class NgramProposer(NoOwnKVProposer):
         # history in _resolve_pending, before this step's proposal is
         # scored as a hit or a miss.
         self._pending: dict[str, tuple[int, tuple[int, ...]]] = {}
-        # Upstream reads only scalar config (prompt_lookup_min/max,
-        # num_speculative_tokens, max_model_len, max_num_seqs) and runs a one-time
-        # Numba JIT warmup in its constructor — keep that off the hot path.
-        self._ngram = VllmNgramProposer(vllm_config)
+        # The matcher compiles its Numba kernel in the constructor, off the
+        # hot path.
+        self._ngram = NgramMatcher(vllm_config)
         spec = vllm_config.speculative_config
         assert spec is not None
         # Below this many committed tokens, the kernel structurally cannot
@@ -85,7 +84,7 @@ class NgramProposer(NoOwnKVProposer):
         assert spec.prompt_lookup_min is not None
         self._prompt_lookup_min = spec.prompt_lookup_min
 
-        # Upstream reads only each row's committed prefix, so tails need no reset.
+        # The matcher reads only each row's committed prefix, so tails need no reset.
         max_num_seqs = vllm_config.scheduler_config.max_num_seqs
         max_model_len = vllm_config.model_config.max_model_len
         self._max_model_len = max_model_len
@@ -176,19 +175,15 @@ class NgramProposer(NoOwnKVProposer):
             self._sync_row(req_id, state.token_ids, in_use)
             for req_id, state in drafting
         ]
-        # Pass a view, not a copy. Empty sampled IDs make upstream skip row gaps.
+        # Pass a view, not a copy. Gap rows have length 0 and draft nothing.
         first_row, last_row = min(rows), max(rows) + 1
         relative_rows = [row - first_row for row in rows]
         num_rows = last_row - first_row
         num_tokens_no_spec = np.zeros(num_rows, dtype=np.int32)
         num_tokens_no_spec[relative_rows] = self._row_len[rows]
-        sampled_token_ids: list[list[int]] = [[]] * num_rows
-        for row in relative_rows:
-            sampled_token_ids[row] = [0]
 
         row_drafts = self._ngram.propose(
             ctx.num_speculative_tokens,
-            sampled_token_ids,
             num_tokens_no_spec,
             self._token_ids_cpu[first_row:last_row],
         )
@@ -220,8 +215,7 @@ class NgramProposer(NoOwnKVProposer):
             # accepted.
             self._pending[req_id] = (len(state.token_ids), tuple(draft))
             req_ids.append(req_id)
-            # Upstream already yields Python ints via ndarray.tolist() — the
-            # old ``[int(t) for t in draft]`` was redundant.
+            # The matcher already yields Python ints via ndarray.tolist().
             draft_token_ids.append(list(draft))
 
         if not req_ids:
@@ -237,7 +231,7 @@ class NgramProposer(NoOwnKVProposer):
         if row is None:
             row = self._acquire_row(req_id, in_use)
         synced = int(self._row_len[row]) if self._row_source[row] is token_ids else 0
-        # Upstream skips histories at the model limit, including verify overshoot.
+        # The matcher skips histories at the model limit, including verify overshoot.
         num_tokens = min(len(token_ids), self._max_model_len)
         if num_tokens > synced:
             self._token_ids_cpu[row, synced:num_tokens] = token_ids[synced:num_tokens]
