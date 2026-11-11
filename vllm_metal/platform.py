@@ -1180,10 +1180,12 @@ class MetalPlatform(Platform):
         if speculative_config is not None and speculative_config.method not in (
             "ngram",
             "draft_model",
+            "dflash",
+            "dspark",
         ):
             raise NotImplementedError(
-                "Sleep mode on Metal supports only n-gram and draft-model "
-                f"speculative decoding, got method={speculative_config.method!r}."
+                "Sleep mode on Metal does not support speculative decoding with "
+                f"method={speculative_config.method!r}."
             )
 
     @classmethod
