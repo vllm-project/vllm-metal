@@ -694,7 +694,7 @@ struct PagedAttentionMetadata {
   int nax_prefill_split_hint;
 };
 
-static bool gqa_decode_kernel_eligible(
+static bool gqa_decode_metadata_eligible(
     const PagedAttentionMetadata& m, int total_q_tokens, int num_seqs,
     bool has_prefill) {
   // Ordinary decode has exactly one query row per request. Scheduler counts
@@ -892,7 +892,7 @@ static PagedAttentionPlan select_paged_attention_route(
   // existing calibrated geometry scope. Resource gates remain below and at
   // the compiled reducer, where the actual static memory use is available.
   const bool gqa_supported = !m.gqa_disabled
-      && gqa_decode_kernel_eligible(m, total_q_tokens, num_seqs, has_prefill)
+      && gqa_decode_metadata_eligible(m, total_q_tokens, num_seqs, has_prefill)
       && gqa_decode_geometry_supported(
           m.num_heads, m.num_kv_heads, m.head_size, m.block_size);
 
