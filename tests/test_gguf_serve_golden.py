@@ -73,41 +73,38 @@ class _GoldenCase:
 
 
 _CASES = [
-    # Qwen3-0.6B-Q8_0.gguf: the leading 12 ids match the dense reference and
-    # diverge at index 12 (quantized vs dense); the asserted prefix stays
-    # safely inside that agreement.
+    # Qwen3-0.6B-Q8_0.gguf: all 16 ids match the dense reference.
     _GoldenCase(
         label="qwen3",
         quantization="Q8_0",
-        prompt=_DEFAULT_PROMPT,
+        prompt="The first ten prime numbers are 2, 3, 5, 7,",
         gguf_env="VLLM_METAL_TEST_GGUF_SERVE_PATH",
         tokenizer_env="VLLM_METAL_TEST_GGUF_TOKENIZER_PATH",
         dense_env="VLLM_METAL_TEST_GGUF_DENSE_PATH",
         golden_ids=(
-            12095,
-            13,
-            576,
-            6722,
-            315,
-            9625,
-            374,
-            1083,
-            279,
-            6722,
-            315,
-            279,
-            5429,
-            315,
-            9625,
-            13,
+            220,
+            16,
+            16,
+            11,
+            220,
+            16,
+            18,
+            11,
+            220,
+            16,
+            22,
+            11,
+            220,
+            16,
+            24,
+            11,
         ),
-        dense_agree_prefix=8,
+        dense_agree_prefix=16,
         target_dtype=mx.bfloat16,
     ),
     # Qwen_Qwen3-0.6B-Q4_1.gguf: all 16 ids match the dense reference for this
-    # high-confidence factual sequence. The file has a tied, redundant Q6_K
-    # output.weight; the loader correctly skips it and uses the Q4_1 embedding
-    # table as the tied output projection.
+    # high-confidence factual sequence. The config ties the head, but the file
+    # carries a Q6_K output.weight, so the loader reads that table as the head.
     _GoldenCase(
         label="qwen3-q4_1",
         quantization="Q4_1",
@@ -137,40 +134,40 @@ _CASES = [
         target_dtype=mx.bfloat16,
     ),
     # Qwen3-0.6B-Q4_K_M.gguf (unsloth, rev 50968a44): Q4_K linears plus Q6_K
-    # attn_v/ffn_down in some layers and a Q6_K tied embedding. The ids match
-    # the Q8_0 case; dense agreement holds through index 11, diverging at 12.
+    # attn_v/ffn_down in some layers and a Q6_K tied embedding. All 16 ids
+    # match the dense reference.
     _GoldenCase(
         label="qwen3-q4_k_m",
         quantization="Q4_K_M",
-        prompt=_DEFAULT_PROMPT,
+        prompt="The first ten prime numbers are 2, 3, 5, 7,",
         gguf_env="VLLM_METAL_TEST_GGUF_Q4KM_SERVE_PATH",
         tokenizer_env="VLLM_METAL_TEST_GGUF_Q4KM_TOKENIZER_PATH",
         dense_env="VLLM_METAL_TEST_GGUF_Q4KM_DENSE_PATH",
         golden_ids=(
-            12095,
-            13,
-            576,
-            6722,
-            315,
-            9625,
-            374,
-            1083,
-            279,
-            6722,
-            315,
-            279,
-            5429,
-            315,
-            9625,
-            13,
+            220,
+            16,
+            16,
+            11,
+            220,
+            16,
+            18,
+            11,
+            220,
+            16,
+            22,
+            11,
+            220,
+            16,
+            24,
+            11,
         ),
-        dense_agree_prefix=12,
+        dense_agree_prefix=16,
         target_dtype=mx.bfloat16,
     ),
     # qwen2.5-0.5b-instruct-q4_k_m.gguf (Qwen, rev 9217f5db): Q4_K/Q6_K only on
-    # the 4864-wide ffn_down; the 896-wide rows, tied embedding included, fall
-    # back to Q5_0 (Q8_0 for some attn_v and the unused output.weight). All 16
-    # ids match the dense reference for this high-confidence factual sequence.
+    # the 4864-wide ffn_down; the 896-wide rows, embedding included, fall back
+    # to Q5_0 (Q8_0 for some attn_v and the output.weight head). All 16 ids
+    # match the dense reference for this high-confidence factual sequence.
     _GoldenCase(
         label="qwen2.5-q4_k_m",
         quantization="Q4_K_M",
