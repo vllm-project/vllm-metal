@@ -636,6 +636,19 @@ def _whole_batch_decode_routing_kwargs(
             max_decode_context_len=ctx.max_decode_context_len,
         )
     num_decode = ctx.num_decode_requests
+    # Expanded spec-verify rows are one-token segments, each with its own
+    # length: route them as one decode request per row.
+    if (
+        not ctx.gqa_disabled
+        and ctx.verify_window_q == 1
+        and num_decode
+        < ctx.num_decode_tokens
+        == num_query_rows
+        == len(ctx.context_lens)
+    ):
+        num_decode = ctx.num_decode_tokens
+        if capabilities["decode_routing_metadata"]:
+            kwargs["num_decode_requests"] = num_decode
     ordinary_decode_rows = (
         not ctx.gqa_disabled
         and num_decode == ctx.num_decode_tokens

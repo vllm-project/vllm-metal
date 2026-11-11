@@ -391,6 +391,52 @@ def test_batch_gate_keeps_excluded_routes(kwargs):
     _assert_close(out, ref, mx.float16)
 
 
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+def test_expanded_verify_rows_take_gqa_and_match_window(dtype):
+    """Expanded verify rows, routed as one request each, match the window kernel."""
+    ops = get_ops()
+    window, context = 4, 8190
+    lengths = [context + r + 1 for r in range(window)]
+    blocks = (lengths[-1] + 15) // 16
+    mx.random.seed(1010)
+    shape = (blocks + 2, 16, 8, 128)
+    keys = mx.random.normal(shape).astype(dtype)
+    values = mx.random.normal(shape).astype(dtype)
+    query = mx.random.normal((window, 32, 128)).astype(dtype)
+    pages = list(reversed(range(blocks)))
+    ref = ops.paged_attention_primitive(
+        query,
+        keys,
+        values,
+        8,
+        128**-0.5,
+        0.0,
+        mx.array([pages], mx.int32),
+        mx.array(lengths[-1:], mx.int32),
+        mx.array([0, window], mx.int32),
+        16,
+        lengths[-1],
+        -1,
+        window_seqlen_q=window,
+    )
+    mx.eval(ref)
+    # Every row of the request reads the same pages.
+    out = _primitive(
+        query,
+        keys,
+        values,
+        mx.array([pages] * window, mx.int32),
+        mx.array(lengths, mx.int32),
+        16,
+        lengths[-1],
+        lengths,
+    )
+    mx.eval(out)
+    assert _dispatch_family() == "gqa_decode"
+    assert ops.last_gqa_num_requests() == window
+    _assert_close(out, ref, dtype)
+
+
 @pytest.mark.parametrize("cores,expected_partition", [(0, 0), (4, 512)])
 def test_batch_uses_known_core_budget_without_unsplit_grid_veto(
     cores, expected_partition

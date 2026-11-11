@@ -951,7 +951,7 @@ class TestSDPAForward:
     @pytest.mark.parametrize("disabled", [False, True])
     @pytest.mark.parametrize("capability", ["none", "plan", "mixed_plan"])
     @pytest.mark.parametrize("kind", ["decode", "mixed", "expanded_verify"])
-    def test_gqa_batch_metadata_is_only_forwarded_for_ordinary_decode(
+    def test_gqa_batch_metadata_is_only_forwarded_for_decode_rows(
         self, monkeypatch, disabled, capability, kind
     ) -> None:
         monkeypatch.setenv("VLLM_METAL_DISABLE_GQA_DECODE", str(int(disabled)))
@@ -997,8 +997,10 @@ class TestSDPAForward:
         # capability) the leading decode rows of a mixed batch.
         planned = capability in ("plan", "mixed_plan")
         eligible = not disabled and (
-            kind == "decode" or (kind == "mixed" and capability == "mixed_plan")
+            kind in ("decode", "expanded_verify")
+            or (kind == "mixed" and capability == "mixed_plan")
         )
+        expected_plan = (2, 3, 4, 5) if kind == "expanded_verify" else (2, 4)
         with (
             patch.object(sdpa_mod, "get_ops", return_value=spy),
             patch.object(sdpa_mod, "truncate_padded_output", return_value=zeros),
@@ -1006,9 +1008,13 @@ class TestSDPAForward:
             for _layer in range(3):
                 sdpa_forward(inner, x, ctx, cache, layer_idx=0)
             plan = spy.calls[-1].gqa_length_plan
-            assert plan == ((2, 4) if eligible and planned else None)
+            assert plan == (expected_plan if eligible and planned else None)
             assert len(spy.length_plans) == int(eligible and planned)
             query.assert_called_once_with()
+            if kind == "expanded_verify":
+                # Native sees one request per row; the scheduler count is kept.
+                assert spy.calls[-1].num_decode_requests == (4 if eligible else 2)
+                assert ctx.num_decode_requests == 2
             if eligible and planned and kind == "decode":
                 # A new forward has new lengths and must not reuse the old plan.
                 prepare_grouped([([[1]], 4), ([[0]], 2)], [], (8,))
