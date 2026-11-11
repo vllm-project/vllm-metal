@@ -68,7 +68,10 @@ missing, ambiguous, or shard-only matches also fail before model load.
   kernels. Small batches use a fused kernel on the packed blocks, and larger
   ones, such as a prefill, dequantize a transient dense copy of the weight
   for one GEMM and free it afterwards.
-- A tied model's unused `output.weight` is skipped whatever its qtype.
+- When a tied model's file also carries `output.weight`, logits use it, as
+  llama.cpp does: llama-quantize stores that table at the output qtype (for
+  example Q6_K) even when `token_embd` uses a lower one. An `output.weight` in
+  a qtype the loader cannot run is skipped and the head stays tied.
 - Unsupported: IQ1, IQ2, IQ3_XXS and T-quants, MoE, SSM or hybrid models
   other than Qwen3.5, vision input, sharded GGUF files, and LoRA
   (`--enable-lora`).

@@ -132,6 +132,8 @@ class PagedAttentionContext:
     kv_groups: tuple[PagedKVGroupContext, ...] | None = None
     # Fixed at worker startup and deducted before scheduler KV allocation.
     tq_prefill_workspace_bytes: int = 0
+    # The caller reads every packed row's output, so no fast path may reduce rows.
+    all_rows_consumed: bool = False
     # Kernel-format metadata memo, keyed by (KV group index, cache block
     # size).  The context lives for exactly one forward pass, so entries
     # never go stale; every layer of a group reuses the first layer's
@@ -228,6 +230,7 @@ def prepare_grouped(
     merge_verify_windows: bool = False,
     *,
     tq_prefill_workspace_bytes: int = 0,
+    all_rows_consumed: bool = False,
 ) -> None:
     """Compute metadata for every scheduler KV-cache group in one forward pass.
 
@@ -258,6 +261,9 @@ def prepare_grouped(
             the tiled one.
         tq_prefill_workspace_bytes: allowance already reserved by the worker
             before KV allocation. Defaults to zero, disabling materialization.
+        all_rows_consumed: the caller reads every packed row's output (prompt
+            logprobs), so row-reducing fast paths must keep every row.
+            Defaults to False.
     """
     group_slot_mappings: list[list[int]] = [[] for _ in block_sizes]
     group_block_tables: list[list[list[int]]] = [[] for _ in block_sizes]
@@ -350,6 +356,7 @@ def prepare_grouped(
             verify_window_q=1 if prefill_requests else max_decode_window,
             kv_groups=kv_groups,
             tq_prefill_workspace_bytes=tq_prefill_workspace_bytes,
+            all_rows_consumed=all_rows_consumed,
         )
     )
 

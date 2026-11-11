@@ -554,7 +554,7 @@ def test_turboquant_per_layer_shapes_raise_early() -> None:
         with pytest.raises(
             NotImplementedError, match="TurboQuant with per-layer KV shapes"
         ):
-            runner.build_paged_attention_runtime(block_size=16)
+            runner.validate_paged_attention_support()
     finally:
         reset_config()
 

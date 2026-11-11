@@ -331,30 +331,6 @@ class TestMetalPagedKVCachePerLayer:
         assert "4.7 MB" not in messages[0]
 
 
-class TestSDPARuntimePerLayer:
-    """SDPAPagedAttentionRuntime passes per-layer shapes to cache."""
-
-    def test_backend_propagates_per_layer_shapes(self) -> None:
-        kv_heads = [16, 4]
-        head_dims = [256, 512]
-
-        backend = SDPAPagedAttentionRuntime(
-            num_layers=2,
-            num_kv_heads=kv_heads[0],
-            head_dim=head_dims[0],
-            block_size=16,
-            dtype=mx.bfloat16,
-            kv_heads_per_layer=kv_heads,
-            head_dim_per_layer=head_dims,
-        )
-        backend.initialize(num_blocks=4)
-
-        cache = backend._cache
-        assert cache is not None
-        assert cache.key_caches[0].shape[-2:] == (16, 256)
-        assert cache.key_caches[1].shape[-2:] == (4, 512)
-
-
 class TestCachePolicyPerLayerBytes:
     """Block-size-bytes and one-sequence-bytes with per-layer shapes."""
 
@@ -449,7 +425,7 @@ class TestCachePolicyPerLayerBytes:
         with pytest.raises(
             NotImplementedError, match="Per-layer KV shapes with hybrid models"
         ):
-            runner.build_paged_attention_runtime(block_size=self._BLOCK_SIZE)
+            runner.validate_paged_attention_support()
 
     def test_turboquant_per_layer_shapes_raise_early(
         self, monkeypatch: pytest.MonkeyPatch
@@ -572,13 +548,7 @@ class TestUpstreamAttentionStorage:
             kv_cache_dtype=mx.bfloat16,
             cache_config=SimpleNamespace(block_size=32),
         )
-        backend = SDPAPagedAttentionRuntime(
-            num_layers=4,
-            num_kv_heads=4,
-            head_dim=512,
-            block_size=32,
-            dtype=mx.bfloat16,
-        )
+        backend = SDPAPagedAttentionRuntime(block_size=32, dtype=mx.bfloat16)
         monkeypatch.setattr(
             runner._cache_policy, "_build_sdpa_backend", lambda **_: backend
         )
@@ -612,7 +582,7 @@ class TestUpstreamAttentionStorage:
             kv_heads_per_layer=[16, 16, 4, 4],
             head_dim_per_layer=[256, 256, 512, 512],
         )
-        backend = runner.build_paged_attention_runtime(block_size=16)
+        backend = runner._cache_policy._build_sdpa_backend(block_size=16)
         monkeypatch.setattr(
             runner._cache_policy, "_build_sdpa_backend", lambda **_: backend
         )

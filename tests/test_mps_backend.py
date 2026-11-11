@@ -502,6 +502,86 @@ def test_mps_logprobs(num_logprobs):
     )
 
 
+def test_prompt_logprobs_match_cpu_reference(run_in_spawn_process, monkeypatch):
+    monkeypatch.setenv("VLLM_METAL_BACKEND", "mps")
+    monkeypatch.setenv("PYTORCH_ENABLE_MPS_FALLBACK", "0")
+    run_in_spawn_process(_check_prompt_logprobs)
+
+
+def _check_prompt_logprobs():
+    from vllm.sampling_params import SamplingParams
+    from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
+
+    from vllm_metal.platform import MetalPlatform
+
+    MetalPlatform.register_triton_kernel_overrides()
+    install()
+    device = torch.device("mps")
+    worker = PromptLogprobsWorker(4, device)
+    prompt_lens = np.array([8, 4, 150, 4])
+    for req_id, slot, k in (("b", 0, 0), ("c", 1, None), ("a", 2, 2), ("d", 3, 1)):
+        worker.add_request(req_id, slot, SamplingParams(prompt_logprobs=k))
+    torch.manual_seed(0)
+    all_ids = torch.randint(0, 32, (4, 160), dtype=torch.int32, device=device)
+    computed = torch.zeros(4, dtype=torch.int32, device=device)
+    chunk_rows = []
+
+    def logits_fn(hidden_states):
+        chunk_rows.append(hidden_states.shape[0])
+        return hidden_states
+
+    def step(req_ids, slots, done, scheduled):
+        slots_np = np.array(slots)
+        cu_np = np.concatenate([[0], np.cumsum(scheduled)]).astype(np.int32)
+        logits = torch.randn(int(cu_np[-1]), 32, device=device)
+        batch = SimpleNamespace(
+            req_ids=req_ids,
+            idx_mapping=torch.tensor(slots_np, dtype=torch.int32, device=device),
+            idx_mapping_np=slots_np,
+            num_tokens=int(cu_np[-1]),
+            query_start_loc=torch.tensor(cu_np, device=device),
+            query_start_loc_np=cu_np,
+            num_computed_prefill_tokens_np=np.array(done),
+            num_scheduled_tokens=np.array(scheduled),
+            prefill_len_np=prompt_lens[slots_np],
+        )
+        computed[batch.idx_mapping.long()] = torch.tensor(
+            done, dtype=torch.int32, device=device
+        )
+        out = worker.compute_prompt_logprobs(
+            logits_fn, logits, batch, all_ids, computed, prompt_lens
+        )
+        return out, logits.cpu().log_softmax(-1), cu_np
+
+    # Slots out of batch order; "b" spans both steps and "d" is decoding.
+    first, first_expected, first_cu = step(
+        ["a", "b", "c", "d"], [2, 0, 1, 3], [0, 0, 0, 9], [150, 5, 4, 1]
+    )
+    second, second_expected, _ = step(["b"], [0], [5], [3])
+    assert sorted(first) == ["a"] and sorted(second) == ["b"]
+    assert chunk_rows == [128, 32, 3]
+    ids = all_ids.cpu().long()
+    cases = (
+        (first["a"], first_expected[:149], ids[2, 1:150], 2),
+        (
+            second["b"],
+            torch.cat([first_expected[first_cu[1] : first_cu[2]], second_expected[:2]]),
+            ids[0, 1:8],
+            0,
+        ),
+    )
+    for actual, expected, targets, k in cases:
+        expected_target = expected.gather(-1, targets[:, None])
+        assert actual.logprob_token_ids.shape == (len(targets), k + 1)
+        assert actual.logprob_token_ids[:, 0].tolist() == targets.tolist()
+        torch.testing.assert_close(actual.logprobs[:, 0].cpu(), expected_target[:, 0])
+        torch.testing.assert_close(
+            actual.logprobs[:, 1:].cpu(), expected.topk(k, -1).values
+        )
+        ranks = (expected >= expected_target).sum(-1)
+        assert actual.selected_token_ranks.tolist() == ranks.tolist()
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize(
     "rows,heads,kv_heads,head_size,gapped_heads",
@@ -728,36 +808,6 @@ def test_omni_macos_transport_handles_long_names_and_page_padding(with_metadata)
 
 
 @pytest.mark.parametrize(
-    "length", [1, 5, 64, 65, 200], ids=["one", "short", "chunk", "chunk+1", "multi"]
-)
-def test_gdn_chunked_prefill_matches_transformers_recurrence(length):
-    from transformers.models.qwen3_5.modeling_qwen3_5 import (
-        torch_recurrent_gated_delta_rule,
-    )
-
-    from vllm_metal.pytorch_backend.models.qwen3_5 import delta_rule_chunked
-
-    heads, k_dim, v_dim = 3, 32, 16
-    q, k = (
-        torch.nn.functional.normalize(torch.randn(length, heads, k_dim), dim=-1)
-        for _ in range(2)
-    )
-    v = torch.randn(length, heads, v_dim)
-    g = -torch.rand(length, heads)
-    beta = torch.rand(length, heads)
-    state = torch.randn(heads, k_dim, v_dim) * 0.1
-    expected, expected_state = torch_recurrent_gated_delta_rule(
-        q[None], k[None], v[None], g[None], beta[None], state[None], True
-    )
-    out, final = delta_rule_chunked(
-        *(x.to("mps") for x in (q * k_dim**-0.5, k, v, g, beta, state))
-    )
-    # The chunked form reorders the recurrence's fp32 sums.
-    torch.testing.assert_close(out.cpu(), expected[0], atol=1e-5, rtol=1e-4)
-    torch.testing.assert_close(final.cpu(), expected_state[0], atol=1e-5, rtol=1e-4)
-
-
-@pytest.mark.parametrize(
     "pooled",
     [
         pytest.param(False, id="dense"),
@@ -765,10 +815,12 @@ def test_gdn_chunked_prefill_matches_transformers_recurrence(length):
     ],
 )
 def test_gdn_state_carries_across_chunked_prefill_and_decode(pooled):
-    """``pooled`` puts the caches at the start of one buffer holding more than
-    INT_MAX fp32 elements, like the shared KV buffer on a large Mac. MPSGraph
-    matmuls reject a view into it at a non-zero offset, so resumed prefill must
-    copy its slot. Metal wires that whole buffer on first use, hence slow."""
+    """Preserve #1244's resumed-prefill regression above INT_MAX fp32 elements.
+
+    The shared kernel copies the slot into private state before recurrence,
+    avoiding MPSGraph matmuls on the pooled view. Metal wires the whole buffer
+    on first use, so the large-pool case remains slow.
+    """
     from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
     from vllm_metal.pytorch_backend.models.qwen3_5 import _gdn_core
@@ -780,7 +832,7 @@ def test_gdn_state_carries_across_chunked_prefill_and_decode(pooled):
         or torch.mps.recommended_max_memory() < 2 * pool_bytes
     ):
         pytest.skip("Needs a Metal buffer past INT_MAX fp32 elements, with headroom")
-    k_heads, v_heads, k_dim, v_dim, width = 2, 4, 16, 8, 4
+    k_heads, v_heads, k_dim, v_dim, width = 2, 4, 32, 8, 4
     channels = 2 * k_heads * k_dim + v_heads * v_dim
     layer = SimpleNamespace(
         key_dim=k_heads * k_dim,
@@ -864,7 +916,7 @@ def test_gdn_state_carries_across_chunked_prefill_and_decode(pooled):
             rtol=1e-4,
         )
     torch.testing.assert_close(
-        layer.kv_cache[1][1].cpu().view(v_heads, k_dim, v_dim),
+        layer.kv_cache[1][1].cpu().transpose(-1, -2),
         state,
         atol=1e-4,
         rtol=1e-4,

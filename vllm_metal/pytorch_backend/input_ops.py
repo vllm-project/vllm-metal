@@ -35,6 +35,22 @@ def prepare_prefill_inputs(ids, lookahead, mapping, cu, all_ids, prefill, comput
         )
 
 
+def prompt_logprobs_token_ids(
+    ids,
+    cu,
+    mapping,
+    computed,
+    all_ids,
+    all_ids_stride,
+    BLOCK_SIZE,  # noqa: N803 - upstream kernel launch keyword
+):
+    # Each prompt row scores the token after it.
+    offsets, rows = token_rows(cu, ids.numel())
+    slots = mapping[rows].long()
+    positions = computed[slots].long() + 1 + offsets - cu[rows]
+    ids.copy_(all_ids[slots, positions.clamp_max(all_ids.shape[1] - 1)])
+
+
 def prepare_pos_seq_lens(mapping, cu, computed, pos, seq_lens):
     offsets, rows = token_rows(cu, pos.numel())
     pos.copy_(computed[mapping[rows].long()].long() + offsets - cu[rows])

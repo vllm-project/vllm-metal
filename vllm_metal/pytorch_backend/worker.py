@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Opt-in vLLM worker for the MPS proof of concept."""
 
+import os
+
 import torch
 from vllm.config.utils import getattr_iter
 from vllm.utils.torch_utils import set_random_seed
@@ -12,9 +14,16 @@ from vllm_metal.v1.worker import MetalWorker, init_worker_distributed_environmen
 
 # PyTorch's MPS allocator rounds large heaps up to this size (kRoundLarge).
 _MPS_HEAP_ALIGNMENT = 2 << 20
+_MPS_WATERMARK_ENVS = (
+    "PYTORCH_MPS_LOW_WATERMARK_RATIO",
+    "PYTORCH_MPS_HIGH_WATERMARK_RATIO",
+)
+_mps_low_watermark_default: str | None = None
 
 
 def configure_mps(config, *, omni=False):
+    global _mps_low_watermark_default
+
     from vllm import envs as vllm_envs
     from vllm.config.compilation import CompilationMode, CUDAGraphMode
 
@@ -91,6 +100,19 @@ def configure_mps(config, *, omni=False):
     config.compilation_config.mode = CompilationMode.NONE
     config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
     model.enforce_eager = True
+    # PyTorch proactively reclaims cached heaps past its low watermark, 1.4x the
+    # recommended working set by default. Metal runs out before that on small
+    # Macs, so start reclaiming at the configured budget instead.
+    low_env, high_env = _MPS_WATERMARK_ENVS
+    current = os.environ.get(low_env)
+    # Set the default when absent, or update it when it still matches the
+    # default we installed.
+    if high_env not in os.environ and (
+        current is None or current == _mps_low_watermark_default
+    ):
+        desired = str(config.cache_config.gpu_memory_utilization)
+        os.environ[low_env] = desired
+        _mps_low_watermark_default = desired
 
 
 class MPSWorker(MetalWorker):

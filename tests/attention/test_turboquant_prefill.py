@@ -941,10 +941,12 @@ def test_fused_materialization_matches_independent_decode(
         cache.key_zero_caches[0],
         cache.value_scale_caches[0],
     ]
+    # Read the same offsets through a stride-two view.
+    offsets = mx.repeat(plan.pool_offsets, 2)[::2]
     actual = sdpa.materialize_turboquant_pages(
         *arrays,
         plan.pool_pages,
-        plan.pool_offsets,
+        offsets,
         get_v_centroids(cache.v_bits),
         head_dim=head_dim,
         key_quant_type=k_quant,

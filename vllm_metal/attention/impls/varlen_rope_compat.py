@@ -14,6 +14,7 @@ from mlx_lm.models.rope_utils import (
     SuScaledRoPE,
     YarnRoPE,
 )
+from mlx_vlm.models.lfm3.language import RotaryEmbedding as Lfm3RotaryEmbedding
 
 _VECTOR_OFFSET_ROPE_TYPES = (
     nn.RoPE,
@@ -21,6 +22,7 @@ _VECTOR_OFFSET_ROPE_TYPES = (
     ProportionalRoPE,
     SuScaledRoPE,
     YarnRoPE,
+    Lfm3RotaryEmbedding,
 )
 
 

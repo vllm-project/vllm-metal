@@ -411,15 +411,23 @@ class TestMetalPlatform:
     def test_sleep_mode_is_available(self) -> None:
         assert MetalPlatform.is_sleep_mode_available()
 
-    def test_check_and_update_config_rejects_sleep_mode_with_model_drafting(
+    def test_check_and_update_config_rejects_sleep_mode_with_mtp_drafting(
         self,
     ) -> None:
         vllm_config = self._platform_config(
             model_config=SimpleNamespace(enable_sleep_mode=True),
-            speculative_config=SimpleNamespace(method="draft_model"),
+            speculative_config=SimpleNamespace(method="mtp"),
         )
-        with pytest.raises(NotImplementedError, match="only n-gram"):
+        with pytest.raises(NotImplementedError, match="Sleep mode.*method='mtp'"):
             MetalPlatform.check_and_update_config(vllm_config)
+
+    @pytest.mark.parametrize("method", ["ngram", "draft_model", "dflash", "dspark"])
+    def test_sleep_mode_accepts_drafters_without_private_kv(self, method) -> None:
+        """Their KV, if any, is a view of the storage that sleep re-creates."""
+        vllm_config = self._platform_config(
+            speculative_config=SimpleNamespace(method=method)
+        )
+        MetalPlatform._check_sleep_mode_config(vllm_config, "mlx")
 
     def test_check_and_update_config_rejects_sleep_mode_on_mps(
         self, monkeypatch: pytest.MonkeyPatch
@@ -445,6 +453,12 @@ class TestMetalPlatform:
         else:
             with pytest.raises(VLLMValidationError, match="repetition_penalty"):
                 MetalPlatform.validate_request({}, params)
+
+    def test_mps_accepts_prompt_logprobs(self, monkeypatch):
+        monkeypatch.setattr("vllm_metal.envs.VLLM_METAL_BACKEND", "mps")
+        MetalPlatform.validate_request(
+            {}, SamplingParams(temperature=0, prompt_logprobs=5)
+        )
 
     def test_check_and_update_config_rejects_pipeline_with_tensor_parallel(
         self,
@@ -1885,6 +1899,42 @@ class TestMetalPlatform:
         assert vllm_config.model_config.tokenizer == "openai/whisper-tiny"
         assert vllm_config.scheduler_config.async_scheduling is False
 
+    @pytest.mark.parametrize("mode", ["auto", "multimodal-native", "text-only"])
+    def test_check_and_update_config_keeps_audio_for_stt(
+        self, monkeypatch: pytest.MonkeyPatch, mode: str
+    ) -> None:
+        """STT models keep their audio in every multimodal mode; the STT
+        runner, not a multimodal adapter, consumes it."""
+        self._patch_stt_resolution(monkeypatch, is_stt=True)
+        monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", mode)
+        multimodal_config = MultiModalConfig(limit_per_prompt={"audio": 1})
+        model_config = SimpleNamespace(
+            quantization=None,
+            enable_sleep_mode=False,
+            model="openai/whisper-tiny",
+            tokenizer=None,
+            max_model_len=128,
+            multimodal_config=multimodal_config,
+            hf_config=SimpleNamespace(
+                model_type="whisper",
+                architectures=["WhisperForConditionalGeneration"],
+            ),
+            is_hybrid=False,
+        )
+        reset_config()
+        try:
+            vllm_config = self._platform_config(
+                model_config=model_config,
+                cache_config=SimpleNamespace(enable_prefix_caching=False),
+            )
+
+            MetalPlatform.check_and_update_config(vllm_config)
+        finally:
+            reset_config()
+
+        assert model_config.multimodal_config is multimodal_config
+        assert multimodal_config.get_limit_per_prompt("audio") == 1
+
     def test_check_and_update_config_preserves_existing_tokenizer_for_stt(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -2041,6 +2091,38 @@ class TestMetalPlatform:
         ).create_engine_config()
         mm_config = config.model_config.get_multimodal_config()
         assert mm_config.get_limit_per_prompt("image") == 0
+
+    @pytest.mark.parametrize(
+        "exported",
+        [
+            {},
+            {"PYTORCH_MPS_LOW_WATERMARK_RATIO": "1.2"},
+            {"PYTORCH_MPS_HIGH_WATERMARK_RATIO": "1.0"},
+        ],
+        ids=["unset", "low-exported", "high-exported"],
+    )
+    def test_mps_reclaims_cached_heaps_at_the_memory_budget(
+        self, tmp_path, monkeypatch, exported
+    ) -> None:
+        from transformers import Qwen3Config
+
+        Qwen3Config(
+            architectures=["Qwen3ForCausalLM"], hidden_size=64, head_dim=64
+        ).save_pretrained(tmp_path)
+        environ = {k: v for k, v in os.environ.items() if "WATERMARK" not in k}
+        monkeypatch.setattr(os, "environ", environ | exported)
+        monkeypatch.setitem(vars(platform_module.envs), "VLLM_METAL_BACKEND", "mps")
+        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+        EngineArgs(
+            model=str(tmp_path),
+            dtype="bfloat16",
+            skip_tokenizer_init=True,
+            max_model_len=128,
+            gpu_memory_utilization=0.5,
+        ).create_engine_config()
+        watermarks = {k: v for k, v in os.environ.items() if "WATERMARK" in k}
+        # An exported watermark always wins.
+        assert watermarks == (exported or {"PYTORCH_MPS_LOW_WATERMARK_RATIO": "0.5"})
 
     def test_kept_multimodal_config_normalizes_pixels_on_the_host(
         self, monkeypatch: pytest.MonkeyPatch

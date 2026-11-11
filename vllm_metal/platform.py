@@ -387,11 +387,7 @@ class MetalPlatform(Platform):
             ]
             unsupported_controls += [
                 name
-                for name in (
-                    "logprob_token_ids",
-                    "prompt_logprobs",
-                    "structured_outputs",
-                )
+                for name in ("logprob_token_ids", "structured_outputs")
                 if getattr(params, name, None) is not None
             ]
         if unsupported_controls:
@@ -1007,6 +1003,22 @@ class MetalPlatform(Platform):
                 scheduler_config.max_num_batched_tokens,
             )
 
+        # STT model detection. Lazy imports to avoid circular import: platform.py
+        # is loaded during vllm.config init, and stt.detection imports from
+        # vllm.config.
+        from vllm_metal.stt.detection import is_stt_model
+        from vllm_metal.stt.policy import apply_stt_scheduler_policy
+        from vllm_metal.utils import get_model_download_path
+
+        resolved_model = (
+            get_model_download_path(model_config.model, revision=model_config.revision)
+            if model_config is not None
+            else None
+        )
+        serves_stt_model = resolved_model is not None and is_stt_model(
+            resolved_model, revision=model_config.revision
+        )
+
         # Let the adapter apply any model-specific normalisations (e.g. clearing
         # ``multimodal_config`` for model types served on the text-only
         # backbone — see ``DefaultModelAdapter.normalize_model_config``).
@@ -1014,9 +1026,12 @@ class MetalPlatform(Platform):
             from vllm_metal.v1.model_adapter import DefaultModelAdapter
 
             if backend == "mlx":
-                DefaultModelAdapter().normalize_model_config(
-                    model_config, speculative_config=vllm_config.speculative_config
-                )
+                # The STT runner owns the audio input of STT checkpoints.
+                if not serves_stt_model:
+                    DefaultModelAdapter().normalize_model_config(
+                        model_config,
+                        speculative_config=vllm_config.speculative_config,
+                    )
             elif (
                 config.multimodal_mode == "text-only"
                 and model_config.multimodal_config is not None
@@ -1055,21 +1070,6 @@ class MetalPlatform(Platform):
                     "(the multimodal tensor-IPC path is DP=1 only)."
                 )
 
-        # STT model detection — set tokenizer fallback if not already configured.
-        # Lazy imports to avoid circular import: platform.py is loaded during
-        # vllm.config init, and stt.detection imports from vllm.config.
-        from vllm_metal.stt.detection import is_stt_model
-        from vllm_metal.stt.policy import apply_stt_scheduler_policy
-        from vllm_metal.utils import get_model_download_path
-
-        resolved_model = (
-            get_model_download_path(model_config.model, revision=model_config.revision)
-            if model_config is not None
-            else None
-        )
-        serves_stt_model = resolved_model is not None and is_stt_model(
-            resolved_model, revision=model_config.revision
-        )
         if serves_stt_model:
             # STT checkpoints use a dedicated STTModelRunner with no pipeline-
             # split path. Reject PP here, with the other config-time PP guards,
@@ -1168,8 +1168,8 @@ class MetalPlatform(Platform):
     @classmethod
     def _check_sleep_mode_config(cls, vllm_config: "VllmConfig", backend: str) -> None:
         """Sleep mode re-creates the MLX runner's shared KV storage in place.
-        Drafters that keep their own caches or arrays derived from it are not
-        covered, and the PyTorch MPS runner has no such storage.
+        Only drafters verified to keep no KV or only views of that storage are
+        allowed, and the PyTorch MPS runner has no such storage.
         """
         if backend != "mlx":
             raise NotImplementedError(
@@ -1177,10 +1177,15 @@ class MetalPlatform(Platform):
                 f"(VLLM_METAL_BACKEND={backend!r})."
             )
         speculative_config = vllm_config.speculative_config
-        if speculative_config is not None and speculative_config.method != "ngram":
+        if speculative_config is not None and speculative_config.method not in (
+            "ngram",
+            "draft_model",
+            "dflash",
+            "dspark",
+        ):
             raise NotImplementedError(
-                "Sleep mode on Metal supports only n-gram speculative decoding, "
-                f"got method={speculative_config.method!r}."
+                "Sleep mode on Metal does not support speculative decoding with "
+                f"method={speculative_config.method!r}."
             )
 
     @classmethod

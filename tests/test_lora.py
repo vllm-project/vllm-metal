@@ -12,6 +12,7 @@ import pytest
 import torch
 from vllm.lora.layers import LoRAMapping
 from vllm.sampling_params import SamplingParams
+from vllm.v1.core.sched.output import NewRequestData
 
 import vllm_metal.v1.model_runner as model_runner_mod
 from tests.stub_runner import make_stub_runner
@@ -385,6 +386,35 @@ def test_peft_loader_normalizes_module_name_and_preserves_weights(
         np.array(weights.lora_b.astype(mx.float32)), np.arange(8).reshape(4, 2)
     )
     assert weights.scaling == pytest.approx(4.0)
+
+
+@pytest.mark.parametrize("use_rslora", [False, True])
+@pytest.mark.parametrize(
+    "patterns,rank,alpha",
+    [
+        ({"rank_pattern": {"q_proj": 2}}, 2, 8),
+        ({"alpha_pattern": {"q_proj": 16}}, 2, 16),
+        ({"rank_pattern": {"q_proj": 2}, "alpha_pattern": {"q_proj": 12}}, 2, 12),
+        ({"rank_pattern": {"v_proj": 4}, "alpha_pattern": {"v_proj": 16}}, 2, 8),
+    ],
+    ids=["rank", "alpha", "rank-and-alpha", "unmatched"],
+)
+def test_peft_loader_respects_per_module_scaling(
+    tmp_path: Path, use_rslora: bool, patterns: dict, rank: int, alpha: int
+) -> None:
+    """Pattern overrides determine each layer's scale, including rsLoRA."""
+    adapter_dir = _write_peft_adapter(tmp_path)
+    cfg_path = adapter_dir / "adapter_config.json"
+    cfg = json.loads(cfg_path.read_text())
+    cfg.update(patterns, use_rslora=use_rslora)
+    if "q_proj" in patterns.get("rank_pattern", {}):
+        cfg["r"] = 1
+    cfg_path.write_text(json.dumps(cfg))
+
+    loaded = peft_loader_mod.load_peft_adapter(adapter_dir, lora_id=1)
+    weights = loaded.weights["layers.0.self_attn.q_proj"]
+    assert weights.rank == rank
+    assert weights.scaling == pytest.approx(alpha / (rank**0.5 if use_rslora else rank))
 
 
 def test_peft_loader_materializes_weights_before_return(tmp_path: Path) -> None:
@@ -1170,10 +1200,11 @@ def test_handle_new_request_registers_lora_before_paged_prefill() -> None:
         _lora=spy_lora,
     )
     lora_request = SimpleNamespace(lora_int_id=17)
-    new_req = SimpleNamespace(
+    new_req = NewRequestData(
         req_id="req-lora",
         pooling_params=None,
         prompt_token_ids=[1, 2, 3],
+        mm_features=[],
         sampling_params=SamplingParams(temperature=0, max_tokens=1),
         block_ids=([4],),
         num_computed_tokens=0,
@@ -1654,7 +1685,13 @@ def test_peft_loader_maps_hf_vlm_names_to_wrapped_modules(tmp_path: Path) -> Non
 
     from vllm_metal.multimodal.qwen3_vl.adapter import Qwen3VLMultimodalAdapter
 
-    config = {"peft_type": "LORA", "r": 1, "lora_alpha": 1, "target_modules": []}
+    config = {
+        "peft_type": "LORA",
+        "r": 1,
+        "lora_alpha": 1,
+        "target_modules": [],
+        "alpha_pattern": {"model.language_model.layers.0.mlp.up_proj": 3},
+    }
     (tmp_path / "adapter_config.json").write_text(json.dumps(config))
     tensors = {}
     for module in (
@@ -1675,6 +1712,8 @@ def test_peft_loader_maps_hf_vlm_names_to_wrapped_modules(tmp_path: Path) -> Non
         "visual.blocks.0.attn.qkv",
         "model.layers.0.mlp.up_proj",
     }
+    assert loaded.weights["visual.blocks.0.attn.qkv"].scaling == pytest.approx(1)
+    assert loaded.weights["model.layers.0.mlp.up_proj"].scaling == pytest.approx(3)
 
 
 _TINY_QWEN3_5_TEXT_CONFIG = {
@@ -1822,8 +1861,8 @@ def test_adapter_churn_does_not_accumulate_buffers_in_idle_encoder() -> None:
                 mx.eval(language_model(x))  # text-only step: encoder idle
 
     def live_bytes() -> int:
-        mx.synchronize()
         gc.collect()
+        mx.synchronize()
         mx.clear_cache()
         return mx.get_active_memory()
 

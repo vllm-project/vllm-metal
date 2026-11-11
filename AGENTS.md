@@ -7,6 +7,7 @@ For Omni additions, follow the [model ownership and layout](docs/pytorch-mps.md#
 
 - Address real problems backed by a reproducer, measurements, or a concrete user need. Avoid fixes justified only by hypothetical failures.
 - State the motivation clearly in the PR description: the current behavior, the affected use case, and why the issue matters in practice.
+- When creating an issue, always use available templates from `.github/ISSUE_TEMPLATE/`, following its structure and required fields.
 
 ## Duplicate-work checks
 

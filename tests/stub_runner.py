@@ -11,6 +11,7 @@ import mlx.core as mx
 import torch
 from vllm.config import AttentionConfig, CacheConfig, DeviceConfig
 from vllm.v1.attention.backends.utils import record_kv_cache_layout
+from vllm.v1.core.sched.output import NewRequestData
 
 import vllm_metal.v1.model_runner as mr
 from vllm_metal.attention.caches.placement import KV_CACHE_LAYOUT
@@ -32,6 +33,27 @@ from vllm_metal.v1.pooling.backends.decoder.factory import (
 from vllm_metal.v1.prompt_logprobs import PromptLogprobsTracker
 from vllm_metal.v1.spec_decode import SpeculativeDecodeController
 from vllm_metal.v1.structured_output import MetalStructuredOutputApplier
+
+
+def admit_prefill_request(
+    runner: mr.MetalModelRunner, prefill: mr.PrefillRequest
+) -> mr.RequestState:
+    """Install history for tests that start at a final prefill's forward/sample."""
+    assert prefill.prompt_len is not None
+    token_ids = list(prefill.full_prompt_token_ids or prefill.token_ids)
+    return runner._admit_request(
+        NewRequestData(
+            req_id=prefill.req_id,
+            prompt_token_ids=token_ids[: prefill.prompt_len],
+            prefill_token_ids=token_ids,
+            mm_features=[],
+            sampling_params=prefill.sampling_params,
+            pooling_params=prefill.pooling_params,
+            block_ids=tuple(prefill.block_ids),
+            num_computed_tokens=prefill.start_pos,
+            lora_request=None,
+        )
+    )
 
 
 def initialize_hybrid_runtime(
@@ -500,3 +522,70 @@ def make_state_cache(
             )
         )
     return PagedStateCache(states)
+
+
+def make_sdpa_runtime(
+    *,
+    num_layers,
+    num_kv_heads,
+    head_dim,
+    num_blocks,
+    block_size,
+    dtype,
+    cache_idx_map=None,
+    kv_heads_per_layer=None,
+    head_dim_per_layer=None,
+    sliding_window_per_layer=None,
+):
+    """SDPA runtime over a count-allocated cache.
+
+    Serving binds runtimes from vLLM's ``KVCacheConfig``
+    (``initialize_from_config``); unit fixtures size a pool directly.
+    """
+    from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
+    from vllm_metal.attention.runtime.sdpa import SDPAPagedAttentionRuntime
+
+    runtime = SDPAPagedAttentionRuntime(
+        block_size=block_size,
+        dtype=dtype,
+        cache_idx_map=cache_idx_map,
+        sliding_window_per_layer=sliding_window_per_layer,
+    )
+    runtime._cache = MetalPagedKVCache(
+        num_layers=num_layers,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        num_blocks=num_blocks,
+        block_size=block_size,
+        dtype=dtype,
+        kv_heads_per_layer=kv_heads_per_layer,
+        head_dim_per_layer=head_dim_per_layer,
+        sliding_window_per_layer=sliding_window_per_layer,
+    )
+    return runtime
+
+
+def make_mla_runtime(*, num_layers, latent_dim, num_blocks, block_size, dtype):
+    """MLA runtime over a count-allocated latent cache (unit fixtures only)."""
+    from vllm_metal.attention.caches.mla_cache import MLAPagedLatentCache
+    from vllm_metal.attention.runtime.mla import MLAPagedAttentionRuntime
+
+    runtime = MLAPagedAttentionRuntime()
+    runtime._cache = MLAPagedLatentCache(
+        num_layers=num_layers,
+        latent_dim=latent_dim,
+        num_blocks=num_blocks,
+        block_size=block_size,
+        dtype=dtype,
+    )
+    return runtime
+
+
+def adopt_draft_group(proposer, group_index, target_max_model_len):
+    """Hand a draft proposer its scheduler group without a storage bind.
+
+    Serving resolves both inside ``bind_paged_cache``; proposer unit fixtures
+    wire their own caches and only need the group and context limit.
+    """
+    proposer._scheduler_group_index = group_index
+    proposer._max_model_len = min(proposer._max_model_len, target_max_model_len)
