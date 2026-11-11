@@ -194,7 +194,9 @@ static const std::vector<int64_t>* gqa_compact_offsets(
       ? &offsets : nullptr;
 }
 
-static int gqa_decode_partition_for_arch(
+// Temporary compatibility policy for the measured M3 cases. Keep device
+// identity out of the common work rule; changing this policy is a separate step.
+static int apply_legacy_m3_gqa_policy(
     int partition, int num_heads, int num_kv_heads, int head_size,
     const GqaDecodeLengthPlan& plan, int block_size,
     const std::string& architecture, int max_seq_len) {
@@ -219,30 +221,37 @@ static int gqa_decode_partition_for_arch(
   return 256;
 }
 
+// Performance selection only: the caller owns eligibility and resource checks.
+static int gqa_partition_for_work(
+    const GqaDecodeLengthPlan& plan, int num_heads, int gpu_cores,
+    bool turboquant) {
+  if (gpu_cores <= 0 || plan.num_requests == 0) return 0;
+  for (size_t i = 0; i < kGqaPartitionSizes.size(); ++i) {
+    // TurboQuant producers measured faster at P256 than P512 below 64K
+    // tokens on M5 and M1 Max, so keep the existing P256-only policy.
+    if (turboquant && kGqaPartitionSizes[i] != 256) continue;
+    if (plan.full_partitions[i] * num_heads >= kGqaSimdGroupsPerCore * gpu_cores)
+      return kGqaPartitionSizes[i];
+  }
+  return 0;
+}
+
 static int gqa_decode_partition_for_lengths(
     int num_heads, int num_kv_heads, int head_size,
     const GqaDecodeLengthPlan& plan, int gpu_cores, int block_size,
-    const std::string& gpu_arch = "", int max_seq_len = 0,
-    bool turboquant = false) {
-  if (gpu_cores <= 0 || plan.num_requests == 0 ||
-      !gqa_decode_geometry_supported(
+    const std::string& gpu_arch, int max_seq_len, bool turboquant) {
+  // This table is the calibrated default scope, not a claim that every
+  // unlisted geometry is mathematically unsupported by the kernel.
+  if (!gqa_decode_geometry_supported(
           num_heads, num_kv_heads, head_size, block_size)) return 0;
-  int partition = 0;
-  for (size_t i = 0; i < kGqaPartitionSizes.size(); ++i) {
-    // TurboQuant producers measured faster at P256 than P512 below 64K
-    // tokens on M5 and M1 Max, so they admit only P256, under the same budget.
-    if (turboquant && kGqaPartitionSizes[i] != 256) continue;
-    if (plan.full_partitions[i] * num_heads >= kGqaSimdGroupsPerCore * gpu_cores) {
-      partition = kGqaPartitionSizes[i];
-      break;
-    }
-  }
+  const int partition = gqa_partition_for_work(
+      plan, num_heads, gpu_cores, turboquant);
   if (partition == 0 || plan.num_requests == 1 ||
       gpu_cores != kM3GqaGpuCores) return partition;
 
   const auto& architecture = gpu_arch.empty()
       ? metal::device(Device::gpu).get_architecture() : gpu_arch;
-  return gqa_decode_partition_for_arch(
+  return apply_legacy_m3_gqa_policy(
       partition, num_heads, num_kv_heads, head_size, plan, block_size,
       architecture, max_seq_len);
 }
@@ -685,6 +694,30 @@ struct PagedAttentionMetadata {
   int nax_prefill_split_hint;
 };
 
+static bool gqa_decode_kernel_eligible(
+    const PagedAttentionMetadata& m, int total_q_tokens, int num_seqs,
+    bool has_prefill) {
+  // Ordinary decode has exactly one query row per request. Scheduler counts
+  // distinguish it from expanded verification and one-token prefill segments.
+  // A mixed batch's decode prefix qualifies only with its own length plan.
+  const bool gqa_decode_rows =
+      total_q_tokens == num_seqs &&
+      ((num_seqs == 1 &&
+        (m.num_decode_requests == -1 || m.num_decode_requests == 1)) ||
+       (num_seqs > 1 && m.num_decode_requests == num_seqs &&
+        m.num_decode_tokens == num_seqs));
+  const bool gqa_turboquant = m.use_turboquant
+      && (m.key_dtype == int8 || m.key_dtype == uint8)
+      && m.value_dtype == uint8;
+  const bool gqa_cache_dtypes = m.use_turboquant
+      ? gqa_turboquant
+      : m.query_dtype == m.key_dtype && m.query_dtype == m.value_dtype;
+  return !has_prefill && m.window_seqlen_q <= 1 && gqa_decode_rows
+      && (m.query_dtype == float16 || m.query_dtype == bfloat16)
+      && gqa_cache_dtypes && m.softcap <= 0.f && !m.use_sinks
+      && m.sliding_window < 0;
+}
+
 // The single routing point selects execution paths from CPU metadata and lazy providers.
 enum class PagedAttentionRoute {
   MixedNaxSplit, MixedNaxUnsplit, MixedTiled,
@@ -855,33 +888,13 @@ static PagedAttentionPlan select_paged_attention_route(
 
   prepare_encoder();
 
-  // Ordinary decode has exactly one query row per request. Scheduler counts
-  // distinguish it from expanded verification and one-token prefill segments.
-  // A mixed batch's decode prefix qualifies only with its own length plan.
-  const bool gqa_decode_rows =
-      total_q_tokens == num_seqs &&
-      ((num_seqs == 1 &&
-        (m.num_decode_requests == -1 || m.num_decode_requests == 1)) ||
-       (num_seqs > 1 && m.num_decode_requests == num_seqs &&
-        m.num_decode_tokens == num_seqs));
-  // Enforce geometry at the actual dispatch boundary, including the private
-  // forced-partition entry. That entry bypasses only occupancy selection.
-  // TurboQuant caches take the TurboQuant producer under the same work
-  // budget, restricted to P256 (see gqa_decode_partition_for_lengths).
-  const bool gqa_turboquant = m.use_turboquant
-      && (m.key_dtype == int8 || m.key_dtype == uint8)
-      && m.value_dtype == uint8;
-  const bool gqa_cache_dtypes = m.use_turboquant
-      ? gqa_turboquant
-      : m.query_dtype == m.key_dtype && m.query_dtype == m.value_dtype;
+  // The test override skips performance selection, never eligibility or the
+  // existing calibrated geometry scope. Resource gates remain below and at
+  // the compiled reducer, where the actual static memory use is available.
   const bool gqa_supported = !m.gqa_disabled
-      && !has_prefill && m.window_seqlen_q <= 1 && gqa_decode_rows
-      && (m.query_dtype == float16 || m.query_dtype == bfloat16)
-      && gqa_cache_dtypes && m.softcap <= 0.f && !m.use_sinks
-      && m.sliding_window < 0
+      && gqa_decode_kernel_eligible(m, total_q_tokens, num_seqs, has_prefill)
       && gqa_decode_geometry_supported(
-          m.num_heads, m.num_kv_heads,
-          m.head_size, m.block_size);
+          m.num_heads, m.num_kv_heads, m.head_size, m.block_size);
 
   const int gqa_partition_size = !gqa_supported ? 0
       : m.gqa_test_partition > 0 ? m.gqa_test_partition
