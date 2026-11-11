@@ -1056,6 +1056,7 @@ def test_omni_platform_peak_memory_resets_per_interval():
             buf[offset : offset + (1 << 20)] = b"\x01" * (1 << 20)
     peak = MPSOmniPlatform.max_memory_reserved()
     assert peak - start >= size * 0.9
+    assert MPSOmniPlatform.max_memory_allocated() >= peak
 
     MPSOmniPlatform.reset_peak_memory_stats()
     assert MPSOmniPlatform.max_memory_reserved() < peak - size // 2

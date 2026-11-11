@@ -131,15 +131,19 @@ class MPSOmniPlatform(OmniPlatform, MetalPlatform):
     def is_initialized(cls):
         return torch.backends.mps.is_available()
 
-    # torch.mps keeps no peak statistics. Unified memory makes the process's
-    # physical footprint the closest measure; the kernel tracks its peak.
+    # torch.mps keeps no allocator or tensor peak statistics. Both peaks report
+    # the kernel-tracked peak physical footprint of this process since the last
+    # reset: on unified memory it covers MPS allocations, but it also counts
+    # CPU-side memory, so it reads higher than an allocator-only peak. Returning
+    # the same value for both keeps reserved - allocated from reporting an
+    # allocator overhead that is not measured.
     @classmethod
     def max_memory_reserved(cls, device=None):
         return _interval_max_phys_footprint()
 
     @classmethod
     def max_memory_allocated(cls, device=None):
-        return torch.mps.current_allocated_memory()
+        return _interval_max_phys_footprint()
 
     @classmethod
     def reset_peak_memory_stats(cls, device=None):
