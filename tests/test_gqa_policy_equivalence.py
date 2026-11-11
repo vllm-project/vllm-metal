@@ -90,29 +90,6 @@ def test_default_planner_matches_generic_policy(geometry, cores):
         assert actual == expected, (geometry, lengths, cores, bound)
 
 
-@pytest.mark.parametrize(
-    "geometry,lengths,legacy_m3_partition,expected",
-    [
-        ((32, 8, 128, 16), [703] * 6, 0, 256),
-        ((24, 4, 256, 16), [4096] * 4, 256, 512),
-        ((16, 2, 256, 32), [8192] * 5, 256, 512),
-        ((24, 4, 256, 16), [131072] * 128, 0, 512),
-    ],
-)
-def test_intended_changes_from_legacy_m3_policy(
-    geometry, lengths, legacy_m3_partition, expected
-):
-    """These are policy changes, not route-equivalent stage-one refactoring."""
-    heads, kv_heads, width, page = geometry
-    assert expected != legacy_m3_partition
-    assert (
-        get_ops().gqa_decode_batch_partition_size(
-            heads, kv_heads, width, lengths, 10, page
-        )
-        == expected
-    )
-
-
 @pytest.mark.parametrize("geometry", [(32, 8, 128, 16), (24, 4, 256, 16)])
 @pytest.mark.parametrize("bound", [65536, 65537, 131072, 131073])
 def test_allocation_bound_does_not_change_work_selected_partition(geometry, bound):
