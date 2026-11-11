@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Freeze the pre-refactor default policy, independently of native helpers.
+"""Check the device-independent default policy against an independent oracle.
 
 This is a planning-only differential check: it allocates no KV arrays and does
 not claim numerical parity or test the compiled reducer's final safety check.
-The measured geometry table and calibration values are deliberately frozen here
+The measured geometry table and work budget are deliberately frozen here
 rather than read from the implementation being checked.
 """
 
@@ -24,13 +24,13 @@ _GEOMETRIES = (
 )
 
 
-def _original_partition(geometry, lengths, cores, architecture, bound):
-    """Reference contract of main@3ccf7b2, before policy extraction."""
+def _generic_partition(geometry, lengths, cores, bound):
+    """Stage-one generic work rule and scratch check, without legacy M3 policy."""
     if geometry not in _GEOMETRIES or cores <= 0 or not lengths:
         return 0
     if min(lengths) <= 0:
         return 0
-    heads, _, width, page = geometry
+    heads, _, width, _ = geometry
     enough_work = {
         p for p in (256, 512) if heads * sum(n // p for n in lengths) >= 33 * cores
     }
@@ -38,16 +38,6 @@ def _original_partition(geometry, lengths, cores, architecture, bound):
         return 0
     selected = max(enough_work)
     allocation = max(bound, max(lengths))
-    if architecture == "applegpu_g15g" and cores == 10 and len(lengths) > 1:
-        if geometry[:3] == (32, 8, 128) and len(lengths) == 6 and max(lengths) < 704:
-            return 0
-        # 32 KiB minus 64 static bytes leaves room for 4,088 P256
-        # statistics pairs. This is the legacy preference's conservative
-        # check, not a replacement for the actual compiled-pipeline check.
-        threshold = 4096 if page == 16 else 8192
-        if width == 256 and max(lengths) >= threshold and allocation <= 4088 * 256:
-            selected = 256
-
     rectangle = len(lengths) * ((allocation + selected - 1) // selected)
     actual = sum((n + selected - 1) // selected for n in lengths)
     compact = len(lengths) > 1 and actual < rectangle
@@ -58,14 +48,14 @@ def _original_partition(geometry, lengths, cores, architecture, bound):
 
 
 def _length_cases():
-    # Full-partition work, short M3 veto, page-specific preference, reducer
+    # Full-partition work, former calibration boundaries, allocation
     # capacity and scratch transitions; also rotate which row owns the maximum.
     boundaries = (255, 256, 511, 512, 703, 704, 1023, 1024, 4095, 4096, 8191, 8192)
     for n in boundaries:
         for batch in (1, 4, 6, 8):
             yield [n] * batch, 0
         yield [1, n, 255, 512], n + 512
-    for bound in (1046528, 1046529, 1048576, 1048577):
+    for bound in (65536, 65537, 131072, 131073, 1046528, 1046529, 1048576, 1048577):
         yield [8192] * 4, bound
     for batch in (63, 127, 128, 256):
         yield [131072] * batch, 0
@@ -82,13 +72,12 @@ def _length_cases():
 
 
 @pytest.mark.parametrize("geometry", (*_GEOMETRIES, (16, 4, 256, 16), (32, 8, 128, 32)))
-@pytest.mark.parametrize("cores", (0, 10, 20, 40))
-@pytest.mark.parametrize("architecture", ("applegpu_g15g", "applegpu_g18p", "unknown"))
-def test_default_planner_matches_pre_refactor_policy(geometry, cores, architecture):
+@pytest.mark.parametrize("cores", (-1, 0, 7, 9, 10, 11, 20, 40))
+def test_default_planner_matches_generic_policy(geometry, cores):
     ops = get_ops()
     heads, kv_heads, width, page = geometry
     for lengths, bound in _length_cases():
-        expected = _original_partition(geometry, lengths, cores, architecture, bound)
+        expected = _generic_partition(geometry, lengths, cores, bound)
         actual = ops.gqa_decode_batch_partition_size(
             heads,
             kv_heads,
@@ -96,7 +85,73 @@ def test_default_planner_matches_pre_refactor_policy(geometry, cores, architectu
             lengths,
             cores,
             page,
-            gpu_arch=architecture,
             max_seq_len=bound,
         )
-        assert actual == expected, (geometry, lengths, cores, architecture, bound)
+        assert actual == expected, (geometry, lengths, cores, bound)
+
+
+@pytest.mark.parametrize(
+    "geometry,lengths,legacy_m3_partition,expected",
+    [
+        ((32, 8, 128, 16), [703] * 6, 0, 256),
+        ((24, 4, 256, 16), [4096] * 4, 256, 512),
+        ((16, 2, 256, 32), [8192] * 5, 256, 512),
+        ((24, 4, 256, 16), [131072] * 128, 0, 512),
+    ],
+)
+def test_intended_changes_from_legacy_m3_policy(
+    geometry, lengths, legacy_m3_partition, expected
+):
+    """These are policy changes, not route-equivalent stage-one refactoring."""
+    heads, kv_heads, width, page = geometry
+    assert expected != legacy_m3_partition
+    assert (
+        get_ops().gqa_decode_batch_partition_size(
+            heads, kv_heads, width, lengths, 10, page
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize("geometry", [(32, 8, 128, 16), (24, 4, 256, 16)])
+@pytest.mark.parametrize("bound", [65536, 65537, 131072, 131073])
+def test_allocation_bound_does_not_change_work_selected_partition(geometry, bound):
+    heads, kv, width, page = geometry
+    assert (
+        get_ops().gqa_decode_batch_partition_size(
+            heads, kv, width, [8192] * 4, 10, page, max_seq_len=bound
+        )
+        == 512
+    )
+
+
+def test_allocation_bound_does_not_supply_missing_work():
+    # P256 has 384 complete groups; P512 has 192, below the 330-group budget.
+    assert (
+        get_ops().gqa_decode_batch_partition_size(
+            32, 8, 128, [512] * 6, 10, 16, max_seq_len=65537
+        )
+        == 256
+    )
+
+
+@pytest.mark.parametrize("bound,expected", [(16268800, 256), (16268801, 0)])
+def test_work_selected_p256_scratch_limit_does_not_promote_to_p512(bound, expected):
+    # Actual 10,752-token work admits only P256 at 40 cores. A single row
+    # uses rectangular scratch: 63,550 P256 slots fit, one more does not.
+    # P512 would fit the allocation budget but still lacks complete work.
+    assert (
+        get_ops().gqa_decode_batch_partition_size(
+            32, 8, 128, [10752], 40, 16, max_seq_len=bound
+        )
+        == expected
+    )
+
+
+def test_work_selected_p512_scratch_failure_falls_back():
+    # Work chooses P512 first; exceeding its scratch budget returns fallback,
+    # rather than running a separate resource-driven partition search.
+    assert (
+        get_ops().gqa_decode_batch_partition_size(24, 4, 256, [131072] * 256, 10, 16)
+        == 0
+    )

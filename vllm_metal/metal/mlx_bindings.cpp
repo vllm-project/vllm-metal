@@ -39,10 +39,10 @@ static int gqa_decode_plan_for_shape(int num_heads, int num_kv_heads,
 static int gqa_decode_batch_plan_for_shape(
     int num_heads, int num_kv_heads, int head_size,
     const std::vector<int>& context_lens, int gpu_cores, int block_size,
-    const std::string& gpu_arch = "", int max_seq_len = 0) {
+    int max_seq_len = 0) {
   return gqa_decode_plan_for_lengths(num_heads, num_kv_heads, head_size,
       gqa_decode_length_plan(context_lens), gpu_cores, block_size,
-      gpu_arch, max_seq_len);
+      max_seq_len);
 }
 
 static bool gqa_decode_shape_eligible(int num_heads, int num_kv_heads,
@@ -157,10 +157,9 @@ NB_MODULE(_paged_ops, m) {
   m.def("gqa_decode_batch_partition_size", &gqa_decode_batch_plan_for_shape,
         nb::arg("num_heads"), nb::arg("num_kv_heads"), nb::arg("head_size"),
         nb::arg("context_lens"), nb::arg("gpu_cores"), nb::arg("block_size") = 16,
-        nb::arg("gpu_arch") = "", nb::arg("max_seq_len") = 0,
-        "GQA partition from per-request KV lengths, or zero. Empty gpu_arch "
-        "uses the executing GPU; an explicit architecture is a read-only planning "
-        "input and does not override dispatch. max_seq_len optionally supplies "
+        nb::arg("max_seq_len") = 0,
+        "GQA partition from per-request KV lengths and core count, or zero. "
+        "No device query or architecture-specific policy. max_seq_len supplies "
         "the dispatch bound; compact scratch uses actual lengths. Dispatch separately "
         "checks features and compiled reducer resources.");
   m.def("last_gqa_partition_size", []() {
@@ -194,18 +193,6 @@ NB_MODULE(_paged_ops, m) {
     config["partitions"] = partitions;
     config["simd_groups_per_core"] = kGqaSimdGroupsPerCore;
     config["max_scratch_bytes"] = kGqaMaxScratchBytes;
-    nb::dict m3;
-    m3["architecture"] = "applegpu_g15g";
-    m3["gpu_cores"] = kM3GqaGpuCores;
-    m3["short_head128_batch"] = kM3GqaShortHead128Batch;
-    m3["short_head128_min_context"] = kM3GqaShortHead128MinContext;
-    m3["long_head_size"] = 256;
-    m3["block16_min_context"] = kM3GqaBlock16MinContext;
-    m3["block32_min_context"] = kM3GqaBlock32MinContext;
-    m3["preferred_partition"] = 256;
-    m3["reducer_memory_bytes"] = kM3GqaReducerMemoryBytes;
-    m3["reducer_static_memory_bytes"] = kGqaReduceStaticMemoryBytes;
-    config["m3_batched_preference"] = m3;
     return config;
   }, "Read-only test metadata from the native dispatch table and planner. "
      "Does not create pipelines, override policy or inspect hardware.");

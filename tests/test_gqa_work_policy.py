@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Independent M3 partition boundaries, resources and executed lazy batches."""
+"""Work-budget boundaries, resource checks and executed lazy batches."""
 
 import mlx.core as mx
 import numpy as np
@@ -7,8 +7,6 @@ import pytest
 
 from tests.gqa_test_utils import _primitive
 from vllm_metal.metal import get_ops
-
-M3_ARCH = "applegpu_g15g"
 
 
 @pytest.fixture(autouse=True)
@@ -31,102 +29,81 @@ def _native_diagnostics():
         ((24, 4, 256, 16), [1024] * 4, 256),
         ((24, 4, 256, 16), [2048] * 4, 512),
         ((24, 4, 256, 16), [4095] * 4, 512),
-        ((24, 4, 256, 16), [4096] * 4, 256),
-        ((24, 4, 256, 16), [8192] * 8, 256),
-        ((24, 4, 256, 16), [1] * 63 + [131072], 256),
-        ((24, 4, 256, 16), [1] * 127 + [131072], 256),
-        ((24, 4, 256, 16), [131072] * 128, 0),  # Still exceeds compact budget.
-        ((24, 4, 256, 16), [1, 255, 256, 8192], 256),
+        ((24, 4, 256, 16), [4096] * 4, 512),
+        ((24, 4, 256, 16), [8192] * 8, 512),
+        ((24, 4, 256, 16), [1] * 63 + [131072], 512),
+        ((24, 4, 256, 16), [1] * 127 + [131072], 512),
+        (
+            (24, 4, 256, 16),
+            [131072] * 128,
+            512,
+        ),  # The original P512-first selection fits the scratch budget.
+        ((24, 4, 256, 16), [131072] * 256, 0),  # P512 also exceeds scratch.
+        ((24, 4, 256, 16), [1, 255, 256, 8192], 512),
         ((16, 2, 256, 16), [4095] * 5, 512),
-        ((16, 2, 256, 16), [4096] * 5, 256),
+        ((16, 2, 256, 16), [4096] * 5, 512),
         ((16, 2, 256, 32), [1280] * 5, 256),
         ((16, 2, 256, 32), [2559] * 5, 256),
         ((16, 2, 256, 32), [2560] * 5, 512),
         ((16, 2, 256, 32), [1535] * 10, 256),
         ((16, 2, 256, 32), [1536] * 10, 512),
         ((16, 2, 256, 32), [8191] * 5, 512),
-        ((16, 2, 256, 32), [8192] * 5, 256),
-        ((16, 2, 256, 32), [8192] * 10, 256),
-        # Only the measured six-request short interval falls back in head128.
+        ((16, 2, 256, 32), [8192] * 5, 512),
+        ((16, 2, 256, 32), [8192] * 10, 512),
+        # Complete partition work determines short-context admission.
         ((32, 8, 128, 16), [512] * 5, 0),
-        ((32, 8, 128, 16), [512] * 6, 0),
-        ((32, 8, 128, 16), [639] * 6, 0),
-        ((32, 8, 128, 16), [640] * 6, 0),
-        ((32, 8, 128, 16), [703] * 6, 0),
+        ((32, 8, 128, 16), [512] * 6, 256),
+        ((32, 8, 128, 16), [639] * 6, 256),
+        ((32, 8, 128, 16), [640] * 6, 256),
+        ((32, 8, 128, 16), [703] * 6, 256),
         ((32, 8, 128, 16), [704] * 6, 256),
         ((32, 8, 128, 16), [767] * 6, 256),
         ((32, 8, 128, 16), [512] * 7, 256),
         ((32, 8, 128, 16), [512] * 8, 256),
-        ((32, 8, 128, 16), [512] * 5 + [256], 0),
+        ((32, 8, 128, 16), [512] * 5 + [256], 256),
         ((32, 8, 128, 16), [1024] * 3, 256),
         ((32, 8, 128, 16), [2048] * 3, 512),
         ((16, 2, 128, 16), [1280] * 5, 256),
         ((16, 2, 128, 16), [8192] * 5, 512),
         # Functional admission and malformed-length handling are unchanged.
         ((16, 4, 256, 16), [8192] * 4, 0),
-        # (24, 4, 256) uses the existing head256/block32 M3 preference.
-        ((24, 4, 256, 32), [8192] * 4, 256),
+        # The page size does not introduce a separate performance preference.
+        ((24, 4, 256, 32), [8192] * 4, 512),
         ((24, 4, 256, 16), [], 0),
         ((24, 4, 256, 16), [0, 8192], 0),
         ((24, 4, 256, 16), [-1, 8192], 0),
     ],
 )
-def test_m3_batch_planner_boundaries(geometry, lengths, expected):
+def test_batch_planner_boundaries(geometry, lengths, expected):
     q, kv, head, block = geometry
     assert (
-        get_ops().gqa_decode_batch_partition_size(
-            q, kv, head, lengths, 10, block, gpu_arch=M3_ARCH
-        )
+        get_ops().gqa_decode_batch_partition_size(q, kv, head, lengths, 10, block)
         == expected
     )
 
 
-@pytest.mark.parametrize("cores", [10, 20, 40])
-@pytest.mark.parametrize(
-    "architecture", ["applegpu_g14g", "applegpu_g16g", "applegpu_g18p", "unknown"]
-)
-def test_other_devices_keep_the_common_work_rule(cores, architecture):
-    assert (
-        get_ops().gqa_decode_batch_partition_size(
-            24, 4, 256, [8192] * 4, cores, 16, gpu_arch=architecture
-        )
-        == 512
-    )
-
-
-@pytest.mark.parametrize("cores", [20, 40])
-def test_m3_preference_is_scoped_to_the_measured_core_count(cores):
-    assert (
-        get_ops().gqa_decode_batch_partition_size(
-            24, 4, 256, [8192] * 4, cores, 16, gpu_arch=M3_ARCH
-        )
-        == 512
-    )
-
-
-@pytest.mark.parametrize("architecture", ["applegpu_g16g", "applegpu_g18p"])
-def test_short_guards_do_not_change_other_architectures(architecture):
+@pytest.mark.parametrize("cores", [7, 9, 10, 11, 13, 20, 40])
+def test_work_budget_scales_with_core_count(cores):
+    # A single row has ceil(33 * cores / 32) full partitions at the
+    # transition. Head128 retains P512 promotion when it gains enough work.
+    required = (33 * cores + 31) // 32
     ops = get_ops()
-    assert (
-        ops.gqa_decode_batch_partition_size(
-            32, 8, 128, [512] * 6, 10, 16, gpu_arch=architecture
+    for partition, expected_before in ((256, 0), (512, 256)):
+        boundary = required * partition
+        assert (
+            ops.gqa_decode_batch_partition_size(32, 8, 128, [boundary - 1], cores, 16)
+            == expected_before
         )
-        == 256
-    )
-    assert (
-        ops.gqa_decode_batch_partition_size(
-            16, 2, 256, [1280] * 5, 10, 32, gpu_arch=architecture
+        assert (
+            ops.gqa_decode_batch_partition_size(32, 8, 128, [boundary], cores, 16)
+            == partition
         )
-        == 256
-    )
 
 
 @pytest.mark.parametrize("cores", [0, -1])
-def test_m3_profile_does_not_bypass_unknown_core_fallback(cores):
+def test_unknown_core_count_falls_back(cores):
     assert (
-        get_ops().gqa_decode_batch_partition_size(
-            24, 4, 256, [8192] * 4, cores, 16, gpu_arch=M3_ARCH
-        )
+        get_ops().gqa_decode_batch_partition_size(24, 4, 256, [8192] * 4, cores, 16)
         == 0
     )
 
@@ -134,13 +111,11 @@ def test_m3_profile_does_not_bypass_unknown_core_fallback(cores):
 @pytest.mark.parametrize(
     "geometry", [(24, 4, 256, 16), (16, 2, 256, 16), (16, 2, 256, 32)]
 )
-def test_single_request_policy_is_preserved(geometry):
+def test_single_and_batch_planners_agree(geometry):
     q, kv, head, block = geometry
     ops = get_ops()
     assert (
-        ops.gqa_decode_batch_partition_size(
-            q, kv, head, [16384], 10, block, gpu_arch=M3_ARCH
-        )
+        ops.gqa_decode_batch_partition_size(q, kv, head, [16384], 10, block)
         == ops.gqa_decode_partition_size(q, kv, head, 16384, 10, block)
         == 512
     )
@@ -148,16 +123,15 @@ def test_single_request_policy_is_preserved(geometry):
 
 @pytest.mark.parametrize(
     "maximum,expected",
-    [(1046528, 256), (1046529, 512), (1048576, 512), (1048577, 512)],
+    [(1046528, 512), (1046529, 512), (1048576, 512), (1048577, 512)],
 )
-def test_m3_smaller_partition_respects_the_allocation_bound(maximum, expected):
+def test_compact_plan_keeps_p512_across_former_preference_boundary(maximum, expected):
     ops = get_ops()
-    # 4,088 partitions use 32,704 dynamic bytes plus 64 static bytes. The old
-    # 1,048,576-token bound spent all 32 KiB on dynamic memory and then threw
-    # at the real reducer dispatch, despite a feasible P512 route.
+    # Actual lengths determine compact scratch; a larger dispatch bound
+    # neither changes the work budget nor creates a device-specific preference.
     assert (
         ops.gqa_decode_batch_partition_size(
-            24, 4, 256, [8192] * 4, 10, 16, gpu_arch=M3_ARCH, max_seq_len=maximum
+            24, 4, 256, [8192] * 4, 10, 16, max_seq_len=maximum
         )
         == expected
     )
@@ -165,20 +139,20 @@ def test_m3_smaller_partition_respects_the_allocation_bound(maximum, expected):
 
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
 @pytest.mark.parametrize(
-    "geometry,length,batch,m3_partition,generic_partition",
+    "geometry,length,batch,expected_partition",
     [
-        ((24, 4, 256, 16), 8192, 4, 256, 512),
-        ((16, 2, 256, 16), 8192, 5, 256, 512),
-        ((16, 2, 256, 32), 8192, 4, 256, 512),
-        ((16, 2, 256, 32), 1280, 5, 256, 256),
-        ((32, 8, 128, 16), 639, 6, 0, 256),
-        ((32, 8, 128, 16), 640, 6, 0, 256),
-        ((32, 8, 128, 16), 704, 6, 256, 256),
-        ((32, 8, 128, 16), 512, 7, 256, 256),
+        ((24, 4, 256, 16), 8192, 4, 512),
+        ((16, 2, 256, 16), 8192, 5, 512),
+        ((16, 2, 256, 32), 8192, 4, 512),
+        ((16, 2, 256, 32), 1280, 5, 256),
+        ((32, 8, 128, 16), 639, 6, 256),
+        ((32, 8, 128, 16), 640, 6, 256),
+        ((32, 8, 128, 16), 704, 6, 256),
+        ((32, 8, 128, 16), 512, 7, 256),
     ],
 )
 def test_default_planner_matches_executed_batch_and_constant_oracle(
-    dtype, geometry, length, batch, m3_partition, generic_partition
+    dtype, geometry, length, batch, expected_partition
 ):
     q, kv, head, block = geometry
     query = mx.zeros((batch, q, head), dtype)
@@ -188,11 +162,6 @@ def test_default_planner_matches_executed_batch_and_constant_oracle(
         [[i] * ((length + block - 1) // block) for i in range(batch)], mx.int32
     )
     lengths = [length] * batch
-    expected_partition = (
-        m3_partition
-        if mx.device_info()["architecture"] == M3_ARCH
-        else generic_partition
-    )
     ops = get_ops()
     assert (
         ops.gqa_decode_batch_partition_size(q, kv, head, lengths, 10, block)
@@ -214,7 +183,7 @@ def test_default_planner_matches_executed_batch_and_constant_oracle(
     )
 
 
-def test_partition_transition_and_reordered_rows_survive_lazy_evaluation():
+def test_length_transition_and_reordered_rows_survive_lazy_evaluation():
     ops = get_ops()
     q, kv, head, block = 24, 4, 256, 16
     keys = mx.zeros((5, block, kv, head), mx.float16)
@@ -259,11 +228,10 @@ def test_partition_transition_and_reordered_rows_survive_lazy_evaluation():
         host_lengths,
     )
     host_lengths[:] = [1]  # Neither the saved plan nor its GPU lengths may drift.
-    selected = 256 if mx.device_info()["architecture"] == M3_ARCH else 512
     for out, partition, expected in [
         (first, 512, [1.0] * 4),
-        (second, selected, [1 + (i + 1) / 64 for i in range(4)]),
-        (third, selected, [1 + 3 / 64, 1.0, 1 + 4 / 64]),
+        (second, 512, [1 + (i + 1) / 64 for i in range(4)]),
+        (third, 512, [1 + 3 / 64, 1.0, 1 + 4 / 64]),
     ]:
         mx.eval(out)
         assert ops.last_gqa_partition_size() == partition
@@ -272,7 +240,7 @@ def test_partition_transition_and_reordered_rows_survive_lazy_evaluation():
         np.testing.assert_allclose(np.array(out), reference, atol=2e-3, rtol=0)
 
 
-def test_short_guard_transition_survives_deferred_decode():
+def test_short_lengths_survive_deferred_decode():
     ops = get_ops()
     batch, q, kv, head, block = 6, 32, 8, 128, 16
     keys = mx.zeros((batch, block, kv, head), mx.float16)
@@ -297,10 +265,7 @@ def test_short_guard_transition_survives_deferred_decode():
         pending.append((length, out))
     for length, out in reversed(pending):
         mx.eval(out)
-        expected_partition = (
-            0 if length == 703 and mx.device_info()["architecture"] == M3_ARCH else 256
-        )
-        assert ops.last_gqa_partition_size() == expected_partition
+        assert ops.last_gqa_partition_size() == 256
         expected = np.arange(1, batch + 1) + 64 * (length // block) / length
         reference = np.broadcast_to(expected[:, None, None], out.shape)
         np.testing.assert_allclose(np.array(out), reference, atol=0.004, rtol=0.001)
@@ -308,11 +273,11 @@ def test_short_guard_transition_survives_deferred_decode():
 
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
 @pytest.mark.parametrize(
-    "maximum,m3_partition",
+    "maximum,forced_partition",
     [(1046528, 256), (1046529, 512), (1048576, 512), (1048577, 512)],
 )
 def test_native_selection_keeps_resource_feasible_partition(
-    dtype, maximum, m3_partition
+    dtype, maximum, forced_partition
 ):
     ops = get_ops()
     batch, q, kv, head, block = 4, 24, 4, 256, 16
@@ -333,11 +298,10 @@ def test_native_selection_keeps_resource_feasible_partition(
     )
     mx.eval(out)
     assert ops.last_paged_dispatch() == "gqa_decode"
-    expected = m3_partition if mx.device_info()["architecture"] == M3_ARCH else 512
-    assert ops.last_gqa_partition_size() == expected
+    assert ops.last_gqa_partition_size() == 512
     np.testing.assert_allclose(np.array(out.astype(mx.float32)), 2, atol=2e-3, rtol=0)
-    # Exercise the selected M3 specialization on non-M3 CI as well. Only
-    # occupancy/preference is forced; real pipeline resource checks remain.
+    # Also exercise P256 at the conservative 32-KiB boundary. Only
+    # occupancy is forced; actual pipeline resource checks remain.
     selected = ops._gqa_paged_attention_for_test(
         query,
         keys,
@@ -347,10 +311,10 @@ def test_native_selection_keeps_resource_feasible_partition(
         mx.array(lengths, mx.int32),
         block,
         maximum,
-        m3_partition,
+        forced_partition,
     )
     mx.eval(selected)
-    assert ops.last_gqa_partition_size() == m3_partition
+    assert ops.last_gqa_partition_size() == forced_partition
     np.testing.assert_allclose(
         np.array(selected.astype(mx.float32)), 2, atol=2e-3, rtol=0
     )
