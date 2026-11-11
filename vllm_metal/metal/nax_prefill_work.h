@@ -198,7 +198,7 @@ inline double nax_prefill_cost(
 
 inline double nax_admission_margin(const NaxPrefillWork& upstream,
                                    const NaxPrefillWork& candidate, int cores) {
-  constexpr double kMinimumGain = .15;
+  constexpr double kMinimumGain = .10;
   constexpr double kCapacityReserve = .30;
   // A candidate with fewer useful groups than GPU cores has less parallel
   // slack. Apply the reserve to full query work, where upstream is efficient.

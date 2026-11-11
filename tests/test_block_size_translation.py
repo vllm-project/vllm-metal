@@ -461,6 +461,8 @@ def _nax_plan_config(
         ({"q": 64, "split": 1}, (64, 1, 128)),
         # The guarded BQ64 tail has a long KV scan; BQ16 is full only at Q1056.
         ({"q": 1056, "prefix": 15840, "split": 1}, (16, 4, 128)),
+        ({"q": 1056, "prefix": 15840, "split": 1, "cores": 10}, (16, 4, 128)),
+        ({"q": 1056, "prefix": 15840, "split": 1, "cores": 20}, (16, 4, 128)),
         ({"q": 1057, "prefix": 15840, "split": 1}, (64, 1, 128)),
         # A large, fully occupied grid alone does not justify eight heads.
         ({"q": 32768, "prefix": 0, "split": 1}, (64, 1, 128)),
