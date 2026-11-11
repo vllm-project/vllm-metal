@@ -50,6 +50,16 @@ unset below that, on Ray executors, or when `max_num_batched_tokens` exceeds
 4096 (the #585 startup-failure shape). A value you export yourself always
 wins. Outputs are unaffected.
 
+## PyTorch MPS Allocator Watermark
+
+On the PyTorch MPS backend the plugin defaults
+`PYTORCH_MPS_LOW_WATERMARK_RATIO` to the effective memory fraction
+(`--gpu-memory-utilization`), so PyTorch starts returning cached heaps once
+the pool passes the configured budget. PyTorch's own default is 1.4 times the
+recommended working set, which an 8 GB Mac cannot reach before Metal runs out
+of memory. Exporting either `PYTORCH_MPS_LOW_WATERMARK_RATIO` or
+`PYTORCH_MPS_HIGH_WATERMARK_RATIO` yourself leaves both untouched.
+
 ## Multimodal Serve Modes
 
 - `auto`: use the native multimodal path where it is supported. Qwen3.5/Qwen3.6
