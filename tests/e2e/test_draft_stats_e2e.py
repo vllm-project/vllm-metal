@@ -334,13 +334,13 @@ def test_controlled_rejection_recovers_after_prefix_hit(
     )
 
 
-def _run_sleep_round_trip():
+def _run_sleep_round_trip(model, speculative_config):
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
     import mlx.core as mx
     from vllm import LLM, SamplingParams
 
     llm = LLM(
-        model="Qwen/Qwen3-0.6B",
+        model=model,
         max_model_len=128,
         max_num_seqs=2,
         block_size=16,
@@ -349,11 +349,7 @@ def _run_sleep_round_trip():
         enable_sleep_mode=True,
         async_scheduling=False,
         disable_log_stats=False,
-        speculative_config={
-            "method": "draft_model",
-            "model": "Qwen/Qwen3-0.6B",
-            "num_speculative_tokens": 3,
-        },
+        speculative_config=speculative_config,
     )
     runner = llm.llm_engine.model_executor.driver_worker.model_runner
     try:
@@ -387,6 +383,24 @@ def _run_sleep_round_trip():
 
 
 @pytest.mark.slow
-def test_draft_model_sleep_round_trip_e2e(run_in_spawn_process):
+@pytest.mark.parametrize(
+    ("model", "method", "draft_model", "width"),
+    [
+        ("Qwen/Qwen3-0.6B", "draft_model", "Qwen/Qwen3-0.6B", 3),
+        ("mlx-community/Qwen3-4B-4bit", "dflash", "z-lab/Qwen3-4B-DFlash-b16", 3),
+        (
+            "mlx-community/Qwen3-4B-4bit",
+            "dspark",
+            "deepseek-ai/dspark_qwen3_4b_block7",
+            7,
+        ),
+    ],
+    ids=["draft_model", "dflash", "dspark"],
+)
+def test_sleep_round_trip_e2e(run_in_spawn_process, model, method, draft_model, width):
     """Wake re-creates target and draft KV: same tokens, same acceptance."""
-    run_in_spawn_process(_run_sleep_round_trip)
+    run_in_spawn_process(
+        _run_sleep_round_trip,
+        model,
+        {"method": method, "model": draft_model, "num_speculative_tokens": width},
+    )

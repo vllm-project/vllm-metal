@@ -411,17 +411,17 @@ class TestMetalPlatform:
     def test_sleep_mode_is_available(self) -> None:
         assert MetalPlatform.is_sleep_mode_available()
 
-    def test_check_and_update_config_rejects_sleep_mode_with_block_drafting(
+    def test_check_and_update_config_rejects_sleep_mode_with_mtp_drafting(
         self,
     ) -> None:
         vllm_config = self._platform_config(
             model_config=SimpleNamespace(enable_sleep_mode=True),
-            speculative_config=SimpleNamespace(method="dflash"),
+            speculative_config=SimpleNamespace(method="mtp"),
         )
-        with pytest.raises(NotImplementedError, match="only n-gram and draft-model"):
+        with pytest.raises(NotImplementedError, match="Sleep mode.*method='mtp'"):
             MetalPlatform.check_and_update_config(vllm_config)
 
-    @pytest.mark.parametrize("method", ["ngram", "draft_model"])
+    @pytest.mark.parametrize("method", ["ngram", "draft_model", "dflash", "dspark"])
     def test_sleep_mode_accepts_drafters_without_private_kv(self, method) -> None:
         """Their KV, if any, is a view of the storage that sleep re-creates."""
         vllm_config = self._platform_config(
