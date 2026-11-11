@@ -13,6 +13,7 @@ from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, override
 
 import vllm.v1.kv_offload.tiering.spec as _tiering_spec_module
+from vllm.logger import init_logger
 from vllm.v1.kv_offload.base import (
     CanonicalKVCaches,
     OffloadingManager,
@@ -21,6 +22,10 @@ from vllm.v1.kv_offload.base import (
 )
 from vllm.v1.kv_offload.config import OffloadingConfig
 from vllm.v1.kv_offload.tiering.spec import TieringOffloadingSpec
+
+from vllm_metal.v1.kv_offload.config import AUTO_POOL_KEY
+
+logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from vllm_metal.attention.caches.storage import KVCacheStorage
@@ -102,8 +107,44 @@ class MetalTieringOffloadingSpec(TieringOffloadingSpec):
     @override
     def get_manager(self) -> OffloadingManager:
         """Upstream body with the Metal shared region."""
+        self._warn_if_pool_under_one_request()
         with _metal_shared_region():
             return super().get_manager()
+
+    def _warn_if_pool_under_one_request(self) -> None:
+        """Warn when the host pool holds less than one full-length request.
+
+        vLLM stores a prefill step's chunks all or nothing, so a longer
+        prompt may never be stored. With a disk tier, restoring a longer
+        prompt stalled the request in testing. Related: vllm#62931.
+        """
+        if self.num_chunks <= 0:
+            return
+        tokens_per_chunk = self.tokens_per_block[0] * self.blocks_per_chunk
+        request_chunks = self.config.model.max_model_len // tokens_per_chunk
+        if self.num_chunks >= request_chunks:
+            return
+        # Hundredths of a GiB, rounded up.
+        min_size = -(-request_chunks * self.kv_bytes_per_chunk * 100 // 2**30)
+        size = f"--kv-offloading-size to {min_size // 100}.{min_size % 100:02d} GiB"
+        if self.extra_config.get(AUTO_POOL_KEY) is True:
+            fix = (
+                "This is the default pool. Use a shorter --max-model-len, or "
+                f"set {size} or more if memory allows."
+            )
+        else:
+            fix = f"Set {size} or more, or use a shorter --max-model-len."
+        effect = "Prompts longer than the pool may not be stored."
+        if self.secondary_tier_configs:
+            effect += " A request restoring a longer prompt from disk can stall."
+        logger.warning(
+            "KV offloading host pool holds %d chunks, one --max-model-len "
+            "request needs %d. %s %s",
+            self.num_chunks,
+            request_chunks,
+            effect,
+            fix,
+        )
 
     @classmethod
     @override
