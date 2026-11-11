@@ -105,8 +105,9 @@ Sleep levels mean something different on unified memory than on a GPU:
   well under a second, and the prefix cache starts empty.
 - `llm.sleep(level=0)` followed by `llm.release_kv_cache_memory()` also frees
   the KV cache. Restore it with `llm.wake_up(tags=["kv_cache"])`.
-- The amount freed is the part of the KV pool that was in use, because the
-  pool is allocated lazily.
+- The amount freed is the whole KV pool, not only the blocks in use. The pool
+  is resident again at wake if it keeps the zero fill, otherwise once requests
+  run again.
 - With [KV offloading](kv_offloading.md), sleep also frees the host pool. It
   comes back empty at wake. Prompts already on the disk tier still restore.
 
@@ -135,36 +136,28 @@ sliding layers to release old blocks. This can improve long-context capacity,
 but not necessarily generation speed. Use `--disable-hybrid-kv-cache-manager`
 for dense allocation.
 
-The KV pool is allocated lazily. vLLM's allocator zero-fills the backing store,
-which on unified memory commits every page of the pool at startup; vllm-metal
-requests the same layout without the fill whenever vLLM does not require it
-(uniform-precision attention caches — `KVCacheConfig.needs_kv_cache_zeroing`
-covers Mamba state and mixed-precision caches, which keep the zero fill). Pages
-are then committed only as blocks are used, so `--gpu-memory-utilization` sizes
-the *capacity* the engine may reach rather than the resident footprint it pays
-for immediately: a 16 GB Mac can give the cache a multi-GB budget while a short
-request only occupies the blocks it writes. A slot a request never writes never
+The KV pool is allocated without a zero fill where it can be. vLLM's allocator
+zero-fills the backing store, which on unified memory commits every page of the
+pool at startup; vllm-metal requests the same layout without the fill whenever
+vLLM does not require it (uniform-precision attention caches —
+`KVCacheConfig.needs_kv_cache_zeroing` covers Mamba state and mixed-precision
+caches, which keep the zero fill).
+Skipping the fill does not keep the pool out of memory on a server. The first
+use of a layer makes that layer's whole buffer resident, so the whole pool is
+resident once a request has run every layer, idle blocks included. The worker
+also raises the MLX wired limit at startup, and then the pool is resident by
+the time the server is ready
+([#1198](https://github.com/vllm-project/vllm-metal/issues/1198)). Without the
+fill, process RSS does not show it. Plan for the pool to hold its full size in
+RAM. With automatic sizing the pool and the weights together are about the
+`--gpu-memory-utilization` fraction (default 0.92) of Metal's recommended
+working set. A slot a request never writes never
 reaches an output — the attention kernels mask every position past the sequence
 length — so the missing zero fill does not change results. MLA's batched decode
 also zeroes padded latent rows before attention.
 
-Unified memory means the pool is not a reservation either way. Nothing pins it:
-`mx.set_wired_limit()` covers MLX-allocated buffers, not this torch allocation
-that MLX imports in place, so the kernel may compress or swap any of its pages
-as soon as something else wants the RAM — zeros from the fill or KV from a
-request alike. The fill decides when the pages become resident, not whether the
-OS can take them back. Resident KV is bounded by the blocks in use, so a run
-that fills the pool peaks at the footprint the eager fill would have committed,
-and a run that leaves blocks idle never pays for them. The difference is when
-the pages are asked for: the fill paid up front, before the first request, while
-a lazy pool faults them in during serving — a long prefill can demand hundreds
-of megabytes at once, at the moment the MLX working set is also at its peak.
-Faulting a page in under pressure is satisfied from the compressor or swap — it
-costs latency, it does not raise an allocation error — and a machine that
-exhausts both ends the process the same way it would end a startup zero-fill.
-`--gpu-memory-utilization` therefore bounds cache capacity rather than
-admission: two processes sized against the same free memory will both claim it,
-where the eager fill's resident pages at least showed up as used.
+`--gpu-memory-utilization` does not account for other processes. Two servers
+given the same fraction each plan for the full amount.
 
 Because of that, the planner checks the plan against the machine before serving:
 `VLLM_METAL_KV_COMMIT_PROBE` (on by default) forces a bounded sample of the
@@ -190,6 +183,7 @@ recommended working set)` and less the memory the engine holds outside the pool
 (`--kv-offloading-size`), which is pageable but the same RAM — with a warning.
 The budget keeps the full byte count: vLLM chooses its own grouped layout from
 the bytes it is handed. If free memory is merely below the plan, the pool keeps
-its capacity and the shortfall is logged: a plan is a cap, and only the blocks
-requests actually write are ever backed. Set `VLLM_METAL_KV_COMMIT_PROBE=0` to
-skip the touch and use the configured cache budget.
+its capacity and a warning is logged. Make the pool smaller when that warning
+appears. The probe samples at most 512 MiB, so passing it does not show that a
+larger pool fits. Set `VLLM_METAL_KV_COMMIT_PROBE=0` to skip the touch and use
+the configured cache budget.
