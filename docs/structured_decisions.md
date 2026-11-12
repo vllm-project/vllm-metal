@@ -1,12 +1,15 @@
 # Structured decisions
 
-Structured decisions return choices (`choice`), yes/no probabilities (`noul`),
-and scores (`score`). With vLLM 0.33.0, `vllm serve` exposes `/v1/systemone`
-directly on the model server; no separate proxy is needed.
-See the [upstream guide](https://docs.vllm.ai/en/latest/models/structured_decisions_models/)
-for question schemas and model-specific options.
+Jev-like System 1 decisions return yes/no probabilities, choices, and scores.
+See the [upstream guide](https://github.com/vllm-project/vllm/blob/v0.31.0/examples/features/structured_diffusion/README.md)
+for `/v1/systemone` request examples, question schemas, and sampling options.
 
 ## D3 (Decision 3.0)
+
+With vLLM 0.33.0, D3 uses the native `/v1/systemone` endpoint on the model
+server; no separate proxy is needed. See the
+[upstream D3 guide](https://docs.vllm.ai/en/latest/models/structured_decisions_models/#decision-30)
+for question schemas and options.
 
 The MLX backend supports text and JSON states. `vllm-sr/d3-nano` and
 `vllm-sr/d3-flash` have been tested on Metal; their checkpoint downloads are
@@ -66,10 +69,22 @@ Start the Metal model server:
 ```bash
 VLLM_METAL_BACKEND=mlx vllm serve mlx-community/diffusiongemma-26B-A4B-it-4bit \
   --served-model-name dgemma --host 127.0.0.1 --port 8000 \
-  --diffusion-config '{"canvas_length": 16}' --max-logprobs 32
+  --diffusion-config '{"canvas_length": 32}' --max-logprobs 32
 ```
 
-Send the request above to the same `/v1/systemone` endpoint, changing `model`
-to `dgemma`. The 16-token canvas matches upstream vLLM 0.33.0's native decision
-requests; smaller per-request canvases are unsupported on Metal.
+Run the upstream example server in another terminal to expose `/v1/systemone`
+on port 8011:
+
+```bash
+curl -fL \
+  https://raw.githubusercontent.com/vllm-project/vllm/v0.31.0/examples/features/structured_diffusion/structured_server.py \
+  -o structured_server.py
+python structured_server.py \
+  --upstream http://127.0.0.1:8000 --model dgemma \
+  --tokenizer mlx-community/diffusiongemma-26B-A4B-it-4bit \
+  --canvas 32 --canvas-step 32 --host 127.0.0.1 --port 8011
+```
+
+Set `--canvas` and `--canvas-step` to the served `canvas_length`; smaller
+per-request canvases are unsupported on Metal.
 DiffusionGemma currently accepts text input only and uses the MLX backend.
