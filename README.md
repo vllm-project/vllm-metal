@@ -14,6 +14,7 @@ vLLM Metal is a plugin that enables vLLM to run on Apple Silicon Macs using MLX 
 ---
 *Latest News* 🔥
 
+- [2026/11] [MiniCPM-o 4.5](https://docs.vllm.ai/projects/vllm-metal/en/latest/omni/#minicpm-o-45) now supports concurrent duplex audio/video conversations on Apple Silicon through vLLM-Omni.
 - [2026/11] [Text-to-image generation](https://docs.vllm.ai/projects/vllm-metal/en/latest/omni/#text-to-image) is now supported through vLLM-Omni, starting with SDXL.
 - [2026/10] Experimental [Recursive Flint INT4](https://huggingface.co/RecursiveSI/flint-int4) support is now available on the MLX backend, including concurrent serving.
 - [2026/10] DiffusionGemma now supports Jev-like System 1 decisions on Metal, with median decision latency under 0.2 s on an M5 Pro. See the [structured decisions guide](https://docs.vllm.ai/projects/vllm-metal/en/latest/structured_decisions/).
