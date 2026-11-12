@@ -70,6 +70,48 @@ class MetalConfig:
                     f"Available quantization types: {available}"
                 )
 
+    def apply_turboquant(self, additional_config: Any) -> None:
+        """Read the TurboQuant keys from ``--additional-config``.
+
+        The dict is caller-provided JSON, so typos would otherwise leave
+        TurboQuant off (or on with default quantization) without a word.
+        """
+        if not isinstance(additional_config, dict):
+            return
+
+        canonical = {"turboquant", "k_quant", "v_quant"}
+        normalized = {
+            "turboquant": "turboquant",
+            "kquant": "k_quant",
+            "vquant": "v_quant",
+        }
+        for key in additional_config:
+            slug = key.lower().replace("_", "").replace("-", "").rstrip("s")
+            if slug in normalized and key not in canonical:
+                raise ValueError(
+                    f"Unknown --additional-config key {key!r}; did you mean "
+                    f"{normalized[slug]!r}? TurboQuant keys: {sorted(canonical)}"
+                )
+
+        if "turboquant" in additional_config and not isinstance(
+            additional_config["turboquant"], bool
+        ):
+            raise ValueError(
+                "turboquant must be a JSON boolean, got "
+                f"{additional_config['turboquant']!r}"
+            )
+
+        if not additional_config.get("turboquant"):
+            extra = {"k_quant", "v_quant"} & additional_config.keys()
+            if extra:
+                raise ValueError(f"{', '.join(sorted(extra))} requires turboquant=true")
+            return
+
+        self.turboquant = True
+        self.k_quant = additional_config.get("k_quant", "q8_0")
+        self.v_quant = additional_config.get("v_quant", "q3_0")
+        self._validate_turboquant()
+
     def apply_moe_expert_offload(self, additional_config: Any) -> None:
         """Read ``{"moe_expert_offload": {"cache_gb": <float>}}`` from --additional-config."""
         if not isinstance(additional_config, dict):

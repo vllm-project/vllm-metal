@@ -91,6 +91,38 @@ class TestMetalConfig:
                 v_quant="fp16",
             )
 
+    def test_apply_turboquant_reads_canonical_keys(self) -> None:
+        config = MetalConfig(mlx_device="gpu")
+        config.apply_turboquant({"turboquant": True, "k_quant": "q4_0"})
+        assert config.turboquant is True
+        assert config.k_quant == "q4_0"
+        assert config.v_quant == "q3_0"
+
+    @pytest.mark.parametrize(
+        "key", ["turboquants", "turbo_quant", "K_quant", "k-quant"]
+    )
+    def test_apply_turboquant_rejects_near_miss_keys(self, key: str) -> None:
+        config = MetalConfig(mlx_device="gpu")
+        with pytest.raises(ValueError, match="did you mean"):
+            config.apply_turboquant({key: True})
+
+    @pytest.mark.parametrize("value", ["false", "true", 1, None])
+    def test_apply_turboquant_requires_a_boolean(self, value) -> None:
+        config = MetalConfig(mlx_device="gpu")
+        with pytest.raises(ValueError, match="must be a JSON boolean"):
+            config.apply_turboquant({"turboquant": value})
+
+    def test_apply_turboquant_rejects_quant_keys_without_enable(self) -> None:
+        config = MetalConfig(mlx_device="gpu")
+        with pytest.raises(ValueError, match="requires turboquant=true"):
+            config.apply_turboquant({"k_quant": "q4_0"})
+        assert config.turboquant is False
+
+    def test_apply_turboquant_ignores_unrelated_keys(self) -> None:
+        config = MetalConfig(mlx_device="gpu")
+        config.apply_turboquant({"moe_expert_offload": {"cache_gb": 1}})
+        assert config.turboquant is False
+
     def test_text_only_multimodal_mode_is_accepted(self, monkeypatch) -> None:
         monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "text-only")
         reset_config()

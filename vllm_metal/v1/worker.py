@@ -109,11 +109,7 @@ class MetalWorker(WorkerBase):
         # runs in a separate process and doesn't inherit the config singleton
         # state set in MetalPlatform.check_and_update_config).
         add = vllm_config.additional_config
-        if isinstance(add, dict) and add.get("turboquant"):
-            self.metal_config.turboquant = True
-            self.metal_config.k_quant = add.get("k_quant", "q8_0")
-            self.metal_config.v_quant = add.get("v_quant", "q3_0")
-            self.metal_config._validate_turboquant()
+        self.metal_config.apply_turboquant(add)
         self.metal_config.apply_moe_expert_offload(add)
 
         # Disable custom all reduce (not supported on Metal)
@@ -362,7 +358,12 @@ class MetalWorker(WorkerBase):
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         """Add a LoRA/QLoRA adapter."""
-        return self.model_runner.add_lora(lora_request)
+        add_lora = getattr(self.model_runner, "add_lora", None)
+        if add_lora is None:
+            raise NotImplementedError(
+                f"{type(self.model_runner).__name__} does not support LoRA"
+            )
+        return add_lora(lora_request)
 
     def remove_lora(self, lora_id: int) -> bool:
         """Remove a LoRA adapter."""
