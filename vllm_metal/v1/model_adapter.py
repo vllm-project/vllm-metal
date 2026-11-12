@@ -25,7 +25,9 @@ logger = init_logger(__name__)
 BackboneMode = Literal["native", "text_sidecar", "text_only"]
 """How a multimodal checkpoint is served.
 
-- ``native``: the mlx-vlm composite runs both towers (Qwen3-VL family).
+- ``native``: the mlx-vlm composite runs both towers for the families
+  ``build_multimodal_adapter`` has an adapter for; other checkpoints load the
+  same way with their media inputs refused.
 - ``text_sidecar``: the mlx_lm text model serves text, a
   :class:`Gemma4VisionSidecar` serves images (Gemma 4).
 - ``text_only``: ``multimodal_config`` is cleared and images are refused.
@@ -439,6 +441,23 @@ _LFM2_VL_ARCHITECTURES: frozenset[str] = frozenset({"Lfm2VlForConditionalGenerat
 # d1 checkpoints also declare ``lfm3_vl`` but add decision heads, so match the
 # generative architecture only.
 _LFM3_VL_ARCHITECTURES: frozenset[str] = frozenset({"Lfm3VlForConditionalGeneration"})
+# Families ``build_multimodal_adapter`` has a native adapter for.
+_NativeMultimodalFamily = Literal[
+    "qwen3_vl", "paddleocr_vl", "lfm3_audio", "lfm3_vl", "lfm2_vl"
+]
+_NATIVE_MM_RULES: dict[
+    _NativeMultimodalFamily,
+    tuple[frozenset[str], frozenset[str]],
+] = {
+    "qwen3_vl": (_QWEN3_VL_MODEL_TYPES, _QWEN3_VL_ARCHITECTURES),
+    "paddleocr_vl": (_PADDLEOCR_VL_MODEL_TYPES, _PADDLEOCR_VL_ARCHITECTURES),
+    "lfm3_audio": (
+        frozenset(),
+        frozenset({"Lfm3AudioForConditionalGeneration"}),
+    ),
+    "lfm3_vl": (frozenset(), _LFM3_VL_ARCHITECTURES),
+    "lfm2_vl": (_LFM2_VL_MODEL_TYPES, _LFM2_VL_ARCHITECTURES),
+}
 
 
 class DefaultModelAdapter(ModelAdapter):
@@ -462,9 +481,8 @@ class DefaultModelAdapter(ModelAdapter):
         Gemma4: mlx_vlm forward currently produces garbled output; remove this
         override once mlx_vlm Gemma4 parity is fixed upstream.
 
-        Mistral 3 and Muse Glimmer: no multimodal adapter yet. The text backbone
-        clears ``multimodal_config``, so the frontend rejects image input
-        instead of the runner raising on it.
+        Mistral 3 and Muse Glimmer: no multimodal adapter yet. They serve text
+        on mlx_lm, the backbone ``tools/check_parity.py`` uses as its reference.
 
         Qwen3.5/Qwen3.6 conditional-generation wrappers: these configs are
         marked multimodal even when served text-only, and the FP8 family fails
@@ -501,17 +519,23 @@ class DefaultModelAdapter(ModelAdapter):
             return True
 
         # MLX affine wrappers stay native only when their family has an adapter.
-        return self._has_mlx_quantized_weights(
-            hf_config
-        ) and not self._is_qwen3_vl_family(hf_config)
+        return (
+            self._has_mlx_quantized_weights(hf_config)
+            and self._native_multimodal_family(hf_config) is None
+        )
 
-    def _is_qwen3_vl_family(self, hf_config: Any) -> bool:
-        """Whether ``build_multimodal_adapter`` has a native adapter for this."""
+    def _native_multimodal_family(
+        self, hf_config: Any
+    ) -> _NativeMultimodalFamily | None:
+        """Return the family whose native adapter serves ``hf_config``, if any."""
         model_type = getattr(hf_config, "model_type", "")
         architectures = getattr(hf_config, "architectures", ()) or ()
-        return model_type in _QWEN3_VL_MODEL_TYPES or any(
-            arch in _QWEN3_VL_ARCHITECTURES for arch in architectures
-        )
+
+        for family, (model_types, arch_names) in _NATIVE_MM_RULES.items():
+            if model_type in model_types or arch_names.intersection(architectures):
+                return family
+
+        return None
 
     def _has_mlx_quantized_weights(self, hf_config: Any) -> bool:
         mlx_quantization_from_hf = getattr(hf_config, "quantization", None)
@@ -602,9 +626,11 @@ class DefaultModelAdapter(ModelAdapter):
         setup. When the mode is ``text_sidecar`` (Gemma 4), the config is
         kept but audio is turned off unless the checkpoint has an audio
         encoder, and video is turned off on prefix-LM checkpoints, so the
-        frontend rejects inputs the sidecar cannot serve. ``native`` leaves the
-        config untouched. :meth:`multimodal_backbone_mode` is the single
-        source of truth for which mode applies.
+        frontend rejects inputs the sidecar cannot serve. ``native`` keeps the
+        config but turns off every modality and ``--enable-mm-embeds`` when no
+        native adapter serves the checkpoint, so the frontend rejects inputs
+        the runner cannot serve. :meth:`multimodal_backbone_mode` is the
+        single source of truth for which mode applies.
         """
         if model_config.multimodal_config is None:
             return
@@ -633,6 +659,7 @@ class DefaultModelAdapter(ModelAdapter):
             keep_video = not getattr(model_config, "is_mm_prefix_lm", False)
             self._restrict_modalities(
                 model_config.multimodal_config,
+                keep_image=True,
                 keep_audio=keep_audio,
                 keep_video=keep_video,
             )
@@ -642,18 +669,55 @@ class DefaultModelAdapter(ModelAdapter):
                 keep_audio,
                 keep_video,
             )
+            return
+        if self._native_multimodal_family(hf_config) is None:
+            self._restrict_modalities(
+                model_config.multimodal_config,
+                keep_image=False,
+                keep_audio=False,
+                keep_video=False,
+            )
+            # vLLM lets embeddings past a 0 limit when --enable-mm-embeds is set.
+            if model_config.multimodal_config.enable_mm_embeds:
+                logger.warning(
+                    "Metal: multimodal embedding inputs are unsupported for this "
+                    "model; overriding --enable-mm-embeds with False"
+                )
+                model_config.multimodal_config.enable_mm_embeds = False
+            logger.warning(
+                "Metal: no native multimodal adapter for model_type=%s "
+                "(architectures=%s, multimodal_mode=%s); image, video and "
+                "audio inputs are refused",
+                getattr(hf_config, "model_type", "unknown"),
+                getattr(hf_config, "architectures", None),
+                self._multimodal_mode(),
+            )
 
     @staticmethod
     def _restrict_modalities(
-        multimodal_config: Any, *, keep_audio: bool, keep_video: bool
+        multimodal_config: Any,
+        *,
+        keep_image: bool,
+        keep_audio: bool,
+        keep_video: bool,
     ) -> None:
-        """Set the limits of modalities the sidecar cannot serve to 0 so the
+        """Set the limits of modalities Metal cannot serve to 0 so the
         frontend rejects them (idempotent)."""
-        from vllm.config.multimodal import AudioDummyOptions, VideoDummyOptions
+        from vllm.config.multimodal import (
+            AudioDummyOptions,
+            BaseDummyOptions,
+            ImageDummyOptions,
+            VideoDummyOptions,
+        )
 
         refused: list[tuple[str, type]] = []
+        if not keep_image:
+            refused.append(("image", ImageDummyOptions))
         if not keep_video:
             refused.append(("video", VideoDummyOptions))
+        if not (keep_image or keep_video):
+            # Kimi-K2.5 takes images and videos as one ``vision_chunk`` modality.
+            refused.append(("vision_chunk", BaseDummyOptions))
         if not keep_audio:
             refused.append(("audio", AudioDummyOptions))
         limits = multimodal_config.limit_per_prompt
@@ -661,7 +725,7 @@ class DefaultModelAdapter(ModelAdapter):
             current = limits.get(modality)
             if current is not None and int(getattr(current, "count", 0)) > 0:
                 logger.warning(
-                    "Metal: %s inputs are unsupported on the Gemma 4 sidecar path; "
+                    "Metal: %s inputs are unsupported for this model; "
                     "overriding --limit-mm-per-prompt %s=%s with 0",
                     modality,
                     modality,
@@ -1014,12 +1078,8 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
                     ),
                 ),
             )
-        if hf_config is None:
-            return None
-
-        model_type = getattr(hf_config, "model_type", "")
-        architectures = getattr(hf_config, "architectures", ()) or ()
-        if self._is_qwen3_vl_family(hf_config):
+        family = self._native_multimodal_family(hf_config)
+        if family == "qwen3_vl":
             from vllm_metal.multimodal.qwen3_vl import Qwen3VLMultimodalAdapter
 
             return cast(
@@ -1027,9 +1087,7 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
                 Qwen3VLMultimodalAdapter.from_loaded_model(model, hf_config),
             )
 
-        if model_type in _PADDLEOCR_VL_MODEL_TYPES or any(
-            arch in _PADDLEOCR_VL_ARCHITECTURES for arch in architectures
-        ):
+        if family == "paddleocr_vl":
             from vllm_metal.multimodal.paddleocr_vl import (
                 PaddleOCRVLMultimodalAdapter,
             )
@@ -1039,7 +1097,7 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
                 PaddleOCRVLMultimodalAdapter.from_loaded_model(model),
             )
 
-        if "Lfm3AudioForConditionalGeneration" in architectures:
+        if family == "lfm3_audio":
             from vllm_metal.multimodal.lfm3_audio import Lfm3AudioMultimodalAdapter
 
             return cast(
@@ -1047,7 +1105,7 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
                 Lfm3AudioMultimodalAdapter.from_loaded_model(model),
             )
 
-        if any(arch in _LFM3_VL_ARCHITECTURES for arch in architectures):
+        if family == "lfm3_vl":
             from vllm_metal.multimodal.lfm3_vl import Lfm3VlMultimodalAdapter
 
             return cast(
@@ -1055,9 +1113,7 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
                 Lfm3VlMultimodalAdapter.from_loaded_model(model),
             )
 
-        if model_type in _LFM2_VL_MODEL_TYPES or any(
-            arch in _LFM2_VL_ARCHITECTURES for arch in architectures
-        ):
+        if family == "lfm2_vl":
             from vllm_metal.multimodal.lfm2_vl import Lfm2VlMultimodalAdapter
 
             return cast(

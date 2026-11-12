@@ -51,6 +51,8 @@ scripts/test.sh
 ```
 
 For a shorter loop, run `pytest -m "not slow" tests/` in the activated environment.
+Full engine and server workflows live in `tests/e2e/`; run an individual file
+with `pytest tests/e2e/<test_file>.py`. Each test documents its checkpoint requirements.
 Model parity runs separately through [scheduled and requested CI](tools.md#scheduled-and-requested-ci).
 
 ## Pull requests

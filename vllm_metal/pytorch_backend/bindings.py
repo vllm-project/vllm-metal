@@ -8,7 +8,7 @@ import torch
 def register_kernel_overrides():
     from vllm.triton_utils.dispatcher import register_kernels
 
-    from vllm_metal.pytorch_backend import sampling, speculative_ops
+    from vllm_metal.pytorch_backend import input_ops, sampling, speculative_ops
 
     module = "vllm.v1.worker.gpu.spec_decode.rejection_sampler"
     sample_module = "vllm.v1.worker.gpu.sample"
@@ -19,6 +19,9 @@ def register_kernel_overrides():
             f"{sample_module}.min_p._min_p_kernel": sampling.min_p,
             f"{module}._gather_draft_sampled_kernel": speculative_ops.gather_draft_sampled,
             f"{module}._flatten_sampled_kernel": speculative_ops.flatten_sampled,
+            f"{sample_module}.prompt_logprob._prompt_logprobs_token_ids_kernel": (
+                input_ops.prompt_logprobs_token_ids
+            ),
         }
     )
 
@@ -86,7 +89,7 @@ def install():
     from vllm.model_executor.layers.mamba.short_conv import ShortConv
     from vllm.v1.attention.ops import vit_attn_wrappers
     from vllm.v1.worker.gpu import buffer_utils, model_runner
-    from vllm.v1.worker.gpu.sample import sampler
+    from vllm.v1.worker.gpu.sample import prompt_logprob, sampler
 
     from vllm_metal.pytorch_backend import runtime
     from vllm_metal.pytorch_backend.models.qwen3_5 import install as install_qwen3_5
@@ -122,4 +125,8 @@ def install():
     _install_input_ops()
     _install_speculative_ops()
     sampler.compute_topk_scores = runtime.compute_topk_scores
+    prompt_logprob.compute_topk_scores = runtime.compute_topk_scores
+    # Unlike upstream's Triton kernels, this scorer materializes fp32 logprobs:
+    # 1024 rows of a 248k vocab is 1 GB.
+    prompt_logprob.CHUNK_SIZE = 128
     buffer_utils._metal_installed = True

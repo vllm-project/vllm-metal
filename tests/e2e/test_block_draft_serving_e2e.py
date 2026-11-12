@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Qualified checkpoint: exact greedy parity, pressure, cancellation, and limits.
 
-Run explicitly with ``pytest -m slow tests/test_block_draft_serving_e2e.py``.
+Run explicitly with ``pytest -m slow tests/e2e/test_block_draft_serving_e2e.py``.
 """
 
 import json

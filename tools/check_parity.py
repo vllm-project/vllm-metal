@@ -138,6 +138,8 @@ def serving(
     additional_config: str | None = None,
     trust_remote_code: bool = False,
     speculative_config: dict | None = None,
+    prefix_caching: bool = False,
+    extra_args: list[str] | None = None,
 ):
     """Start one local server and clean up its process group on every exit."""
     with socket.socket() as sock:
@@ -162,7 +164,11 @@ def serving(
                 str(max_num_seqs),
                 "--gpu-memory-utilization",
                 str(gpu_memory_utilization),
-                "--no-enable-prefix-caching",
+                (
+                    "--enable-prefix-caching"
+                    if prefix_caching
+                    else "--no-enable-prefix-caching"
+                ),
                 "--generation-config",
                 "vllm",
             ]
@@ -172,7 +178,8 @@ def serving(
                 ["--speculative-config", json.dumps(speculative_config)]
                 if speculative_config is not None
                 else []
-            ),
+            )
+            + list(extra_args or []),
             stdout=log,
             stderr=subprocess.STDOUT,
             start_new_session=True,

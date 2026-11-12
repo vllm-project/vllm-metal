@@ -14,7 +14,8 @@ vLLM Metal is a plugin that enables vLLM to run on Apple Silicon Macs using MLX 
 ---
 *Latest News* 🔥
 
-- [2026/11] Experimental D3 (Decision 3.0) support is now available on MLX for text-only choice, yes/no, and score requests. See the [structured decisions guide](https://docs.vllm.ai/projects/vllm-metal/en/latest/structured_decisions/).
+- [2026/11] D3 (Decision 3.0) support is now available on MLX for text-only choice, yes/no, and score requests. See the [structured decisions guide](https://docs.vllm.ai/projects/vllm-metal/en/latest/structured_decisions/).
+- [2026/11] [Text-to-image generation](https://docs.vllm.ai/projects/vllm-metal/en/latest/omni/#text-to-image) is now supported through vLLM-Omni, starting with SDXL.
 - [2026/10] Experimental [Recursive Flint INT4](https://huggingface.co/RecursiveSI/flint-int4) support is now available on the MLX backend, including concurrent serving.
 - [2026/10] DiffusionGemma now supports Jev-like System 1 decisions on Metal, with median decision latency under 0.2 s on an M5 Pro. See the [structured decisions guide](https://docs.vllm.ai/projects/vllm-metal/en/latest/structured_decisions/).
 - [2026/10] Desktop inference competes with your other applications for memory. Sleep mode lets an idle model server return memory to those apps without shutting down. Read [Abhigith Neil Abraham's walkthrough](https://abneil.dev/blog/sleep-mode-on-a-mac-with-kv-offloading.html).

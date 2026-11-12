@@ -104,9 +104,9 @@ configured limit does not change the block-table shape.
 Run the real-checkpoint lifecycle test with:
 
 ```bash
-pytest -m slow tests/test_block_draft_serving_e2e.py
-pytest -m slow tests/test_block_draft_schedule_e2e.py
-pytest -m slow tests/test_block_draft_prefix_caching_e2e.py -k dflash
+pytest -m slow tests/e2e/test_block_draft_serving_e2e.py
+pytest -m slow tests/e2e/test_block_draft_schedule_e2e.py
+pytest -m slow tests/e2e/test_block_draft_prefix_caching_e2e.py -k dflash
 python -m tools.check_parity --method dflash --model mlx-community/Qwen3-4B-4bit --max-tokens 32 --output-dir /path/to/new-parity-results
 python -m tools.check_parity --method dflash --model mlx-community/Qwen3-4B-4bit --max-tokens 32 --batch-size 1 2 4 \
     --draft-schedule '[[1,1,3],[2,2,1],[3,4,0]]' \

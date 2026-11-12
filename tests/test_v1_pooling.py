@@ -322,15 +322,7 @@ def _make_runner(
         model_config=model_config or _pooling_model_config(),
         tokenizer=tokenizer,
         _paged_attention_runtime=(
-            SDPAPagedAttentionRuntime(
-                num_layers=1,
-                num_kv_heads=1,
-                head_dim=4,
-                block_size=4,
-                dtype=mx.float32,
-            )
-            if paged
-            else None
+            SDPAPagedAttentionRuntime(block_size=4, dtype=mx.float32) if paged else None
         ),
         _paged_block_size=4,
         num_layers=1,

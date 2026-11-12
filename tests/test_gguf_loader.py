@@ -324,18 +324,47 @@ def test_loads_cached_remote_model_offline(tmp_path, monkeypatch):
     np.testing.assert_array_equal(np.array(model(tokens)), np.array(reference(tokens)))
 
 
-@pytest.mark.parametrize("output_kind", ["q6_k", "tq2_0"])
-def test_skips_tie_redundant_output(tmp_path, output_kind):
-    # Tied config, but the GGUF still carries a redundant output.weight, as
-    # llama.cpp exports of tied models do. It is never read, so even a qtype
-    # the loader cannot execute (TQ2_0) does not block the model.
+def test_tied_config_reads_output_weight_like_llama_cpp(tmp_path):
+    # Tied config, but the GGUF carries its own output.weight, as llama.cpp
+    # exports of tied models often do: llama-quantize keeps it at the output
+    # qtype (Q6_K/Q8_0) while token_embd follows the base qtype, and llama.cpp
+    # computes logits from it. The injected table differs from token_embd, so
+    # the logits must match an untied load of the same file.
+    d = _dims(_tiny_config("qwen3"))
+    gguf_path, cfg_dir = _build_dense_fixture(
+        tmp_path,
+        "qwen3",
+        has_qk_norm=True,
+        inject={"output.weight": ("q", (d["vocab"], d["h"]))},
+    )
+    untied_dir = tmp_path / "untied"
+    untied_dir.mkdir()
+    config = json.loads((Path(cfg_dir) / "config.json").read_text())
+    config["tie_word_embeddings"] = False
+    (untied_dir / "config.json").write_text(json.dumps(config))
+
+    model = GGUFModelLoader(
+        gguf_path, config_dir=cfg_dir, target_dtype=mx.float32
+    ).load()
+    untied = GGUFModelLoader(
+        gguf_path, config_dir=untied_dir, target_dtype=mx.float32
+    ).load()
+
+    assert isinstance(model.lm_head, GGUFLinear)
+    tokens = mx.array([[1, 2, 3]])
+    np.testing.assert_array_equal(np.array(model(tokens)), np.array(untied(tokens)))
+
+
+def test_tied_model_skips_unloadable_output(tmp_path):
+    # An output.weight in a qtype the loader cannot execute (TQ2_0) does not
+    # block a tied model; the head stays on the embedding.
     d = _dims(_tiny_config("qwen3", **_KQUANT_CONFIG))
     gguf_path, cfg_dir = _build_dense_fixture(
         tmp_path,
         "qwen3",
         config_overrides=_KQUANT_CONFIG,
         has_qk_norm=True,
-        inject={"output.weight": (output_kind, (d["vocab"], d["h"]))},
+        inject={"output.weight": ("tq2_0", (d["vocab"], d["h"]))},
     )
 
     model = GGUFModelLoader(
@@ -351,7 +380,7 @@ def test_skips_tie_redundant_output(tmp_path, output_kind):
     ("model_type", "has_qk_norm", "with_bias", "needs_tokenizer"),
     [("qwen2", False, True, False), ("llama", False, False, True)],
 )
-def test_skips_tie_redundant_output_when_config_omits_tie_flag(
+def test_reads_output_weight_when_config_omits_tie_flag(
     tmp_path, model_type, has_qk_norm, with_bias, needs_tokenizer
 ):
     d = _dims(_tiny_config(model_type))
@@ -375,8 +404,8 @@ def test_skips_tie_redundant_output_when_config_omits_tie_flag(
         target_dtype=mx.float32,
     ).load()
 
-    assert not hasattr(model, "lm_head")
-    assert _gguf_module_histogram(model).get("GGUFEmbedding") == 1
+    assert isinstance(model.lm_head, GGUFLinear)
+    _assert_forward_vocab_shape(model)
 
 
 @pytest.mark.parametrize(
@@ -1585,19 +1614,23 @@ def test_qwen35_ssm_out_reads_hf_order_columns(tmp_path, ssm_out_type, geometry)
 
 
 @pytest.mark.parametrize(
-    ("tie", "has_lm_head"),
+    ("tie", "with_output", "has_lm_head"),
     [
-        pytest.param(True, False, id="text-tie-true"),
-        pytest.param(False, True, id="text-tie-false"),
-        pytest.param(None, True, id="text-tie-omitted"),
+        pytest.param(True, False, False, id="text-tie-true"),
+        pytest.param(True, True, True, id="text-tie-true-with-output"),
+        pytest.param(False, True, True, id="text-tie-false"),
+        pytest.param(None, True, True, id="text-tie-omitted"),
     ],
 )
-def test_qwen35_tie_flag_resolves_on_text_model(tmp_path, tie, has_lm_head):
-    # This fixture always carries output.weight; a tied model must skip it.
+def test_qwen35_tie_flag_resolves_on_text_model(
+    tmp_path, tie, with_output, has_lm_head
+):
+    # A tied text config reads the embedding unless the file carries its own
+    # output.weight, which the logits then use, as llama.cpp does.
     text = _QWEN35_TEXT_CONFIG
     output = {"output.weight": ("q", (text["vocab_size"], text["hidden_size"]))}
     gguf_path, cfg_dir, _ = _build_qwen35_fixture(
-        tmp_path, _GDN_R1, tie=tie, inject=output
+        tmp_path, _GDN_R1, tie=tie, inject=output if with_output else None
     )
 
     model = GGUFModelLoader(

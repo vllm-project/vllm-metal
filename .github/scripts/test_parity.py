@@ -176,6 +176,75 @@ def test_summary_exposes_acceptance_failure_and_incomplete_suite(tmp_path, passe
     assert "| controlled | 2 | cached | — | — | — | — | — | Missing |" in text
     assert "Acceptance suite: 1 tests, 1 failures, 0 errors, 0 skipped." in text
     assert "| Native → same-model draft | 1 | — | — | — | Missing |" in text
+    assert "| disk after restart | — | — | — | — | Missing |" in text
+    assert "KV offload suite: missing JUnit result" in text
+
+
+def test_summary_reports_each_kv_offload_restore(tmp_path):
+    case = tmp_path / "kv-offload/test_restores0"
+    case.mkdir(parents=True)
+    (case.parent / "test_restorescurrent").symlink_to(case, target_is_directory=True)
+    rows = [
+        {
+            "restore": "host pool",
+            "restored_tokens": 992,
+            "recomputed_tokens": 11,
+            "disk_read_bytes": 0,
+            "output": "EXACT",
+            "passed": True,
+        },
+        {
+            "restore": "disk after restart",
+            "restored_tokens": 992,
+            "recomputed_tokens": 11,
+            "disk_read_bytes": 113_770_496,
+            "output": "FAIL",
+            "passed": False,
+        },
+    ]
+    (case / "restores.json").write_text(
+        json.dumps({"probe_tokens": 1003, "device_blocks": 192, "restores": rows})
+    )
+    (tmp_path / "kv-offload.xml").write_text(
+        '<testsuites><testsuite tests="1" failures="1" errors="0" skipped="0" /></testsuites>'
+    )
+    text = parity.summarize(
+        tmp_path, model="Qwen/Qwen3-0.6B", revision="rev", sha="head"
+    )
+    assert "| host pool | 992 | 11 | 0.0 | EXACT | PASS |" in text
+    assert "| disk after restart | 992 | 11 | 108.5 | FAIL | FAIL |" in text
+    assert "a 1003-token probe evicted from a 192-block device cache" in text
+    assert "KV offload suite: 1 tests, 1 failures, 0 errors, 0 skipped." in text
+
+
+def test_summary_marks_a_missing_kv_offload_restore(tmp_path):
+    case = tmp_path / "kv-offload/test_restores0"
+    case.mkdir(parents=True)
+    row = {
+        "restore": "host pool",
+        "restored_tokens": 992,
+        "recomputed_tokens": 11,
+        "disk_read_bytes": 0,
+        "output": "EXACT",
+        "passed": True,
+    }
+    (case / "restores.json").write_text(json.dumps({"restores": [row]}))
+    (tmp_path / "kv-offload.xml").write_text("<testsuites><testsuite")
+    text = parity.summarize(
+        tmp_path, model="Qwen/Qwen3-0.6B", revision="rev", sha="head"
+    )
+    assert "| host pool | 992 | 11 | 0.0 | EXACT | PASS |" in text
+    assert "| disk after restart | — | — | — | — | Missing |" in text
+    assert "KV offload suite: unreadable JUnit result" in text
+
+
+def test_summary_rejects_duplicate_kv_offload_results(tmp_path):
+    for name in ("first", "retry"):
+        case = tmp_path / "kv-offload" / name
+        case.mkdir(parents=True)
+        (case / "restores.json").write_text(json.dumps({"restores": []}))
+    with pytest.raises(ValueError, match="Duplicate KV offload results"):
+        parity.summarize(tmp_path, model="Qwen/Qwen3-0.6B", revision="rev", sha="head")
 
 
 def test_summary_does_not_choose_between_duplicate_attempts(tmp_path):

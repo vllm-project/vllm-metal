@@ -8,7 +8,10 @@ Verifies the full chain from model config to Metal KV cache:
       -> MetalModelRunner.sliding_window_per_layer
       -> ModelCachePolicy._build_sdpa_backend (slice to num_cache_layers)
       -> SDPAPagedAttentionRuntime (kwarg)
-      -> MetalPagedKVCache.sliding_window_per_layer
+
+``initialize_from_config`` copies the runtime's list onto the bound
+``MetalPagedKVCache`` (asserted in test_per_layer_kv_cache's engine-layout
+binding test), so the runtime kwarg is the end of the policy-owned chain.
 
 Kernel-level correctness (that a ``sliding_window`` value actually
 masks out-of-window tokens) is validated via the production
@@ -84,14 +87,12 @@ class TestNonYocoSlidingWindowWiring:
             _yoco_cache_mapping=None,
         )
 
-        # Act: build the backend, which constructs the KV cache with the
-        # per-layer window list sliced by the cache policy.
-        backend = runner.build_paged_attention_runtime(block_size=_BLOCK_SIZE)
-        backend.initialize(num_blocks=_NUM_BLOCKS)
+        # Act: build the backend, which carries the per-layer window list
+        # sliced by the cache policy.
+        backend = runner._cache_policy._build_sdpa_backend(block_size=_BLOCK_SIZE)
 
         # Assert
-        assert backend._cache is not None
-        assert backend._cache.sliding_window_per_layer == expected
+        assert backend._sliding_window_per_layer == expected
 
     def test_model_without_sliding_window_defaults_to_disabled(self) -> None:
         """Non-Gemma config (Qwen3/Llama) yields all-disabled windows.
@@ -120,12 +121,10 @@ class TestNonYocoSlidingWindowWiring:
         )
 
         # Act
-        backend = runner.build_paged_attention_runtime(block_size=_BLOCK_SIZE)
-        backend.initialize(num_blocks=_NUM_BLOCKS)
+        backend = runner._cache_policy._build_sdpa_backend(block_size=_BLOCK_SIZE)
 
         # Assert: all disabled (preserves pre-PR behaviour for non-sliding models)
-        assert backend._cache is not None
-        assert backend._cache.sliding_window_per_layer == [_NO_WINDOW] * num_layers
+        assert backend._sliding_window_per_layer is None
 
 
 # ===
@@ -184,14 +183,12 @@ class TestYocoSlidingWindowWiring:
         )
 
         # Act
-        backend = runner.build_paged_attention_runtime(block_size=_BLOCK_SIZE)
-        backend.initialize(num_blocks=_NUM_BLOCKS)
+        backend = runner._cache_policy._build_sdpa_backend(block_size=_BLOCK_SIZE)
 
-        # Assert #1: cache stores one entry per unique layer, matching the
-        # identity segment of the YOCO map.
-        cache = backend._cache
-        assert cache is not None
-        assert cache.sliding_window_per_layer == [
+        # Assert #1: the runtime carries one entry per unique layer, matching
+        # the identity segment of the YOCO map.
+        windows = backend._sliding_window_per_layer
+        assert windows == [
             _SLIDING_WINDOW,
             _NO_WINDOW,
             _SLIDING_WINDOW,
@@ -202,7 +199,7 @@ class TestYocoSlidingWindowWiring:
         # ``sdpa_forward`` relies on when indexing by ``cache_idx``.
         for model_layer_idx, lt in enumerate(layer_types):
             cache_idx = cache_idx_map[model_layer_idx]
-            retrieved = cache.sliding_window_per_layer[cache_idx]
+            retrieved = windows[cache_idx]
             expected = _SLIDING_WINDOW if lt == "sliding_attention" else _NO_WINDOW
             assert retrieved == expected, (
                 f"layer {model_layer_idx} ({lt}): "

@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from tests.stub_draft_model import StubDraftModel
-from tests.stub_runner import make_stub_runner
+from tests.stub_runner import adopt_draft_group, make_stub_runner
 from tests.test_draft_model_proposer import (
     _context,
     _proposer,
@@ -28,7 +28,7 @@ def test_worker_reports_effective_limits_and_detached_snapshots(min_draft_tokens
         max_model_len=4096,
         min_speculative_tokens=min_draft_tokens,
     )
-    proposer.adopt_scheduler_group(0, 32)
+    adopt_draft_group(proposer, 0, 32)
     worker = _worker(make_stub_runner(_drafter=proposer))
     expected = {
         "num_context_limit_fallback_requests": 0,

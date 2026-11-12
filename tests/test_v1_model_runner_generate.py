@@ -143,7 +143,7 @@ def test_gemma4_mtp_config_installs_gemma4_proposer() -> None:
         ),
     )
 
-    runner.install_drafter(num_blocks=1, block_size=16)
+    runner.install_drafter()
 
     assert isinstance(runner._drafter, Gemma4MTPProposer)
 
@@ -178,13 +178,10 @@ def test_draft_model_loads_before_cache_binding(
     build.assert_called_once()
     proposer.bind_paged_cache.assert_not_called()
 
-    runner.install_drafter(num_blocks=9, block_size=32)
-
-    proposer.bind_paged_cache.assert_called_once_with(
-        num_blocks=9,
-        block_size=32,
-        dtype=mx.float16,
-    )
+    # install_drafter leaves the draft bind to _initialize_upstream_storage,
+    # which hands the proposer the target's shared KV storage.
+    runner.install_drafter()
+    proposer.bind_paged_cache.assert_not_called()
 
 
 class TestDrafterReleaseOnLifecycle:
@@ -1817,11 +1814,7 @@ class TestV1MetalModelRunnerExecuteModel:
     def test_paged_cached_request_without_state_raises(self) -> None:
         runner = self._make_runner()
         runner._paged_attention_runtime = SDPAPagedAttentionRuntime(
-            num_layers=1,
-            num_kv_heads=1,
-            head_dim=4,
-            block_size=4,
-            dtype=mx.float32,
+            block_size=4, dtype=mx.float32
         )
 
         with pytest.raises(RuntimeError, match="req-0"):
@@ -1895,11 +1888,7 @@ class TestV1MetalModelRunnerExecuteModel:
     def test_paged_spec_decode_failure_does_not_mutate_request_setup(self) -> None:
         runner = self._make_runner()
         runner._paged_attention_runtime = SDPAPagedAttentionRuntime(
-            num_layers=1,
-            num_kv_heads=1,
-            head_dim=4,
-            block_size=4,
-            dtype=mx.float32,
+            block_size=4, dtype=mx.float32
         )
         req_state = mr.RequestState(
             token_ids=[1, 6],
@@ -2143,11 +2132,7 @@ class TestV1MetalModelRunnerGDNSubmit:
         submitted: list[tuple[object, ...]] = []
         runner = make_stub_runner(
             _paged_attention_runtime=SDPAPagedAttentionRuntime(
-                num_layers=1,
-                num_kv_heads=1,
-                head_dim=4,
-                block_size=4,
-                dtype=mx.float32,
+                block_size=4, dtype=mx.float32
             )
         )
         logits = mx.array([0], dtype=mx.float32)

@@ -30,9 +30,10 @@ thing: the cached child must resolve to align mode with
 ``mamba_block_size == block_size`` and must admit at least one request at a
 block-aligned ``num_computed_tokens > 0`` (a genuine restore).
 
-This is the single cache-on/off parity harness;
-``tests/test_hybrid_prefix_caching_e2e.py`` is a thin slow-pytest wrapper
-around ``--quick``.
+``tests/e2e/test_hybrid_prefix_caching_e2e.py`` wraps this harness with ``--quick``.
+The quick gate caps both cache modes at the resolved 544-token block size so
+prefill-shape rounding does not confound the one-block comparisons.
+Use the full matrix to diagnose other scheduling configurations.
 
 Not in CI — requires local model weights.
 
@@ -55,6 +56,8 @@ import time
 
 MODEL_DEFAULT = os.environ.get("QWEN35_MODEL_PATH", "Qwen/Qwen3.5-0.8B")
 GPU_MEMORY_UTILIZATION = 0.5
+# Qwen3.5-0.8B's resolved state block size.
+QUICK_PREFILL_TOKENS = 544
 
 CORPUS_A = (
     "The vLLM Metal backend executes transformer inference on Apple "
@@ -160,6 +163,12 @@ def run_child(model, enable_prefix_caching, mnbt, shared_corpus, quick, queue):
         if enable_prefix_caching:
             assert cache_config.mamba_block_size == cache_config.block_size
         block_size = cache_config.block_size
+        if quick:
+            assert mnbt == block_size, (
+                f"quick parity requires a prefill cap matching the resolved "
+                f"block size ({mnbt=} != {block_size=}); use the full matrix "
+                "for other model geometries"
+            )
 
         tok = llm.get_tokenizer()
         singles, batch = build_cases(tok, block_size, shared_corpus, quick)
@@ -240,12 +249,12 @@ def main() -> int:
     parser.add_argument(
         "--quick",
         action="store_true",
-        help="reduced gate for the slow pytest wrapper: defaults arm only, "
+        help=f"reduced gate for the slow pytest wrapper: {QUICK_PREFILL_TOKENS}-token prefill cap, "
         "1-block edges and 1-block-depth hits",
     )
     args = parser.parse_args()
 
-    arms = (("defaults", None),)
+    arms = ((f"mnbt{QUICK_PREFILL_TOKENS}", QUICK_PREFILL_TOKENS),)
     if not args.quick:
         arms = (("defaults", None), ("mnbt1088", 1088))
     failed = False

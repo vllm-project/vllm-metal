@@ -15,8 +15,8 @@ new file.
   the AWQ-transform output buffers, no regular `bias` parameter.
 
 No parametrized vLLM `LLM.generate` smoke test in this file, by design:
-the 1.5B file already exercises the AWQ + Metal paged runner combination
-end-to-end on `Qwen/Qwen2.5-1.5B-Instruct-AWQ`. Adding the same smoke
+`tests/e2e/test_awq_e2e_qwen25_15b.py` exercises the AWQ + Metal paged
+runner combination end-to-end on `Qwen/Qwen2.5-1.5B-Instruct-AWQ`. Adding the same smoke
 test for three more 7-8B models in the same pytest process leaks wired
 Metal allocations between LLM instances (mx.clear_cache releases the
 cache but not wired memory), so the second model load SIGABRTs in the

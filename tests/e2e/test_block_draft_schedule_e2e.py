@@ -5,16 +5,16 @@ import json
 
 import pytest
 
-from tests.scheduler_helpers import (
-    assert_v2_model_runner,
-    track_preemptions_and_resumptions,
-)
-from tests.test_block_draft_serving_e2e import (
+from tests.e2e.test_block_draft_serving_e2e import (
     DRAFT_MODELS,
     DRAFT_WIDTHS,
     _block_draft_llm,
     _serve,
     _spawn_env,
+)
+from tests.scheduler_helpers import (
+    assert_v2_model_runner,
+    track_preemptions_and_resumptions,
 )
 
 

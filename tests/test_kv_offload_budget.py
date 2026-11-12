@@ -93,7 +93,6 @@ def test_offload_off_matches_upstream() -> None:
 
     # 10GB * 0.5 - 1GB weights - 1GB overhead.
     assert plan.kv_budget == 3 * _GB
-    assert plan.num_blocks == 3000
     assert plan.kv_offload_pool == 0
     assert plan.format_breakdown() == (
         "metal_limit=10.00GB, fraction=0.5, usable_metal=5.00GB, "
@@ -113,7 +112,6 @@ def test_pool_comes_out_of_the_reported_budget() -> None:
 
     assert plan.kv_offload_pool == _POOL
     assert plan.kv_budget == without.kv_budget - _POOL
-    assert plan.num_blocks == without.num_blocks - _POOL // _PER_BLOCK
     assert "kv_offload_pool=2.00GB, kv_budget=1.00GB" in plan.format_breakdown()
     assert plan.format_mitigations().startswith(
         "Mitigations: lower --kv-offloading-size; "
@@ -652,8 +650,10 @@ def test_explicit_budget_probe_accounts_for_host_pool_and_workspace(
     _paging_probe(monkeypatch, free=_RESERVE + 3 * _GB + pool + workspace + free_delta)
 
     if free_delta < 0:
-        with pytest.raises(ValueError, match="Refusing to silently shrink"):
+        with pytest.raises(ValueError, match="Refusing to silently shrink") as err:
             planner.determine_available_memory()
+        hint = "or --kv-offloading-size" in str(err.value)
+        assert hint == (pool_mode == "explicit")
     else:
         assert planner.determine_available_memory() == 3 * _GB
     if config is not None:

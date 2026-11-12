@@ -35,11 +35,7 @@ def _make_paged_runner(num_layers: int = 2) -> mr.MetalModelRunner:
         model_args={"vocab_size": 32000},
         model=MagicMock(),
         _paged_attention_runtime=SDPAPagedAttentionRuntime(
-            num_layers=num_layers,
-            num_kv_heads=1,
-            head_dim=4,
-            block_size=4,
-            dtype=mx.float32,
+            block_size=4, dtype=mx.float32
         ),
         _paged_block_size=4,
         num_layers=num_layers,

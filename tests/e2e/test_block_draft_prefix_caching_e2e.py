@@ -7,11 +7,11 @@ from importlib.metadata import version
 
 import pytest
 
+from tests.e2e.test_block_draft_serving_e2e import _block_draft_llm, _spawn_env
 from tests.scheduler_helpers import (
     assert_v2_model_runner,
     track_preemptions_and_resumptions,
 )
-from tests.test_block_draft_serving_e2e import _block_draft_llm, _spawn_env
 
 # Use the same checkpoint revisions as the serving/continuation qualification.
 CHECKPOINTS = {

@@ -21,66 +21,38 @@ class SDPAPagedAttentionRuntime(PagedAttentionRuntimeBase):
     """Paged attention runtime for SDPA attention models (MHA, GQA, MQA).
 
     Bind upstream cache storage and patch model layers for native Metal kernels.
-    Model-based speculative decoding still uses count-initialized storage.
     """
 
     def __init__(
         self,
         *,
-        num_layers: int,
-        num_kv_heads: int,
-        head_dim: int,
         block_size: int,
         dtype: mx.Dtype,
-        turboquant: bool = False,
-        k_quant: str | None = None,
-        v_quant: str | None = None,
         cache_idx_map: dict[int, int] | None = None,
-        kv_heads_per_layer: list[int] | None = None,
-        head_dim_per_layer: list[int] | None = None,
         sliding_window_per_layer: list[int] | None = None,
     ) -> None:
-        self._num_layers = num_layers
-        self._num_kv_heads = num_kv_heads
-        self._head_dim = head_dim
         self._block_size = block_size
         self._dtype = dtype
         self._cache = None
-        self._turboquant = turboquant
-        self._k_quant = k_quant
-        self._v_quant = v_quant
         self._cache_idx_map = cache_idx_map
-        self._kv_heads_per_layer = kv_heads_per_layer
-        self._head_dim_per_layer = head_dim_per_layer
         self._sliding_window_per_layer = sliding_window_per_layer
         self._storage: KVCacheStorage | None = None
         self._scheduler_group_indices = (0,)
         self._group_block_sizes = (block_size,)
 
-    def initialize(self, num_blocks: int) -> None:
-        # TODO: Move model-based speculation's target and committed draft KV to
-        # initialize_from_config, handling lookahead scratch separately. Then
-        # remove this initializer and MetalPagedKVCache's count-based allocation.
-        self._cache = MetalPagedKVCache(
-            num_layers=self._num_layers,
-            num_kv_heads=self._num_kv_heads,
-            head_dim=self._head_dim,
-            num_blocks=num_blocks,
-            block_size=self._block_size,
-            dtype=self._dtype,
-            turboquant=self._turboquant,
-            k_quant=self._k_quant,
-            v_quant=self._v_quant,
-            kv_heads_per_layer=self._kv_heads_per_layer,
-            head_dim_per_layer=self._head_dim_per_layer,
-            sliding_window_per_layer=self._sliding_window_per_layer,
-        )
-
     def initialize_from_config(
-        self, config: KVCacheConfig, layer_names: tuple[str, ...]
+        self,
+        config: KVCacheConfig,
+        layer_names: tuple[str, ...],
+        *,
+        storage: KVCacheStorage | None = None,
     ) -> None:
-        """Use the physical allocation and views planned by vLLM."""
-        self._storage = KVCacheStorage(config)
+        """Use the physical allocation and views planned by vLLM.
+
+        ``storage`` shares another runtime's backing instead of allocating:
+        the draft model's layers live in the target's one allocation.
+        """
+        self._storage = storage if storage is not None else KVCacheStorage(config)
         self._cache = MetalPagedKVCache.from_upstream(
             self._storage, layer_names, dtype=self._dtype
         )
@@ -89,12 +61,13 @@ class SDPAPagedAttentionRuntime(PagedAttentionRuntimeBase):
         if self._sliding_window_per_layer is not None:
             self._cache.sliding_window_per_layer = self._sliding_window_per_layer
         self.adopt_scheduler_groups(config, layer_names)
-        logger.info(
-            "Shared attention cache: %d blocks, %.2f GiB across %d Metal regions",
-            config.num_blocks,
-            self._storage.nbytes / (1 << 30),
-            len(self._storage.buffers),
-        )
+        if storage is None:
+            logger.info(
+                "Shared attention cache: %d blocks, %.2f GiB across %d Metal regions",
+                config.num_blocks,
+                self._storage.nbytes / (1 << 30),
+                len(self._storage.buffers),
+            )
 
     def adopt_scheduler_groups(
         self, config: KVCacheConfig, layer_names: tuple[str, ...]
@@ -137,9 +110,6 @@ class SDPAPagedAttentionRuntime(PagedAttentionRuntimeBase):
         return self._require_initialized("kv_cache")
 
     def release_kv_memory(self) -> None:
-        if self._storage is None:
-            # Count-initialized caches (draft-model speculation) own their arrays.
-            super().release_kv_memory()
         self.storage.release()
 
     def restore_kv_memory(self) -> None:
