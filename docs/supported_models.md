@@ -35,11 +35,9 @@ The MLX backend has experimental text-only pooling support. See
 validation guidance. The reranker requires Qwen3 sequence-classification
 `hf_overrides`.
 
-A d3 checkpoint scores prompts with `readout.safetensors`, which ships next to
-the weights and is fetched with them when the model is a repo id. Larger d3
-sizes declare `tie_word_embeddings: false` and ship no vocabulary head; a
-pooling load drops the head mlx_lm builds, since a decision model never
-generates tokens.
+D3 (Decision 3.0) answers choice, yes/no, and score questions about text or JSON.
+See [Structured decisions](structured_decisions.md) for supported checkpoints
+and `/v1/systemone` usage.
 
 | Model | MLX | PyTorch MPS | Runner | Example checkpoint |
 | --- | --- | --- | --- | --- |
