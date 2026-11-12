@@ -3,6 +3,10 @@
 
 import torch
 from vllm.config import set_current_vllm_config
+from vllm.utils.math_utils import cdiv
+from vllm.v1.core.kv_cache_config_builder import get_kv_cache_config_builder
+from vllm.v1.core.kv_cache_planning import get_kv_cache_groups_from_builder
+from vllm.v1.worker.gpu.cudagraph_utils import _teardown_profiling_state
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 from vllm_metal.pytorch_backend.bindings import install
@@ -40,6 +44,43 @@ class MPSModelRunner(GPUModelRunner):
         self.kv_block_zeroer = MPSKVBlockZeroer(
             self.kv_caches, kv_cache_config.num_blocks
         )
+
+    @torch.inference_mode()
+    def profile_largest_step(self):
+        """Return the MPS pool growth of the largest step the scheduler can run.
+
+        Like the MLX profile, the forward runs that step with attention, as the
+        fewest requests it can hold, on a throwaway KV cache, and logits cover
+        every row a decode step can sample.
+        """
+        torch.accelerator.reset_peak_memory_stats()
+        reserved = torch.accelerator.memory_reserved()
+        max_num_reqs = self.max_num_reqs
+        num_tokens = min(self.max_num_tokens, max_num_reqs * self.max_model_len)
+        builder = get_kv_cache_config_builder(self.vllm_config)
+        groups = get_kv_cache_groups_from_builder(
+            builder, self.vllm_config, self.get_kv_cache_spec()
+        )
+        # Dummy block tables point every request at block 0.
+        config = builder.get_kv_cache_config_from_groups(
+            self.vllm_config, groups, num_blocks=1
+        )
+        self.initialize_kv_cache(config, is_profiling=True)
+        try:
+            # TODO: drop once upstream _dummy_run takes a request count; it
+            # spreads its tokens over max_num_reqs requests.
+            self.max_num_reqs = cdiv(num_tokens, self.max_model_len)
+            with set_current_vllm_config(self.vllm_config):
+                hidden_states, _ = self._dummy_run(num_tokens)
+            rows = min(num_tokens, max_num_reqs * self.decode_query_len)
+            self.model.compute_logits(hidden_states[-rows:])
+            del hidden_states
+            torch.mps.synchronize()
+            return torch.accelerator.max_memory_reserved() - reserved
+        finally:
+            self.max_num_reqs = max_num_reqs
+            del self.kv_block_zeroer
+            _teardown_profiling_state(self)
 
     def warm_up(self):
         with set_current_vllm_config(self.vllm_config):

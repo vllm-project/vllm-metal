@@ -53,12 +53,13 @@ wins. Outputs are unaffected.
 ## PyTorch MPS Allocator Watermark
 
 On the PyTorch MPS backend the plugin defaults
-`PYTORCH_MPS_LOW_WATERMARK_RATIO` to the effective memory fraction
-(`--gpu-memory-utilization`), so PyTorch starts returning cached heaps once
-the pool passes the configured budget. PyTorch's own default is 1.4 times the
-recommended working set, which an 8 GB Mac cannot reach before Metal runs out
-of memory. Exporting either `PYTORCH_MPS_LOW_WATERMARK_RATIO` or
-`PYTORCH_MPS_HIGH_WATERMARK_RATIO` yourself leaves both untouched.
+`PYTORCH_MPS_LOW_WATERMARK_RATIO` to `0.01`. Below its low watermark (1.4
+times the recommended working set by default) PyTorch packs mid-sized buffers
+into 1 GiB heaps; past it, heaps match the request and free ones are returned.
+Loading the weights crosses 1% of the working set, so the startup profile of
+the largest scheduled step allocates the way serving does. The KV cache gets
+the `--gpu-memory-utilization` budget minus what is allocated after loading
+and that step. A low watermark you export yourself wins.
 
 ## Multimodal Serve Modes
 
