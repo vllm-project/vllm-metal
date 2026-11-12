@@ -1,8 +1,8 @@
 # Supported Models
 
 vllm-metal supports text language models and a small set of native multimodal
-models on Apple Silicon. Multimodal support is currently vision-only and runs on
-the paged backend.
+models on Apple Silicon. For speech and image generation through vLLM-Omni,
+see [Omni](omni.md).
 
 ## Legend
 
