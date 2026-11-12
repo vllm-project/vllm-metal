@@ -83,56 +83,6 @@ no universal utilization cutoff that certifies a clean comparison. Likewise,
 no thermal warning does not prove stable GPU clocks. Record memory pressure
 and swapping if the workload approaches available unified memory.
 
-## Plan repetitions and diagnose order effects
-
-Use this protocol for both native kernel probes and serving comparisons, but
-keep their metrics and conclusions separate.
-
-Before running, record the workload, primary metric, warmup, number of rounds,
-arm order and stopping rules. Distinguish successful completion from safety
-stops, failed requests and lack of progress. Size timeouts for the workload;
-a time limit does not turn a partial run into a performance result. If further
-rounds may be needed, define their schedule and limit in advance rather than
-repeat until the preferred arm wins.
-
-ABBA balances arm positions against some simple time trends; it does **not**
-guarantee removal of clock ramp-up, thermal drift, cache carry-over, swapping
-or background load. A large difference between the first and last A is a
-warning about comparability, not evidence that the change in B caused it.
-Likewise, no thermal warning or fixed cooldown duration proves stable clocks.
-
-When order effects appear:
-
-- Keep every result, including failed, incomplete and inconclusive runs, with
-  timestamps and the actual order. Do not drop the first A because it makes
-  the ratio inconvenient, or report only the fastest pair.
-- Investigate machine state and repeat according to a declared protocol, such
-  as additional balanced blocks or randomized paired rounds. Appending AB,
-  BA or BAAB alone does not guarantee that the bias has been corrected. If
-  the protocol changes after seeing results, label the new run as exploratory
-  and retain the original result.
-- Mark an unplanned restart, different cooldown or warmup, changed memory
-  budget, or other intervention as a new experimental block. Apply each block's
-  protocol equally to both arms. Report within-block comparisons before any
-  aggregate; do not silently pool different conditions as equivalent repeats.
-- Show the spread and baseline drift alongside the arm comparison. For a
-  kernel loop, many launches within one timed round are not automatically
-  independent samples. Retain round-level measurements and synchronization
-  details; do not infer confidence from the raw launch count alone.
-
-Warmup must exercise the measured kernel and workload, not just load the
-model. For example, two warmup requests cannot warm a four-row-only dispatch;
-use enough concurrent work and verify the executed route. Exclude discarded
-warmup from the reported timing and preserve its configuration. For native
-probes, distinguish hot-KV reuse from a cold or disrupted-cache experiment.
-
-Record power source/mode, background activity, memory pressure, swap-in/out
-changes and thermal observations before and during each block. System-wide
-counters do not attribute activity to the benchmark, and allocated swap alone
-does not prove active swapping. If variability remains comparable to the
-observed difference, report the result as inconclusive rather than using it
-to justify a routing exception or claim a speedup.
-
 ## Compare the same work and verify the route
 
 Keep model weights and quantization, tokenizer, input token IDs, output length,

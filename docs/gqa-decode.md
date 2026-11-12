@@ -314,9 +314,7 @@ dispatch checks. Separate primitive timing from HTTP decode throughput,
 and keep noisy measurements visible. The
 [macOS benchmarking guide](benchmarking-macos.md)
 explains why in-process engine measurements and short probes are not
-interchangeable with serving results. Follow its
-[run-order protocol](benchmarking-macos.md#plan-repetitions-and-diagnose-order-effects)
-when kernel or serving comparisons drift across repetitions.
+interchangeable with serving results.
 
 ## Follow-up work (separate PRs)
 
