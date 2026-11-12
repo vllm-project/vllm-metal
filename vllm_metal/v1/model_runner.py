@@ -1649,6 +1649,18 @@ class MetalModelRunner:
                     DecoderPoolingBackend,
                     self._pooling_backend,
                 )
+                # A checkpoint whose model config is not causal (d3's
+                # noncausal_full_attention) scores the prompt with the whole
+                # input in view: one bidirectional block per prefill segment.
+                # Linear (GDN) layers keep their recurrence, so only
+                # full-attention layers take the block.
+                hf_config = getattr(self.model_config, "hf_config", None)
+                if ctx is not None and not getattr(hf_config, "is_causal", True):
+                    ctx.bidi_layer_kinds = frozenset({"full"})
+                    ctx.segment_bidi_ranges = [
+                        [(pr.start_pos, pr.start_pos + len(pr.token_ids))]
+                        for pr in prefill_reqs
+                    ]
                 pooling_hidden_states = decoder_pooling_backend.forward_packed(
                     input_ids,
                     offset_caches,

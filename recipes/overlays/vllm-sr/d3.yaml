@@ -1,0 +1,59 @@
+meta:
+  date_updated: "2026-11-12"
+  hardware:
+    apple_64gb: supported
+
+variants:
+  mlx_bf16:
+    label: MLX BF16
+    model_id: vllm-sr/d3
+    description: Text-only D3 decisions through /v1/systemone.
+    precision: bf16
+    # Checkpoint size plus 20% headroom, rounded up; not a serving budget.
+    vram_minimum_gb: 63
+    supported_hardware: [apple_64gb]
+    min_vllm_version: "0.33.0"
+    nightly_required: false
+    install:
+      pip:
+        note: Requires Apple Silicon and macOS 15 or later. Install vLLM Metal.
+        command: |
+          curl -fsSL https://raw.githubusercontent.com/vllm-project/vllm-metal/main/install.sh | bash
+          source ~/.venv-vllm-metal/bin/activate
+      docker: false
+    supported_frontends: [python]
+    supported_features: []
+    base_args:
+      - --runner
+      - pooling
+      - --served-model-name
+      - d3
+      - --host
+      - "127.0.0.1"
+      - --max-model-len
+      - "2048"
+      - --max-num-batched-tokens
+      - "2048"
+      - --max-num-seqs
+      - "1"
+      - --kv-cache-memory-bytes
+      - "1073741824"
+
+notes:
+  - title: Decisions on Metal
+    when:
+      hardware: [apple_64gb]
+      variants: [mlx_bf16]
+    body: |
+      - The first run downloads about 52.2 GB.
+      - Support is based on model configuration and checkpoint tensor checks.
+        These serving settings have not been verified end to end on Metal;
+        memory use and performance have not been measured.
+      - The BF16 weights leave limited headroom on a 64 GB Mac. Start with
+        one concurrent sequence and the 2,048-token limit shown here.
+      - Send text or JSON states to `/v1/systemone`; images, videos,
+        `/v1/decisions`, and chat completions are unsupported on this path.
+      - Prefix caching and chunked prefill are disabled automatically. Keep
+        `--max-num-batched-tokens` at least as large as `--max-model-len`.
+      - See the [Metal structured decisions guide](https://docs.vllm.ai/projects/vllm-metal/en/latest/structured_decisions/)
+        for a request example.

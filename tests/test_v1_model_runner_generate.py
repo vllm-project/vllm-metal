@@ -33,6 +33,7 @@ from tests.stub_runner import (
     make_stub_runner,
 )
 from vllm_metal.attention.caches.state_cache import PagedStateCache
+from vllm_metal.attention.context import clear_context, get_context
 from vllm_metal.attention.runtime.hybrid import HybridPagedAttentionRuntime
 from vllm_metal.attention.runtime.hybrid_plan import HybridRuntimePlan
 from vllm_metal.attention.runtime.sdpa import SDPAPagedAttentionRuntime
@@ -121,9 +122,12 @@ class ForwardOutputRuntimeStub:
 class PoolingForwardBackendStub:
     def __init__(self, hidden_states: mx.array) -> None:
         self.hidden_states = hidden_states
+        self.ctx = None
 
     def forward_packed(self, input_ids, offset_caches):
         del input_ids, offset_caches
+        # The runner stages a fresh context per forward; keep the live one.
+        self.ctx = get_context()
         return self.hidden_states
 
 
@@ -2038,6 +2042,53 @@ class TestV1MetalModelRunnerGDNSubmit:
         assert submitted[0][0] is pooling_hidden_states
         for actual, expected in zip(submitted[0][1:], runtime._arrays, strict=True):
             assert actual is expected
+
+    @pytest.mark.parametrize("is_causal", [True, False])
+    def test_pooling_bidi_follows_the_checkpoint_attention_mode(
+        self, monkeypatch, is_causal
+    ) -> None:
+        """d3 declares a non-causal model config; that flag, not a pooler
+        attribute, decides whether prefill runs as bidirectional blocks."""
+        backend = PoolingForwardBackendStub(mx.array([[[1.0]]], dtype=mx.float32))
+        runner = make_stub_runner(
+            _paged_attention_runtime=self.make_runtime_with_side_effects(),
+            _is_pooling=True,
+            _pooling_backend=backend,
+            _paged_block_size=4,
+            num_layers=0,
+        )
+        runner.model_config.hf_config = SimpleNamespace(is_causal=is_causal)
+        monkeypatch.setattr(mr.mx, "async_eval", lambda *args: None)
+        try:
+            runner._start_paged_forward(
+                mr._ExecutionBatch(),
+                prefill_reqs=[
+                    mr.PrefillRequest(
+                        req_id="pool-0",
+                        token_ids=[1, 2],
+                        sampling_params=SamplingParams(),
+                        block_ids=[[0]],
+                        generator=None,
+                        prompt_len=2,
+                        start_pos=0,
+                        full_prompt_token_ids=[1, 2],
+                        pooling_params=PoolingParams(),
+                    )
+                ],
+                decode_reqs=[],
+                scheduler_output=SchedulerOutput.make_empty(),
+            )
+        finally:
+            clear_context()
+
+        ctx = backend.ctx
+        assert ctx is not None
+        if is_causal:
+            assert ctx.segment_bidi_ranges is None
+            assert ctx.bidi_layer_kinds == frozenset()
+        else:
+            assert ctx.segment_bidi_ranges == [[(0, 2)]]
+            assert ctx.bidi_layer_kinds == frozenset({"full"})
 
     def test_non_last_pp_send_submits_runtime_outputs(self, monkeypatch) -> None:
         submitted: list[tuple[object, ...]] = []

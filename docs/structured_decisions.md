@@ -4,6 +4,73 @@ Jev-like System 1 decisions return yes/no probabilities, choices, and scores.
 See the [upstream guide](https://github.com/vllm-project/vllm/blob/v0.31.0/examples/features/structured_diffusion/README.md)
 for `/v1/systemone` request examples, question schemas, and sampling options.
 
+## D3 (Decision 3.0)
+
+With vLLM 0.33.0, D3 uses the native `/v1/systemone` endpoint on the model
+server; no separate proxy is needed. See the
+[upstream D3 guide](https://docs.vllm.ai/en/latest/models/structured_decisions_models/#decision-30)
+for question schemas and options.
+
+The MLX backend supports text and JSON states. `vllm-sr/d3-nano` and
+`vllm-sr/d3-flash` have been tested on Metal; their checkpoint downloads are
+about 4.4 GB and 16.8 GB respectively. Flash has been tested on a 64 GB Mac.
+Lite, Mini, and base D3 are also supported, with recipes based on model
+configuration and checkpoint checks; their serving settings have not been
+verified end to end on Metal. Edge is not supported because its attention-layer
+layout is not yet handled by the MLX integration.
+Images and videos are not supported. Checkpoints using `prefix_bidir`, including
+`d3-turbo` and `d3-ultra`, are not supported by this integration.
+
+Start the server:
+
+```bash
+VLLM_METAL_BACKEND=mlx vllm serve vllm-sr/d3-nano \
+  --runner pooling --served-model-name d3 --host 127.0.0.1 \
+  --max-model-len 2048 --max-num-batched-tokens 2048 \
+  --max-num-seqs 2 --kv-cache-memory-bytes 1073741824
+```
+
+For Flash, replace the model ID with `vllm-sr/d3-flash`. Serving settings are
+available in the [Nano](https://github.com/vllm-project/vllm-metal/blob/main/recipes/overlays/vllm-sr/d3-nano.yaml),
+[Flash](https://github.com/vllm-project/vllm-metal/blob/main/recipes/overlays/vllm-sr/d3-flash.yaml),
+[Lite](https://github.com/vllm-project/vllm-metal/blob/main/recipes/overlays/vllm-sr/d3-lite.yaml),
+[Mini](https://github.com/vllm-project/vllm-metal/blob/main/recipes/overlays/vllm-sr/d3-mini.yaml),
+and [base D3](https://github.com/vllm-project/vllm-metal/blob/main/recipes/overlays/vllm-sr/d3.yaml)
+recipes. Base D3 downloads about 52.2 GB and starts with one concurrent sequence
+to limit memory use.
+The 2,048-token limit includes the state, question, and answer options.
+Keep `--max-num-batched-tokens` at least as large as `--max-model-len`.
+
+Ask a question:
+
+```bash
+curl http://127.0.0.1:8000/v1/systemone \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "d3",
+    "state": "I was charged twice for my subscription and need a refund.",
+    "questions": {
+      "route": {
+        "type": "choice",
+        "instructions": "Which team should handle this request?",
+        "criteria": {
+          "billing": "Payments, charges, and refunds",
+          "technical": "Software errors and login issues"
+        }
+      }
+    }
+  }'
+```
+
+The response contains the selected option and its probabilities under
+`answers.route`. Use `/v1/systemone`: upstream vLLM 0.33.0 does not enable
+`/v1/decisions` for D3 and returns HTTP 501. D3 does not serve chat completions.
+
+Prefix caching and chunked prefill are disabled automatically, as in upstream
+vLLM. These checkpoints read the whole prompt bidirectionally, so changing the
+question changes the state representations. Each question processes the full
+prompt, even when several questions share the same state.
+
 ## DiffusionGemma
 
 Start the Metal model server:

@@ -20,8 +20,8 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 _APPLIED = False
-_EMBEDDING_LOAD_SCOPE: ContextVar[bool] = ContextVar(
-    "vllm_metal_embedding_load_scope", default=False
+_HEADLESS_LOAD_SCOPE: ContextVar[bool] = ContextVar(
+    "vllm_metal_headless_load_scope", default=False
 )
 _QWEN35_FP8_BLOCK_SIZE = 128
 _QWEN3_BACKBONE_ROOTS = frozenset({"embed_tokens", "layers", "norm", "lm_head"})
@@ -71,6 +71,7 @@ def apply_compat_patches() -> None:
     _apply_bytelevel_patch_during_registration()
     _patch_mlx_lm_qwen35_fp8_sanitize()
     _patch_mlx_lm_qwen3_flat_weight_prefix()
+    _patch_mlx_lm_d3_weight_layout()
     _patch_mlx_lm_minicpm4_model_type()
     _patch_transformers_exaone4_config()
 
@@ -921,23 +922,24 @@ def ensure_lfm2_vl_torch_outputs(model_type: str | None) -> None:
 
 
 @contextmanager
-def embedding_load_scope(*, enabled: bool = True) -> Iterator[None]:
-    """Mark the wrapped model load as embedding-only for compat shims.
+def headless_load_scope(*, enabled: bool = True) -> Iterator[None]:
+    """Mark the wrapped model load as never reading the LM head.
 
-    The Qwen3 flat-prefix shim below drops mlx_lm's ``lm_head`` module only
-    inside this scope. Embedding pooling reads body hidden states and never
-    calls logits. Classify rerankers read ``lm_head`` logits and generation
-    needs the head tensor, so outside this scope the module stays and strict
-    load fails with the honest missing-tensor error.
+    Pooling that scores hidden states — embeddings, and d3's readout — leaves
+    mlx_lm's ``lm_head`` unused, and some checkpoints ship no tensor for it.
+    Inside this scope a compat shim may drop the module so strict load stops
+    demanding a tensor the checkpoint never wrote. Classify rerankers read
+    ``lm_head`` logits and generation needs the head, so outside the scope the
+    module stays and strict load fails with the honest missing-tensor error.
     """
     if not enabled:
         yield
         return
-    token = _EMBEDDING_LOAD_SCOPE.set(True)
+    token = _HEADLESS_LOAD_SCOPE.set(True)
     try:
         yield
     finally:
-        _EMBEDDING_LOAD_SCOPE.reset(token)
+        _HEADLESS_LOAD_SCOPE.reset(token)
 
 
 def _qwen3_flat_weight_prefix(
@@ -954,7 +956,7 @@ def _qwen3_flat_weight_prefix(
     ``lm_head.weight`` keeps its top-level name: upstream ``sanitize`` drops it
     for tied embeddings, and untied checkpoints own it there. When an untied
     checkpoint ships no head tensor at all (the official 8B embedding) and the
-    load runs inside ``embedding_load_scope()``, drop the module mlx_lm
+    load runs inside ``headless_load_scope()``, drop the module mlx_lm
     constructed: embed pooling reads body hidden states and never this
     module, and mlx ``nn.Module.__delattr__`` removes it from
     ``parameters()``, so strict load stops demanding a tensor Qwen never
@@ -970,13 +972,101 @@ def _qwen3_flat_weight_prefix(
         "lm_head.weight" not in weights
         and not model.args.tie_word_embeddings
         and getattr(model, "lm_head", None) is not None
-        and _EMBEDDING_LOAD_SCOPE.get()
+        and _HEADLESS_LOAD_SCOPE.get()
     ):
         delattr(model, "lm_head")
     return {
         key if key.startswith("lm_head.") else f"model.{key}": value
         for key, value in weights.items()
     }
+
+
+def _patch_mlx_lm_d3_weight_layout() -> bool:
+    """Teach mlx_lm's Qwen3.5 wrapper to load a d3 decision checkpoint.
+
+    d3 checkpoints (``vllm-sr/d3-*``) keep the Qwen3.5 backbone as
+    ``language_model.layers.*`` next to a ``visual.*`` tower. mlx_lm's
+    ``qwen3_5`` wrapper expects ``language_model.model.*`` and, on a text-only
+    load, rejects the vision tensors that come with the tower. Re-key the
+    backbone and drop the tower before upstream ``sanitize`` runs.
+
+    This is a checkpoint-layout shim, not permanent vllm-metal behavior.
+    """
+    from importlib import import_module
+    from importlib.util import find_spec
+
+    if find_spec("mlx_lm.models.qwen3_5") is None:
+        return False
+    try:
+        qwen3_5 = import_module("mlx_lm.models.qwen3_5")
+    except ImportError as exc:
+        logger.warning(
+            "Could not import mlx_lm.models.qwen3_5 while installing the d3 "
+            "weight layout compatibility patch: %s",
+            exc,
+        )
+        return False
+    model_cls = getattr(qwen3_5, "Model", None)
+    if model_cls is None:
+        logger.warning(
+            "Could not install the d3 weight layout compatibility patch: "
+            "mlx_lm.models.qwen3_5 has no Model class."
+        )
+        return False
+    patched = _wrap_model_sanitize(
+        model_cls,
+        "_vllm_metal_d3_weight_layout_patch",
+        _d3_weight_layout,
+    )
+    if patched:
+        logger.debug("Patched mlx_lm d3 weight layout compatibility")
+    return patched
+
+
+_D3_BACKBONE_PREFIXES = (
+    "language_model.layers.",
+    "language_model.embed_tokens.",
+    "language_model.norm.",
+)
+
+
+def _d3_weight_layout(model: Any, weights: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Drop d3's vision tower and re-key its flat backbone for mlx_lm.
+
+    Keys already in the wrapper layout (``language_model.model.*``, every
+    mlx-community conversion) pass through untouched.
+    """
+    keys = [str(key) for key in weights]
+    if not any(key.startswith(_D3_BACKBONE_PREFIXES) for key in keys):
+        return weights
+    language_model = getattr(model, "language_model", None)
+    if (
+        "language_model.lm_head.weight" not in weights
+        and not getattr(
+            getattr(language_model, "args", None), "tie_word_embeddings", True
+        )
+        and getattr(language_model, "lm_head", None) is not None
+        and _HEADLESS_LOAD_SCOPE.get()
+    ):
+        # d3 scores codes with the readout, never the vocabulary head; the
+        # larger checkpoints ship no tensor for it and strict load would fail.
+        delattr(language_model, "lm_head")
+    remapped = {}
+    dropped = 0
+    for key, value in weights.items():
+        if key.startswith("visual.") or key.startswith("vision_tower"):
+            dropped += 1
+            continue
+        if key.startswith(_D3_BACKBONE_PREFIXES):
+            key = "language_model.model." + key[len("language_model.") :]
+        remapped[key] = value
+    if dropped:
+        logger.info(
+            "Dropped %d vision tensor(s) for a text-only qwen3_5 load; "
+            "multimodal inputs are not served on this path.",
+            dropped,
+        )
+    return remapped
 
 
 def _patch_mlx_lm_minicpm4_model_type() -> None:
