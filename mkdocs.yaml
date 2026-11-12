@@ -77,6 +77,7 @@ nav:
     - Speculative Decoding: speculative_decoding.md
     - Text Pooling: text_embedding_pooling.md
     - Speech-to-Text: stt.md
+    - Omni: omni.md
     - Turboquant: turboquant.md
     - KV Cache Offloading: kv_offloading.md
     - MoE Expert Offloading: moe_offload.md
@@ -86,4 +87,3 @@ nav:
   - Benchmarking on macOS: benchmarking-macos.md
   - Contributing: CONTRIBUTING.md
   - PyTorch MPS decisions: pytorch-mps.md
-  - Qwen3-TTS on MPS: qwen3-tts-mps.md
