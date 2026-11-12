@@ -11,6 +11,8 @@ from typing import TYPE_CHECKING, Any
 import vllm.envs as vllm_envs
 from vllm.logger import init_logger
 
+from vllm_metal.compat import effective_num_loops
+
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
@@ -67,9 +69,11 @@ def default_host_pool_bytes(vllm_config: VllmConfig) -> int:
     were shorter than each pool. Offloading serves only uniform
     full-attention models, whose KV is ``2 * kv_heads * head_size`` elements
     per token and layer. MLA keeps one latent row of
-    ``kv_lora_rank + qk_rope_head_dim``. A compressed layout only lets the
-    same bytes hold more blocks. The token count rounds up to whole blocks
-    once the block size is known.
+    ``kv_lora_rank + qk_rope_head_dim``. Weight-tied looped models cache each
+    loop iteration as its own KV layer, so physical layers are scaled by
+    ``effective_num_loops``. A compressed layout only lets the same bytes hold
+    more blocks. The token count rounds up to whole blocks once the block size
+    is known.
     """
     model_config = vllm_config.model_config
     parallel_config = vllm_config.parallel_config
@@ -89,9 +93,12 @@ def default_host_pool_bytes(vllm_config: VllmConfig) -> int:
             * model_config.get_num_kv_heads(parallel_config)
             * model_config.get_head_size()
         )
+    num_layers = model_config.get_num_layers_by_block_type(
+        parallel_config
+    ) * effective_num_loops(text_config)
     per_token = (
         per_layer
-        * model_config.get_num_layers_by_block_type(parallel_config)
+        * num_layers
         * _kv_dtype_bytes(cache_config.cache_dtype, model_config.dtype)
     )
     tokens = int(model_config.max_model_len)

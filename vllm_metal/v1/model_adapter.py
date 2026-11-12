@@ -13,6 +13,8 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 import mlx.core as mx
 from vllm.logger import init_logger
 
+from vllm_metal.compat import effective_num_loops as effective_num_loops
+
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
 

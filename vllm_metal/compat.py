@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import lru_cache, wraps
@@ -26,6 +26,107 @@ _HEADLESS_LOAD_SCOPE: ContextVar[bool] = ContextVar(
 _QWEN35_FP8_BLOCK_SIZE = 128
 _QWEN3_BACKBONE_ROOTS = frozenset({"embed_tokens", "layers", "norm", "lm_head"})
 _EXAONE4_LAYER_TYPE = {"L": "sliding_attention", "G": "full_attention"}
+_UNSUPPORTED_NANBEIGE_FLAGS = (
+    "enable_double_loop_split",
+    "loop_share_kv",
+    "enable_depth_attention",
+    "enable_hyper_connection",
+    "enable_mhc",
+    "qk_layernorm",
+)
+
+
+def _config_field(config: Any, key: str) -> Any:
+    if isinstance(config, Mapping):
+        return config.get(key)
+    return getattr(config, key, None)
+
+
+def effective_num_loops(config: Any) -> int:
+    """Return the number of executed weight-tied loops for ``config``.
+
+    Matches ``mlx_lm.models.nanbeige.ModelArgs.effective_num_loops`` while
+    failing fast on Nanbeige variants whose weights or attention layout
+    neither ``mlx_lm`` nor the paged runtime implements.
+    """
+    if config is None:
+        return 1
+    for flag in _UNSUPPORTED_NANBEIGE_FLAGS:
+        val = _config_field(config, flag)
+        if isinstance(val, (bool, int)) and bool(val):
+            raise NotImplementedError(f"Nanbeige option {flag}=True is not supported.")
+    emb_neighbor_num = _config_field(config, "emb_neighbor_num")
+    if emb_neighbor_num is not None and not callable(emb_neighbor_num):
+        raise NotImplementedError(
+            "Nanbeige N-gram embeddings (emb_neighbor_num) are not supported."
+        )
+
+    loop_loss_weights = _config_field(config, "loop_loss_weights")
+    if (
+        isinstance(loop_loss_weights, Sequence)
+        and not isinstance(loop_loss_weights, (str, bytes))
+        and len(loop_loss_weights) > 0
+    ):
+        num_loops = len(loop_loss_weights) + 1
+    else:
+        raw = _config_field(config, "num_loops")
+        if raw is None or callable(raw):
+            return 1
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            raise ValueError(f"num_loops must be an integer >= 1, got {raw!r}")
+        num_loops = raw
+
+    if num_loops < 1:
+        raise ValueError(f"num_loops must be >= 1, got {num_loops}")
+    return num_loops
+
+
+# TODO: Remove Nanbeige fallbacks once the pinned Transformers knows it.
+def _nanbeige_config_class() -> type[Any]:
+    """Parse Nanbeige checkpoint metadata on Transformers releases without it."""
+    from transformers.configuration_utils import PretrainedConfig
+
+    class NanbeigeCompatConfig(PretrainedConfig):
+        model_type = "nanbeige"
+        keys_to_ignore_at_inference = ["past_key_values"]
+
+        def __init__(
+            self,
+            use_cache: bool = True,
+            initializer_range: float = 0.02,
+            tie_word_embeddings: bool = False,
+            num_loops: int = 1,
+            skip_loop_final_norm: bool = False,
+            **kwargs: Any,
+        ) -> None:
+            if (
+                isinstance(num_loops, bool)
+                or not isinstance(num_loops, int)
+                or num_loops < 1
+            ):
+                raise ValueError(
+                    f"num_loops must be an integer >= 1, got {num_loops!r}"
+                )
+            num_attention_heads = kwargs.get("num_attention_heads")
+            if (
+                kwargs.get("num_key_value_heads") is None
+                and num_attention_heads is not None
+            ):
+                kwargs["num_key_value_heads"] = num_attention_heads
+            hidden_size = kwargs.get("hidden_size")
+            if (
+                kwargs.get("head_dim") is None
+                and hidden_size is not None
+                and num_attention_heads
+            ):
+                kwargs["head_dim"] = hidden_size // num_attention_heads
+            self.use_cache = use_cache
+            self.initializer_range = initializer_range
+            self.num_loops = num_loops
+            self.skip_loop_final_norm = skip_loop_final_norm
+            super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
+
+    return NanbeigeCompatConfig
 
 
 def register_model_compat() -> None:
@@ -45,9 +146,23 @@ def register_model_compat() -> None:
     if not isinstance(current_platform, MetalPlatform):
         return
 
+    from transformers import AutoConfig
     from vllm.model_executor.models import ModelRegistry
 
+    try:
+        AutoConfig.for_model("nanbeige")
+    except ValueError:
+        AutoConfig.register("nanbeige", _nanbeige_config_class(), exist_ok=True)
+        logger.debug("Registered Nanbeige config compatibility")
+
     supported = ModelRegistry.get_supported_archs()
+    if "NanbeigeForCausalLM" not in supported:
+        ModelRegistry.register_model(
+            "NanbeigeForCausalLM",
+            "vllm.model_executor.models.transformers:TransformersForCausalLM",
+        )
+        logger.debug("Registered Nanbeige architecture compatibility")
+
     for arch in ("Lfm3ForCausalLM", "Lfm3VlForConditionalGeneration"):
         if arch not in supported:
             ModelRegistry.register_model(

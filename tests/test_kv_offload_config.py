@@ -8,6 +8,7 @@ connector/spec lookups to the Metal classes.
 """
 
 import os
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -645,6 +646,35 @@ def test_default_pool_for_null_kv_lora_rank_holds_k_and_v() -> None:
 
     extra = vllm_config.kv_transfer_config.kv_connector_extra_config
     assert extra["cpu_bytes_to_use"] == 2 * 2 * 4 * 64 * 2 * 4096 * 2
+
+
+@pytest.mark.parametrize(
+    "loop_fields",
+    [
+        {"num_loops": 2},
+        {"num_loops": 1, "loop_loss_weights": [0.3]},
+    ],
+    ids=["num_loops", "loop_loss_weights"],
+)
+def test_default_pool_scales_by_effective_num_loops(
+    monkeypatch: pytest.MonkeyPatch, loop_fields: dict[str, object]
+) -> None:
+    """Weight-tied looped models allocate a KV layer per loop iteration, and
+    config-time sizing must remain free of MLX imports."""
+    monkeypatch.setitem(sys.modules, "mlx", None)
+    monkeypatch.setitem(sys.modules, "mlx.core", None)
+    vllm_config = _base_config()
+    vllm_config.model_config.hf_text_config = SimpleNamespace(
+        model_type="nanbeige", **loop_fields
+    )
+    vllm_config.kv_transfer_config = _metal_connector_without_size()
+    _uniform_model(vllm_config, layers=22, kv_heads=8, head_size=128)
+
+    MetalPlatform.check_and_update_config(vllm_config)
+
+    extra = vllm_config.kv_transfer_config.kv_connector_extra_config
+    # 2 * (22 * 2) * 8 * 128 * fp16 bytes, for two 4096-token requests.
+    assert extra["cpu_bytes_to_use"] == 2 * 44 * 8 * 128 * 2 * 4096 * 2
 
 
 def test_mla_pool_rope_default_matches_the_runtime() -> None:
