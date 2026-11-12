@@ -35,15 +35,20 @@ Keys for an `fs` tier:
 | `max_size_gib` | 10% of the volume | Disk cap in GiB. `0` means no cap. If unset and the disk has less free space than 10% of the volume, startup fails. |
 
 Without `--kv-offloading-size`, the pool defaults to the KV of two
-`--max-model-len` requests, rounded up to whole blocks. A full pool does not lose
-a block, the scheduler retries the store on the next step; two requests is the
-smallest pool with no retries at concurrency 4 in the #1037 measurements. The
-default is capped at a quarter of the KV budget (after weights and
-activations), or one host chunk if that is larger, and leaves room for one
-`--max-model-len` request. With `--max-model-len -1`,
+`--max-model-len` requests, rounded up to whole blocks. A store that does not fit
+is retried on the next step; two requests is the smallest pool with no retries
+at concurrency 4 in the #1037 measurements. The default is capped at a quarter
+of the KV budget (after weights and activations), or one host chunk if that is
+larger, and leaves room for one `--max-model-len` request. With `--max-model-len -1`,
 `--num-gpu-blocks-override` or `--kv-cache-memory-bytes` no request is
 reserved. The startup log says when the pool is changed. Pass the flag to size
 it yourself.
+
+A pool smaller than one `--max-model-len` request logs a warning at startup
+with the size to use. The default pool can be that small when the KV budget
+caps it. Prompts longer than the pool may not be stored, and with a disk tier
+a request that restores a longer prompt can stall. Related:
+[vllm#62931](https://github.com/vllm-project/vllm/issues/62931).
 
 By default the host pool comes out of `--gpu-memory-utilization` (see
 [Configuration](configuration.md#kv-cache-memory-settings)), which is the total

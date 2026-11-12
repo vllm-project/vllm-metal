@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Committed feature ownership is independent of temporary draft acceptance."""
 
+import gc
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -170,6 +171,34 @@ def test_chunked_prefill_then_rejection_overwrites_temporary_kv(accepted, propos
     assert not proposer._valid_ends
     state.token_ids = [1] * 15 + [2]
     assert proposer.propose(_prefill(state, _features(15), 0, True)) is not None
+
+
+def test_compiled_draft_follows_storage_recreated_by_sleep(proposer):
+    """Sleep frees the storage the draft shares; wake re-creates it in place."""
+    state = RequestState(
+        token_ids=[1] * 15 + [2],
+        prompt_len=15,
+        sampling_params=SamplingParams(temperature=0),
+        block_ids=[[0], [5, 2, 7, 1]],
+    )
+    storage = proposer.cache.storage
+    assert proposer.propose(_prefill(state, _features(15), 0, True)) is not None
+    gc.collect()
+    active = mx.get_active_memory()
+    storage.release()
+    gc.collect()
+    assert active - mx.get_active_memory() >= storage.nbytes
+    storage.reallocate()
+    for tensor in storage.tensors.values():
+        tensor.fill_(float("nan"))
+    # The engine recomputes the request after wake. Every slot read below must
+    # be written to the new backing by the draft compiled before sleep.
+    proposer.release_requests({"r"})
+    features = _features(15)
+    drafts = proposer.propose(_prefill(state, features, 0, True))
+    expected = _dense_tokens(proposer, mx.array([2]), [f[None] for f in features], 3)
+    assert drafts.draft_token_ids == expected.tolist()
+    _assert_committed(proposer, state.block_ids[1], features)
 
 
 @pytest.mark.parametrize(

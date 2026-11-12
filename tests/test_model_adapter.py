@@ -12,6 +12,7 @@ from mlx_lm.models.cache import KVCache, RotatingKVCache
 from vllm.config.multimodal import (
     AudioDummyOptions,
     ImageDummyOptions,
+    MultiModalConfig,
     VideoDummyOptions,
 )
 
@@ -19,6 +20,7 @@ import vllm_metal.envs as envs
 import vllm_metal.v1.model_adapter as model_adapter_module
 from vllm_metal.config import reset_config
 from vllm_metal.multimodal.lfm2_vl import Lfm2VlMultimodalAdapter
+from vllm_metal.multimodal.lfm3_audio import Lfm3AudioMultimodalAdapter
 from vllm_metal.multimodal.lfm3_vl import Lfm3VlMultimodalAdapter
 from vllm_metal.multimodal.paddleocr_vl import PaddleOCRVLMultimodalAdapter
 from vllm_metal.multimodal.qwen3_vl import Qwen3VLMultimodalAdapter
@@ -108,8 +110,8 @@ class TestShouldForceTextBackbone:
     def test_mlx_quant_wrapper_without_adapter_keeps_text_backbone(
         self, model_type: str, architecture: str
     ) -> None:
-        # `build_multimodal_adapter` has no adapter for these, and an image
-        # request against a missing adapter raises in the runner.
+        # `build_multimodal_adapter` has no adapter for these, so mlx_lm
+        # serves their text.
         hf_config = SimpleNamespace(
             model_type=model_type,
             architectures=[architecture],
@@ -120,8 +122,8 @@ class TestShouldForceTextBackbone:
         assert adapter.build_multimodal_adapter(object(), hf_config) is None
 
     def test_unquantized_muse_glimmer_keeps_text_backbone(self) -> None:
-        # No multimodal adapter, so a native load would let image requests
-        # reach the runner and raise there, whatever the quantization.
+        # No multimodal adapter, so mlx_lm serves the text whatever the
+        # quantization.
         hf_config = SimpleNamespace(
             model_type="muse_glimmer",
             architectures=["MuseGlimmerForConditionalGeneration"],
@@ -837,6 +839,76 @@ class TestNormalizeModelConfig:
 
         assert model_config.multimodal_config is None
 
+    @pytest.mark.parametrize("enable_mm_embeds", [False, True])
+    @pytest.mark.parametrize(
+        ("multimodal_mode", "model_type", "architecture"),
+        [
+            ("auto", "gemma3", "Gemma3ForConditionalGeneration"),
+            ("auto", "idefics3", "Idefics3ForConditionalGeneration"),
+            # d1 checkpoints share LFM3-VL's model_type but have no adapter.
+            ("auto", "lfm3_vl", "D1Model"),
+            ("multimodal-native", "gemma4", "Gemma4ForConditionalGeneration"),
+        ],
+    )
+    def test_vlm_without_native_adapter_keeps_config_and_refuses_media(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        multimodal_mode: str,
+        model_type: str,
+        architecture: str,
+        enable_mm_embeds: bool,
+    ) -> None:
+        monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", multimodal_mode)
+        reset_config()
+        multimodal_config = MultiModalConfig(
+            limit_per_prompt={"image": 4}, enable_mm_embeds=enable_mm_embeds
+        )
+        model_config = SimpleNamespace(
+            quantization=None,
+            multimodal_config=multimodal_config,
+            hf_config=SimpleNamespace(
+                model_type=model_type, architectures=[architecture]
+            ),
+        )
+
+        DefaultModelAdapter().normalize_model_config(model_config)
+
+        assert model_config.multimodal_config is multimodal_config
+        assert [
+            multimodal_config.get_limit_per_prompt(modality)
+            for modality in ("image", "video", "audio", "vision_chunk")
+        ] == [0, 0, 0, 0]
+        assert multimodal_config.enable_mm_embeds is False
+
+    @pytest.mark.parametrize(
+        ("model_type", "architecture"),
+        [
+            ("qwen3_vl", "Qwen3VLForConditionalGeneration"),
+            ("paddleocr_vl", "PaddleOCRVLForConditionalGeneration"),
+            ("lfm2_vl", "Lfm2VlForConditionalGeneration"),
+            ("lfm3_vl", "Lfm3VlForConditionalGeneration"),
+            ("lfm3_audio", "Lfm3AudioForConditionalGeneration"),
+        ],
+    )
+    def test_native_adapter_family_keeps_media_limits(
+        self, model_type: str, architecture: str
+    ) -> None:
+        multimodal_config = MultiModalConfig(limit_per_prompt={"image": 4})
+        model_config = SimpleNamespace(
+            quantization=None,
+            multimodal_config=multimodal_config,
+            hf_config=SimpleNamespace(
+                model_type=model_type, architectures=[architecture]
+            ),
+        )
+
+        DefaultModelAdapter().normalize_model_config(model_config)
+
+        assert model_config.multimodal_config is multimodal_config
+        assert multimodal_config.limit_per_prompt == {
+            "image": ImageDummyOptions(count=4)
+        }
+
 
 class TestTextModel:
     def test_returns_language_model_when_present(self) -> None:
@@ -1079,6 +1151,22 @@ class TestBuildMultimodalAdapter:
         adapter = DefaultModelAdapter().build_multimodal_adapter(model, hf_config)
 
         assert isinstance(adapter, Lfm2VlMultimodalAdapter)
+
+    def test_builds_lfm3_audio_adapter_from_architecture(self) -> None:
+        language_model = _Lfm2VlLanguageModelStub()
+        language_model._placeholder_ids = [4, 5]
+        model = SimpleNamespace(
+            language_model=language_model,
+            config=SimpleNamespace(audio_start_token_id=2, mixed_start_token_id=3),
+        )
+        hf_config = SimpleNamespace(
+            model_type="custom",
+            architectures=["Lfm3AudioForConditionalGeneration"],
+        )
+
+        adapter = DefaultModelAdapter().build_multimodal_adapter(model, hf_config)
+
+        assert isinstance(adapter, Lfm3AudioMultimodalAdapter)
 
     @pytest.mark.parametrize(
         ("architecture", "expected"),
