@@ -14,6 +14,11 @@ DSPARK_DRAFT_QUANTIZATION_KEY = "dspark_draft_quantization"
 DSPARK_DRAFT_QUANTIZATION_Q4 = "q4"
 DSPARK_Q4_GROUP_SIZE = 64
 
+# Split Qwen3.5 MTP drafter (mlx-vlm ``qwen3_5_mtp`` repo or path) for targets
+# whose checkpoint dropped its ``mtp.*`` tensors, selected through
+# additional_config with ``method="mtp"``.
+QWEN_MTP_DRAFTER_KEY = "qwen_mtp_drafter"
+
 # Valid key quantization types for TurboQuant (mirrors QUANT_PARAMS in turboquant.py).
 # Kept here as a plain set so config can be imported without MLX.
 TURBOQUANT_VALID_K_QUANTS: frozenset[str] = frozenset(
