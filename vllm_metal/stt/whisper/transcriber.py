@@ -41,6 +41,20 @@ TIMESTAMP_RE = re.compile(r"<\|(\d+\.\d+)\|>")
 WHISPER_TASKS = frozenset({"transcribe", "translate"})
 
 
+def _drop_repeated_prefix(previous: str, current: str) -> str:
+    """Drop words at the start of ``current`` that already end ``previous``.
+
+    Adjacent chunks share ``overlap_chunk_second`` of audio, so the decoder
+    repeats those words. Keep the overlap for decoding, remove it from text.
+    """
+    prev_words = previous.split()
+    cur_words = current.split()
+    for size in range(min(len(prev_words), len(cur_words)), 0, -1):
+        if prev_words[-size:] == cur_words[:size]:
+            return " ".join(cur_words[size:])
+    return current
+
+
 class WhisperTranscriber:
     @staticmethod
     def validate_language(
@@ -137,9 +151,13 @@ class WhisperTranscriber:
         all_segments: list[TranscriptionSegment] = []
         all_text_parts: list[str] = []
         seg_id_offset = 0
+        last_end = 0.0
+        joined_text = ""
 
         for chunk_audio, chunk_start in chunks:
             features = self._encode_chunk(chunk_audio)
+            if language is None and self.model.is_multilingual:
+                language = self._detect_language(features)
             output_tokens = self._greedy_decode(
                 features, language, task, prompt, with_timestamps=with_timestamps
             )
@@ -149,19 +167,28 @@ class WhisperTranscriber:
                     output_tokens, chunk_start, seg_id_offset
                 )
                 for seg in segments:
+                    if seg.start < last_end:
+                        # This span was already transcribed from the previous
+                        # chunk's overlap.
+                        continue
                     all_segments.append(seg)
                     all_text_parts.append(seg.text)
+                    last_end = max(last_end, seg.end)
                 seg_id_offset += len(segments)
                 if not segments:
                     text = self.tokenizer.decode(
                         output_tokens, skip_special_tokens=True
                     )
-                    if text.strip():
-                        all_text_parts.append(text.strip())
+                    text = _drop_repeated_prefix(joined_text, text.strip())
+                    if text:
+                        all_text_parts.append(text)
+                        joined_text = " ".join((joined_text, text)).strip()
             else:
                 text = self.tokenizer.decode(output_tokens, skip_special_tokens=True)
-                if text.strip():
-                    all_text_parts.append(text.strip())
+                text = _drop_repeated_prefix(joined_text, text.strip())
+                if text:
+                    all_text_parts.append(text)
+                    joined_text = " ".join((joined_text, text)).strip()
 
         return TranscriptionResult(
             text=" ".join(all_text_parts).strip(),
@@ -311,8 +338,20 @@ class WhisperTranscriber:
         )
         return [
             self._get_token_id("<|startoftranscript|>"),
-            *(token_id for _, token_id in forced_decoder_ids),
+            *(token_id for _, token_id in sorted(forced_decoder_ids)),
         ]
+
+    def _detect_language(self, audio_features: mx.array) -> str | None:
+        """Pick the language token Whisper would choose after the SOT token."""
+        lang_ids = getattr(self.tokenizer, "lang_code_to_id", None)
+        if not lang_ids:
+            return None
+        sot = self._get_token_id("<|startoftranscript|>")
+        logits, _ = self.model.decode(
+            mx.array([[sot]], dtype=mx.int32), audio_features, None
+        )
+        scores = logits[0, -1, :]
+        return max(lang_ids, key=lambda code: float(scores[lang_ids[code]]))
 
     def _greedy_decode(
         self,

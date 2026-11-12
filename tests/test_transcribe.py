@@ -40,6 +40,10 @@ class _ChunkingTestTranscriber(WhisperTranscriber):
         del audio
         return mx.zeros((1, 1, 1), dtype=mx.float32)
 
+    def _detect_language(self, audio_features: mx.array) -> str:
+        del audio_features
+        return "en"
+
     def _greedy_decode(
         self,
         audio_features: mx.array,
@@ -306,6 +310,40 @@ class TestChunkingPolicy:
 
         assert result.text == "ok"
         assert result.duration > 0
+
+    def test_transcribe_does_not_repeat_overlap_text(self) -> None:
+        """Chunks share one second of audio; the join must not repeat it."""
+        config = SpeechToTextConfig(
+            max_audio_clip_s=30,
+            overlap_chunk_second=1.0,
+            min_energy_split_window_size=1600,
+        )
+        transcriber = _ChunkingTestTranscriber(config)
+        audio = mx.zeros(int(65 * SAMPLE_RATE), dtype=mx.float32)
+
+        result = transcriber.transcribe(audio, language="en")
+
+        assert len(transcriber._prepare_audio_chunks(audio)) == 3
+        assert result.text == "ok"
+
+    def test_transcribe_detects_language_before_decoding(self) -> None:
+        """A multilingual model with language=None gets a detected code."""
+
+        class _DetectLanguage(_ChunkingTestTranscriber):
+            def _detect_language(self, audio_features: mx.array) -> str:
+                del audio_features
+                return "zh"
+
+            def _greedy_decode(self, *args, **kwargs):  # type: ignore[override]
+                self.seen_language = kwargs.get("language") or args[1]
+                return [1]
+
+        transcriber = _DetectLanguage(SpeechToTextConfig(max_audio_clip_s=30))
+
+        result = transcriber.transcribe(mx.zeros(1600, dtype=mx.float32))
+
+        assert result.language == "zh"
+        assert transcriber.seen_language == "zh"
 
     @pytest.mark.parametrize(
         "config",
