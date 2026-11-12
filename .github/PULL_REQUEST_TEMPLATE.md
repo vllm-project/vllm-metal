@@ -13,15 +13,7 @@ conversation content without authorization.
 
 <!-- Required: the human contributor's answer, or a public-safe reference to their explicit answer. -->
 
-### 2. What is the highest-leverage variable for that outcome?
-
-<!-- Required: the human contributor's answer, or a public-safe reference to their explicit answer. -->
-
-### 3. How will this work move that variable?
-
-<!-- Required: the human contributor's answer, or a public-safe reference to their explicit answer. -->
-
-### 4. Whose user or workload needs does this address, and what are those needs?
+### 2. Does this PR break anything (behavior, API, config, model support)?
 
 <!-- Required: the human contributor's answer, or a public-safe reference to their explicit answer. -->
 
