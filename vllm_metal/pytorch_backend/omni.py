@@ -26,6 +26,13 @@ class MPSOmniGenerationModelRunner(MPSModelRunner, OmniGenerationModelRunner):
 class MPSOmniWorker(OmniWorkerMixin, MPSWorker):
     is_omni = True
 
+    def init_device(self):
+        super().init_device()
+        # Bound allocator caches too: colocated stages share unified memory.
+        torch.mps.set_per_process_memory_fraction(
+            self.cache_config.gpu_memory_utilization
+        )
+
     def get_stage_post_warmup_memory_stats(self) -> None:
         """MPS does not provide the optional CUDA warmup snapshot."""
         return None
