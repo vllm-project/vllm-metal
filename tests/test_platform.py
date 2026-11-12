@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for Metal platform."""
 
+import ast
 import importlib
 import json
 import os
 import platform
 import re
 import sys
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -2561,3 +2563,24 @@ class TestAutoFitMaxModelLenChain:
 
         with pytest.raises(ValueError, match="Cannot auto-fit max_model_len"):
             get_kv_cache_configs(vllm_config, [specs], [available], groups)
+
+
+def test_register_omni_points_at_a_real_platform_class(monkeypatch) -> None:
+    """The entry-point string must name an existing class in an existing module.
+
+    The Omni extra is not installed in CI, so the module cannot be imported
+    here; ``find_spec`` plus an AST scan still catches a rename or a broken
+    dotted path.
+    """
+    monkeypatch.setenv("VLLM_METAL_BACKEND", "mps")
+    from vllm_metal import register_omni
+
+    dotted = register_omni()
+    assert dotted == "vllm_metal.pytorch_backend.omni_platform.MPSOmniPlatform"
+
+    module_name, _, class_name = dotted.rpartition(".")
+    spec = importlib.util.find_spec(module_name)
+    assert spec is not None and spec.origin is not None
+    tree = ast.parse(Path(spec.origin).read_text())
+    classes = {node.name for node in ast.walk(tree) if isinstance(node, ast.ClassDef)}
+    assert class_name in classes
