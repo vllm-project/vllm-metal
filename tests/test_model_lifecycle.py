@@ -293,9 +293,7 @@ class TestModelLifecycle:
         )
         resolve_path.assert_called_once_with("org/model", revision=revision)
         if backend == "awq":
-            loader.assert_called_once_with(
-                "resolved/model", target_dtype=mx.float16, revision=revision
-            )
+            loader.assert_called_once_with("resolved/model", revision=revision)
         else:
             download.assert_called_once_with("resolved/model", revision=revision)
             selected_loader = loader if backend in {"vlm", "lfm3"} else weights_loader
@@ -1055,19 +1053,8 @@ class TestModelLifecycle:
             ) -> _StubAWQLoader | None:
                 return cls() if is_awq else None
 
-            def load(
-                self,
-                model_path: str,
-                *,
-                target_dtype: object,
-                revision: str | None,
-            ) -> object:
-                awq_load_calls.append(
-                    {
-                        "model_path": model_path,
-                        "target_dtype": target_dtype,
-                    }
-                )
+            def load(self, model_path: str, *, revision: str | None) -> object:
+                awq_load_calls.append({"model_path": model_path})
                 return fake_model
 
         def _fake_mlx_lm_load(*args: object, **kwargs: object) -> tuple[object, object]:
@@ -1094,12 +1081,7 @@ class TestModelLifecycle:
                 "generic mlx_lm.load must NOT be called when AWQQuantLoader "
                 "owns the load path"
             )
-            call = awq_load_calls[0]
-            assert call["model_path"] == "stub-model"
-            assert call["target_dtype"] is not None, (
-                "lifecycle must derive target_dtype from "
-                "runner.model_config.dtype and thread it to the loader"
-            )
+            assert awq_load_calls[0]["model_path"] == "stub-model"
         else:
             assert awq_load_calls == [], (
                 "AWQQuantLoader.load must NOT be called for a non-AWQ checkpoint"

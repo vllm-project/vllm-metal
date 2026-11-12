@@ -407,12 +407,7 @@ class ModelLifecycle:
 
         elif awq_loader is not None:
             load_label = "AWQ model"
-            model = self._load_awq_text_model(
-                model_name,
-                awq_loader,
-                target_dtype,
-                revision=revision,
-            )
+            model = self._load_awq_text_model(model_name, awq_loader, revision=revision)
 
         else:
             load_label = "MLX-LM model"
@@ -456,16 +451,11 @@ class ModelLifecycle:
         self,
         model_name: str,
         awq_loader: AWQQuantLoader,
-        target_dtype: Any,
         *,
         revision: str | None = None,
     ) -> Any:
         with _mlx_lm_compatible_model_path(model_name) as compatible_model_name:
-            return awq_loader.load(
-                str(compatible_model_name),
-                target_dtype=target_dtype,
-                revision=revision,
-            )
+            return awq_loader.load(str(compatible_model_name), revision=revision)
 
     def _load_mlx_lm_text_model(
         self,
