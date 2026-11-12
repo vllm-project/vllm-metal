@@ -1,4 +1,4 @@
-# MiniCPM-o 4.5 native duplex on a 64 GB Apple Silicon Mac.
+# MiniCPM-o 4.5 native duplex for one or two sessions on a 64 GB Mac.
 pipeline: minicpmo_4_5
 model_runner: v2
 session_mode: duplex
@@ -6,7 +6,7 @@ async_chunk: true
 trust_remote_code: true
 enable_prefix_caching: false
 duplex_session:
-  max_sessions: 8
+  max_sessions: 2
 connectors:
   connector_of_shared_memory:
     name: SharedMemoryConnector
