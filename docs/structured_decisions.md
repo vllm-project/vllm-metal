@@ -14,6 +14,10 @@ for question schemas and options.
 The MLX backend supports text and JSON states. `vllm-sr/d3-nano` and
 `vllm-sr/d3-flash` have been tested on Metal; their checkpoint downloads are
 about 4.4 GB and 16.8 GB respectively. Flash has been tested on a 64 GB Mac.
+Lite, Mini, and base D3 are also supported, with recipes based on model
+configuration and checkpoint checks; their serving settings have not been
+verified end to end on Metal. Edge is not supported because its attention-layer
+layout is not yet handled by the MLX integration.
 Images and videos are not supported. Checkpoints using `prefix_bidir`, including
 `d3-turbo` and `d3-ultra`, are not supported by this integration.
 
@@ -26,9 +30,14 @@ VLLM_METAL_BACKEND=mlx vllm serve vllm-sr/d3-nano \
   --max-num-seqs 2 --kv-cache-memory-bytes 1073741824
 ```
 
-For Flash, replace the model ID with `vllm-sr/d3-flash`. These settings are also
-available in the [Nano recipe](https://github.com/vllm-project/vllm-metal/blob/main/recipes/overlays/vllm-sr/d3-nano.yaml)
-and [Flash recipe](https://github.com/vllm-project/vllm-metal/blob/main/recipes/overlays/vllm-sr/d3-flash.yaml).
+For Flash, replace the model ID with `vllm-sr/d3-flash`. Serving settings are
+available in the [Nano](https://github.com/vllm-project/vllm-metal/blob/main/recipes/overlays/vllm-sr/d3-nano.yaml),
+[Flash](https://github.com/vllm-project/vllm-metal/blob/main/recipes/overlays/vllm-sr/d3-flash.yaml),
+[Lite](https://github.com/vllm-project/vllm-metal/blob/main/recipes/overlays/vllm-sr/d3-lite.yaml),
+[Mini](https://github.com/vllm-project/vllm-metal/blob/main/recipes/overlays/vllm-sr/d3-mini.yaml),
+and [base D3](https://github.com/vllm-project/vllm-metal/blob/main/recipes/overlays/vllm-sr/d3.yaml)
+recipes. Base D3 downloads about 52.2 GB and starts with one concurrent sequence
+to limit memory use.
 The 2,048-token limit includes the state, question, and answer options.
 Keep `--max-num-batched-tokens` at least as large as `--max-model-len`.
 
