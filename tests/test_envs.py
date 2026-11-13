@@ -14,6 +14,11 @@ import vllm_metal.envs as envs
     ("name", "value", "message"),
     [
         (
+            "VLLM_METAL_GDN_STATE_SCATTER",
+            "auto",
+            "VLLM_METAL_GDN_STATE_SCATTER must be one of native, tilelang, got 'auto'",
+        ),
+        (
             "VLLM_METAL_SPEC_INGEST_CHUNK",
             "1k",
             "VLLM_METAL_SPEC_INGEST_CHUNK must be an integer, got '1k'",

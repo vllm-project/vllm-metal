@@ -10,6 +10,8 @@ from typing import TYPE_CHECKING
 
 import mlx.core as mx
 
+from vllm_metal import envs
+
 if TYPE_CHECKING:
     from vllm_metal.attention.context import PagedAttentionContext
     from vllm_metal.attention.impls.gdn_spec import GDNSpecVerifyStep
@@ -40,6 +42,7 @@ class PagedStateCache:
         if len(states) not in (1, 2):
             raise ValueError("state cache requires conv and optional recurrent views")
         self.conv_states = states[0]
+        self._tilelang_scatter = envs.VLLM_METAL_GDN_STATE_SCATTER == "tilelang"
         self.recurrent_states = states[1] if len(states) > 1 else []
         self.num_layers = len(self.conv_states)
         self.max_seqs = self.conv_states[0].shape[0]
@@ -154,8 +157,12 @@ class PagedStateCache:
             for states in (self.conv_states, self.recurrent_states):
                 if states:
                     pool = states[layer_idx]
-                    states[layer_idx] = _native_row_scatter()(
-                        pool, pool, ids, zero=True
+                    states[layer_idx] = self._scatter_rows(
+                        pool,
+                        pool,
+                        ids,
+                        zero=True,
+                        strides=self._state_strides(states, layer_idx),
                     )
 
     def set_pending_conv_state(
@@ -288,17 +295,43 @@ class PagedStateCache:
                 )
         return arrays
 
-    def _scatter_rows(self, pool: mx.array, rows: mx.array, ids: mx.array) -> mx.array:
+    @staticmethod
+    def _state_strides(states, layer_idx: int) -> tuple[int, ...] | None:
+        # CacheViews retains physical page strides; plain array lists are dense.
+        descriptors = getattr(states, "descriptors", None)
+        return descriptors[layer_idx][2] if descriptors is not None else None
+
+    def _scatter_rows(
+        self,
+        pool: mx.array,
+        rows: mx.array,
+        ids: mx.array,
+        *,
+        strides: tuple[int, ...] | None = None,
+        zero: bool = False,
+    ) -> mx.array:
         """Write distinct rows in place and return the rebound pool handle."""
         # MLX's indexed assignment converts the source implicitly and callers
         # rely on it; the primitive requires an exact match.  ``astype`` is a
         # no-op when the dtypes already agree, and O(rows) otherwise.
-        return _native_row_scatter()(pool, rows.astype(pool.dtype), ids)
+        if self._tilelang_scatter:
+            from vllm_metal.attention.caches.tilelang_scatter import scatter
+
+            return scatter(
+                pool, rows.astype(pool.dtype), ids, strides=strides, zero=zero
+            )
+        return _native_row_scatter()(pool, rows.astype(pool.dtype), ids, zero=zero)
 
     def write_conv_rows(self, layer_idx: int, rows: mx.array, ids: mx.array) -> None:
         """Write conv rows and rebind every sibling to the returned handle."""
         self.store_conv_state(
-            layer_idx, self._scatter_rows(self.conv_states[layer_idx], rows, ids)
+            layer_idx,
+            self._scatter_rows(
+                self.conv_states[layer_idx],
+                rows,
+                ids,
+                strides=self._state_strides(self.conv_states, layer_idx),
+            ),
         )
 
     def write_recurrent_rows(
@@ -307,7 +340,12 @@ class PagedStateCache:
         """Write recurrent rows and rebind siblings to the returned handle."""
         self.store_recurrent_state(
             layer_idx,
-            self._scatter_rows(self.recurrent_states[layer_idx], rows, ids),
+            self._scatter_rows(
+                self.recurrent_states[layer_idx],
+                rows,
+                ids,
+                strides=self._state_strides(self.recurrent_states, layer_idx),
+            ),
         )
 
     def apply_pending_conv_state(self, layer_idx: int) -> None:
