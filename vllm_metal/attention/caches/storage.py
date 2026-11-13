@@ -80,7 +80,15 @@ def allocate_kv_cache_lazily(
     sizes = {tensor.size for tensor in config.kv_cache_tensors}
     if len(sizes) != 1:
         raise ValueError("KV cache tensors must share one backing allocation.")
-    backing = torch.empty(sizes.pop(), dtype=torch.int8, device="cpu")
+    # Allocate on MPS, outside MLX's allocator. MLX adds every buffer it owns,
+    # including CPU memory imported with from_dlpack, to its residency set
+    # until the wired limit is full, so a CPU backing was fully resident as
+    # soon as it was imported (#1198). A buffer imported from a Metal tensor
+    # is not MLX-owned and stays uncommitted until the GPU touches it. Torch
+    # writes to these tensors are asynchronous; synchronize before MLX reads.
+    # TODO(#1198): one allocation per region. A single MPS allocation is one
+    # MTLBuffer and cannot exceed max_buffer_length (21 GiB on a 36 GB Mac).
+    backing = torch.empty(sizes.pop(), dtype=torch.int8, device="mps")
     caches: dict[str, torch.Tensor] = {}
     for tensor in config.kv_cache_tensors:
         spec = specs[tensor.layers[0]]
@@ -165,7 +173,7 @@ class KVCacheStorage:
         )
         first = next(iter(self.tensors.values()))
         backing = first.untyped_storage()
-        raw = torch.empty(0, dtype=torch.uint8).set_(backing)
+        raw = torch.empty(0, dtype=torch.uint8, device=backing.device).set_(backing)
         self.nbytes = backing.nbytes()
         # Metal advertises LBNHC: each distinct layer address starts a compact
         # region. Import views of those regions from vLLM's one allocation, so
