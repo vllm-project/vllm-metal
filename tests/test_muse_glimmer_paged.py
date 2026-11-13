@@ -6,8 +6,8 @@ import pytest
 from mlx_lm.models import muse_glimmer
 from mlx_vlm.models.muse_glimmer import language
 
+from tests.stub_runner import make_kv_cache
 from vllm_metal.attention.attention_contracts import attention_contract_for
-from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
 from vllm_metal.attention.context import PagedAttentionContext
 from vllm_metal.attention.impls.sdpa import prepare_sdpa_qkv, sdpa_forward
 from vllm_metal.attention.impls.sdpa_wrapper import patch_sdpa_attention
@@ -67,7 +67,7 @@ def test_paged_attention_matches_upstream(
     upstream = _mlx_vlm_attention(layer_idx)
     upstream.update(attention.parameters())
     x = mx.random.normal((1, 6, 128)).astype(dtype)
-    cache = MetalPagedKVCache(
+    cache = make_kv_cache(
         num_layers=1,
         num_kv_heads=1,
         head_dim=64,

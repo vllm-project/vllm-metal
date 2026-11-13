@@ -9,7 +9,7 @@ from typing import Any
 import mlx.core as mx
 import pytest
 
-from tests.stub_runner import make_sdpa_runtime, make_stub_runner
+from tests.stub_runner import make_kv_cache, make_sdpa_runtime, make_stub_runner
 from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
 from vllm_metal.attention.context import get_context
 from vllm_metal.attention.impls.sdpa_wrapper import (
@@ -74,7 +74,7 @@ def _target_args(
 
 
 def _target_cache(num_layers: int) -> MetalPagedKVCache:
-    return MetalPagedKVCache(
+    return make_kv_cache(
         num_layers=num_layers,
         num_kv_heads=1,
         head_dim=4,
@@ -470,7 +470,7 @@ def test_runtime_runs_tiny_assistant_forward_over_target_kv() -> None:
             hidden_size=hidden_size,
             non_shared_layer_types=layer_types,
         ),
-        target_kv_cache=MetalPagedKVCache(
+        target_kv_cache=make_kv_cache(
             num_layers=1,
             num_kv_heads=1,
             head_dim=hidden_size,

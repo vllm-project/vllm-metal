@@ -14,7 +14,7 @@ import pytest
 from mlx_lm.models.cache import KVCache
 from mlx_lm.models.ministral3 import Model, ModelArgs
 
-from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
+from tests.stub_runner import make_kv_cache
 from vllm_metal.attention.context import (
     OffsetCache,
     PagedAttentionContext,
@@ -65,7 +65,7 @@ def test_packed_prefill_and_decode_match_mlx_lm() -> None:
     next_a, next_b = 11, 13
     blocks_a, blocks_b = [0, 1], [2, 3]
 
-    kv_cache = MetalPagedKVCache(
+    kv_cache = make_kv_cache(
         num_layers=2,
         num_kv_heads=1,
         head_dim=64,

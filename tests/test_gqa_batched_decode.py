@@ -210,7 +210,7 @@ def test_forward_context_reorder_and_membership_survive_deferred_evaluation(
 
     import mlx.nn as nn
 
-    from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
+    from tests.stub_runner import make_kv_cache
     from vllm_metal.attention.context import clear_context, get_context, prepare_grouped
     from vllm_metal.attention.impls.sdpa import sdpa_forward
 
@@ -223,7 +223,7 @@ def test_forward_context_reorder_and_membership_survive_deferred_evaluation(
     for count in counts:
         pages.append(list(range(cursor, cursor + count)))
         cursor += count
-    cache = MetalPagedKVCache(
+    cache = make_kv_cache(
         num_layers=1,
         num_kv_heads=kv,
         head_dim=head,
@@ -233,15 +233,25 @@ def test_forward_context_reorder_and_membership_survive_deferred_evaluation(
     )
     # Zero Q/K makes the oracle a plain mean. Distinct per-request histories
     # and large new values expose row mixups, stale lengths and missing writes.
-    cache.key_caches[0] = mx.zeros_like(cache.key_caches[0])
-    values = np.zeros((cursor, block, kv, head), np.float16)
-    histories = []
+    histories, slots = [], []
     for rid, length in enumerate(past):
-        history = [float(rid + 1 + (i % 5)) for i in range(length)]
-        histories.append(history)
-        for pos, value in enumerate(history):
-            values[pages[rid][pos // block], pos % block] = value
-    cache.value_caches[0] = mx.array(values)
+        histories.append([float(rid + 1 + (i % 5)) for i in range(length)])
+        slots += [
+            pages[rid][pos // block] * block + pos % block for pos in range(length)
+        ]
+    values = np.zeros((len(slots), kv, head), np.float16)
+    values[:] = np.array(sum(histories, []), np.float16)[:, None, None]
+    values = mx.array(values)
+    cache.replace_layer_cache(
+        0,
+        *get_ops().reshape_and_cache(
+            mx.zeros_like(values),
+            values,
+            cache.key_caches[0],
+            cache.value_caches[0],
+            mx.array(slots, mx.int64),
+        ),
+    )
     mx.eval(cache.key_caches[0], cache.value_caches[0])
     inner = SimpleNamespace(
         n_heads=q,

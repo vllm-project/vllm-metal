@@ -1017,8 +1017,7 @@ class MetalModelRunner:
 
         Called by the worker after ``initialize_kv_cache`` when a KV connector
         is configured. Only the SDPA and MLA runtimes' ``KVCacheStorage`` is
-        registered. Hybrid and count-based (draft model) caches have no layout
-        the connector can address.
+        registered. Hybrid caches have no layout the connector can address.
         """
         from vllm_metal.attention.runtime.mla import MLAPagedAttentionRuntime
         from vllm_metal.attention.runtime.sdpa import SDPAPagedAttentionRuntime
