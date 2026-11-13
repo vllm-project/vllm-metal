@@ -89,6 +89,8 @@ def make_cache(
     storage.tensors["target"].fill_(7)
     for name in names[1:]:
         storage.tensors[name].fill_(float("nan"))
+    # The pool lives on MPS; torch writes are asynchronous to MLX reads.
+    torch.mps.synchronize()
     return model, DSparkPagedCache(
         model, storage, names[1:], max_model_len=max_model_len
     )
@@ -434,6 +436,7 @@ def test_window_buckets_preserve_ragged_attention_during_growth_and_reuse(
         for name, tensor in cache.storage.tensors.items():
             if name != "target":
                 tensor.fill_(float("nan"))
+        torch.mps.synchronize()
         features = [
             [mx.random.normal((1, length, 64)).astype(dtype) for _ in range(3)]
             for length in lengths

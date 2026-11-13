@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import mlx.core as mx
 import numpy as np
 import pytest
+import torch
 from vllm import SamplingParams
 from vllm.sampling_params import StructuredOutputsParams
 
@@ -184,13 +185,14 @@ def test_compiled_draft_follows_storage_recreated_by_sleep(proposer):
     storage = proposer.cache.storage
     assert proposer.propose(_prefill(state, _features(15), 0, True)) is not None
     gc.collect()
-    active = mx.get_active_memory()
+    active = torch.mps.current_allocated_memory()
     storage.release()
     gc.collect()
-    assert active - mx.get_active_memory() >= storage.nbytes
+    assert active - torch.mps.current_allocated_memory() >= storage.nbytes
     storage.reallocate()
     for tensor in storage.tensors.values():
         tensor.fill_(float("nan"))
+    torch.mps.synchronize()
     # The engine recomputes the request after wake. Every slot read below must
     # be written to the new backing by the draft compiled before sleep.
     proposer.release_requests({"r"})

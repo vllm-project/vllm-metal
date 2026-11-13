@@ -921,12 +921,12 @@ class TestSharedStorageRuntime:
     def test_sleep_frees_the_backing_and_wake_rebinds_the_views(self) -> None:
         backend = self._make_backend()
         cache = backend._cache
-        before = mx.get_active_memory()
+        before = torch.mps.current_allocated_memory()
 
         backend.release_kv_memory()
 
         assert backend.storage.released
-        assert before - mx.get_active_memory() >= backend.storage.nbytes
+        assert before - torch.mps.current_allocated_memory() >= backend.storage.nbytes
 
         backend.restore_kv_memory()
         rows = mx.random.normal((16, _LATENT_DIM)).astype(mx.float16)

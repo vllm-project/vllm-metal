@@ -89,6 +89,7 @@ def test_draft_kv_matches_native_after_rejection_and_recompute(
     storage = KVCacheStorage(config)
     for tensor in storage.tensors.values():
         tensor.fill_(torch.nan)
+    torch.mps.synchronize()
     proposer.bind_paged_cache(
         storage=storage,
         kv_cache_config=config,
@@ -171,12 +172,15 @@ def test_draft_kv_matches_native_after_rejection_and_recompute(
     # Sleep frees the one backing the draft shares; the engine recomputes the
     # request after wake. Draft reads and writes must follow the new backing.
     gc.collect()
-    before = mx.get_active_memory()
+    before = torch.mps.current_allocated_memory()
     storage.release()
     gc.collect()
-    assert before - mx.get_active_memory() >= storage.nbytes
+    mx.synchronize()
+    torch.mps.synchronize()
+    assert before - torch.mps.current_allocated_memory() >= storage.nbytes
     storage.reallocate()
     for tensor in storage.tensors.values():
         tensor.fill_(torch.nan)
+    torch.mps.synchronize()
     proposer.release_requests({"r"})
     check_round()

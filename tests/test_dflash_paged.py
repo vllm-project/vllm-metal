@@ -61,6 +61,7 @@ def make_cache(dtype=mx.float16, *, block_size=16):
     )
     for tensor in storage.tensors.values():
         tensor.fill_(7)
+    torch.mps.synchronize()
     cache = DFlashPagedCache(model, storage, names[1:], max_model_len=64)
     return model, embed, cache
 
@@ -76,6 +77,7 @@ def test_compiled_ragged_blocks_rejection_and_page_reuse(
     if poison:
         for name in ("dflash_layers.0.self_attn", "dflash_layers.1.self_attn"):
             cache.storage.tensors[name].fill_(float("nan"))
+        torch.mps.synchronize()
     draft = cache.compile_draft(
         num_draft_tokens=num_draft_tokens, embed=embed, project=embed.as_linear
     )
