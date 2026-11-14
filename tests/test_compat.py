@@ -410,6 +410,32 @@ class TestMiniCPM4ModelTypeCompatPatch:
         assert model_cls.__module__ == "mlx_lm.models.minicpm"
 
 
+class TestQwen35TextModelTypeCompatPatch:
+    def test_text_types_resolve_to_the_shared_qwen35_modules(self, monkeypatch) -> None:
+        from mlx_lm import utils as mlx_lm_utils
+
+        remapping = dict(mlx_lm_utils.MODEL_REMAPPING)
+        remapping.pop("qwen3_5_text", None)
+        remapping.pop("qwen3_5_moe_text", None)
+        monkeypatch.setattr(mlx_lm_utils, "MODEL_REMAPPING", remapping)
+        dense = {"model_type": "qwen3_5_text", "architectures": ["Qwen3_5ForCausalLM"]}
+        moe = {
+            "model_type": "qwen3_5_moe_text",
+            "architectures": ["Qwen3_5MoeForCausalLM"],
+        }
+        with pytest.raises(ValueError, match="qwen3_5_text"):
+            mlx_lm_utils._get_classes(dense)
+        with pytest.raises(ValueError, match="qwen3_5_moe_text"):
+            mlx_lm_utils._get_classes(moe)
+
+        compat._patch_mlx_lm_qwen35_text_model_type()
+
+        model_cls, _ = mlx_lm_utils._get_classes(dense)
+        assert model_cls.__module__ == "mlx_lm.models.qwen3_5"
+        model_cls, _ = mlx_lm_utils._get_classes(moe)
+        assert model_cls.__module__ == "mlx_lm.models.qwen3_5_moe"
+
+
 class TestQwen35Fp8CompatPatch:
     def test_logs_when_mlx_core_is_unavailable(self, monkeypatch) -> None:
         original_import = builtins.__import__
