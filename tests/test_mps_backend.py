@@ -481,26 +481,51 @@ def test_shortconv_checkpoint_survives_resume():
     assert torch.equal(cache[2], checkpoint)
 
 
+@pytest.mark.parametrize("logits_mode", [False, True])
 @pytest.mark.parametrize("num_logprobs", [0, 2])
-def test_mps_logprobs(num_logprobs):
-    from vllm_metal.pytorch_backend.runtime import compute_topk_scores
+def test_mps_logprobs(run_in_spawn_process, monkeypatch, num_logprobs, logits_mode):
+    monkeypatch.setenv("VLLM_METAL_BACKEND", "mps")
+    monkeypatch.setenv("PYTORCH_ENABLE_MPS_FALLBACK", "0")
+    run_in_spawn_process(_check_logprobs, num_logprobs, logits_mode)
 
-    logits = torch.tensor([[3.0, 3.0, 1.0, -2.0], [1.0, 5.0, 2.0, 0.0]], device="mps")
-    # Include the selected token even outside top-k, with correct tie ranks.
-    actual = compute_topk_scores(
-        logits, num_logprobs, torch.tensor([2, 1], device="mps")
+
+def _check_logprobs(num_logprobs, logits_mode):
+    from vllm.v1.worker.gpu.sample.logprob import compute_topk_scores
+
+    from vllm_metal.platform import MetalPlatform
+
+    MetalPlatform.register_triton_kernel_overrides()
+    install()
+    torch.manual_seed(0)
+    # bf16 rows as wide as Qwen3.5's vocabulary check the fp32 normalizer, and
+    # 40 of them span two scoring chunks.
+    wide = (torch.randn(40, 248320) * 4).bfloat16()
+    cases = (
+        # Include the selected token even outside top-k, with correct tie ranks.
+        (torch.tensor([[3.0, 3.0, 1.0, -2.0], [1.0, 5.0, 2.0, 0.0]]), [2, 1]),
+        (wide, wide.argmin(-1).tolist()),
     )
-    expected = logits.cpu().log_softmax(-1)
-    assert actual.logprobs.device.type == "mps"
-    assert actual.logprob_token_ids[:, 0].tolist() == [2, 1]
-    assert actual.selected_token_ranks.tolist() == [3, 1]
-    torch.testing.assert_close(
-        actual.logprobs.cpu(),
-        expected.gather(-1, actual.logprob_token_ids.cpu().long()),
-    )
-    torch.testing.assert_close(
-        actual.logprobs[:, 1:].cpu(), expected.topk(num_logprobs, -1).values
-    )
+    for logits, sampled in cases:
+        actual = compute_topk_scores(
+            logits.to("mps"),
+            num_logprobs,
+            torch.tensor(sampled, device="mps"),
+            logits_mode=logits_mode,
+        )
+        # CPU fp32 log_softmax drifts by 1e-4 on this width; fp64 does not.
+        expected = logits.double() if logits_mode else logits.double().log_softmax(-1)
+        expected = expected.float()
+        selected = logits.gather(-1, torch.tensor(sampled)[:, None])
+        assert actual.logprobs.device.type == "mps"
+        assert actual.logprob_token_ids[:, 0].tolist() == sampled
+        ranks = (logits >= selected).sum(-1)
+        assert actual.selected_token_ranks.tolist() == ranks.tolist()
+        torch.testing.assert_close(
+            actual.logprobs.cpu(), expected.gather(-1, actual.logprob_token_ids.cpu())
+        )
+        torch.testing.assert_close(
+            actual.logprobs[:, 1:].cpu(), expected.topk(num_logprobs, -1).values
+        )
 
 
 def test_prompt_logprobs_match_cpu_reference(run_in_spawn_process, monkeypatch):
@@ -712,9 +737,7 @@ def _check_chunked_verification(logprobs):
         chunked_scores = chunked.logprobs_tensors
         assert scores is not None and chunked_scores is not None
         kept = torch.tensor([0, 1, 2, 3, 4, 5, 8], device="mps")
-        torch.testing.assert_close(
-            scores.logprob_token_ids[kept, 0], winners[kept].int()
-        )
+        torch.testing.assert_close(scores.logprob_token_ids[kept, 0], winners[kept])
         expected = logits.log_softmax(-1).gather(1, winners[:, None])[:, 0]
         torch.testing.assert_close(scores.logprobs[kept, 0], expected[kept])
         assert scores.cu_num_generated_tokens == cu_np.tolist()
