@@ -231,58 +231,34 @@ BUFFER_LIMITS = pytest.mark.parametrize(
 )
 
 
-@pytest.mark.parametrize(
-    ("config_name", "fields", "width"),
-    [
-        ("Qwen3Config", {"hidden_size": 64, "intermediate_size": 192}, 192),
-        ("OPTConfig", {"hidden_size": 64, "ffn_dim": 192}, 192),
-        ("GPT2Config", {"n_embd": 64, "n_inner": 192}, 192),
-        ("GPT2Config", {"n_embd": 64}, 256),
-        ("PretrainedConfig", {"hidden_size": 64}, None),
-    ],
-)
-def test_cache_budget_handles_model_dimensions(mps_memory, config_name, fields, width):
-    import transformers
+def _profiled_worker(utilization, step):
+    return SimpleNamespace(
+        cache_config=SimpleNamespace(
+            kv_cache_memory_bytes=None, gpu_memory_utilization=utilization
+        ),
+        model_runner=SimpleNamespace(profile_largest_step=lambda: step),
+    )
 
+
+@pytest.mark.parametrize("step", [256 << 20, 2 << 30], ids=["fits", "too-large"])
+def test_cache_budget_leaves_room_for_the_profiled_step(mps_memory, step):
     from vllm_metal.pytorch_backend.worker import MPSWorker
 
-    hf = getattr(transformers, config_name)(**fields)
-    worker = SimpleNamespace(
-        cache_config=SimpleNamespace(
-            kv_cache_memory_bytes=None, gpu_memory_utilization=0.5
-        ),
-        model_config=SimpleNamespace(
-            hf_text_config=hf, get_hidden_size=lambda: hf.hidden_size
-        ),
-        scheduler_config=SimpleNamespace(max_num_batched_tokens=8),
-    )
-    if width is None:
-        with pytest.raises(ValueError, match="--kv-cache-memory-bytes"):
-            MPSWorker.determine_available_memory(worker)
+    worker = _profiled_worker(0.5, step)
+    available = (2 << 30) - (128 << 20) - step
+    if available > 0:
+        assert MPSWorker.determine_available_memory(worker) == available
     else:
-        expected = (2 << 30) - (128 << 20) - (512 << 20) - 8 * (width * 2 + 64 * 8) * 4
-        assert MPSWorker.determine_available_memory(worker) == expected
-    # Explicit budgets bypass dimension introspection, including unknown layouts.
-    worker.cache_config.kv_cache_memory_bytes = 1234
-    worker.model_config = None
-    assert MPSWorker.determine_available_memory(worker) == 1234
+        with pytest.raises(ValueError, match="exceed the memory budget"):
+            MPSWorker.determine_available_memory(worker)
 
 
 @BUFFER_LIMITS
 def test_cache_budget_fits_one_metal_buffer(mps_memory, limit, largest):
     """Upstream puts all KV layers in one buffer, so the budget must fit in it."""
-    import transformers
-
     from vllm_metal.pytorch_backend.worker import MPSWorker
 
-    hf = transformers.Qwen3Config(hidden_size=64, intermediate_size=192)
-    worker = SimpleNamespace(
-        cache_config=SimpleNamespace(
-            kv_cache_memory_bytes=None, gpu_memory_utilization=0.9
-        ),
-        model_config=SimpleNamespace(hf_text_config=hf, get_hidden_size=lambda: 64),
-        scheduler_config=SimpleNamespace(max_num_batched_tokens=8),
-    )
+    worker = _profiled_worker(0.9, 128 << 20)
     mps_memory(limit)
     assert MPSWorker.determine_available_memory(worker) == largest
 
@@ -299,6 +275,58 @@ def test_explicit_cache_budget_must_fit_one_metal_buffer(mps_memory, limit, larg
     worker.cache_config.kv_cache_memory_bytes = largest + 1
     with pytest.raises(ValueError, match=f"at most {largest} bytes"):
         MPSWorker.determine_available_memory(worker)
+
+
+@pytest.mark.parametrize(
+    ("max_num_seqs", "max_model_len", "step"),
+    [
+        (256, 8192, [(8192, 1), 256]),
+        (256, 2048, [(8192, 4), 256]),
+        (2, 2048, [(4096, 2), 2]),
+    ],
+    ids=["one-request", "packed", "seq-limited"],
+)
+def test_profile_runs_the_largest_schedulable_step(
+    monkeypatch, max_num_seqs, max_model_len, step
+):
+    """Profile the biggest step the scheduler can issue, with logits for every
+    request slot, then restore the runner."""
+    from contextlib import nullcontext
+
+    from vllm_metal.pytorch_backend import runner as runner_module
+
+    torn_down = []
+    builder = SimpleNamespace(get_kv_cache_config_from_groups=lambda *_, num_blocks: 0)
+    monkeypatch.setattr(runner_module, "get_kv_cache_config_builder", lambda _: builder)
+    monkeypatch.setattr(
+        runner_module, "get_kv_cache_groups_from_builder", lambda *_: []
+    )
+    monkeypatch.setattr(
+        runner_module, "set_current_vllm_config", lambda _: nullcontext()
+    )
+    monkeypatch.setattr(runner_module, "_teardown_profiling_state", torn_down.append)
+    hidden_states = torch.zeros(8192, 4, device="mps")
+    calls = []
+
+    def dummy_run(num_tokens):
+        calls.append((num_tokens, runner.max_num_reqs))
+        return hidden_states[:num_tokens], None
+
+    runner = SimpleNamespace(
+        max_num_reqs=max_num_seqs,
+        max_num_tokens=8192,
+        max_model_len=max_model_len,
+        decode_query_len=1,
+        vllm_config=None,
+        get_kv_cache_spec=dict,
+        initialize_kv_cache=lambda *_, **__: setattr(runner, "kv_block_zeroer", 0),
+        _dummy_run=dummy_run,
+        model=SimpleNamespace(compute_logits=lambda rows: calls.append(len(rows))),
+    )
+    runner_module.MPSModelRunner.profile_largest_step(runner)
+    assert calls == step
+    assert runner.max_num_reqs == max_num_seqs
+    assert torn_down == [runner] and not hasattr(runner, "kv_block_zeroer")
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])

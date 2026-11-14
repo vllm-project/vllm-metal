@@ -4,7 +4,6 @@
 import os
 
 import torch
-from vllm.config.utils import getattr_iter
 from vllm.utils.torch_utils import set_random_seed
 
 from vllm_metal.pytorch_backend.attention import MPSAttentionBackend
@@ -14,16 +13,9 @@ from vllm_metal.v1.worker import MetalWorker, init_worker_distributed_environmen
 
 # PyTorch's MPS allocator rounds large heaps up to this size (kRoundLarge).
 _MPS_HEAP_ALIGNMENT = 2 << 20
-_MPS_WATERMARK_ENVS = (
-    "PYTORCH_MPS_LOW_WATERMARK_RATIO",
-    "PYTORCH_MPS_HIGH_WATERMARK_RATIO",
-)
-_mps_low_watermark_default: str | None = None
 
 
 def configure_mps(config, *, omni=False):
-    global _mps_low_watermark_default
-
     from vllm import envs as vllm_envs
     from vllm.config.compilation import CompilationMode, CUDAGraphMode
 
@@ -100,19 +92,12 @@ def configure_mps(config, *, omni=False):
     config.compilation_config.mode = CompilationMode.NONE
     config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
     model.enforce_eager = True
-    # PyTorch proactively reclaims cached heaps past its low watermark, 1.4x the
-    # recommended working set by default. Metal runs out before that on small
-    # Macs, so start reclaiming at the configured budget instead.
-    low_env, high_env = _MPS_WATERMARK_ENVS
-    current = os.environ.get(low_env)
-    # Set the default when absent, or update it when it still matches the
-    # default we installed.
-    if high_env not in os.environ and (
-        current is None or current == _mps_low_watermark_default
-    ):
-        desired = str(config.cache_config.gpu_memory_utilization)
-        os.environ[low_env] = desired
-        _mps_low_watermark_default = desired
+    # Below its low watermark (1.4x the recommended working set by default),
+    # PyTorch packs 10-512 MiB buffers into 1 GiB heaps and keeps them cached.
+    # Past it, heaps match the request and free ones are reclaimed. Loading the
+    # weights crosses 1% of the working set, so the profiled step sizes its
+    # heaps the way serving does.
+    os.environ.setdefault("PYTORCH_MPS_LOW_WATERMARK_RATIO", "0.01")
 
 
 class MPSWorker(MetalWorker):
@@ -152,31 +137,15 @@ class MPSWorker(MetalWorker):
                     f"MPS buffer; use at most {max_buffer} bytes on this device."
                 )
             return requested
-        hf = self.model_config.hf_text_config
-        hidden_size = self.model_config.get_hidden_size()
-        intermediate_size = getattr_iter(
-            hf, ("intermediate_size", "ffn_dim", "n_inner")
-        )
-        if intermediate_size is None and hasattr(hf, "n_inner"):
-            # Upstream GPT-2/GPT-J use 4 * hidden_size when n_inner is None.
-            intermediate_size = 4 * hidden_size
-        if intermediate_size is None:
-            raise ValueError(
-                "Cannot estimate MPS activation memory from this model config; "
-                "set --kv-cache-memory-bytes explicitly."
-            )
-        # PoC estimate only; --kv-cache-memory-bytes bypasses this heuristic.
-        # TODO: measure execution overhead at the configured prefill/concurrency
-        # limits instead of estimating it from model dimensions.
-        reserve = self.scheduler_config.max_num_batched_tokens * (
-            intermediate_size * 2 + hidden_size * 8
-        ) * 4 + (512 << 20)
+        step = self.model_runner.profile_largest_step()
+        torch.mps.synchronize()
+        torch.mps.empty_cache()
         # Like the MLX backend, budget against the GPU working set, not RAM.
         budget = int(
             torch.mps.recommended_max_memory()
             * self.cache_config.gpu_memory_utilization
         )
-        available = budget - torch.mps.driver_allocated_memory() - reserve
+        available = budget - torch.mps.driver_allocated_memory() - step
         if available <= 0:
             raise ValueError(
                 "MPS model and activation allowance exceed the memory budget"
