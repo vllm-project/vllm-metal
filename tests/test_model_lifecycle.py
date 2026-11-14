@@ -293,9 +293,7 @@ class TestModelLifecycle:
         )
         resolve_path.assert_called_once_with("org/model", revision=revision)
         if backend == "awq":
-            loader.assert_called_once_with(
-                "resolved/model", target_dtype=mx.float16, revision=revision
-            )
+            loader.assert_called_once_with("resolved/model", revision=revision)
         else:
             download.assert_called_once_with("resolved/model", revision=revision)
             selected_loader = loader if backend in {"vlm", "lfm3"} else weights_loader
@@ -1055,19 +1053,8 @@ class TestModelLifecycle:
             ) -> _StubAWQLoader | None:
                 return cls() if is_awq else None
 
-            def load(
-                self,
-                model_path: str,
-                *,
-                target_dtype: object,
-                revision: str | None,
-            ) -> object:
-                awq_load_calls.append(
-                    {
-                        "model_path": model_path,
-                        "target_dtype": target_dtype,
-                    }
-                )
+            def load(self, model_path: str, *, revision: str | None) -> object:
+                awq_load_calls.append({"model_path": model_path})
                 return fake_model
 
         def _fake_mlx_lm_load(*args: object, **kwargs: object) -> tuple[object, object]:
@@ -1094,12 +1081,7 @@ class TestModelLifecycle:
                 "generic mlx_lm.load must NOT be called when AWQQuantLoader "
                 "owns the load path"
             )
-            call = awq_load_calls[0]
-            assert call["model_path"] == "stub-model"
-            assert call["target_dtype"] is not None, (
-                "lifecycle must derive target_dtype from "
-                "runner.model_config.dtype and thread it to the loader"
-            )
+            assert awq_load_calls[0]["model_path"] == "stub-model"
         else:
             assert awq_load_calls == [], (
                 "AWQQuantLoader.load must NOT be called for a non-AWQ checkpoint"
@@ -1110,6 +1092,35 @@ class TestModelLifecycle:
             kwargs = mlx_lm_load_calls[0]["kwargs"]
             assert isinstance(kwargs, dict)
             assert "model_config" not in kwargs
+
+    def test_awq_load_keeps_float16_under_bfloat16_runner(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Casting the other params to the runner dtype would promote the
+        float16 quantized layer's output to float32."""
+        awq_config = {
+            "quant_method": "awq",
+            "bits": 4,
+            "group_size": 128,
+            "zero_point": True,
+            "version": "gemm",
+        }
+        (tmp_path / "config.json").write_text(
+            json.dumps({"quantization_config": awq_config})
+        )
+        model = nn.Sequential(nn.Embedding(4, 64), nn.QuantizedLinear(64, 4))
+        model.set_dtype(mx.float16)
+        monkeypatch.setattr(
+            "vllm_metal.quant.awq_loader.mlx_lm_load_model",
+            lambda *_args, **_kwargs: (model, {}),
+        )
+        lifecycle, _ = _make_lifecycle(
+            model_config=_runner_model_config(dtype=torch.bfloat16)
+        )
+
+        loaded = lifecycle._load_generation_model(str(tmp_path), is_vlm=False)
+
+        assert loaded(mx.array([[0]])).dtype == mx.float16
 
     def test_load_routes_gguf_to_owner_on_quantization_detection(
         self,
