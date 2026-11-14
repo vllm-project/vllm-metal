@@ -160,11 +160,29 @@ def force_tiled_prefill():
 
 
 @pytest.fixture
+def pre_m5_mixed_split(request):
+    """Force the pre-M5 mixed split (serialized halves and the decode-work
+    floor) or the M5 one (concurrent halves, no floor).
+
+    Parametrize indirectly with a bool. Lets an M5 cover the pre-M5 split and
+    a pre-M5 runner cover the M5 one, whatever hardware runs the test.
+    """
+    from vllm_metal.metal import get_ops
+
+    ops = get_ops()
+    previous = ops._override_pre_m5_mixed_split_for_test(int(request.param))
+    try:
+        yield request.param
+    finally:
+        ops._override_pre_m5_mixed_split_for_test(previous)
+
+
+@pytest.fixture
 def nax_prefill():
     """Route eligible prefill to NAX and record the dispatch family.
 
     Skips off M5: the NAX kernel cannot run there, and the tiled twin of this
-    path is covered by test_mixed_batch_splits_decode_by_work.
+    path is covered by test_mixed_batch_splits_decode_rows.
     """
     import mlx.core as mx
 

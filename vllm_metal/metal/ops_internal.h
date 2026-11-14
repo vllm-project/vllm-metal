@@ -107,6 +107,7 @@ extern std::atomic<int> g_last_nax_split;
 extern std::atomic<int> g_last_nax_heads_per_tg;
 extern bool nax_lib_ready_;
 extern bool nax_enabled_;
+int override_pre_m5_mixed_split_for_test(int pre_m5);
 template <typename Lengths>
 static GqaDecodeLengthPlan gqa_decode_length_plan(const Lengths& context_lens) {
   GqaDecodeLengthPlan plan;
