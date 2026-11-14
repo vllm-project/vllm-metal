@@ -67,7 +67,7 @@ Measure speed separately with the [DSpark serving benchmark](https://github.com/
 
 Parity runs daily at 07:17 UTC on `main`. Users with repository write access can also comment `/ci parity` on an open PR once the workflow is on the default branch.
 
-Both triggers invoke this same tool for Qwen3-0.6B and Qwen3.5-0.8B on a self-hosted Apple Silicon Mac: 40 shared prompts, 20 output tokens, top-K 5, and HTTP request batch sizes 1/2. CI supplies the checkpoint and environment and collects the tool's results.
+Both triggers invoke this same tool for Qwen3-0.6B and Qwen3.5-0.8B on a self-hosted Apple Silicon Mac: 40 shared prompts, 20 output tokens, top-K 5, and HTTP request batch sizes 1/2. The Qwen3.5-0.8B job also compares a pinned Q6_K GGUF file of that checkpoint with its native reference at top-K 8. CI supplies the checkpoint and environment and collects the tool's results.
 
 The Qwen3-0.6B job also checks speculative output parity and FP32 acceptance
 and rejection recovery, including prefix-cache reuse.

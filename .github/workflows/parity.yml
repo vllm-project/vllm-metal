@@ -118,6 +118,28 @@ jobs:
           python tools/check_parity.py --model "$MODEL_PATH" --top-k 5 --max-tokens 20 \
             --batch-size 1 2 --output-dir "$RUNNER_TEMP/parity" \
             --gpu-memory-utilization "$PARITY_GPU_MEMORY_UTILIZATION"
+      - name: Compare GGUF parity through HTTP serving
+        # Does not depend on the parity results, so it also runs when they fail.
+        if: >-
+          !cancelled() && matrix.model.name == 'qwen35-0.8b'
+          && steps.install.outcome == 'success'
+          && steps.checkpoint.outcome == 'success'
+        run: |
+          source .venv-vllm-metal/bin/activate
+          gguf=$(python - <<'PY'
+          from huggingface_hub import hf_hub_download
+          print(hf_hub_download(
+              "unsloth/Qwen3.5-0.8B-GGUF",
+              "Qwen3.5-0.8B-Q6_K.gguf",
+              revision="6ab461498e2023f6e3c1baea90a8f0fe38ab64d0",
+          ))
+          PY
+          )
+          printf 'gguf=%s\n' "$gguf" >> "$RUNNER_TEMP/parity/environment.txt"
+          # A quantized file against its dense source, so top-8 as in vllm-gguf-plugin.
+          python tools/check_parity.py --model "$gguf" --reference-model "$MODEL_PATH" \
+            --top-k 8 --max-tokens 20 --batch-size 1 2 --output-dir "$RUNNER_TEMP/parity/gguf" \
+            --gpu-memory-utilization "$PARITY_GPU_MEMORY_UTILIZATION"
       - name: Compare same-model speculative parity
         if: matrix.model.name == 'qwen3-0.6b'
         run: |
