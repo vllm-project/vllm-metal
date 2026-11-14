@@ -166,11 +166,8 @@ class GGUFModelLoader:
             )
         try:
             reader = gguf.GGUFReader(str(self._gguf_path))
-        except Exception as exc:
-            # GGUFReader is a third-party parser over possibly truncated bytes;
-            # it raises ValueError/OSError for most short reads but plain
-            # IndexError when a header section is cut. Every failure here is a
-            # bad input file, so surface it as GGUFLoadError.
+        except (ValueError, OSError, IndexError) as exc:
+            # A cut header surfaces as IndexError; all three mean unreadable input.
             raise GGUFLoadError(
                 f"Could not read GGUF file {str(self._gguf_path)!r}: {exc}"
             ) from exc
