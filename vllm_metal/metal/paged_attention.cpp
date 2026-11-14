@@ -150,6 +150,26 @@ bool gqa_decode_geometry_supported(int num_heads, int num_kv_heads,
       });
 }
 
+bool gqa_decode_no_split_geometry_supported(int num_heads, int num_kv_heads,
+                                            int head_size, int block_size) {
+  return num_heads == kGqaNoSplitGeometry.num_heads &&
+      num_kv_heads == kGqaNoSplitGeometry.num_kv_heads &&
+      head_size == kGqaNoSplitGeometry.head_size &&
+      block_size == kGqaNoSplitGeometry.block_size;
+}
+
+bool gqa_decode_no_split_eligible(
+    int num_heads, int num_kv_heads, int head_size,
+    const GqaDecodeLengthPlan& plan, int gpu_cores, int block_size, bool nax) {
+  return nax && gpu_cores > 0 &&
+      gqa_decode_no_split_geometry_supported(
+          num_heads, num_kv_heads, head_size, block_size) &&
+      plan.min_length >= kGqaNoSplitMinContext &&
+      plan.max_length <= kGqaNoSplitMaxContext &&
+      plan.num_requests <= kGqaNoSplitMaxRequests &&
+      int64_t(plan.num_requests) * num_heads >= kGqaSimdGroupsPerCore * gpu_cores;
+}
+
 std::string gqa_decode_kernel_name(
     const std::string& dtype, int head_size, int block_size, int partition_size) {
   return "paged_attention_gqa_decode_" + dtype + "_hs" + std::to_string(head_size)
@@ -296,6 +316,13 @@ static const bool nax_gqa_prefill_enabled_ = []() {
 void init_nax_library_path(const std::string& path) {
   init_library_path("paged_attention_nax_kern", path);
   nax_lib_ready_ = true;
+}
+
+bool nax_hardware_supported() {
+  static const bool supported = hardware::nax_supported(
+      metal::device(Device::gpu).mtl_device()->supportsFamily(
+          static_cast<MTL::GPUFamily>(hardware::kApple10)));
+  return supported;
 }
 
 // Match the instantiated NAX shapes; other shapes retain the tiled path.
@@ -722,7 +749,7 @@ static bool gqa_decode_metadata_eligible(
 enum class PagedAttentionRoute {
   MixedNaxSplit, MixedNaxUnsplit, MixedTiled,
   NaxSplit, NaxUnsplit, Tiled,
-  GqaDecode, PerToken, SplitKv, Window, WindowSplitKv
+  GqaDecode, GqaDecodeNoSplit, PerToken, SplitKv, Window, WindowSplitKv
 };
 
 struct PagedAttentionPlan {
@@ -896,6 +923,19 @@ static PagedAttentionPlan select_paged_attention_route(
       && gqa_decode_geometry_supported(
           m.num_heads, m.num_kv_heads, m.head_size, m.block_size);
 
+  if (gqa_supported && !m.use_turboquant &&
+      (m.gqa_test_partition == kGqaNoSplitTestPartition
+           ? gqa_decode_no_split_geometry_supported(
+                 m.num_heads, m.num_kv_heads, m.head_size, m.block_size)
+           : m.gqa_test_partition == 0 &&
+             gqa_decode_no_split_eligible(
+                 m.num_heads, m.num_kv_heads, m.head_size, m.gqa_length_plan,
+                 get_detected_gpu_cores(), m.block_size, nax_hardware_supported()))) {
+    plan.route = PagedAttentionRoute::GqaDecodeNoSplit;
+    plan.gqa_partitions = 1;
+    return plan;
+  }
+
   const int gqa_partition_size = !gqa_supported ? 0
       : m.gqa_test_partition > 0 ? m.gqa_test_partition
       : gqa_decode_plan_for_lengths(
@@ -1026,9 +1066,11 @@ static void dispatch_paged_attention_gqa_decode(
     const PagedAttentionPlan& plan, const PagedAttentionEncoding& encoding,
     MTL::ComputePipelineState* gqa_rkernel) {
   auto& enc = *encoding.encoder;
+  const bool no_split = plan.route == PagedAttentionRoute::GqaDecodeNoSplit;
   const int gqa_num_partitions = static_cast<int>(plan.gqa_partitions);
   record_paged_dispatch(
-      PagedDispatch::GqaDecode, plan.gqa_partition_size, plan.num_seqs);
+      no_split ? PagedDispatch::GqaDecodeNoSplit : PagedDispatch::GqaDecode,
+      plan.gqa_partition_size, plan.num_seqs);
   const bool tq = metadata.use_turboquant;
   std::string name = tq
       ? gqa_decode_tq_kernel_name(encoding.dt, encoding.k_cache_dt,
@@ -1058,25 +1100,29 @@ static void dispatch_paged_attention_gqa_decode(
             name, encoding.library, hash,
             {{&plan.compact, MTL::DataType::DataTypeBool, NS::UInteger(130)}});
 
-  Shape stats_shape = plan.offsets
-      ? Shape{static_cast<int>(plan.offsets->back()), metadata.num_heads}
-      : Shape{plan.total_q_tokens, metadata.num_heads, gqa_num_partitions};
-  Shape output_shape = stats_shape;
-  output_shape.push_back(metadata.head_size);
-  array g_tmp_out = make_paged_attention_temp(enc, output_shape, arrays.query.dtype());
-  array g_exp_sums = make_paged_attention_temp(enc, stats_shape, float32);
-  array g_max_logits = make_paged_attention_temp(enc, stats_shape, float32);
-  std::optional<array> g_offsets;
-  if (plan.compact) {
-    g_offsets.emplace(
-        plan.offsets->data(), Shape{static_cast<int>(plan.offsets->size())}, int64);
-    enc.add_temporary(*g_offsets);
-  }
-
+  std::optional<array> g_tmp_out, g_exp_sums, g_max_logits, g_offsets;
   enc.set_compute_pipeline_state(gkernel);
-  enc.set_output_array(g_exp_sums, 0);
-  enc.set_output_array(g_max_logits, 1);
-  enc.set_output_array(g_tmp_out, 2);
+  if (no_split) {
+    enc.set_output_array(arrays.out, 2);
+  } else {
+    Shape stats_shape = plan.offsets
+        ? Shape{static_cast<int>(plan.offsets->back()), metadata.num_heads}
+        : Shape{plan.total_q_tokens, metadata.num_heads, gqa_num_partitions};
+    Shape output_shape = stats_shape;
+    output_shape.push_back(metadata.head_size);
+    g_tmp_out = make_paged_attention_temp(enc, output_shape, arrays.query.dtype());
+    g_exp_sums = make_paged_attention_temp(enc, stats_shape, float32);
+    g_max_logits = make_paged_attention_temp(enc, stats_shape, float32);
+    enc.set_output_array(*g_exp_sums, 0);
+    enc.set_output_array(*g_max_logits, 1);
+    enc.set_output_array(*g_tmp_out, 2);
+    if (plan.compact) {
+      g_offsets.emplace(
+          plan.offsets->data(), Shape{static_cast<int>(plan.offsets->size())}, int64);
+      enc.add_temporary(*g_offsets);
+      enc.set_input_array(*g_offsets, 18);
+    }
+  }
   enc.set_input_array(arrays.query, 3);
   enc.set_input_array(arrays.key_cache, 4);
   enc.set_input_array(arrays.value_cache, 5);
@@ -1088,7 +1134,6 @@ static void dispatch_paged_attention_gqa_decode(
   int32_t g_max_blocks = static_cast<int32_t>(arrays.block_tables.shape(1));
   enc.set_bytes(g_max_blocks, 13);
   bind_paged_attn_strides(enc, arrays.query, arrays.key_cache, metadata.block_size);
-  if (plan.compact) enc.set_input_array(*g_offsets, 18);
   if (tq) bind_turboquant_buffers(enc, arrays);
   // One threadgroup per (partition, kv head, sequence); each simdgroup
   // owns one query head of the GQA group.
@@ -1096,8 +1141,9 @@ static void dispatch_paged_attention_gqa_decode(
       MTL::Size::Make(gqa_num_partitions, metadata.num_kv_heads, plan.num_seqs),
       MTL::Size::Make(num_threads, 1, 1));
 
+  if (no_split) return;
   dispatch_paged_attention_v2_reduce(
-      *encoding.device, enc, arrays.out, g_exp_sums, g_max_logits, g_tmp_out,
+      *encoding.device, enc, arrays.out, *g_exp_sums, *g_max_logits, *g_tmp_out,
       arrays.seq_lens, arrays.cu_seqlens_q, plan.num_seqs, plan.total_q_tokens,
       metadata.num_heads, metadata.head_size,
       gqa_num_partitions, encoding.dt, /*use_sinks=*/false, nullptr,
@@ -1328,6 +1374,7 @@ static void dispatch_paged_attention_v2_online(
           sliding_window, 0, *plan.tile_config, s, sinks, mm_prefix_ranges);
       return;
     case PagedAttentionRoute::GqaDecode:
+    case PagedAttentionRoute::GqaDecodeNoSplit:
       dispatch_paged_attention_gqa_decode(arrays, metadata, plan, encoding, gqa_rkernel);
       return;
     case PagedAttentionRoute::PerToken:
