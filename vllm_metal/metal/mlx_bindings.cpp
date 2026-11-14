@@ -7,6 +7,8 @@
 
 #include "metal_device.h"
 #include "ops_internal.h"
+#include <limits>
+
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/string.h>
@@ -60,6 +62,47 @@ static bool nax_hardware_supported() {
   auto* device = metal::device(Device::gpu).mtl_device();
   return hardware::nax_supported(
       device->supportsFamily(static_cast<MTL::GPUFamily>(hardware::kApple10)));
+}
+
+// A Metal buffer of exactly `nbytes` that MLX refers to but does not own: not
+// wired, not counted, committed only when the GPU touches it (#1198).
+static array new_shared_buffer(size_t nbytes) {
+  if (nbytes == 0) {
+    throw std::invalid_argument("new_shared_buffer: nbytes must be positive");
+  }
+  auto* device = metal::device(Device::gpu).mtl_device();
+  if (nbytes > device->maxBufferLength()) {
+    throw std::invalid_argument(
+        "new_shared_buffer: " + std::to_string(nbytes) +
+        " bytes exceeds the device's maxBufferLength of " +
+        std::to_string(device->maxBufferLength()));
+  }
+  MTL::Buffer* buffer = device->newBuffer(
+      nbytes, MTL::ResourceStorageModeShared | MTL::ResourceHazardTrackingModeUntracked);
+  if (buffer == nullptr) {
+    throw std::runtime_error("new_shared_buffer: Metal could not allocate " +
+                             std::to_string(nbytes) + " bytes");
+  }
+  // Shape elements are int32: split the bytes into power-of-two rows.
+  size_t cols = 1;
+  while (cols < 4096 && nbytes % (cols * 2) == 0) {
+    cols *= 2;
+  }
+  const size_t rows = nbytes / cols;
+  if (rows > static_cast<size_t>(std::numeric_limits<ShapeElem>::max())) {
+    buffer->release();
+    throw std::invalid_argument(
+        "new_shared_buffer: " + std::to_string(nbytes) +
+        " bytes cannot be shaped as a uint8 array (too few power-of-two factors)");
+  }
+  array out({static_cast<ShapeElem>(rows), static_cast<ShapeElem>(cols)}, uint8,
+            nullptr, {});
+  out.set_data(
+      allocator::Data(allocator::Buffer(buffer),
+                      [buffer](allocator::Buffer) { buffer->release(); }),
+      nbytes, {static_cast<int64_t>(cols), 1}, array::Flags{true, true, false}, 0);
+  out.set_status(array::Status::available);
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -118,6 +161,10 @@ static nb::dict take_nax_prefill_dispatch_trace_python() {
 NB_MODULE(_paged_ops, m) {
   register_mlx_patch(m);
   m.attr("PARTITION_SIZE") = nb::int_(kPartitionSize);
+  m.def("new_shared_buffer", &new_shared_buffer, nb::arg("nbytes"),
+        "A Metal buffer of exactly nbytes, outside MLX's allocator and its "
+        "residency set, as a row-contiguous 2-D uint8 array (reshape as "
+        "needed). Pages are committed when the GPU first touches them.");
   m.def("detected_gpu_core_count", &detected_gpu_core_count,
         "Detected GPU core count, or zero when detection is unavailable.");
   m.def("_override_detected_gpu_core_count_for_test",

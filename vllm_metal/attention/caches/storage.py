@@ -21,6 +21,7 @@ from vllm.v1.kv_cache_interface import (
 
 from vllm_metal.tensor_bridge import (
     TORCH_TO_MLX_DTYPE,
+    mlx_to_torch,
     torch_to_mlx,
 )
 
@@ -64,6 +65,20 @@ def region_offsets_of(config: KVCacheConfig) -> list[int]:
     )
 
 
+def _new_region(nbytes: int, *, zero: bool) -> torch.Tensor:
+    """One Metal buffer of exactly ``nbytes`` as a flat uint8 MPS tensor.
+
+    Not torch's allocator: it packs requests under 512 MiB into 1 GiB heaps.
+    """
+    from vllm_metal.metal import get_ops
+
+    region = mlx_to_torch(get_ops().new_shared_buffer(nbytes), "mps").view(-1)
+    if zero:
+        region.zero_()
+        torch.mps.synchronize()
+    return region
+
+
 def allocate_kv_cache_regions(
     config: KVCacheConfig,
     layout: KVCacheLayout,
@@ -85,19 +100,12 @@ def allocate_kv_cache_regions(
     caches skip per-block zeroing upstream, and their kernels mask every slot
     past the sequence length, so unwritten memory never reaches an output.
 
-    The regions live on MPS, outside MLX's allocator. MLX adds every buffer it
-    owns, including CPU memory imported with ``from_dlpack``, to its residency
-    set until the wired limit is full, so a CPU backing was fully resident as
-    soon as it was imported (#1198). A buffer imported from a Metal tensor is
-    not MLX-owned and stays uncommitted until the GPU touches it. One
-    allocation per region keeps each under Metal's ``max_buffer_length``,
-    which the cache planner already sizes regions against. Torch writes to
-    these tensors are asynchronous; synchronize before MLX reads them.
-
-    The layer views are built by vLLM's own :func:`create_kv_cache_views`
-    relative to their region, so shape, strides and dtype are identical to
-    the single-allocation layout; ``tests/attention/test_lazy_kv_allocation.py``
-    pins that equality.
+    The regions are Metal buffers MLX refers to but does not own, so they are
+    not wired and their pages are committed only when the GPU touches them
+    (#1198). Torch writes to them are asynchronous; synchronize before MLX
+    reads. The layer views come from vLLM's own :func:`create_kv_cache_views`,
+    so the layout matches the single-allocation one;
+    ``tests/attention/test_lazy_kv_allocation.py`` pins that.
     """
     sizes = {tensor.size for tensor in config.kv_cache_tensors}
     if len(sizes) != 1:
@@ -105,9 +113,8 @@ def allocate_kv_cache_regions(
     nbytes = sizes.pop()
     offsets = region_offsets_of(config)
     ends = [*offsets[1:], nbytes]
-    alloc = torch.zeros if config.needs_kv_cache_zeroing else torch.empty
     regions = [
-        alloc(end - start, dtype=torch.uint8, device="mps")
+        _new_region(end - start, zero=config.needs_kv_cache_zeroing)
         for start, end in zip(offsets, ends, strict=True)
     ]
     caches: dict[str, torch.Tensor] = {}
@@ -137,8 +144,7 @@ class CacheViews(Sequence[mx.array]):
         self.storage = storage
         self.descriptors = []
         for t in tensors:
-            # Each region is its own allocation, so a tensor's storage names
-            # its region and its storage offset is already region-relative.
+            # Each region is its own allocation; the storage names the region.
             self.descriptors.append(
                 (
                     storage.region_index[t.untyped_storage().data_ptr()],

@@ -33,6 +33,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.worker.utils import allocate_kv_cache
 
+from vllm_metal.attention.caches import storage as storage_module
 from vllm_metal.attention.caches.storage import KVCacheStorage
 from vllm_metal.metal import get_ops
 
@@ -117,20 +118,21 @@ def test_uniform_caches_skip_vllms_zero_filling_allocator(monkeypatch):
     never goes through vLLM's zero-filling allocator, while a Mamba cache still
     does.
     """
-    zeroed: list[int] = []
-    original = torch.zeros
+    zeroed: list[bool] = []
+    original = storage_module._new_region
 
-    def spy(*args, **kwargs):
-        zeroed.append(args[0])
-        return original(*args, **kwargs)
+    def spy(nbytes, *, zero):
+        zeroed.append(zero)
+        return original(nbytes, zero=zero)
 
-    monkeypatch.setattr(torch, "zeros", spy)
+    monkeypatch.setattr(storage_module, "_new_region", spy)
 
     KVCacheStorage(_attention_config())
-    assert zeroed == []
+    assert zeroed and not any(zeroed)
 
-    storage = KVCacheStorage(_hybrid_config())
-    assert sum(zeroed) == storage.nbytes
+    zeroed.clear()
+    KVCacheStorage(_hybrid_config())
+    assert zeroed and all(zeroed)
 
 
 def test_uninitialized_backing_matches_upstream_layout():

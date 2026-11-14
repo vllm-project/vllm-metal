@@ -172,12 +172,10 @@ def test_draft_kv_matches_native_after_rejection_and_recompute(
     # Sleep frees the one backing the draft shares; the engine recomputes the
     # request after wake. Draft reads and writes must follow the new backing.
     gc.collect()
-    before = torch.mps.current_allocated_memory()
+    before = torch.mps.driver_allocated_memory()
     storage.release()
     gc.collect()
-    mx.synchronize()
-    torch.mps.synchronize()
-    assert before - torch.mps.current_allocated_memory() >= storage.nbytes
+    assert before - torch.mps.driver_allocated_memory() >= storage.nbytes
     storage.reallocate()
     for tensor in storage.tensors.values():
         tensor.fill_(torch.nan)

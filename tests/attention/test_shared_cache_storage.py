@@ -256,12 +256,12 @@ def test_release_frees_backing_and_reallocate_rebinds_existing_views():
     storage = make_storage(num_blocks=64)
     views = storage.views([storage.tensors["a0"]])
     offsets = storage.region_offsets
-    before = torch.mps.current_allocated_memory()
+    before = torch.mps.driver_allocated_memory()
 
     storage.release()
 
     assert storage.released
-    assert before - torch.mps.current_allocated_memory() >= storage.nbytes
+    assert before - torch.mps.driver_allocated_memory() >= storage.nbytes
 
     storage.reallocate()
     storage.tensors["a0"].fill_(3)

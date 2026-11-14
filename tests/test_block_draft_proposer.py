@@ -185,10 +185,10 @@ def test_compiled_draft_follows_storage_recreated_by_sleep(proposer):
     storage = proposer.cache.storage
     assert proposer.propose(_prefill(state, _features(15), 0, True)) is not None
     gc.collect()
-    active = torch.mps.current_allocated_memory()
+    active = torch.mps.driver_allocated_memory()
     storage.release()
     gc.collect()
-    assert active - torch.mps.current_allocated_memory() >= storage.nbytes
+    assert active - torch.mps.driver_allocated_memory() >= storage.nbytes
     storage.reallocate()
     for tensor in storage.tensors.values():
         tensor.fill_(float("nan"))
