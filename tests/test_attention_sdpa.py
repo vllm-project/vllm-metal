@@ -953,7 +953,7 @@ class TestSDPAForward:
     @pytest.mark.parametrize("disabled", [False, True])
     @pytest.mark.parametrize("capability", ["none", "plan", "mixed_plan"])
     @pytest.mark.parametrize("kind", ["decode", "mixed", "expanded_verify"])
-    def test_gqa_batch_metadata_is_only_forwarded_for_ordinary_decode(
+    def test_gqa_batch_metadata_is_only_forwarded_for_decode_rows(
         self, monkeypatch, disabled, capability, kind
     ) -> None:
         monkeypatch.setenv("VLLM_METAL_DISABLE_GQA_DECODE", str(int(disabled)))
@@ -999,8 +999,10 @@ class TestSDPAForward:
         # capability) the leading decode rows of a mixed batch.
         planned = capability in ("plan", "mixed_plan")
         eligible = not disabled and (
-            kind == "decode" or (kind == "mixed" and capability == "mixed_plan")
+            kind in ("decode", "expanded_verify")
+            or (kind == "mixed" and capability == "mixed_plan")
         )
+        expected_plan = (2, 3, 4, 5) if kind == "expanded_verify" else (2, 4)
         with (
             patch.object(sdpa_mod, "get_ops", return_value=spy),
             patch.object(sdpa_mod, "truncate_padded_output", return_value=zeros),
@@ -1008,9 +1010,13 @@ class TestSDPAForward:
             for _layer in range(3):
                 sdpa_forward(inner, x, ctx, cache, layer_idx=0)
             plan = spy.calls[-1].gqa_length_plan
-            assert plan == ((2, 4) if eligible and planned else None)
+            assert plan == (expected_plan if eligible and planned else None)
             assert len(spy.length_plans) == int(eligible and planned)
             query.assert_called_once_with()
+            if kind == "expanded_verify":
+                # Native sees one request per row; the scheduler count is kept.
+                assert spy.calls[-1].num_decode_requests == (4 if eligible else 2)
+                assert ctx.num_decode_requests == 2
             if eligible and planned and kind == "decode":
                 # A new forward has new lengths and must not reuse the old plan.
                 prepare_grouped([([[1]], 4), ([[0]], 2)], [], (8,))
@@ -1038,15 +1044,19 @@ class TestSDPAForward:
                     assert spy.calls[-1].gqa_length_plan == next_plan
                     assert spy.calls[-1].num_decode_requests == len(next_plan)
 
-    @pytest.mark.parametrize(
-        ("disabled", "expected_plan"), [(False, (2, 4)), (True, None)]
-    )
+    @pytest.mark.parametrize("disabled", [False, True])
+    @pytest.mark.parametrize("kind", ["decode", "expanded_verify"])
     def test_turboquant_decode_batch_forwards_gqa_metadata(
-        self, monkeypatch, disabled, expected_plan
+        self, monkeypatch, disabled, kind
     ) -> None:
         monkeypatch.setenv("VLLM_METAL_DISABLE_GQA_DECODE", str(int(disabled)))
         head_dim = 64
-        prepare_grouped([([[0]], 1), ([[1]], 3)], [], (8,))
+        if kind == "decode":
+            prepare_grouped([([[0]], 1), ([[1]], 3)], [], (8,))
+            rows, requests, plan, longest = 2, 2, (2, 4), 4
+        else:
+            prepare_grouped([([[0]], 1, 2), ([[1]], 3, 2)], [], (8,))
+            rows, requests, plan, longest = 4, 4, (2, 3, 4, 5), 5
         ctx = get_context()
         spy = _TurboQuantRoutingOpsSpy()
         inner = _make_inner(head_dim=head_dim)
@@ -1062,8 +1072,8 @@ class TestSDPAForward:
             k_quant="q8_0",
             v_quant="q3_0",
         )
-        x = mx.ones((1, 2, _HIDDEN), mx.float16)
-        zeros = mx.zeros((1, 2, _N_HEADS * head_dim), mx.float16)
+        x = mx.ones((1, rows, _HIDDEN), mx.float16)
+        zeros = mx.zeros((1, rows, _N_HEADS * head_dim), mx.float16)
 
         with (
             patch.object(sdpa_mod, "get_ops", return_value=spy),
@@ -1074,9 +1084,15 @@ class TestSDPAForward:
         call = spy.calls[-1]
         assert call.use_turboquant
         assert call.gqa_disabled is disabled
-        assert (call.num_decode_requests, call.num_decode_tokens) == (2, 2)
-        assert call.max_decode_context_len == 4
-        assert call.gqa_length_plan == expected_plan
+        # Disabled GQA keeps the scheduler's request count for verify rows.
+        expected_requests = 2 if disabled else requests
+        assert (call.num_decode_requests, call.num_decode_tokens) == (
+            expected_requests,
+            rows,
+        )
+        assert call.max_decode_context_len == longest
+        assert call.gqa_length_plan == (None if disabled else plan)
+        assert ctx.num_decode_requests == 2
 
     @pytest.mark.parametrize(
         "supported,kind",

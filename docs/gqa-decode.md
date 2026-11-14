@@ -132,7 +132,10 @@ Every eligible call additionally requires:
   batch retains the existing `num_decode_requests=1` or omitted-count
   convention. Multiple requests require matching `num_decode_requests` and
   `num_decode_tokens`, plus their CPU `gqa_length_plan` metadata. A mixed-batch
-  decode prefix requires a plan describing exactly its rows.
+  decode prefix requires a plan describing exactly its rows. Expanded
+  speculative-verification rows are one-token segments with their own lengths:
+  a batch made only of such rows is passed as one decode request per row, while
+  `PagedAttentionContext.num_decode_requests` keeps the scheduler's count.
 - A verification window of at most 1.
 - Matching FP16/BF16 query, key-cache and value-cache types, or an FP16/BF16
   query over a TurboQuant cache (int8/uint8 K, packed uint8 V). TurboQuant
@@ -157,7 +160,7 @@ Every eligible call additionally requires:
 - A known, positive GPU core count.
 
 Other calls, including mixed batches without a decode-prefix plan, missing
-batch lengths, expanded verification rows and unknown core counts, use the
+batch lengths, verification windows and unknown core counts, use the
 established attention family. Model context limits, cache capacity and
 primitive resource limits still apply. The 16/4/256 geometry remains
 excluded from default routing.
@@ -255,11 +258,12 @@ encoding, then check that a larger partition computes the same history.
 decode count reach the primitive.
 `tests/test_gqa_batched_decode.py` covers independent batch-planning boundaries,
 ragged lengths, every shipped specialization and dtype, shared prefix pages,
-translated scheduler pages, lazy writes, metadata lifetime and excluded routes.
+translated scheduler pages, lazy writes, metadata lifetime, excluded routes and
+expanded verification rows against the verification-window kernel.
 `tests/test_gqa_m3_policy.py` checks fixed device/page boundaries, unchanged
 single-request and other-device decisions, the reducer allocation limit and
 executed numerical results while lazy batches change membership and partition.
-The Python tests keep expanded verification metadata out of batch planning
+The Python tests pass expanded verification rows as one request per row
 and pass only the decode prefix of a mixed batch, regenerating the plan when
 a later forward changes decode membership, order or lengths. Mixed-prefix
 tests pin the GPU core count and require decode rows bit-identical to the
