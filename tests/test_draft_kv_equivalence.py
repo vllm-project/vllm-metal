@@ -44,6 +44,18 @@ def _draft_kv_cache_config(num_blocks: int) -> KVCacheConfig:
     )
 
 
+def _poison(storage: KVCacheStorage) -> None:
+    """NaN the whole backing so every slot read below must have been written.
+
+    A helper rather than a loop in the test body: a loop variable would keep
+    one layer view, and with it the backing, alive past ``storage.release()``.
+    Torch writes to the pool are asynchronous to MLX reads.
+    """
+    for tensor in storage.tensors.values():
+        tensor.fill_(torch.nan)
+    torch.mps.synchronize()
+
+
 @pytest.mark.parametrize("family", [llama, qwen3], ids=["llama", "qwen3"])
 @pytest.mark.parametrize("prompt_len", [15, 31])
 @pytest.mark.parametrize("windowed", [False, True])
@@ -87,9 +99,7 @@ def test_draft_kv_matches_native_after_rejection_and_recompute(
     # the proposer, never inherited from allocation.
     config = _draft_kv_cache_config(num_blocks=9)
     storage = KVCacheStorage(config)
-    for tensor in storage.tensors.values():
-        tensor.fill_(torch.nan)
-    torch.mps.synchronize()
+    _poison(storage)
     proposer.bind_paged_cache(
         storage=storage,
         kv_cache_config=config,
@@ -177,8 +187,6 @@ def test_draft_kv_matches_native_after_rejection_and_recompute(
     gc.collect()
     assert before - torch.mps.driver_allocated_memory() >= storage.nbytes
     storage.reallocate()
-    for tensor in storage.tensors.values():
-        tensor.fill_(torch.nan)
-    torch.mps.synchronize()
+    _poison(storage)
     proposer.release_requests({"r"})
     check_round()
