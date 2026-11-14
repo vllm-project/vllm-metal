@@ -8,6 +8,7 @@ import time
 from typing import TYPE_CHECKING, Any
 
 import mlx.core as mx
+import torch
 from vllm.config import VllmConfig
 from vllm.distributed import (
     ensure_model_parallel_initialized,
@@ -414,15 +415,17 @@ class MetalWorker(WorkerBase):
             raise NotImplementedError(
                 f"Sleep mode is not supported with {type(self.model_runner).__name__}."
             )
-        before = mx.get_active_memory()
+        # The KV pool is Metal memory MLX refers to but does not own, so count
+        # it through the device total, not MLX's own allocator.
+        before = torch.mps.driver_allocated_memory()
         self.model_runner.release_kv_cache_memory()
         self._kv_cache_released = True
         gc.collect()
         mx.clear_cache()
         logger.info(
             "Sleep mode freed %.2f GiB; %.2f GiB of Metal memory is still in use.",
-            (before - mx.get_active_memory()) / (1 << 30),
-            mx.get_active_memory() / (1 << 30),
+            (before - torch.mps.driver_allocated_memory()) / (1 << 30),
+            torch.mps.driver_allocated_memory() / (1 << 30),
         )
 
     def check_health(self) -> None:
