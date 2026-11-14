@@ -39,7 +39,7 @@ def _diagnostics_and_cores():
         ([5375, 5631], 0),  # Summing tokens before flooring overcounts tails.
         ([5375, 5632], 256),
         ([1, 10751], 0),
-        ([1, 10752], 256),  # max(length) * batch would wrongly promote to 512.
+        ([1, 10752], 256),  # Only the long row contributes complete work.
         ([1, 21504], 512),
         ([65536] * 9, 512),
         ([65536] * 10, 512),  # Batch size alone must not veto long GQA decode.
@@ -94,7 +94,12 @@ def test_generic_admission_counts_static_reducer_memory(
     # Also cover the former dynamic-only limit and its successor.
     # These are allocation bounds, not the actual KV lengths used for planning.
     lengths = [length] * batch
-    assert ops.gqa_decode_batch_partition_size(q, kv, head, lengths, 40) == partition
+    assert (
+        ops.gqa_decode_batch_partition_size(
+            q, kv, head, lengths, 40, max_seq_len=maximum
+        )
+        == partition
+    )
     query = mx.zeros((batch, q, head), dtype)
     keys = mx.zeros((batch, block, kv, head), dtype)
     values = mx.stack(
@@ -135,7 +140,7 @@ def test_generic_admission_counts_static_reducer_memory(
 
 
 @pytest.mark.parametrize(
-    "cores,q,kv,head,batch,entry,promotion",
+    "cores,q,kv,head,batch,entry,p512_work",
     [
         (10, 32, 8, 128, 3, 1024, 2048),
         (10, 24, 4, 256, 4, 1024, 2048),
@@ -145,14 +150,14 @@ def test_generic_admission_counts_static_reducer_memory(
         (20, 16, 2, 256, 10, 1280, 2560),
     ],
 )
-def test_cross_device_batch_boundaries(cores, q, kv, head, batch, entry, promotion):
+def test_cross_device_batch_boundaries(cores, q, kv, head, batch, entry, p512_work):
     # Fixed expectations independent of the planner, including integer rounding
     # at the first batch admitted above the former unsplit-grid veto.
     for length, expected in (
         (entry - 1, 0),
         (entry, 256),
-        (promotion - 1, 256),
-        (promotion, 512),
+        (p512_work - 1, 256),
+        (p512_work, 512),
     ):
         assert (
             get_ops().gqa_decode_batch_partition_size(
@@ -631,6 +636,41 @@ def test_turboquant_batch_uses_p256_gqa_decode(dtype):
     assert ops.last_gqa_partition_size() == 256
     assert ops.last_gqa_num_requests() == 2
     _assert_close(out, ref, dtype)
+
+
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("length", [703, 704])
+def test_turboquant_short_batch_uses_common_work_rule(dtype, length):
+    # The removed M3 six-row veto also affected TurboQuant: at 703 it
+    # previously fell back despite enough P256 work. Both lengths now use
+    # P256 on every device; no simulated architecture is needed.
+    ops = get_ops()
+    previous_cores = ops.detected_gpu_core_count()
+    ops._override_detected_gpu_core_count_for_test(10)
+    try:
+        lengths = [length] * 6
+        out, ref = _run_primitive(
+            lengths,
+            dtype,
+            interleaved=True,
+            seed=991,
+            num_query_heads=32,
+            num_kv_heads=8,
+            head_size=128,
+            block_size=16,
+            num_decode_requests=6,
+            num_decode_tokens=6,
+            gqa_lengths=lengths,
+            turboquant=True,
+        )
+        assert _dispatch_family() == "gqa_decode"
+        assert ops.last_gqa_partition_size() == 256
+        assert ops.last_gqa_num_requests() == 6
+        _assert_close(out, ref, dtype)
+    finally:
+        mx.synchronize()
+        # Restore the module fixture's override; its teardown restores detection.
+        ops._override_detected_gpu_core_count_for_test(previous_cores)
 
 
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])

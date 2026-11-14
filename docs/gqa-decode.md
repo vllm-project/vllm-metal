@@ -8,9 +8,9 @@ shader specializations.
 
 This is a Metal-backend split-KV occupancy heuristic over precompiled
 partitions. It uses a fixed work budget, counts only complete partitions,
-and tries 512, then 256. A measured M3 preference below chooses P256 for
-some long-context batches that also qualify for P512. This is the same class
-of backend-internal scheduling choice
+and prefers the largest work-eligible partition, without architecture strings
+or exact-core-count exceptions. This is the same class of backend-internal
+scheduling choice
 as [FA3 split selection](https://github.com/Dao-AILab/flash-attention/blob/main/hopper/heuristics.h),
 [FlashInfer planning](https://github.com/flashinfer-ai/flashinfer/blob/main/include/flashinfer/attention/scheduler.cuh),
 and [ROCm partition choices](https://github.com/vllm-project/vllm/blob/main/csrc/rocm/attention.cu),
@@ -31,60 +31,50 @@ through `_gqa_decode_config_for_test()` instead of maintaining another list;
 golden threshold values and unsupported-input expectations remain independent.
 
 Let `C` be the detected GPU core count, `Q` the query-head count, and `L_i`
-each request's KV length including its current decode token. Both partitions
-use the same empirical budget of 33 SIMD groups per core. First select the largest
-`P` satisfying `Q * sum(floor(L_i / P)) >= 33 * C`; otherwise use the
-established path. Flooring each length separately avoids counting partial
-tails as complete work or treating short requests as copies of the longest.
+each request's KV length including its current decode token. A candidate `P`
+needs `Q * sum(floor(L_i / P)) >= 33 * C`. Flooring each length separately
+avoids counting partial tails as complete work or treating short requests as
+copies of the longest. Unknown core counts retain the established path.
 
-The measured 10-core M3 (`applegpu_g15g`) uses an additional short-context
-admission guard. A six-request `32/8/128` batch stays on the established path while
-all KV lengths are below 704; adjacent batch sizes keep the common rule.
-This guard conservatively excludes the measured short-context regression;
-other admitted head128 batches retain their existing partition selection.
+For ordinary FP16/BF16 caches, retain the existing generic selection order:
 
-On that M3, multi-request head256 batches that qualify for P512 prefer P256
-when the longest actual KV length reaches
-4,096 tokens with kernel block16, or 8,192 with block32. This preference
-keeps the work gate: it does not admit an otherwise ineligible batch. It
-also requires P256's dynamic statistics plus its 64-byte static workspace to
-fit 32 KiB, using the allocation upper bound as well as the actual lengths;
-an oversized bound retains P512. Dispatch additionally checks the compiled
-pipeline's actual static allocation. These are
-device and layout calibration limits, independent of model names. Outside
-the short guard, shorter contexts and head128 keep the common rule.
-Single requests and other devices are unchanged.
-The preference removes measured M3 P512 regressions without disabling
-the positive long-context GQA cases. These are empirical policy limits, not a claim of the fastest route for every
-prompt or a cross-device speedup claim.
+1. Select P512 if it meets the complete-work budget; otherwise select P256
+   if it meets that budget. If neither does, use the established path.
+2. Check the selected partition's scratch allocation, including compact-layout
+   offsets, against the 512 MiB budget. Failure uses the established path;
+   it does not retry another partition.
+3. Before encoding, check the compiled reducer's actual static allocation plus
+   aligned dynamic memory against the device's queried threadgroup capacity.
+   Failure also retains the established fallback, without retrying another
+   partition.
 
-The same complete-partition budget applies across batch sizes. The GQA
-planner does not reject a batch solely because its unsplit query-head grid
-exceeds a core-count threshold. The established per-token fallback retains
-its own split-KV policy.
+TurboQuant keeps its existing P256-only work rule and the same resource checks.
+The allocation upper bound sizes resources; it does not provide additional
+complete work. There is no head-dimension fan-in preference or new cost model.
 
-The single-request decision is unchanged: each partition starts at
-`P * ceil(33 * C / Q)`. Admission and promotion share one rule, with no
-head-ratio correction or per-model budget. This is an empirical policy, not a
-hardware identity or a prediction of the fastest partition at every position.
+The policy change removes only the legacy M3 exception from this generic
+rule. On the previously matched 10-core M3, six `32/8/128` requests of length
+703 now select P256 rather than fallback, including eligible TurboQuant caches.
+Four ordinary `24/4/256` requests of length 4096 with block16 now select P512
+rather than the M3-specific P256 preference. Devices that did not match the
+exception retain the existing generic policy. Removing a device-specific
+calibration is not a performance improvement claim: previously measured M3
+head256 regressions must remain disclosed, and kernel probes are not serving
+speedup evidence. Compare against the calibrated default, not merely against
+GQA-disabled execution.
 
-For one request on a 40-core GPU this gives:
+The same complete-partition budget applies across batch sizes. The planner
+does not reject a batch solely because its unsplit query-head grid exceeds a
+core-count threshold. The established per-token fallback retains its own
+split-KV policy.
 
-| Q/KV/head dimension | Start P256 | Start P512 |
-|---|---:|---:|
-| 32/8/128 | 10,752 | 21,504 |
-| 24/8/128 or 24/4/256 | 14,080 | 28,160 |
-| 16/2/128 or 256 | 21,248 | 42,496 |
-
-These values scale with the detected core count; they are not per-device or
-per-model context tables in the implementation. Core-count scaling does not
-establish cross-device performance or guarantee a speedup at every boundary.
-The budget is shared by both partitions; it has no per-model exceptions.
-
-For example, two `32/8/128` requests on that GPU start P256 at 5,376 tokens
-each and P512 at 10,752 each. Lengths `[1, 10752]` instead select P256:
-the short request supplies no complete partition. Ten `32/8/128` requests
-start P256 at 1,280 tokens each and P512 at 2,560 each on that GPU.
+For one request on a 40-core GPU, the P256 work threshold is 10,752 tokens
+for 32 query heads, 14,080 for 24, and 21,248 for 16. These thresholds scale
+with core count and query-head count; P512 becomes work-eligible at twice
+those single-request lengths. Admission does not establish a speedup
+at every boundary. Two `32/8/128` requests start P256 at 5,376 tokens each;
+lengths `[1, 10752]` also admit P256 because the short row contributes no
+complete partition.
 
 Only complete partitions count toward selection. The producer, temporary
 buffers and reducer still use `ceil(KV_length / P)` so the final partial
@@ -98,10 +88,9 @@ Single- and multi-request selection use the same planner. There is no GPU
 readback, startup benchmark or per-request performance probe.
 `gqa_decode_partition_size` exposes the default decision for tests;
 `gqa_decode_shape_eligible` is true when it selects a nonzero partition.
-`gqa_decode_batch_partition_size` takes a list of per-request lengths and
-applies the M3 preference using the executing GPU's architecture by default.
-Its optional `gpu_arch` is a read-only simulation input; it cannot change
-actual dispatch. `max_seq_len` optionally supplies an allocation upper bound.
+`gqa_decode_batch_partition_size` takes per-request lengths and a core count,
+without reading the executing device. The architecture simulation argument
+is removed. `max_seq_len` optionally supplies an allocation upper bound.
 These queries check geometry, work and the scratch budget, not all dispatch
 conditions. Direct primitive callers can pass `gqa_length_plan` from
 `gqa_decode_length_plan(context_lens)`; it must agree with GPU `seq_lens`.
@@ -185,8 +174,7 @@ without it keep their existing batch routing.
 
 Kernel dtype, page layout, query-row shape, feature and resource checks determine
 whether an operation can run. Default admission is a separate measured policy:
-ordinary decode, the listed geometries, the two-tier work budget and the
-scoped M3 partition preference.
+ordinary decode, the listed geometries and the complete-partition work budget.
 The C++ boundary enforces both, including for direct primitive callers.
 
 The native planner consumes post-append KV lengths, query/KV head geometry
@@ -256,9 +244,11 @@ decode count reach the primitive.
 `tests/test_gqa_batched_decode.py` covers independent batch-planning boundaries,
 ragged lengths, every shipped specialization and dtype, shared prefix pages,
 translated scheduler pages, lazy writes, metadata lifetime and excluded routes.
-`tests/test_gqa_m3_policy.py` checks fixed device/page boundaries, unchanged
-single-request and other-device decisions, the reducer allocation limit and
-executed numerical results while lazy batches change membership and partition.
+`tests/test_gqa_work_policy.py` checks work-budget scaling across core counts,
+page boundaries, reducer allocation limits and executed numerical results while
+lazy batches change membership and partition.
+`tests/test_gqa_policy_equivalence.py` compares the common policy with an
+independent oracle and explicitly records changes from the previous M3 policy.
 The Python tests keep expanded verification metadata out of batch planning
 and pass only the decode prefix of a mixed batch, regenerating the plan when
 a later forward changes decode membership, order or lengths. Mixed-prefix

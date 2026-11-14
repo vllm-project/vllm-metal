@@ -38,7 +38,7 @@ using hardware::gpu_core_count;
 // One measured dispatch table, also exposed read-only to numerical/routing
 // tests. Include the kernel page view so geometry and page admission cannot
 // drift independently. Model names are not routing inputs; the calibrated
-// device preference below is separate from functional geometry admission.
+// work-budget policy is separate from functional geometry admission.
 struct GqaDecodeGeometry {
   int num_heads;
   int num_kv_heads;
@@ -60,22 +60,6 @@ static_assert(kPartitionSize == 512,
               "GQA partition list assumes the established 512-token split");
 constexpr std::array<int, 2> kGqaPartitionSizes = {512, 256};
 constexpr int64_t kGqaSimdGroupsPerCore = 33;
-// The ordinary GQA reducer specializes out the TurboQuant workspace, but
-// retains red_smem[2 * NUM_WARPS] (256 threads / 32 SIMD lanes). Reserve its
-// 64 bytes as well as the dynamic statistics; dispatch also checks the
-// compiled pipeline's actual static allocation before encoding the reducer.
-constexpr size_t kGqaReduceStaticMemoryBytes = 2 * (256 / 32) * sizeof(float);
-
-// M3 (10-core, g15g) batched calibration. Tighten short-context admission,
-// and avoid the slower P512 producer for measured long head256 layouts.
-// Single requests and other devices retain the existing selection.
-constexpr int kM3GqaGpuCores = 10;
-constexpr int kM3GqaShortHead128Batch = 6;
-constexpr int kM3GqaShortHead128MinContext = 704;
-constexpr int kM3GqaBlock16MinContext = 4096;
-constexpr int kM3GqaBlock32MinContext = 8192;
-constexpr size_t kM3GqaReducerMemoryBytes = 32 * 1024;
-
 // Bound partial outputs, both statistics and any compact-layout offsets.
 // This is a per-invocation ceiling, not a reservation or a process memory limit.
 constexpr size_t kGqaMaxScratchBytes = 512 * 1024 * 1024;
@@ -146,7 +130,7 @@ std::string gqa_decode_tq_kernel_name(
 int gqa_decode_plan_for_lengths(
     int num_heads, int num_kv_heads, int head_size,
     const GqaDecodeLengthPlan& plan, int gpu_cores, int block_size,
-    const std::string& gpu_arch = "", int max_seq_len = 0, bool turboquant = false);
+    int max_seq_len = 0, bool turboquant = false);
 void init_library_path(const std::string& name, const std::string& path);
 void init_nax_library_path(const std::string& path);
 std::string dtype_to_metal(Dtype dt);
