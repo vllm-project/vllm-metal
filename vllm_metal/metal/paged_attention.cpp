@@ -434,18 +434,21 @@ static void dispatch_paged_attention_nax(
     const array& block_tables, const array& seq_lens,
     const array& cu_seqlens_q,
     int block_size, int max_seq_len, int sliding_window, int q_block_offset,
-    Stream s, const array* sinks, bool split_full) {
+    Stream s, const array* sinks, bool split_full, int grouped_reference_hint) {
   auto& d = metal::device(s.device);
 
   int total_q_tokens = static_cast<int>(query.shape(0));
   int head_size  = static_cast<int>(query.shape(2));
   int num_seqs   = static_cast<int>(cu_seqlens_q.shape(0)) - 1;
   int num_heads = static_cast<int>(query.shape(1));
+  // Grouped layouts retain their calibrated reference. The actual BQ64
+  // fallback still uses split_full if grouping or a pipeline check declines.
   auto cfg = kernels::select_nax_config(
       num_heads, num_kv_heads, head_size, block_size, total_q_tokens,
       num_seqs, max_seq_len, q_block_offset, nax_gqa_prefill_enabled_,
       query.dtype() == bfloat16,
-      sliding_window < 0 && softcap <= 0.0f && sinks == nullptr, split_full,
+      sliding_window < 0 && softcap <= 0.0f && sinks == nullptr,
+      grouped_reference_hint >= 0 ? grouped_reference_hint != 0 : split_full,
       detected_gpu_core_count());
   auto make_plan = [&](kernels::NaxConfig config) {
     return make_nax_attention_plan(
@@ -692,6 +695,7 @@ struct PagedAttentionMetadata {
   int gqa_test_partition;
   int nax_split_hint;
   int nax_prefill_split_hint;
+  int nax_grouped_reference_hint;
 };
 
 static bool gqa_decode_metadata_eligible(
@@ -1234,7 +1238,8 @@ static void dispatch_paged_attention_v2_online(
     int decode_only_rows = 0, bool gqa_disabled = false,
     int gqa_test_partition = 0,
     const GqaDecodeLengthPlan& gqa_length_plan = {},
-    int nax_split_hint = -1, int nax_prefill_split_hint = -1) {
+    int nax_split_hint = -1, int nax_prefill_split_hint = -1,
+    int nax_grouped_reference_hint = -1) {
   int head_size = static_cast<int>(query.shape(2));
   PagedAttentionMetadata metadata{
       gqa_length_plan, query.dtype(), key_cache.dtype(), value_cache.dtype()};
@@ -1265,6 +1270,7 @@ static void dispatch_paged_attention_v2_online(
   metadata.gqa_test_partition = gqa_test_partition;
   metadata.nax_split_hint = nax_split_hint;
   metadata.nax_prefill_split_hint = nax_prefill_split_hint;
+  metadata.nax_grouped_reference_hint = nax_grouped_reference_hint;
   const PagedAttentionArrays arrays{
       out, query, key_cache, value_cache, block_tables, seq_lens, cu_seqlens_q,
       key_scale_cache, value_scale_cache, key_zero_cache, v_centroids,
@@ -1315,7 +1321,8 @@ static void dispatch_paged_attention_v2_online(
       dispatch_paged_attention_nax(
           out, query, key_cache, value_cache, num_kv_heads, scale, softcap,
           block_tables, seq_lens, cu_seqlens_q, block_size, max_seq_len, sliding_window,
-          0, s, sinks, plan.route == PagedAttentionRoute::NaxSplit);
+          0, s, sinks, plan.route == PagedAttentionRoute::NaxSplit,
+          metadata.nax_grouped_reference_hint);
       return;
     // TurboQuant stays excluded from the tiled kernel. Sink prefill can use it:
     // pagedattention_tiled.metal folds the sink into each row's denominator-only
@@ -1381,7 +1388,8 @@ static void dispatch_paged_attention_mixed(
         metadata.block_size, metadata.max_seq_len, metadata.sliding_window,
         metadata.num_decode_tokens / kernels::kNaxBQ + metadata.num_decode_requests,
         arrays.s, arrays.sinks,
-        plan.route == PagedAttentionRoute::MixedNaxSplit);
+        plan.route == PagedAttentionRoute::MixedNaxSplit,
+        metadata.nax_grouped_reference_hint);
     record_paged_dispatch(PagedDispatch::MixedNaxPrefillDecode,
                           decode_partition, decode_requests);
     return;
@@ -1418,7 +1426,8 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
       int num_decode_tokens = 0, int max_decode_context_len = 0,
       bool gqa_disabled = false, int gqa_test_partition = 0,
       const GqaDecodeLengthPlan& gqa_length_plan = {},
-      int nax_split_hint = -1, int nax_prefill_split_hint = -1)
+      int nax_split_hint = -1, int nax_prefill_split_hint = -1,
+      int nax_grouped_reference_hint = -1)
       : UnaryPrimitive(stream),
         num_kv_heads_(num_kv_heads), scale_(scale), softcap_(softcap),
         block_size_(block_size), max_seq_len_(max_seq_len),
@@ -1431,7 +1440,8 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
         max_decode_context_len_(max_decode_context_len),
         gqa_disabled_(gqa_disabled), gqa_test_partition_(gqa_test_partition),
         gqa_length_plan_(gqa_length_plan), nax_split_hint_(nax_split_hint),
-        nax_prefill_split_hint_(nax_prefill_split_hint) {}
+        nax_prefill_split_hint_(nax_prefill_split_hint),
+        nax_grouped_reference_hint_(nax_grouped_reference_hint) {}
 
   void eval_cpu(const std::vector<array>&, array&) override {
     throw std::runtime_error(
@@ -1465,7 +1475,7 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
         ks, vs, kz, vc, use_turboquant_, k_bits_, v_bits_, sk, mp,
         num_decode_requests_, num_decode_tokens_, max_decode_context_len_,
         0, gqa_disabled_, gqa_test_partition_, gqa_length_plan_,
-        nax_split_hint_, nax_prefill_split_hint_);
+        nax_split_hint_, nax_prefill_split_hint_, nax_grouped_reference_hint_);
   }
 
   const char* name() const override { return "PagedAttention"; }
@@ -1490,7 +1500,8 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
         && rhs->gqa_test_partition_ == gqa_test_partition_
         && rhs->gqa_length_plan_ == gqa_length_plan_
         && rhs->nax_split_hint_ == nax_split_hint_
-        && rhs->nax_prefill_split_hint_ == nax_prefill_split_hint_;
+        && rhs->nax_prefill_split_hint_ == nax_prefill_split_hint_
+        && rhs->nax_grouped_reference_hint_ == nax_grouped_reference_hint_;
   }
 
  private:
@@ -1514,6 +1525,7 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
   GqaDecodeLengthPlan gqa_length_plan_;
   int nax_split_hint_;
   int nax_prefill_split_hint_;
+  int nax_grouped_reference_hint_;
 };
 
 array paged_attention_primitive_fn(
@@ -1536,11 +1548,14 @@ array paged_attention_primitive_fn(
     int max_decode_context_len, bool gqa_disabled,
     int gqa_test_partition,
     const std::optional<GqaDecodeLengthPlan>& gqa_length_plan,
-    int nax_split_hint, int nax_prefill_split_hint) {
+    int nax_split_hint, int nax_prefill_split_hint,
+    int nax_grouped_reference_hint) {
   if (nax_split_hint < -1 || nax_split_hint > 1)
     throw std::invalid_argument("nax_split_hint must be -1, 0 or 1");
   if (nax_prefill_split_hint < -1 || nax_prefill_split_hint > 1)
     throw std::invalid_argument("nax_prefill_split_hint must be -1, 0 or 1");
+  if (nax_grouped_reference_hint < -1 || nax_grouped_reference_hint > 1)
+    throw std::invalid_argument("nax_grouped_reference_hint must be -1, 0 or 1");
   const auto lengths =
       gqa_length_plan ? *gqa_length_plan : GqaDecodeLengthPlan{};
   if (gqa_length_plan) {
@@ -1700,7 +1715,7 @@ array paged_attention_primitive_fn(
       use_turboquant, k_bits, v_bits, window_seqlen_q, sinks != nullptr,
       mm_prefix_ranges != nullptr, num_decode_requests, num_decode_tokens,
       max_decode_context_len, gqa_disabled, gqa_test_partition, lengths,
-      nax_split_hint, nax_prefill_split_hint);
+      nax_split_hint, nax_prefill_split_hint, nax_grouped_reference_hint);
   std::vector<array> inputs = {query, key_cache, value_cache,
                                block_tables, seq_lens, cu_seqlens_q};
   if (use_turboquant) {

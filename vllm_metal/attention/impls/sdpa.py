@@ -65,7 +65,11 @@ from vllm_metal.attention.impls.turboquant_prefill import (
 from vllm_metal.attention.impls.varlen_rope_compat import (
     apply_attention_rope,
 )
-from vllm_metal.attention.nax_split import nax_split_kwargs, nax_tile_work
+from vllm_metal.attention.nax_split import (
+    nax_gpu_core_count,
+    nax_split_kwargs,
+    nax_tile_work,
+)
 from vllm_metal.metal import get_ops, paged_attention_capabilities
 
 logger = init_logger(__name__)
@@ -1014,6 +1018,8 @@ def sdpa_forward(
             and layer_sliding_window < 0
             and reason is None
         ):
+            if ctx.paged_native_capabilities is None:
+                ctx.paged_native_capabilities = paged_attention_capabilities(ops)
             plan = _turboquant_prefill_plan(
                 ctx,
                 meta,
@@ -1024,6 +1030,9 @@ def sdpa_forward(
                 q_3d.shape[2],
                 key_quant_type=kv_cache.k_quant,
                 value_bits=kv_cache.v_bits,
+                compute_nax_work=(
+                    ctx.paged_native_capabilities["nax_split_hint"] and ops.nax_ready()
+                ),
             )
 
         if plan is None and not has_prefill:
@@ -1068,6 +1077,18 @@ def sdpa_forward(
             query = q_3d if batch.query_indices is None else q_3d[batch.query_indices]
             if ctx.paged_native_capabilities is None:
                 ctx.paged_native_capabilities = paged_attention_capabilities(ops)
+            nax_kwargs: dict[str, int] = {}
+            if batch.nax_work is not None:
+                if ctx.nax_gpu_core_count is None:
+                    ctx.nax_gpu_core_count = nax_gpu_core_count(ops)
+                nax_kwargs = nax_split_kwargs(
+                    ctx.paged_native_capabilities,
+                    batch.nax_work,
+                    q_3d.shape[2],
+                    gpu_core_count=ctx.nax_gpu_core_count,
+                    num_heads=q_3d.shape[1],
+                    num_kv_heads=cache_kv_heads,
+                )
             out = ops.paged_attention_primitive(
                 query,
                 k16.reshape(-1, kernel_block_size, cache_kv_heads, q_3d.shape[2]),
@@ -1082,10 +1103,7 @@ def sdpa_forward(
                 batch.max_seq_len,
                 layer_sliding_window,
                 window_seqlen_q=ctx.verify_window_q,
-                # The dequantized lane only admits full-attention layers.
-                **nax_split_kwargs(
-                    ctx.paged_native_capabilities, batch.nax_work, q_3d.shape[2]
-                ),
+                **nax_kwargs,
             )
             if plan.fallback is not None:
                 fallback = plan.fallback
@@ -1112,10 +1130,16 @@ def sdpa_forward(
         paged_kwargs.update(_whole_batch_decode_routing_kwargs(ctx, q_3d.shape[0], ops))
         capabilities = ctx.paged_native_capabilities
         num_decode = ctx.num_decode_requests
-        if capabilities["nax_split_hint"] and q_3d.shape[0] > len(ctx.context_lens):
+        if (
+            capabilities["nax_split_hint"]
+            and q_3d.shape[0] > len(ctx.context_lens)
+            and ops.nax_ready()
+        ):
             # Prefill batch: pick the NAX pipeline from per-sequence lengths
             # the kernel dispatcher could only read back from the GPU.
             # Native alone decides whether to split off ordinary decode rows.
+            if ctx.nax_gpu_core_count is None:
+                ctx.nax_gpu_core_count = nax_gpu_core_count(ops)
             work = prefill_work = None
             if (
                 ctx.cu_seqlens is not None
@@ -1126,12 +1150,19 @@ def sdpa_forward(
                     ctx.nax_tile_work = {}
 
                 def tile_work(first_seq: int):
-                    key = (layer_sliding_window, first_seq)
+                    key = (
+                        layer_sliding_window,
+                        first_seq,
+                        group_index,
+                        cache_block_size,
+                    )
                     if key not in ctx.nax_tile_work:
                         ctx.nax_tile_work[key] = nax_tile_work(
                             ctx.cu_seqlens[first_seq:],
                             ctx.context_lens[first_seq:],
                             layer_sliding_window,
+                            block_tables=raw_block_tables[first_seq:],
+                            block_size=cache_block_size,
                         )
                     return ctx.nax_tile_work[key]
 
@@ -1145,7 +1176,13 @@ def sdpa_forward(
                     prefill_work = tile_work(num_decode)
             paged_kwargs.update(
                 nax_split_kwargs(
-                    capabilities, work, q_3d.shape[2], prefill_work=prefill_work
+                    capabilities,
+                    work,
+                    q_3d.shape[2],
+                    prefill_work=prefill_work,
+                    gpu_core_count=ctx.nax_gpu_core_count,
+                    num_heads=q_3d.shape[1],
+                    num_kv_heads=cache_kv_heads,
                 )
             )
         out = ops.paged_attention_primitive(

@@ -13,13 +13,16 @@ script times both at controlled decode lengths:
                   ``sdpa_forward`` passes it; native code splits the batch.
   split_emulated  the same split as two primitives over sliced inputs: the
                   decode rows as a pure decode batch, then the prefill rows.
-                  Native code runs exactly these two kernels in one
-                  primitive. Use ``--compare split_emulated`` to measure a
+                  Grouped prefill can make this arm use a different layout;
+                  the recorded dispatch events expose that difference.
+                  Use ``--compare split_emulated`` to measure a
                   build whose native split has a context threshold, such as
                   the former 4096-token rule.
 
 ``split_emulated_pertoken`` (opt-in) repeats the emulated split with GQA
-disabled for the decode rows. Every arm records its executed dispatch family.
+disabled for the decode rows. Every arm records its executed dispatch family
+and NAX function/layout, including the split flag. Set
+``VLLM_METAL_NAX_GQA_PREFILL=0`` to isolate dispatch overhead from grouped layouts.
 
 Each timed evaluation queues ``--layers`` independent attention calls, as one
 forward pass does, and reports milliseconds per layer. Arms are interleaved
@@ -66,6 +69,7 @@ from tools.attention_bench_utils import (  # noqa: E402
     package_versions,
 )
 from vllm_metal.attention.nax_split import (  # noqa: E402
+    nax_gpu_core_count,
     nax_split_kwargs,
     nax_tile_work,
 )
@@ -119,6 +123,7 @@ class Result:
     ms_min: dict[str, float] = field(default_factory=dict)
     routes: dict[str, str] = field(default_factory=dict)
     gqa_partition: dict[str, int] = field(default_factory=dict)
+    nax_dispatches: dict[str, list[dict]] = field(default_factory=dict)
 
 
 def _cumsum(lengths: Sequence[int]) -> list[int]:
@@ -176,15 +181,26 @@ class Arms:
         self.x = inputs
         self.ops = get_ops()
         self.caps = capabilities
+        self.gpu_cores = nax_gpu_core_count(self.ops)
         self.scale = shape.head_size**-0.5
         d = shape.num_decode
         cu = _cumsum(shape.query_lens)
         self.decode_lens = shape.kv_lens[:d]
         # Whole-batch and prefill-only NAX hints, as sdpa_forward computes them.
-        self.work_all = nax_tile_work(cu, shape.kv_lens)
-        self.work_prefill = nax_tile_work(cu[d:], shape.kv_lens[d:])
+        # Input creation/evaluation is outside timing. Use the actual page
+        # layout, just as production does, rather than assuming page sharing.
+        tables = inputs.block_tables.tolist()
+        self.work_all = nax_tile_work(
+            cu, shape.kv_lens, block_tables=tables, block_size=shape.block_size
+        )
+        self.work_prefill = nax_tile_work(
+            cu[d:],
+            shape.kv_lens[d:],
+            block_tables=tables[d:],
+            block_size=shape.block_size,
+        )
         prefill_cu = [c - cu[d] for c in cu[d:]]
-        self.work_prefill_only = nax_tile_work(prefill_cu, shape.kv_lens[d:])
+        self.work_prefill_only = self.work_prefill
         x = inputs
         self.decode_x = Inputs(
             query=x.query[:d],
@@ -223,7 +239,13 @@ class Arms:
 
     def _nax(self, work, prefill_work=None) -> dict[str, int]:
         return nax_split_kwargs(
-            self.caps, work, self.shape.head_size, prefill_work=prefill_work
+            self.caps,
+            work,
+            self.shape.head_size,
+            prefill_work=prefill_work,
+            num_heads=self.shape.q_heads,
+            num_kv_heads=self.shape.kv_heads,
+            gpu_core_count=self.gpu_cores,
         )
 
     def unsplit(self) -> list[mx.array]:
@@ -270,23 +292,38 @@ class Arms:
         return [self._decode_only(True), self._prefill_only()]
 
 
-def _route(arms: Arms, name: str) -> tuple[str, int]:
-    """Native dispatch family (decode part first for emulated arms)."""
+def _route(arms: Arms, name: str) -> tuple[str, int, list[dict]]:
+    """Record actual dispatches outside timing; a family alone hides NAX variants."""
     ops = arms.ops
     mx.synchronize()
     previous = ops._set_paged_dispatch_diagnostics(True)
+    tracing = False
     try:
+        ops._start_nax_prefill_dispatch_trace()
+        tracing = True
         if name.startswith("split_emulated"):
             mx.eval(arms._decode_only(name.endswith("pertoken")))
             decode_family = ops.last_paged_dispatch()
             partition = ops.last_gqa_partition_size()
             mx.eval(arms._prefill_only())
-            return f"{decode_family}+{ops.last_paged_dispatch()}", partition
-        mx.eval(getattr(arms, name)())
-        return ops.last_paged_dispatch(), ops.last_gqa_partition_size()
-    finally:
+            family = f"{decode_family}+{ops.last_paged_dispatch()}"
+        else:
+            mx.eval(getattr(arms, name)())
+            family = ops.last_paged_dispatch()
+            partition = ops.last_gqa_partition_size()
         mx.synchronize()
-        ops._set_paged_dispatch_diagnostics(previous)
+        trace = ops._take_nax_prefill_dispatch_trace()
+        tracing = False
+        if trace["overflow"] or trace["dropped_events"]:
+            raise RuntimeError("NAX dispatch trace overflowed")
+        return family, partition, trace["events"]
+    finally:
+        try:
+            mx.synchronize()
+        finally:
+            if tracing:
+                ops._take_nax_prefill_dispatch_trace()
+            ops._set_paged_dispatch_diagnostics(previous)
 
 
 def _check_outputs(arms: Arms, names: Sequence[str]) -> None:
@@ -536,9 +573,10 @@ def main() -> int:
                 _check_outputs(arms, args.arms)
                 result = Result(shape)
                 for name in args.arms:
-                    route, partition = _route(arms, name)
+                    route, partition, events = _route(arms, name)
                     result.routes[name] = route
                     result.gqa_partition[name] = partition
+                    result.nax_dispatches[name] = events
                 timings = _time(
                     {name: getattr(arms, name) for name in args.arms},
                     args.layers,

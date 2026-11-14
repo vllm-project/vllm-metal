@@ -39,6 +39,7 @@ def test_native_reports_public_routing_capabilities():
         "gqa_mixed_decode_plan": True,
         "nax_split_hint": True,
         "nax_prefill_split_hint": True,
+        "nax_grouped_reference_hint": True,
     }
 
 

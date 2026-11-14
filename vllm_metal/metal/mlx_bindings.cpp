@@ -252,6 +252,7 @@ NB_MODULE(_paged_ops, m) {
     caps["gqa_mixed_decode_plan"] = true;
     caps["nax_split_hint"] = true;
     caps["nax_prefill_split_hint"] = true;
+    caps["nax_grouped_reference_hint"] = true;
     return caps;
   }, "Capabilities of the public paged attention interface. Private test "
      "kernels do not imply an enabled production route.");
@@ -474,7 +475,8 @@ NB_MODULE(_paged_ops, m) {
            int num_decode_tokens,
            int max_decode_context_len, bool gqa_disabled,
            const std::optional<GqaDecodeLengthPlan>& gqa_length_plan,
-           int nax_split_hint, int nax_prefill_split_hint) {
+           int nax_split_hint, int nax_prefill_split_hint,
+           int nax_grouped_reference_hint) {
           return paged_attention_primitive_fn(
               query, key_cache, value_cache,
               num_kv_heads, scale, softcap,
@@ -485,7 +487,7 @@ NB_MODULE(_paged_ops, m) {
               window_seqlen_q, sinks, mm_prefix_ranges, num_decode_requests,
               num_decode_tokens, max_decode_context_len, gqa_disabled,
               0, gqa_length_plan, nax_split_hint,
-              nax_prefill_split_hint);
+              nax_prefill_split_hint, nax_grouped_reference_hint);
         },
         nb::arg("query"),
         nb::arg("key_cache"), nb::arg("value_cache"),
@@ -511,6 +513,7 @@ NB_MODULE(_paged_ops, m) {
         nb::arg("gqa_length_plan") = nb::none(),
         nb::arg("nax_split_hint") = -1,
         nb::arg("nax_prefill_split_hint") = -1,
+        nb::arg("nax_grouped_reference_hint") = -1,
         // Window validation may evaluate metadata with a Python-backed reader.
         nb::call_guard<nb::gil_scoped_release>(),
         "Return a lazy paged attention array (read-only). Cache writes are handled "
@@ -539,8 +542,11 @@ NB_MODULE(_paged_ops, m) {
         "pipeline (1) or the original loop (0); -1 uses the batch-average "
         "rule for head_size below 512. nax_prefill_split_hint optionally "
         "overrides it only when native dispatch separates the ordinary "
-        "decode prefix from NAX prefill; -1 retains nax_split_hint. The "
-        "override describes only the remaining prefill sequences. "
+        "decode prefix from NAX prefill; the override describes only the "
+        "remaining prefill sequences, and -1 retains nax_split_hint. "
+        "nax_grouped_reference_hint independently selects the BQ64 reference "
+        "used to score grouped layouts (0/1); -1 uses the execution hint. "
+        "It does not change the BQ64 fallback pipeline. "
         "Outputs are identical either way. For head_size 512, an effective "
         "hint of 1 selects two 256-column output slices; 0 or -1 keeps the "
         "original loop.");
