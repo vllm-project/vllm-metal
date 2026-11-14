@@ -75,7 +75,9 @@ def allocate_kv_cache_lazily(
     ``tests/attention/test_lazy_kv_allocation.py`` pins that equality.
     """
     if config.needs_kv_cache_zeroing:
-        return allocate_kv_cache(config, torch.device("cpu"), layout)
+        # The zero fill commits the whole pool either way; keep it on MPS so
+        # every backing lives on one device.
+        return allocate_kv_cache(config, torch.device("mps"), layout)
 
     sizes = {tensor.size for tensor in config.kv_cache_tensors}
     if len(sizes) != 1:
