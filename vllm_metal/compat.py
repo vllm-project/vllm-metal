@@ -7,6 +7,7 @@ the later general-plugin hook. Unexpected runtime errors remain visible.
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import os
@@ -73,6 +74,7 @@ def apply_compat_patches() -> None:
     _patch_mlx_lm_qwen3_flat_weight_prefix()
     _patch_mlx_lm_d3_weight_layout()
     _patch_mlx_lm_minicpm4_model_type()
+    _patch_mlx_lm_qwen35_layer_types()
     _patch_transformers_exaone4_config()
 
 
@@ -1067,6 +1069,65 @@ def _d3_weight_layout(model: Any, weights: Mapping[str, Any]) -> Mapping[str, An
             dropped,
         )
     return remapped
+
+
+def _patch_mlx_lm_qwen35_layer_types() -> None:
+    """Honour a checkpoint's explicit ``layer_types`` order in Qwen3.5.
+
+    d3-edge ships ``L L F L L F L L F F F F``, which no
+    ``full_attention_interval`` reproduces, but mlx_lm builds every layer from
+    the interval and never reads ``layer_types`` (ml-explore/mlx-lm#1987), so
+    the module tree does not match the checkpoint's tensors. Upstream control
+    flow stays: the interval builds each layer, and this patch swaps the
+    attention module when the checkpoint disagrees.
+    """
+    from mlx_lm.models import qwen3_5
+
+    if "layer_types" in inspect.signature(qwen3_5.TextModelArgs).parameters:
+        return
+
+    original_from_dict = qwen3_5.TextModelArgs.from_dict.__func__
+    original_layer_init = qwen3_5.DecoderLayer.__init__
+    original_text_init = qwen3_5.Qwen3_5TextModel.__init__
+
+    def from_dict(cls, params):
+        args = original_from_dict(cls, params)
+        layer_types = params.get("layer_types")
+        if layer_types:
+            args.layer_types = tuple(layer_types)
+        return args
+
+    def layer_init(self, args, layer_idx):
+        original_layer_init(self, args, layer_idx)
+        layer_types = getattr(args, "layer_types", None)
+        if not layer_types:
+            return
+        want_linear = layer_types[layer_idx] != "full_attention"
+        if want_linear == self.is_linear:
+            return
+        if want_linear:
+            del self.self_attn
+            self.linear_attn = qwen3_5.GatedDeltaNet(args)
+        else:
+            del self.linear_attn
+            self.self_attn = qwen3_5.Attention(args)
+        self.is_linear = want_linear
+
+    def text_init(self, args):
+        original_text_init(self, args)
+        if getattr(args, "layer_types", None) is None:
+            return
+        # The interval's representative indices can point at the wrong kind.
+        self.ssm_idx = next(
+            (i for i, layer in enumerate(self.layers) if layer.is_linear), None
+        )
+        self.fa_idx = next(
+            (i for i, layer in enumerate(self.layers) if not layer.is_linear), None
+        )
+
+    qwen3_5.TextModelArgs.from_dict = classmethod(from_dict)
+    qwen3_5.DecoderLayer.__init__ = layer_init
+    qwen3_5.Qwen3_5TextModel.__init__ = text_init
 
 
 def _patch_mlx_lm_minicpm4_model_type() -> None:

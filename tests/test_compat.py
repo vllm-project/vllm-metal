@@ -410,6 +410,47 @@ class TestMiniCPM4ModelTypeCompatPatch:
         assert model_cls.__module__ == "mlx_lm.models.minicpm"
 
 
+class TestQwen35LayerTypesCompatPatch:
+    def test_model_follows_an_explicit_layer_types_order(self) -> None:
+        from mlx_lm.models import qwen3_5
+
+        compat._patch_mlx_lm_qwen35_layer_types()
+        layer_types = [
+            "linear_attention",
+            "linear_attention",
+            "full_attention",
+            "linear_attention",
+        ]
+        args = qwen3_5.TextModelArgs.from_dict(
+            {
+                "model_type": "qwen3_5_text",
+                "hidden_size": 8,
+                "intermediate_size": 16,
+                "num_hidden_layers": len(layer_types),
+                "num_attention_heads": 2,
+                "num_key_value_heads": 1,
+                "head_dim": 4,
+                "vocab_size": 32,
+                "linear_num_value_heads": 2,
+                "linear_num_key_heads": 2,
+                "linear_key_head_dim": 4,
+                "linear_value_head_dim": 4,
+                "full_attention_interval": 2,
+                "layer_types": layer_types,
+            }
+        )
+        model = qwen3_5.Qwen3_5TextModel(args)
+
+        assert [layer.is_linear for layer in model.layers] == [
+            True,
+            True,
+            False,
+            True,
+        ]
+        assert model.ssm_idx == 0
+        assert model.fa_idx == 2
+
+
 class TestQwen35Fp8CompatPatch:
     def test_logs_when_mlx_core_is_unavailable(self, monkeypatch) -> None:
         original_import = builtins.__import__

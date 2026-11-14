@@ -30,6 +30,7 @@ class GDNHybridConfig:
     """GDN dims parsed once from the third-party model args boundary."""
 
     full_attention_interval: int
+    layer_types: tuple[str, ...] | None
     num_key_heads: int
     num_value_heads: int
     key_head_dim: int
@@ -39,8 +40,10 @@ class GDNHybridConfig:
     @classmethod
     def from_model_args(cls, model_args: Mapping[str, Any]) -> GDNHybridConfig:
         try:
+            layer_types = model_args.get("layer_types")
             return cls(
                 full_attention_interval=model_args["full_attention_interval"],
+                layer_types=tuple(layer_types) if layer_types else None,
                 num_key_heads=model_args["linear_num_key_heads"],
                 num_value_heads=model_args["linear_num_value_heads"],
                 key_head_dim=model_args["linear_key_head_dim"],
@@ -72,6 +75,16 @@ class GDNHybridConfig:
             )
 
     def layer_roles(self, num_layers: int) -> tuple[LayerRole, ...]:
+        if self.layer_types is not None:
+            if len(self.layer_types) != num_layers:
+                raise ValueError(
+                    "GDN hybrid layer_types has "
+                    f"{len(self.layer_types)} entries for {num_layers} layers."
+                )
+            return tuple(
+                ATTENTION_LAYER if layer_type == "full_attention" else STATE_LAYER
+                for layer_type in self.layer_types
+            )
         interval = self.full_attention_interval
         if not 2 <= interval <= num_layers:
             raise ValueError(
