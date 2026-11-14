@@ -1093,6 +1093,35 @@ class TestModelLifecycle:
             assert isinstance(kwargs, dict)
             assert "model_config" not in kwargs
 
+    def test_awq_load_keeps_float16_under_bfloat16_runner(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Casting the other params to the runner dtype would promote the
+        float16 quantized layer's output to float32."""
+        awq_config = {
+            "quant_method": "awq",
+            "bits": 4,
+            "group_size": 128,
+            "zero_point": True,
+            "version": "gemm",
+        }
+        (tmp_path / "config.json").write_text(
+            json.dumps({"quantization_config": awq_config})
+        )
+        model = nn.Sequential(nn.Embedding(4, 64), nn.QuantizedLinear(64, 4))
+        model.set_dtype(mx.float16)
+        monkeypatch.setattr(
+            "vllm_metal.quant.awq_loader.mlx_lm_load_model",
+            lambda *_args, **_kwargs: (model, {}),
+        )
+        lifecycle, _ = _make_lifecycle(
+            model_config=_runner_model_config(dtype=torch.bfloat16)
+        )
+
+        loaded = lifecycle._load_generation_model(str(tmp_path), is_vlm=False)
+
+        assert loaded(mx.array([[0]])).dtype == mx.float16
+
     def test_load_routes_gguf_to_owner_on_quantization_detection(
         self,
         monkeypatch: pytest.MonkeyPatch,
