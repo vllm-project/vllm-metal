@@ -172,6 +172,12 @@ def apply_pipeline_split(model: nn.Module, pp: PipelineGroup) -> tuple[int, int]
         return None
 
     backbone = model.model
+    num_loops = getattr(backbone, "num_loops", 1)
+    if isinstance(num_loops, int) and not isinstance(num_loops, bool) and num_loops > 1:
+        raise NotImplementedError(
+            "Pipeline parallelism does not support weight-tied looped models "
+            f"(num_loops={num_loops})."
+        )
     layers = backbone.layers
     if not isinstance(layers, list):
         raise TypeError(

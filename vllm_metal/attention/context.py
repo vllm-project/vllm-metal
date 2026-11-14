@@ -160,6 +160,10 @@ class PagedAttentionContext:
     # Per-row Llama 4 query scale memo keyed by (beta, original_max); every
     # scaled layer of this forward shares it (``impls.sdpa.llama4_query_scale``).
     llama4_query_scales: dict[tuple[float, int], Any] = field(default_factory=dict)
+    # Per-forward call counts keyed by physical layer index for weight-tied
+    # looped decoders (e.g. Nanbeige), mapping loop k of layer i to cache slot
+    # k * num_physical_layers + i.
+    layer_call_counts: dict[int, int] = field(default_factory=dict)
 
 
 def set_context(ctx: PagedAttentionContext) -> None:

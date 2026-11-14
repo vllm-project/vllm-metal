@@ -72,6 +72,7 @@ from vllm_metal.attention.runtime.sdpa import SDPAPagedAttentionRuntime
 from vllm_metal.metal.constants import PA_WINDOW_MAX_HEAD_SIZE
 from vllm_metal.utils import get_model_download_path, resolve_mlx_lm_model_path
 from vllm_metal.v1.mlx_lm_paths import mlx_lm_compatible_model_path
+from vllm_metal.v1.model_adapter import effective_num_loops
 from vllm_metal.v1.proposer import (
     _DECODE_INGEST_MAX_TOKENS,
     NoOwnKVProposer,
@@ -915,8 +916,9 @@ def resolve_draft_dims(
             "draft_model speculative decoding requires a draft_model_config"
         )
     _require_full_attention_draft(draft_model_config)
+    num_loops = effective_num_loops(getattr(draft_model_config, "hf_text_config", None))
     return DraftDims(
-        num_layers=draft_model_config.get_total_num_hidden_layers(),
+        num_layers=draft_model_config.get_total_num_hidden_layers() * num_loops,
         num_kv_heads=draft_model_config.get_num_kv_heads(parallel_config),
         head_dim=draft_model_config.get_head_size(),
     )

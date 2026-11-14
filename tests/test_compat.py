@@ -298,8 +298,13 @@ class TestModelMetadataCompat:
     @pytest.fixture
     def without_metadata(self, monkeypatch):
         """Hide the fallback architecture registrations."""
+        from transformers.models.auto import configuration_auto
         from vllm.model_executor.models import ModelRegistry
 
+        config_mapping = configuration_auto.CONFIG_MAPPING
+        monkeypatch.setattr(
+            config_mapping, "_extra_content", dict(config_mapping._extra_content)
+        )
         monkeypatch.setattr(ModelRegistry, "models", dict(ModelRegistry.models))
         for arch in _METADATA_ARCHS:
             ModelRegistry.models.pop(arch, None)
@@ -340,6 +345,133 @@ class TestModelMetadataCompat:
         compat.register_model_compat()
 
         assert _METADATA_ARCHS.isdisjoint(without_metadata.get_supported_archs())
+
+
+def _write_nanbeige_config(path) -> None:
+    (path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["NanbeigeForCausalLM"],
+                "model_type": "nanbeige",
+                "hidden_size": 3072,
+                "num_hidden_layers": 22,
+                "num_attention_heads": 48,
+                "num_key_value_heads": 8,
+                "num_loops": 2,
+                "skip_loop_final_norm": False,
+                "tie_word_embeddings": False,
+                "use_cache": True,
+                "initializer_range": 0.02,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+class TestNanbeigeCompat:
+    @pytest.fixture(autouse=True)
+    def metal_mlx(self, monkeypatch):
+        import vllm.platforms as platforms
+
+        from vllm_metal.platform import MetalPlatform
+
+        monkeypatch.delenv("VLLM_METAL_BACKEND", raising=False)
+        monkeypatch.setattr(platforms, "current_platform", MetalPlatform())
+
+    @pytest.fixture
+    def without_nanbeige(self, monkeypatch):
+        """Hide any Nanbeige registration in Transformers and vLLM."""
+        from transformers.models.auto import configuration_auto
+        from vllm.model_executor.models import ModelRegistry
+
+        config_mapping = configuration_auto.CONFIG_MAPPING
+        monkeypatch.setattr(config_mapping, "_mapping", dict(config_mapping._mapping))
+        monkeypatch.setattr(
+            config_mapping, "_extra_content", dict(config_mapping._extra_content)
+        )
+        config_mapping._mapping.pop("nanbeige", None)
+        config_mapping._extra_content.pop("nanbeige", None)
+        monkeypatch.setattr(ModelRegistry, "models", dict(ModelRegistry.models))
+        ModelRegistry.models.pop("NanbeigeForCausalLM", None)
+        return ModelRegistry
+
+    def test_nanbeige_checkpoint_metadata_loads(
+        self, without_nanbeige, tmp_path
+    ) -> None:
+        from transformers import AutoConfig
+
+        with pytest.raises(ValueError, match="nanbeige"):
+            AutoConfig.for_model("nanbeige")
+
+        _write_nanbeige_config(tmp_path)
+        compat.register_model_compat()
+        compat.register_model_compat()
+        config = AutoConfig.from_pretrained(tmp_path)
+
+        assert "NanbeigeForCausalLM" in without_nanbeige.get_supported_archs()
+        assert config.model_type == "nanbeige"
+        assert config.hidden_size == 3072
+        assert config.num_hidden_layers == 22
+        assert config.num_attention_heads == 48
+        assert config.num_key_value_heads == 8
+        assert config.head_dim == 64
+        assert config.num_loops == 2
+        assert config.skip_loop_final_norm is False
+        assert config.tie_word_embeddings is False
+
+    @pytest.mark.parametrize("bad_loops", [0, -1, True])
+    def test_nanbeige_config_rejects_invalid_num_loops(
+        self, without_nanbeige, tmp_path, bad_loops
+    ) -> None:
+        from transformers import AutoConfig
+
+        _write_nanbeige_config(tmp_path)
+        path = tmp_path / "config.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        path.write_text(json.dumps(data | {"num_loops": bad_loops}), encoding="utf-8")
+        compat.register_model_compat()
+
+        with pytest.raises(ValueError, match="num_loops"):
+            AutoConfig.from_pretrained(tmp_path)
+
+    def test_existing_registrations_are_kept(self, without_nanbeige) -> None:
+        from transformers import AutoConfig
+        from transformers.models.auto import configuration_auto
+
+        sentinel_config = type("Sentinel", (), {"model_type": "nanbeige"})
+        AutoConfig.register("nanbeige", sentinel_config, exist_ok=True)
+        without_nanbeige.register_model(
+            "NanbeigeForCausalLM", "vllm.model_executor.models.llama:LlamaForCausalLM"
+        )
+
+        compat.register_model_compat()
+
+        assert configuration_auto.CONFIG_MAPPING["nanbeige"] is sentinel_config
+        assert (
+            without_nanbeige.models["NanbeigeForCausalLM"].class_name
+            == "LlamaForCausalLM"
+        )
+
+    @pytest.mark.parametrize(
+        ("is_metal", "backend"),
+        [(False, "mlx"), (True, "mps")],
+    )
+    def test_other_platforms_and_backends_keep_nanbeige_unregistered(
+        self, without_nanbeige, monkeypatch, is_metal, backend
+    ) -> None:
+        import vllm.platforms as platforms
+        from transformers import AutoConfig
+        from vllm.platforms.cpu import CpuPlatform
+
+        monkeypatch.setenv("VLLM_METAL_BACKEND", backend)
+        if not is_metal:
+            monkeypatch.setattr(platforms, "current_platform", CpuPlatform())
+
+        compat.register_model_compat()
+
+        assert "NanbeigeForCausalLM" not in without_nanbeige.get_supported_archs()
+        with pytest.raises(ValueError, match="nanbeige"):
+            AutoConfig.for_model("nanbeige")
 
 
 def _install_fake_qwen35_modules(monkeypatch, *, include_moe: bool):

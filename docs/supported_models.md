@@ -195,6 +195,7 @@ and TurboQuant are not validated.
 | OLMoE | ✅ | | MHA + full-projection QK norm (paged) | ✅ | `mlx-community/OLMoE-1B-7B-0125-Instruct-4bit` |
 | OLMo 3 | 🔵 | | MHA + per-layer sliding window (paged) | ✅ | `mlx-community/Olmo-3-7B-Instruct-4bit` |
 | Muse Glimmer | 🔵 | | GQA + per-layer sliding window, gated attention with QK norm (paged) | ✅ | `mlx-community/Muse-Glimmer-30B-4bit` |
+| Nanbeige 4.2 | 🔵 | | GQA, weight-tied looped decoder (paged) | ✅ | `mlx-community/Nanbeige4.2-3B-OptiQ-4bit` |
 
 **Hunyuan on MPS:** use `--generation-config vllm` to override the checkpoint’s unsupported `repetition_penalty=1.05` default.
 
