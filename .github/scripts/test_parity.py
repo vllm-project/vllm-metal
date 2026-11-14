@@ -131,6 +131,25 @@ def test_summary_preserves_parity_counts_and_missing_batches(tmp_path):
     assert "same-model" not in text
 
 
+def test_summary_reports_gguf_parity_and_missing_batches(tmp_path):
+    (tmp_path / "gguf").mkdir()
+    (tmp_path / "gguf/batch-1.json").write_text(
+        json.dumps(
+            {
+                "comparison": {
+                    "counts": {"EXACT": 24, "TOP_K_MATCH": 16, "FAIL": 0},
+                    "passed": True,
+                }
+            }
+        )
+    )
+    text = parity.summarize(
+        tmp_path, model="Qwen/Qwen3.5-0.8B", revision="rev", sha="head"
+    )
+    assert "| Native → HTTP GGUF Q6_K (top-8) | 1 | 24 | 16 | 0 | PASS |" in text
+    assert "| Native → HTTP GGUF Q6_K (top-8) | 2 | — | — | — | Missing |" in text
+
+
 @pytest.mark.parametrize("passed", [True, False])
 def test_summary_exposes_acceptance_failure_and_incomplete_suite(tmp_path, passed):
     case = tmp_path / "acceptance/test_same_model0"

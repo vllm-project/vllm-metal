@@ -215,8 +215,10 @@ class TestParityTool:
             additional_config,
             trust_remote_code,
             speculative_config=None,
+            extra_args=None,
         ):
             assert speculative_config == spec
+            assert extra_args is None
             assert not trust_remote_code
             assert max_num_seqs == 2
             assert gpu_memory_utilization == 0.65
@@ -270,7 +272,7 @@ class TestParityTool:
             path.write_text(json.dumps([row]))
 
         @contextmanager
-        def server(*args, speculative_config=None):
+        def server(*args, speculative_config=None, extra_args=None):
             assert speculative_config is None
             trusted.append(args[-1])
             yield "http://localhost/v1"
@@ -292,8 +294,52 @@ class TestParityTool:
         assert commands[0][commands[0].index("--reference-backend") + 1] == "mlx-vlm"
         assert trusted == [True]
 
-    def test_trust_remote_code_is_rejected_with_speculative_method(
-        self, monkeypatch, capsys
+    def test_reference_model_reaches_reference_and_server_tokenizer(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        # The Hugging Face cache links each file name to an extensionless blob.
+        blob = tmp_path / "blob"
+        blob.write_bytes(b"")
+        gguf = tmp_path / "model.gguf"
+        gguf.symlink_to(blob)
+        dense = tmp_path / "dense"
+        dense.mkdir()
+        commands = []
+        servers = []
+        row = {**self._result([2], []), "input_ids": [1]}
+
+        def generate_reference(command, **kwargs):
+            commands.append(command)
+            path = Path(command[command.index("--generate-reference") + 1])
+            path.write_text(json.dumps([row]))
+
+        @contextmanager
+        def server(model, *args, speculative_config=None, extra_args=None):
+            servers.append((model, extra_args))
+            yield "http://localhost/v1"
+
+        monkeypatch.setattr("subprocess.run", generate_reference)
+        monkeypatch.setattr("tools.check_parity.serving", server)
+        monkeypatch.setattr("tools.check_parity.http_generate", lambda *args: args[2])
+
+        assert check_parity(
+            str(gguf),
+            ["test prompt"],
+            1,
+            batch_sizes=(1,),
+            output_dir=tmp_path,
+            reference_model=str(dense),
+        )
+        assert commands[0][commands[0].index("--model") + 1] == str(dense)
+        assert servers == [(str(gguf), ["--tokenizer", str(dense)])]
+
+    @pytest.mark.parametrize(
+        "option",
+        [["--trust-remote-code"], ["--reference-model", "dense"]],
+        ids=["trust-remote-code", "reference-model"],
+    )
+    def test_unsupported_options_are_rejected_with_speculative_method(
+        self, monkeypatch, capsys, option
     ) -> None:
         monkeypatch.setattr(
             "sys.argv",
@@ -305,7 +351,7 @@ class TestParityTool:
                 "draft_model",
                 "--draft",
                 "draft",
-                "--trust-remote-code",
+                *option,
             ],
         )
 
@@ -313,7 +359,7 @@ class TestParityTool:
             main()
 
         assert exc.value.code == 2
-        assert "--trust-remote-code cannot be combined with --method" in (
+        assert f"{option[0]} cannot be combined with --method" in (
             capsys.readouterr().err
         )
 
