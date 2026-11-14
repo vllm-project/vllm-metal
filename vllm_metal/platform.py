@@ -602,11 +602,8 @@ class MetalPlatform(Platform):
 
         # Apply TurboQuant config from --additional-config
         # Example: --additional-config '{"turboquant": true, "k_quant": "q4_0"}'
-        if isinstance(add, dict) and add.get("turboquant"):
-            config.turboquant = True
-            config.k_quant = add.get("k_quant", "q8_0")
-            config.v_quant = add.get("v_quant", "q3_0")
-            config._validate_turboquant()
+        config.apply_turboquant(add)
+        if config.turboquant:
             logger.info(
                 f"TurboQuant enabled via --additional-config: "
                 f"k_quant={config.k_quant}, v_quant={config.v_quant}"
@@ -1084,6 +1081,11 @@ class MetalPlatform(Platform):
                 raise NotImplementedError(
                     "Data parallelism (data_parallel_size > 1) is not "
                     "supported for speech-to-text models."
+                )
+            if vllm_config.lora_config is not None:
+                raise NotImplementedError(
+                    "LoRA is not supported for speech-to-text models on Metal; "
+                    "drop --enable-lora."
                 )
             cache_config = vllm_config.cache_config
             was_async_scheduling = bool(scheduler_config.async_scheduling)

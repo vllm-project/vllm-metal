@@ -710,6 +710,37 @@ class TestMetalPlatform:
         with pytest.raises(NotImplementedError, match="speech-to-text"):
             MetalPlatform.check_and_update_config(vllm_config)
 
+    def test_check_and_update_config_rejects_lora_with_stt(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """STT checkpoints run on a runner with no LoRA interface.
+
+        vLLM accepts --enable-lora because the Whisper architecture declares
+        SupportsLoRA, so the rejection has to happen here.
+        """
+        self._patch_stt_resolution(monkeypatch, is_stt=True)
+        vllm_config = self._platform_config(
+            cache_config=SimpleNamespace(kv_cache_dtype_skip_layers=[]),
+            model_config=SimpleNamespace(
+                enable_sleep_mode=False,
+                model="openai/whisper-tiny",
+                revision=None,
+                disable_cascade_attn=False,
+                tokenizer=None,
+                multimodal_config=None,
+                hf_config=SimpleNamespace(model_type="whisper"),
+                is_hybrid=False,
+            ),
+            scheduler_config=SimpleNamespace(
+                async_scheduling=False,
+                enable_chunked_prefill=False,
+            ),
+            speculative_config=None,
+            lora_config=SimpleNamespace(enable_lora=True),
+        )
+        with pytest.raises(NotImplementedError, match="LoRA is not supported"):
+            MetalPlatform.check_and_update_config(vllm_config)
+
     def test_check_and_update_config_rejects_uni_executor_with_pipeline_parallel(
         self,
     ) -> None:
