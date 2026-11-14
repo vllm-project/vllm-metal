@@ -41,13 +41,17 @@ def min_p(logits, stride, mapping, values, vocab_size, BLOCK_SIZE):
 def compute_token_logprobs(logits, token_ids):
     # Replaces the launcher, not _topk_log_softmax_kernel: it sizes its gather
     # block with triton.next_power_of_2, which the Triton placeholder lacks.
-    # The kernel streams each row; chunks keep the fp32 rows near 32 MiB.
+    # The kernel streams each row; chunks keep the fp32 rows near 32 MiB. A
+    # named chunk would stay alive while the next one is built.
     token_ids = token_ids.long()
     scores = logits.new_empty(token_ids.shape, dtype=torch.float32)
     rows = max(1, (1 << 23) // logits.shape[-1])
     for i in range(0, logits.shape[0], rows):
-        chunk = logits[i : i + rows].log_softmax(-1, dtype=torch.float32)
-        scores[i : i + rows] = chunk.gather(-1, token_ids[i : i + rows])
+        scores[i : i + rows] = (
+            logits[i : i + rows]
+            .log_softmax(-1, dtype=torch.float32)
+            .gather(-1, token_ids[i : i + rows])
+        )
     return scores
 
 
