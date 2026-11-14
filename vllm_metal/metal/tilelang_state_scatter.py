@@ -16,8 +16,7 @@ def _compact_strides(shape: tuple[int, ...]) -> tuple[int, ...]:
 def _compile(shape, strides, count, dtype, zero):
     message = (
         "TileLang state scatter requires the optional TileLang MLX adapter and "
-        "native runtime. Follow docs/tilelang-state-cache.md, or set "
-        "VLLM_METAL_GDN_STATE_SCATTER=native."
+        "native runtime. Follow docs/tilelang-state-cache.md."
     )
     if importlib.util.find_spec("_tilelang_mlx") is None:
         raise ImportError(message)

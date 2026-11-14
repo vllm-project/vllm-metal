@@ -1,9 +1,15 @@
-# Experimental TileLang GDN state updates
+# TileLang GDN state scatter candidate
 
-`VLLM_METAL_GDN_STATE_SCATTER=tilelang` selects TileLang-generated Metal kernels
-for GDN state-cache row writes and zeroing. The default is `native`; installing
-vllm-metal does not install TileLang. This is an explicit experiment, not a
-replacement for the full GDN recurrence or a demonstrated serving speedup.
+Backend policy lives in `vllm_metal/metal/state_scatter.py`. The cache caller
+uses one scatter interface for writes, pending flushes, slot copies and zeroing.
+There is no user-facing backend switch. Native remains the default based on
+the measurements below; installing vllm-metal does not install TileLang.
+Tests can substitute the private kernel implementation, and the benchmark
+calls each candidate directly without changing serving dispatch.
+
+The motivation is to express the operation in maintainable kernel code and
+make algorithm experiments easier. This candidate does not replace the GDN
+recurrence or establish a serving speedup.
 
 ## Install the optional dependencies
 
@@ -37,60 +43,94 @@ python -c 'from tilelang.contrib.mlx import compile; import _tilelang_mlx'
 python -m pytest testing/python/metal/test_metal_mlx.py -q
 ```
 
-Keep this `PYTHONPATH` when starting vLLM and its worker subprocesses. The native
-TileLang libraries are discovered in the checkout's `build` directory. Restart
-the server after switching the backend; each state cache captures the setting
-when constructed.
+## Code comparison and scope
 
-From the vllm-metal checkout, with a model whose weights and state use FP16:
+| Concern | Existing Metal implementation | TileLang candidate |
+| --- | --- | --- |
+| Row addressing | Manual flattened-index decoding and physical-stride arithmetic | Static `T.StridedTensor` and logical tensor indices |
+| Work distribution | Metal grid indices plus C++ launch configuration | `T.Kernel` and `T.Parallel` in the kernel definition |
+| MLX integration | Operator-specific C++ primitive, buffer bindings and dispatch | Shared MLX adapter with `compile_mlx(..., inplace_idx=0)` |
+| Dtypes and optimization | Explicit instantiations, scalar and vec4 paths; broader dtype/paged support | FP16/FP32 nonpaged writes/zeroing; static specialization |
 
-```bash
-VLLM_METAL_GDN_STATE_SCATTER=tilelang \
-  vllm serve /path/to/fp16-model
+The TileLang write body expresses the destination and source directly:
+
+```python
+with T.Kernel(T.ceildiv(width, 256), count, threads=128) as (bx, by):
+    for j in T.Parallel(256):
+        col = bx * 256 + j
+        if col < width and ids[by] >= 0 and ids[by] < slots:
+            pool[(ids[by],) + coords(col)] = rows[(by,) + coords(col)]
 ```
 
-For a text-only converted multimodal checkpoint such as Qwen3.5, also set
-`VLLM_METAL_MULTIMODAL_MODE=text-only`. The model's configured dtype must match
-its actual weights. BF16 state is not supported by this adapter; use an FP16
-checkpoint or keep `VLLM_METAL_GDN_STATE_SCATTER=native`. Missing optional
-dependencies and unsupported state dtypes raise errors rather than silently
-falling back to native.
+Compare `metal/tilelang_state_scatter.py` (98 lines including validation,
+zeroing and caching) with `metal/kernels_v2/gdn_state_scatter.metal` (91 lines)
+plus the scatter primitive and wrapper in `metal/gdn.cpp` (roughly 150 lines).
+These counts are not feature-equivalent: native additionally supports BF16,
+int8/uint8, paged addressing and vec4 writes. Native is retained, so this PR
+increases total repository code. The maintenance benefit is avoiding a separate
+operator-specific MLX primitive and Metal launch plumbing for the candidate;
+the shared adapter still owns that runtime complexity upstream.
 
-## Scope and validation
+The cache passes physical strides and publishes the returned write-dependent
+alias through its existing storage owner. Destination storage is shared;
+non-contiguous read-only rows may be materialized. IDs must be valid and
+distinct under the cache contract. Unsupported dtypes and missing dependencies
+fail explicitly. Up to 128 specializations are cached per process, keyed by
+shape, strides, dtype, row count and zero/write mode.
 
-The cache passes physical page strides to the kernel and publishes its returned
-state alias through the existing `CacheViews` storage owner. Pending writes,
-slot copies and zeroing use the same selection. The destination allocation is
-not copied; non-contiguous read-only update rows may be materialized by MLX.
-Slot IDs must be valid and distinct, as required by the native cache contract.
+## Validation and reproducible measurements
 
-Kernels specialize static shape, strides, dtype, row count and zero/write mode;
-up to 128 specializations are cached per process. New specializations incur
-lowering/compilation overhead. Changing this switch does not replace the GDN
-recurrence, attention, or the scheduling policy that can defer state writes.
-
-Run the existing storage tests in the configured environment:
+From the vllm-metal checkout with the dependencies above:
 
 ```bash
-python -c 'from tilelang.contrib.mlx import compile; import _tilelang_mlx'
 python -m pytest tests/attention/test_shared_cache_storage.py \
   tests/attention/test_lazy_kv_allocation.py -q
+python tools/benchmark/state_scatter_benchmark.py --samples 9 --iterations 32 \
+  --output state-scatter-results.json
 ```
 
-Native cases always run. The four TileLang cases skip only when TileLang or its
-optional native extension is absent; import or execution errors in an installed
-integration remain failures. Standard CI does not install this unmerged
-optional dependency. Run the preflight above and confirm no skips when
-validating the TileLang path.
+Native tests always run. Four optional cases skip only when TileLang or its
+native extension is absent; broken installed integrations still fail. TileLang
+is not added to standard installation or CI. Tests use real KVCacheStorage
+allocations and cover backing bytes, padding, layer offsets, deferred updates,
+copy/zero and cross-stream readers.
 
-Local testing covered real upstream allocations, FP16/FP32 state, layer offsets,
-padding, deferred updates followed by copy/zero, and cross-stream consumers.
-Qwen3.5-0.8B FP16 text serving also matched native MLX tokens for eight prompts
-at request batch sizes one and two with both scatter backends. These checks do
-not qualify all hybrid models, BF16, vision, or speculative decoding.
+Local measurements used Apple M4 (8 GPU cores, 16 GiB), macOS 26.0.1,
+SDK 26.2, Python 3.12.13, MLX 0.32.4 and the TileLang revision pinned above.
+The benchmark alternates backend order across nine samples of 32 updates,
+warms each kernel three times, and checks the full original backing after each
+sample. Shapes, strides, offsets and raw samples are recorded in its JSON.
 
-Repeated HTTP serving comparisons were sensitive to run order and machine
-state. Keep the native default; measure your workload using the
-[macOS benchmark procedure](benchmarking-macos.md) before making performance
-claims. The [TileLang adapter documentation](https://github.com/tile-ai/tilelang/blob/2cdbb1e05efb6aee83590403274bedea31813a4b/examples/metal/README.mlx.md)
-describes its storage, stream and version constraints.
+Median host wall time per update, in microseconds:
+
+| Case | Sync native | Sync TileLang | Lazy chain native | Lazy chain TileLang |
+| --- | ---: | ---: | ---: | ---: |
+| Small FP32 rows | 171.74 | 185.40 | 9.01 | 11.10 |
+| FP16 conv, batch 1 | 176.44 | 190.48 | 24.23 | 26.09 |
+| FP16 conv, batch 2 | 189.49 | 195.43 | 23.26 | 25.58 |
+| FP16 conv, padded offset | 233.62 | 201.37 | 44.12 | 28.42 |
+| FP32 recurrent, batch 1 | 258.81 | 258.33 | 66.45 | 51.97 |
+| FP32 recurrent, batch 2 | 291.12 | 269.26 | 105.54 | 90.14 |
+| FP32 recurrent, padded zero | 263.36 | 266.45 | 91.95 | 66.99 |
+
+Sync evaluates after every update; lazy chain evaluates after all 32 dependent
+updates. These times include Python/MLX submission and completion, exclude
+compilation, and are not pure GPU timings. JSON reports p10/p90 and separates
+loop time from final wait; asynchronous execution overlaps those intervals.
+Cold compilation cost is not characterized by this benchmark.
+
+Small lazy updates regress about 23%, and aligned conv updates about 8–10%,
+while some large or unaligned cases improve. These results do not justify
+promoting TileLang universally. Historical HTTP serving measurements of the
+preceding experimental dispatch also drifted with run order: paired TileLang /
+native throughput ratios were 1.004/1.012/0.932 at concurrency 1 and
+0.995/1.101/1.184 at concurrency 2. They do not establish stable parity or an
+acceptable serving regression. Native remains the internal default; promotion
+requires repeatable workload evidence and an agreed regression budget.
+
+Qwen3.5-0.8B FP16 text parity covers eight fixed prompts, 16 generated tokens,
+and request batch sizes 1 and 2. This does not qualify all hybrid models,
+BF16, vision or speculative serving. See the
+[macOS benchmark procedure](benchmarking-macos.md) for serving measurements and
+[adapter documentation](https://github.com/tile-ai/tilelang/blob/2cdbb1e05efb6aee83590403274bedea31813a4b/examples/metal/README.mlx.md)
+for storage, stream and version constraints.

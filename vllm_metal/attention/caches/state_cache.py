@@ -10,19 +10,17 @@ from typing import TYPE_CHECKING
 
 import mlx.core as mx
 
-from vllm_metal import envs
-
 if TYPE_CHECKING:
     from vllm_metal.attention.context import PagedAttentionContext
     from vllm_metal.attention.impls.gdn_spec import GDNSpecVerifyStep
 
 
 @functools.cache
-def _native_row_scatter() -> Callable[..., mx.array]:
+def _row_scatter() -> Callable[..., mx.array]:
     """Return the required in-place row-scatter primitive."""
-    from vllm_metal.metal import get_ops
+    from vllm_metal.metal.state_scatter import scatter
 
-    return get_ops().gdn_state_scatter
+    return scatter
 
 
 @dataclass(frozen=True)
@@ -42,7 +40,6 @@ class PagedStateCache:
         if len(states) not in (1, 2):
             raise ValueError("state cache requires conv and optional recurrent views")
         self.conv_states = states[0]
-        self._tilelang_scatter = envs.VLLM_METAL_GDN_STATE_SCATTER == "tilelang"
         self.recurrent_states = states[1] if len(states) > 1 else []
         self.num_layers = len(self.conv_states)
         self.max_seqs = self.conv_states[0].shape[0]
@@ -314,13 +311,9 @@ class PagedStateCache:
         # MLX's indexed assignment converts the source implicitly and callers
         # rely on it; the primitive requires an exact match.  ``astype`` is a
         # no-op when the dtypes already agree, and O(rows) otherwise.
-        if self._tilelang_scatter:
-            from vllm_metal.attention.caches.tilelang_scatter import scatter
-
-            return scatter(
-                pool, rows.astype(pool.dtype), ids, strides=strides, zero=zero
-            )
-        return _native_row_scatter()(pool, rows.astype(pool.dtype), ids, zero=zero)
+        return _row_scatter()(
+            pool, rows.astype(pool.dtype), ids, strides=strides, zero=zero
+        )
 
     def write_conv_rows(self, layer_idx: int, rows: mx.array, ids: mx.array) -> None:
         """Write conv rows and rebind every sibling to the returned handle."""

@@ -21,7 +21,7 @@ from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
 from vllm_metal.attention.caches.state_cache import PagedStateCache
 from vllm_metal.attention.caches.storage import KVCacheStorage
 from vllm_metal.attention.impls.linear import GDNPagedAttentionWrapper, _GDNForwardState
-from vllm_metal.metal import get_ops
+from vllm_metal.metal import get_ops, state_scatter
 
 
 def make_storage(num_blocks=4):
@@ -69,7 +69,10 @@ def test_deferred_state_updates_preserve_shared_pages(
         or importlib.util.find_spec("_tilelang_mlx") is None
     ):
         pytest.skip("Install the optional dependencies in docs/tilelang-state-cache.md")
-    monkeypatch.setenv("VLLM_METAL_GDN_STATE_SCATTER", backend)
+    if backend == "tilelang":
+        from vllm_metal.metal.tilelang_state_scatter import scatter
+
+        monkeypatch.setattr(state_scatter, "_implementation", scatter)
     storage = make_storage()
     mx.eval(*storage.buffers)
     backing = next(iter(storage.tensors.values())).untyped_storage()
