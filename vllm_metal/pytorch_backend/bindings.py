@@ -17,6 +17,7 @@ def register_kernel_overrides():
             f"{sample_module}.gumbel._gumbel_sample_kernel": sampling.gumbel_sample,
             f"{sample_module}.gumbel._temperature_kernel": sampling.temperature,
             f"{sample_module}.min_p._min_p_kernel": sampling.min_p,
+            f"{sample_module}.logprob._ranks_kernel": sampling.ranks,
             f"{module}._gather_draft_sampled_kernel": speculative_ops.gather_draft_sampled,
             f"{module}._flatten_sampled_kernel": speculative_ops.flatten_sampled,
             f"{sample_module}.prompt_logprob._prompt_logprobs_token_ids_kernel": (
@@ -60,9 +61,8 @@ def _install_speculative_ops():
     from vllm.v1.worker.gpu.spec_decode import rejection_sampler
     from vllm.v1.worker.gpu.spec_decode.target_dependent_ar import speculator
 
-    from vllm_metal.pytorch_backend import input_ops, runtime, speculative_ops
+    from vllm_metal.pytorch_backend import input_ops, speculative_ops
 
-    rejection_sampler.compute_topk_scores = runtime.compute_topk_scores
     speculator.prepare_prefill_inputs = speculative_ops.prepare_prefill_inputs
     speculator.prepare_decode_inputs = speculative_ops.prepare_decode_inputs
     speculator.update_draft_inputs = speculative_ops.update_draft_inputs
@@ -89,9 +89,9 @@ def install():
     from vllm.model_executor.layers.mamba.short_conv import ShortConv
     from vllm.v1.attention.ops import vit_attn_wrappers
     from vllm.v1.worker.gpu import buffer_utils, model_runner
-    from vllm.v1.worker.gpu.sample import prompt_logprob, sampler
+    from vllm.v1.worker.gpu.sample import logprob, prompt_logprob
 
-    from vllm_metal.pytorch_backend import runtime
+    from vllm_metal.pytorch_backend import runtime, sampling
     from vllm_metal.pytorch_backend.models.qwen3_5 import install as install_qwen3_5
 
     if getattr(buffer_utils, "_metal_installed", False):
@@ -124,9 +124,9 @@ def install():
 
     _install_input_ops()
     _install_speculative_ops()
-    sampler.compute_topk_scores = runtime.compute_topk_scores
-    prompt_logprob.compute_topk_scores = runtime.compute_topk_scores
-    # Unlike upstream's Triton kernels, this scorer materializes fp32 logprobs:
-    # 1024 rows of a 248k vocab is 1 GB.
+    logprob.compute_token_logprobs = sampling.compute_token_logprobs
+    prompt_logprob.compute_token_logprobs = sampling.compute_token_logprobs
+    # MPS topk over a chunk's logits peaks at about 6x their size: 3 GB for
+    # upstream's 1024 rows of a 248k vocab.
     prompt_logprob.CHUNK_SIZE = 128
     buffer_utils._metal_installed = True

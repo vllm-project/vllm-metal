@@ -6,6 +6,7 @@
 # Kernel launch keywords retain the upstream Triton signatures.
 # Temperature and Gumbel ABIs: https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/worker/gpu/sample/gumbel.py
 # Min-p ABI: https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/worker/gpu/sample/min_p.py
+# Logprob ABIs (v0.33.0): https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/worker/gpu/sample/logprob.py#L61-L108
 # ruff: noqa: N803
 
 from functools import cache
@@ -35,6 +36,24 @@ def temperature(logits, stride, mapping, values, vocab_size, BLOCK_SIZE):
 def min_p(logits, stride, mapping, values, vocab_size, BLOCK_SIZE):
     threshold = logits.amax(-1, keepdim=True) + values[mapping.long(), None].log()
     logits.masked_fill_(logits < threshold, -float("inf"))
+
+
+def compute_token_logprobs(logits, token_ids):
+    # Replaces the launcher, not _topk_log_softmax_kernel: it sizes its gather
+    # block with triton.next_power_of_2, which the Triton placeholder lacks.
+    # The kernel streams each row; chunks keep the fp32 rows near 32 MiB.
+    token_ids = token_ids.long()
+    scores = logits.new_empty(token_ids.shape, dtype=torch.float32)
+    rows = max(1, (1 << 23) // logits.shape[-1])
+    for i in range(0, logits.shape[0], rows):
+        chunk = logits[i : i + rows].log_softmax(-1, dtype=torch.float32)
+        scores[i : i + rows] = chunk.gather(-1, token_ids[i : i + rows])
+    return scores
+
+
+def ranks(output, logits, logits_stride, token_ids, vocab_size, BLOCK_SIZE):
+    selected = logits.gather(-1, token_ids.long()[:, None])
+    torch.sum(logits[:, :vocab_size] >= selected, -1, out=output)
 
 
 def gumbel_sample(
