@@ -7,9 +7,9 @@ from collections.abc import Sequence
 
 import mlx.core as mx
 from vllm.sampling_params import SamplingParams
-from vllm.v1.sample.sampler import Sampler
 
 from vllm_metal.stt.sampling import STTSampling
+from vllm_metal.v1.sampling import Sampler
 
 VOCAB_SIZE = 1024
 # Far enough below the scored ids that the rest of vocab never wins.
