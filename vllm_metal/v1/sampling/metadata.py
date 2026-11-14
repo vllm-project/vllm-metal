@@ -5,8 +5,7 @@
 # which vllm-project/vllm#63373 removes. Local modifications:
 #   * LogitsProcessors type comes from vllm_metal.v1.logits_processors.
 #   * thinking_budget_state_holder is typed as the local ThinkingBudgetState
-#     protocol; the hook is kept (None today), so a future thinking-budget
-#     implementation only needs to satisfy the protocol.
+#     protocol, which vllm_metal.v1.thinking_budget.ForcedEndTokens satisfies.
 
 from __future__ import annotations
 

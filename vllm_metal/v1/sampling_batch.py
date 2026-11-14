@@ -28,6 +28,11 @@ from vllm_metal.v1.sampling.builtin_logits_processors import (
     MinTokensLogitsProcessor,
 )
 from vllm_metal.v1.sampling.torch_utils import make_tensor_with_pad
+from vllm_metal.v1.thinking_budget import (
+    ForcedEndTokens,
+    ThinkingBudgetMarkers,
+    forced_end_tokens,
+)
 
 GREEDY_TEMPERATURE_EPS = 1e-5
 _EMPTY_LOGITSPROCS = LogitsProcessors()
@@ -62,6 +67,7 @@ class SamplingBatch:
         *,
         vocab_size: int,
         generators: dict[int, torch.Generator] | None = None,
+        thinking_budget: ThinkingBudgetMarkers | None = None,
     ) -> None:
         batch_size = len(sampling_params_list)
         if len(prompt_token_id_lists) != batch_size:
@@ -102,6 +108,20 @@ class SamplingBatch:
             and sampling_params.presence_penalty == 0.0
             and sampling_params.repetition_penalty == 1.0
             for sampling_params in self.sampling_params_list
+        )
+        budgets = [
+            sampling_params.thinking_token_budget
+            for sampling_params in self.sampling_params_list
+        ]
+        self.forced_end_tokens = (
+            forced_end_tokens(
+                budgets,
+                self.prompt_token_id_lists,
+                self.output_token_id_lists,
+                thinking_budget,
+            )
+            if thinking_budget is not None and any(b is not None for b in budgets)
+            else {}
         )
 
     @property
@@ -223,6 +243,7 @@ class SamplingBatch:
             and not sampling_params.allowed_token_ids
             and not sampling_params.bad_words_token_ids
             and not sampling_params.logit_bias
+            and sampling_params.thinking_token_budget is None
             for sampling_params in sampling_params_list
         )
 
@@ -257,6 +278,7 @@ class SamplingBatch:
             and not sp.allowed_token_ids
             and not sp.bad_words_token_ids
             and not sp.logit_bias
+            and sp.thinking_token_budget is None
             for sp in sampling_params_list
         )
 
@@ -736,6 +758,11 @@ class SamplingBatch:
             bad_words_token_ids=self._make_bad_words_token_ids(),
             logitsprocs=self._make_logitsprocs(),
             logprob_token_ids=logprob_token_ids,
+            thinking_budget_state_holder=(
+                ForcedEndTokens(self.forced_end_tokens)
+                if self.forced_end_tokens
+                else None
+            ),
         )
 
 
@@ -854,6 +881,7 @@ def sample_decode_tokens(
     *,
     vocab_size: int,
     next_native_rng_key: Callable[[], mx.array] | None = None,
+    thinking_budget: ThinkingBudgetMarkers | None = None,
 ) -> _SamplingResult:
     """Sample one token per decode request from evaluated logits.
 
@@ -863,6 +891,7 @@ def sample_decode_tokens(
         num_decode: Number of decode requests (prefix of the token dimension).
         sampler: vLLM Sampler instance.
         vocab_size: Model vocabulary size.
+        thinking_budget: Reasoning markers for ``thinking_token_budget``.
     Returns:
         Sampled token IDs and optional logprobs, one row per decode request.
     """
@@ -890,6 +919,7 @@ def sample_decode_tokens(
         output_tokens_list,
         vocab_size=vocab_size,
         generators=generators,
+        thinking_budget=thinking_budget,
     )
     return sample_from_logits(
         decode_logits, batch, sampler, next_native_rng_key=next_native_rng_key
@@ -905,6 +935,7 @@ def sample_prefill_tokens(
     *,
     vocab_size: int,
     next_native_rng_key: Callable[[], mx.array] | None = None,
+    thinking_budget: ThinkingBudgetMarkers | None = None,
 ) -> _SamplingResult:
     """Sample from the last logit position of each completed prefill.
 
@@ -915,6 +946,7 @@ def sample_prefill_tokens(
         num_decode: Number of decode requests (offset into cu_seqlens).
         sampler: vLLM Sampler instance.
         vocab_size: Model vocabulary size.
+        thinking_budget: Reasoning markers for ``thinking_token_budget``.
     Returns:
         Sampled token IDs and optional logprobs, aligned to ``prefill_reqs``.
         Intermediate chunks have an unused zero token placeholder; they must
@@ -952,6 +984,7 @@ def sample_prefill_tokens(
             for j, pr in enumerate(final_reqs)
             if pr.generator is not None
         },
+        thinking_budget=thinking_budget,
     )
     result = sample_from_logits(
         last_logits, batch, sampler, next_native_rng_key=next_native_rng_key

@@ -355,16 +355,7 @@ class MetalPlatform(Platform):
                 parameter="prompt_logprob_token_ids",
             )
 
-        unsupported_controls = [
-            name
-            for name, enabled in (
-                (
-                    "thinking_token_budget",
-                    getattr(params, "thinking_token_budget", None) is not None,
-                ),
-            )
-            if enabled
-        ]
+        unsupported_controls: list[str] = []
         if envs.VLLM_METAL_BACKEND == "mps":
             unsupported_controls += [
                 name
@@ -387,7 +378,11 @@ class MetalPlatform(Platform):
             ]
             unsupported_controls += [
                 name
-                for name in ("logprob_token_ids", "structured_outputs")
+                for name in (
+                    "logprob_token_ids",
+                    "structured_outputs",
+                    "thinking_token_budget",
+                )
                 if getattr(params, name, None) is not None
             ]
         if unsupported_controls:
@@ -411,6 +406,10 @@ class MetalPlatform(Platform):
                 ("top_p", params.top_p < 1.0),
                 ("logit_bias", bool(params.logit_bias)),
                 ("min_tokens", params.min_tokens > 0),
+                (
+                    "thinking_token_budget",
+                    params.thinking_token_budget is not None,
+                ),
             ):
                 if enabled:
                     raise VLLMValidationError(
