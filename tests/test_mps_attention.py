@@ -74,7 +74,7 @@ ops.forward(
     torch.tensor([[1, 2, 3]], dtype=torch.int32, device="mps"),
     torch.tensor([40], dtype=torch.int32, device="mps"),
     torch.tensor([0, 40], dtype=torch.int32, device="mps"),
-    torch.empty_like(q), 40, 128**-0.5, -1, 0.0, 1,
+    torch.empty_like(q), 40, 128**-0.5, -1, 0.0, 1, None,
 )
 torch.mps.synchronize()
 """,
@@ -107,20 +107,24 @@ torch.mps.synchronize()
     ],
 )
 @pytest.mark.parametrize(
-    "force_tiled,counts,starts,prefilling",
+    "force_tiled,counts,starts,prefilling,causal",
     [
-        (False, [39, 1], [17, 700], [True, False]),
-        (True, [39, 1], [17, 700], [True, False]),
-        (False, [1, 1], [17, 700], None),
-        (False, [1, 1], [17, 40], [False, False]),
-        (False, [3, 4], [511, 700], [False, False]),
-        (False, [5, 1], [17, 700], [False, False]),
-        (False, [2, 2], [17, 40], [False, False]),
-        (False, [2, 2], [17, 40], [True, False]),
+        (False, [39, 1], [17, 700], [True, False], True),
+        (True, [39, 1], [17, 700], [True, False], True),
+        (False, [1, 1], [17, 700], None, True),
+        (False, [1, 1], [17, 40], [False, False], True),
+        (False, [3, 4], [511, 700], [False, False], True),
+        (False, [5, 1], [17, 700], [False, False], True),
+        (False, [2, 2], [17, 40], [False, False], True),
+        (False, [2, 2], [17, 40], [True, False], True),
+        pytest.param(
+            False, [39, 1], [17, 700], [False, False], False, id="block-draft"
+        ),
     ],
 )
 def test_mps_paged_attention(
     dtype,
+    causal,
     head_size,
     block_size,
     window,
@@ -170,10 +174,16 @@ def test_mps_paged_attention(
             torch.arange(start + count)[None, :]
             <= torch.arange(start, start + count)[:, None]
         )
+        if not causal:
+            mask.fill_(True)
         if window is not None:
             mask &= torch.arange(start + count)[None, :] >= (
                 torch.arange(start, start + count)[:, None] + 1 - window
             )
+            if not causal:
+                mask &= torch.arange(start + count)[None, :] <= (
+                    torch.arange(start, start + count)[:, None] + window - 1
+                )
         q_ref = q[offset : offset + count].transpose(0, 1).float()
         k_ref = (
             history[..., :head_size].repeat_interleave(2, dim=1).transpose(0, 1).float()
@@ -210,12 +220,13 @@ def test_mps_paged_attention(
         block_table_tensor=torch.tensor(table, dtype=torch.int32, device="mps"),
         slot_mapping=torch.tensor(slots, dtype=torch.int64, device="mps"),
         is_prefilling=torch.tensor(prefilling) if prefilling is not None else None,
+        causal=causal,
     )
     metadata = MPSAttentionMetadataBuilder(None, [], None, torch.device("mps")).build(
         0, common
     )
     assert metadata.window_seqlen_q == (
-        max(counts) if prefilling == [False, False] else 1
+        max(counts) if causal and prefilling == [False, False] else 1
     )
     gpu_qkv = qkv.to("mps")
     gpu_q, gpu_k, gpu_v = gpu_qkv.split([16, 8, 8], dim=1)
@@ -247,3 +258,16 @@ def test_mps_paged_attention(
         out.cpu().float(), torch.cat(reference), atol=0.003, rtol=0.03
     )
     torch.testing.assert_close(gpu_cache.cpu(), expected_cache, atol=0, rtol=0)
+
+
+def test_context_cache_write_skips_rejected_rows():
+    from vllm_metal.pytorch_backend.attention import MPSAttentionImpl
+
+    impl = MPSAttentionImpl(2, 128, 128**-0.5, num_kv_heads=1)
+    cache = torch.full((3, 1, 16, 256), 7, dtype=torch.bfloat16, device="mps")
+    k, v = torch.randn(2, 3, 1, 128, dtype=cache.dtype, device="mps")
+    impl.do_kv_cache_update(None, k, v, cache, torch.tensor([16, -1, 33], device="mps"))
+    expected = torch.full_like(cache, 7)
+    expected[1, 0, 0] = torch.cat((k[0, 0], v[0, 0]))
+    expected[2, 0, 1] = torch.cat((k[2, 0], v[2, 0]))
+    torch.testing.assert_close(cache, expected, atol=0, rtol=0)

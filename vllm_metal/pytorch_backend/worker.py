@@ -44,8 +44,7 @@ def configure_mps(config, *, omni=False):
         model.get_head_size() not in MPSAttentionBackend.get_supported_head_sizes()
         or model.is_encoder_decoder
         or model.is_diffusion
-        # MPS attention is causal only; prefix LMs attend bidirectionally
-        # over image tokens.
+        # Image-prefix attention metadata is not wired into MPS.
         or model.is_mm_prefix_lm
         or model.is_moe
         or (
@@ -75,15 +74,24 @@ def configure_mps(config, *, omni=False):
         )
     spec = config.speculative_config
     if spec is not None and (
-        spec.method != "eagle3"
+        spec.method not in ("eagle3", "dflash")
         or spec.draft_sample_method != "greedy"
         or spec.rejection_sample_method != "standard"
         or spec.enable_adaptive_verification
-        or spec.parallel_drafting
+        or (spec.parallel_drafting and spec.method != "dflash")
         or model.has_inner_state
         or config.watermark_config is not None
     ):
-        raise NotImplementedError("MPS speculation currently supports greedy EAGLE3")
+        raise NotImplementedError(
+            "MPS speculation currently supports greedy EAGLE3 and DFlash"
+        )
+    if (
+        spec is not None
+        and spec.method == "dflash"
+        and set(spec.draft_model_config.architectures)
+        & {"DFlash2DraftModel", "LiLiCorrDraftModel"}
+    ):
+        raise NotImplementedError("MPS does not yet implement candidate-walk drafting")
     if config.cache_config.block_size is None:
         config.cache_config.block_size = 16
     block_size = config.cache_config.block_size
