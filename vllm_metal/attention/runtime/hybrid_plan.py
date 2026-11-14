@@ -9,7 +9,7 @@ owner in ``families/`` builds all three into one ``HybridRuntimePlan``.
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Literal, Protocol, TypeAlias
 
 import mlx.nn as nn
@@ -175,3 +175,14 @@ class HybridRuntimePlan:
             mamba_type=self.family.mamba_type,
             mamba_cache_mode=mamba_cache_mode,
         )
+
+    def for_tensor_parallel(self, tp_size: int) -> HybridRuntimePlan:
+        """Return one TP rank's plan.
+
+        ``shard()`` splits the conv channels and the recurrent heads evenly, the
+        division vLLM's ``MambaStateShapeCalculator`` applies for GDN.
+        """
+        geometry = replace(self.geometry, conv_dim=self.geometry.conv_dim // tp_size)
+        if isinstance(geometry, RecurrentStateGeometry):
+            geometry = replace(geometry, num_v_heads=geometry.num_v_heads // tp_size)
+        return replace(self, geometry=geometry)

@@ -991,6 +991,12 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
         lm_head = getattr(text_model, "lm_head", None)
         if lm_head is not None:
             logits = lm_head(hidden_states)
+            # mlx-lm's shard() splits an untied head by vocab and gathers it in
+            # the model's own forward.
+            if (group := getattr(text_model, "sharding_group", None)) is not None:
+                from mlx_lm.models.base import gather_last_axis
+
+                logits = gather_last_axis(logits, group)
             return self._apply_target_logit_postprocessing(text_model, logits)
 
         # Some Gemma4-compatible MLX loaders expose tied embedding projection

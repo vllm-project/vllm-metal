@@ -154,32 +154,37 @@ class MetalWorker(WorkerBase):
             self.local_rank,
         )
 
-        # Pipeline parallelism: bring up the mx.distributed ring (the activation
-        # data plane, separate from gloo) and wrap it in a PipelineGroup. With
-        # TP forced to 1, the global rank IS the pipeline stage index, so we use
-        # self.rank directly. Gated on pipeline_parallel_size > 1 so the default
-        # single-stage path creates no group and is byte-for-byte unchanged.
+        # Pipeline or tensor parallelism: bring up the mx.distributed ring (the
+        # data plane, separate from gloo). PP wraps it in a PipelineGroup, TP
+        # hands the raw group to the runner. With PP x TP rejected, the global
+        # rank IS the stage or TP rank, so we use self.rank directly. Gated on
+        # world_size > 1 so the default single-rank path creates no group and is
+        # byte-for-byte unchanged.
         pp_size = self.parallel_config.pipeline_parallel_size
-        if pp_size > 1:
-            # PP+STT is rejected at config time (platform.check_and_update_config,
+        tp_group: mx.distributed.Group | None = None
+        if self.parallel_config.world_size > 1:
+            # PP/TP+STT is rejected at config time (platform.check_and_update_config,
             # with the other PP guards), so only generation models reach here.
-            # Discover every stage's node IP over the gloo control plane (already
+            # Discover every rank's node IP over the gloo control plane (already
             # initialized above) so the MLX ring spans real hosts — the same path
-            # works single- or multi-node. peer_ips[r] is the IP of global rank r;
-            # with TP forced to 1 the global rank is the pipeline-stage index.
+            # works single- or multi-node. peer_ips[r] is the IP of global rank r.
             import torch.distributed as dist
             from vllm.utils.network_utils import get_ip
 
             peer_ips: list[str] = [""] * self.parallel_config.world_size
             dist.all_gather_object(peer_ips, get_ip())
-            self.pp = PipelineGroup.bootstrap_ring(self.rank, peer_ips)
-            logger.info(
-                "Pipeline stage %d/%d (is_first=%s, is_last=%s)",
-                self.pp.rank,
-                self.pp.size,
-                self.pp.is_first,
-                self.pp.is_last,
-            )
+            group = PipelineGroup.bootstrap_ring(self.rank, peer_ips)
+            if pp_size > 1:
+                self.pp = group
+                logger.info(
+                    "Pipeline stage %d/%d (is_first=%s, is_last=%s)",
+                    self.pp.rank,
+                    self.pp.size,
+                    self.pp.is_first,
+                    self.pp.is_last,
+                )
+            else:
+                tp_group = group.group
 
         # Set random seed
         set_random_seed(self.model_config.seed)
@@ -207,8 +212,10 @@ class MetalWorker(WorkerBase):
 
             self.model_runner = MetalModelRunner(vllm_config=self.vllm_config)
             # Hand the pipeline group to the runner so its forward path can pipe
-            # activations stage-to-stage. None on the default single-stage path.
+            # activations stage-to-stage, and the TP group so load_model shards
+            # the model. Both None on the default single-rank path.
             self.model_runner.pp = self.pp
+            self.model_runner.tp_group = tp_group
 
     def load_model(self) -> None:
         """Load the model onto the Metal device."""
