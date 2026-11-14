@@ -2,6 +2,7 @@
 """DSpark's slot-zero proposals over real shared Metal KV and ragged pages."""
 
 from dataclasses import replace
+from unittest.mock import patch
 
 import mlx.core as mx
 import numpy as np
@@ -17,6 +18,7 @@ from vllm.v1.kv_cache_interface import (
 
 from tests.test_dflash import _config, _torch_forward
 from vllm_metal.attention.caches.storage import KVCacheStorage
+from vllm_metal.metal import get_ops
 from vllm_metal.v1.dflash_paged import DFlashPagedCache
 from vllm_metal.v1.dspark import DSparkConfig, DSparkModel
 from vllm_metal.v1.dspark_paged import DSparkPagedCache
@@ -304,12 +306,25 @@ def test_ragged_proposals_without_corrected_logits(draft_topk):
     )
 
 
-def test_one_token_proposal_uses_one_lookahead_slot_at_page_boundary():
+@pytest.mark.parametrize("gqa_disabled", [False, True])
+def test_one_token_proposal_uses_one_lookahead_slot_at_page_boundary(
+    monkeypatch, gqa_disabled
+):
+    monkeypatch.setenv("VLLM_METAL_DISABLE_GQA_DECODE", str(int(gqa_disabled)))
     model, cache = make_cache()
     features = [mx.random.normal((1, 15, 64)).astype(mx.float16) for _ in range(3)]
     cache.write_context([f[0] for f in features], [([2], 0, 15)])
-    actual = cache.compile_draft(num_draft_tokens=1)(mx.array([4]), [([2], 15)])
-    mx.eval(actual, *cache.storage.buffers)
+
+    ops = get_ops()
+    with patch.object(
+        ops, "paged_attention_primitive", wraps=ops.paged_attention_primitive
+    ) as attention:
+        draft = cache.compile_draft(num_draft_tokens=1)
+        actual = draft(mx.array([4]), [([2], 15)])
+        mx.eval(actual, *cache.storage.buffers)
+
+    flags = {call.kwargs.get("gqa_disabled") for call in attention.call_args_list}
+    assert flags == {gqa_disabled}
     expected = model.draft(mx.array([4]), features, num_draft_tokens=1)
     np.testing.assert_allclose(
         np.array(actual[1].astype(mx.float32)),
