@@ -1014,6 +1014,8 @@ def sdpa_forward(
             and layer_sliding_window < 0
             and reason is None
         ):
+            if ctx.paged_native_capabilities is None:
+                ctx.paged_native_capabilities = paged_attention_capabilities(ops)
             plan = _turboquant_prefill_plan(
                 ctx,
                 meta,
@@ -1024,6 +1026,9 @@ def sdpa_forward(
                 q_3d.shape[2],
                 key_quant_type=kv_cache.k_quant,
                 value_bits=kv_cache.v_bits,
+                make_nax_plan=ops.nax_prefill_plan
+                if ctx.paged_native_capabilities.get("nax_work_plan", False)
+                else None,
             )
 
         if plan is None and not has_prefill:
@@ -1066,8 +1071,11 @@ def sdpa_forward(
             )
             batch = plan.prefill
             query = q_3d if batch.query_indices is None else q_3d[batch.query_indices]
-            if ctx.paged_native_capabilities is None:
-                ctx.paged_native_capabilities = paged_attention_capabilities(ops)
+            routing: dict[str, Any] = nax_split_kwargs(
+                ctx.paged_native_capabilities, batch.nax_work, q_3d.shape[2]
+            )
+            if batch.nax_work_plan is not None:
+                routing["nax_work_plan"] = batch.nax_work_plan
             out = ops.paged_attention_primitive(
                 query,
                 k16.reshape(-1, kernel_block_size, cache_kv_heads, q_3d.shape[2]),
@@ -1082,10 +1090,7 @@ def sdpa_forward(
                 batch.max_seq_len,
                 layer_sliding_window,
                 window_seqlen_q=ctx.verify_window_q,
-                # The dequantized lane only admits full-attention layers.
-                **nax_split_kwargs(
-                    ctx.paged_native_capabilities, batch.nax_work, q_3d.shape[2]
-                ),
+                **routing,
             )
             if plan.fallback is not None:
                 fallback = plan.fallback
@@ -1112,7 +1117,11 @@ def sdpa_forward(
         paged_kwargs.update(_whole_batch_decode_routing_kwargs(ctx, q_3d.shape[0], ops))
         capabilities = ctx.paged_native_capabilities
         num_decode = ctx.num_decode_requests
-        if capabilities["nax_split_hint"] and q_3d.shape[0] > len(ctx.context_lens):
+        if (
+            capabilities is not None
+            and capabilities["nax_split_hint"]
+            and q_3d.shape[0] > len(ctx.context_lens)
+        ):
             # Prefill batch: pick the NAX pipeline from per-sequence lengths
             # the kernel dispatcher could only read back from the GPU.
             # Native alone decides whether to split off ordinary decode rows.
@@ -1135,6 +1144,14 @@ def sdpa_forward(
                         )
                     return ctx.nax_tile_work[key]
 
+                if len(ctx.context_lens) == 1 and capabilities.get(
+                    "nax_work_plan", False
+                ):
+                    if ctx.nax_work_plan is None:
+                        ctx.nax_work_plan = ops.nax_prefill_plan(
+                            ctx.cu_seqlens, ctx.context_lens
+                        )
+                    paged_kwargs["nax_work_plan"] = ctx.nax_work_plan
                 work = tile_work(0)
                 if (
                     capabilities["nax_prefill_split_hint"]

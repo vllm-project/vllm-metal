@@ -141,6 +141,13 @@ NB_MODULE(_paged_ops, m) {
         "Call while evaluation is idle; this does not synchronize the GPU. "
         "Events follow append order; serial encoding preserves encode order, "
         "not GPU execution order.");
+  nb::class_<NaxPrefillPlan>(m, "NaxPrefillPlan")
+      .def_ro("query_tokens", &NaxPrefillPlan::query_tokens)
+      .def_ro("max_length", &NaxPrefillPlan::max_length);
+  m.def("nax_prefill_plan", &nax_prefill_plan,
+        nb::arg("cu_seqlens"), nb::arg("kv_lengths"),
+        "Immutable CPU lengths for grouped NAX cost estimation; shared across layers.");
+
   nb::class_<GqaDecodeLengthPlan>(m, "GqaDecodeLengthPlan")
       .def_ro("num_requests", &GqaDecodeLengthPlan::num_requests)
       .def_ro("max_length", &GqaDecodeLengthPlan::max_length);
@@ -252,6 +259,7 @@ NB_MODULE(_paged_ops, m) {
     caps["gqa_mixed_decode_plan"] = true;
     caps["nax_split_hint"] = true;
     caps["nax_prefill_split_hint"] = true;
+    caps["nax_work_plan"] = true;
     return caps;
   }, "Capabilities of the public paged attention interface. Private test "
      "kernels do not imply an enabled production route.");
@@ -474,7 +482,8 @@ NB_MODULE(_paged_ops, m) {
            int num_decode_tokens,
            int max_decode_context_len, bool gqa_disabled,
            const std::optional<GqaDecodeLengthPlan>& gqa_length_plan,
-           int nax_split_hint, int nax_prefill_split_hint) {
+           int nax_split_hint, int nax_prefill_split_hint,
+           const std::optional<NaxPrefillPlan>& nax_work_plan) {
           return paged_attention_primitive_fn(
               query, key_cache, value_cache,
               num_kv_heads, scale, softcap,
@@ -485,7 +494,7 @@ NB_MODULE(_paged_ops, m) {
               window_seqlen_q, sinks, mm_prefix_ranges, num_decode_requests,
               num_decode_tokens, max_decode_context_len, gqa_disabled,
               0, gqa_length_plan, nax_split_hint,
-              nax_prefill_split_hint);
+              nax_prefill_split_hint, nax_work_plan);
         },
         nb::arg("query"),
         nb::arg("key_cache"), nb::arg("value_cache"),
@@ -511,6 +520,7 @@ NB_MODULE(_paged_ops, m) {
         nb::arg("gqa_length_plan") = nb::none(),
         nb::arg("nax_split_hint") = -1,
         nb::arg("nax_prefill_split_hint") = -1,
+        nb::arg("nax_work_plan") = nb::none(),
         // Window validation may evaluate metadata with a Python-backed reader.
         nb::call_guard<nb::gil_scoped_release>(),
         "Return a lazy paged attention array (read-only). Cache writes are handled "
@@ -541,6 +551,8 @@ NB_MODULE(_paged_ops, m) {
         "overrides it only when native dispatch separates the ordinary "
         "decode prefix from NAX prefill; -1 retains nax_split_hint. The "
         "override describes only the remaining prefill sequences. "
+        "nax_work_plan optionally supplies immutable CPU sequence lengths for "
+        "grouped NAX cost estimation without device readback. "
         "Outputs are identical either way. For head_size 512, an effective "
         "hint of 1 selects two 256-column output slices; 0 or -1 keeps the "
         "original loop.");
@@ -549,7 +561,7 @@ NB_MODULE(_paged_ops, m) {
       "last_nax_heads_per_threadgroup",
       []() { return g_last_nax_heads_per_tg.load(std::memory_order_relaxed); },
       "Heads per threadgroup of the most recent recorded NAX launch, after "
-      "pipeline-capacity fallback: 1 upstream, 3 or 6 grouped, 0 for another "
+      "pipeline-capacity fallback: 1 upstream, 2/3/4/6/8 grouped, 0 for another "
       "family or when diagnostics are cleared/disabled. Process-wide test "
       "diagnostic; inspect only after evaluation completes, not a request trace.");
 
@@ -563,20 +575,13 @@ NB_MODULE(_paged_ops, m) {
   m.def(
       "last_paged_dispatch",
       []() {
-        static constexpr const char* names[] = {
-            "", "gqa_decode", "per_token_ps0", "per_token_ps512", "window_ps0",
-            "window_ps512", "nax_prefill", "tiled_prefill", "mixed_prefill_decode",
-            "mixed_nax_prefill_decode", "nax_gqa6_prefill"};
-        static_assert(std::size(names) == static_cast<size_t>(PagedDispatch::Count),
-                      "PagedDispatch and its diagnostic names must stay in sync");
-        return names[static_cast<size_t>(
-            g_last_dispatch.load(std::memory_order_relaxed))];
+        return paged_dispatch_name(g_last_dispatch.load(std::memory_order_relaxed));
       },
       "Dispatch family chosen by the most recent recorded paged_attention_primitive "
       "eval (\"gqa_decode\", \"per_token_ps0\", \"per_token_ps512\", "
       "\"window_ps0\", \"window_ps512\", \"nax_prefill\", "
       "\"tiled_prefill\", \"mixed_prefill_decode\", \"mixed_nax_prefill_decode\", "
-      "\"nax_gqa6_prefill\"). "
+      "\"nax_gqa6_prefill\", \"nax_gqa8_prefill\"). "
       "Diagnostic surface for routing tests; empty "
       "when diagnostics are disabled, cleared or before the first recorded eval.");
 

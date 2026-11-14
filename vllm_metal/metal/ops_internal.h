@@ -31,8 +31,23 @@ constexpr int kPartitionSize = VLLM_METAL_PARTITION_SIZE;
 enum class PagedDispatch {
   None, GqaDecode, PerToken, SplitKv, Window, WindowSplitKv, NaxPrefill,
   TiledPrefill, MixedPrefillDecode, MixedNaxPrefillDecode,
-  NaxGqa6Prefill, Count
+  NaxGqa6Prefill, NaxGqa8Prefill, Count
 };
+
+inline const char* paged_dispatch_name(PagedDispatch family) {
+  static constexpr const char* names[] = {
+      "", "gqa_decode", "per_token_ps0", "per_token_ps512", "window_ps0",
+      "window_ps512", "nax_prefill", "tiled_prefill", "mixed_prefill_decode",
+      "mixed_nax_prefill_decode", "nax_gqa6_prefill", "nax_gqa8_prefill"};
+  static_assert(std::size(names) == static_cast<size_t>(PagedDispatch::Count),
+                "PagedDispatch and its diagnostic names must stay in sync");
+  return names[static_cast<size_t>(family)];
+}
+
+inline PagedDispatch nax_prefill_dispatch_family(kernels::NaxConfig cfg) {
+  if (cfg.HEADS_PER_TG > 1 && cfg.GQA_RATIO == 8) return PagedDispatch::NaxGqa8Prefill;
+  return cfg.HEADS_PER_TG > 1 ? PagedDispatch::NaxGqa6Prefill : PagedDispatch::NaxPrefill;
+}
 using hardware::detected_gpu_core_count;
 using hardware::gpu_core_count;
 // One measured dispatch table, also exposed read-only to numerical/routing
@@ -98,6 +113,33 @@ struct GqaDecodeLengthPlan {
           *partition_offsets == *other.partition_offsets));
   }
 };
+
+// For a single request these bounds are its exact Q/KV lengths. Multi-request
+// plans can be validated at the binding but cannot enable grouped dispatch.
+struct NaxPrefillPlan {
+  int num_requests = 0;
+  int query_tokens = 0;
+  int max_length = 0;
+
+  bool operator==(const NaxPrefillPlan& other) const {
+    return num_requests == other.num_requests && query_tokens == other.query_tokens
+        && max_length == other.max_length;
+  }
+};
+
+inline NaxPrefillPlan nax_prefill_plan(
+    const std::vector<int>& cu_seqlens, const std::vector<int>& kv_lengths) {
+  if (cu_seqlens.size() != kv_lengths.size() + 1 || cu_seqlens.front() != 0)
+    throw std::invalid_argument("NAX prefill lengths require cumulative Q starting at zero");
+  int max_length = 0;
+  for (size_t i = 0; i < kv_lengths.size(); ++i) {
+    const int64_t q = int64_t(cu_seqlens[i + 1]) - cu_seqlens[i];
+    if (q <= 0 || kv_lengths[i] < q)
+      throw std::invalid_argument("NAX prefill lengths require 0 < Q <= KV per sequence");
+    max_length = std::max(max_length, kv_lengths[i]);
+  }
+  return {static_cast<int>(kv_lengths.size()), cu_seqlens.back(), max_length};
+}
 
 extern std::atomic<PagedDispatch> g_last_dispatch;
 extern std::atomic<int> g_last_gqa_partition;
@@ -170,7 +212,8 @@ array paged_attention_primitive_fn(
     int max_decode_context_len = 0, bool gqa_disabled = false,
     int gqa_test_partition = 0,
     const std::optional<GqaDecodeLengthPlan>& gqa_length_plan = std::nullopt,
-    int nax_split_hint = -1, int nax_prefill_split_hint = -1);
+    int nax_split_hint = -1, int nax_prefill_split_hint = -1,
+    const std::optional<NaxPrefillPlan>& nax_work_plan = std::nullopt);
 std::tuple<array, array, array, array, array> tq_encode_primitive_fn(
     const array& key, const array& value,
     const array& key_cache, const array& value_cache,

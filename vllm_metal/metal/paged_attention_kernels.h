@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "nax_prefill_work.h"
+
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -60,49 +63,26 @@ struct NaxConfig {
   int BQ;
   int HEADS_PER_TG;
   int NUM_THREADS;
+  int GQA_RATIO = 1;
 };
 
 inline constexpr NaxConfig kNaxBaseline{kNaxBQ, 1, kNaxThreads};
 
+inline constexpr std::array<NaxConfig, 3> nax_grouped_configs(int ratio) {
+  if (ratio == 6) return {{{16, 2, 64, 6}, {16, 3, 96, 6}, {16, 6, 192, 6}}};
+  if (ratio == 8) return {{{16, 2, 64, 8}, {16, 4, 128, 8}, {16, 8, 256, 8}}};
+  return {};
+}
+
+
 // A shared source-work score for compiled grouped layouts. Complete SG work
 // supplies a capacity budget; whole Q tails and isolated KV edges are separate.
 // Coefficients are conservative empirical weights, not predicted milliseconds.
-// Calibration terms, measured counterexamples and hardware scope are recorded
-// in docs/gqa-prefill.md; keep kernel and serving evidence separate.
+// The original GQA6 policy and its calibration are recorded in PR #1225.
 // In particular, idle cores cannot amplify the baseline tail-work credit.
-struct NaxPrefillWork {
-  double issued, active, guarded, guarded_q, kv_edge, fast;
-  double stream, tail_stream;
-  int64_t groups, full_blocks;
-};
-inline NaxPrefillWork nax_prefill_work(int q, int prefix, int heads, int kv_heads, int bq, bool split) {
-  const int64_t full = q / bq, tail = q % bq;
-  const int64_t prefix_tiles = (int64_t(prefix) + 31) / 32;
-  const int64_t visits = bq == 64
-      ? full * prefix_tiles + full * (full + 1)
-      : full * prefix_tiles + full * full / 4
-        + (prefix % 32 == 0 || prefix % 32 > 16) * ((full + 1) / 2);
-  const int64_t end = tail ? (int64_t(prefix) + q + 31) / 32 : 0;
-  const int64_t full_end = ((int64_t(prefix) + q) / 32) * 32;
-  // C++ integer division truncates toward zero. Clamp before division so
-  // this matches the nonnegative source-loop count even below one KV tile.
-  const int64_t edge_blocks = full - std::min(full,
-      std::max(int64_t(0), full_end - prefix) / bq);
-  const int64_t fast_visits = split ? visits - edge_blocks : 0;
-  const int slices = bq / 16;
-  const int64_t q_blocks = full + (tail != 0);
-  NaxPrefillWork work;
-  work.issued = double(heads) * slices * (visits + end);
-  work.active = double(heads) * (slices * visits + ((tail + 15) / 16) * end);
-  work.fast = double(heads) * slices * fast_visits;
-  work.guarded = work.issued - work.fast;
-  work.guarded_q = double(heads) * slices * end;
-  work.kv_edge = double(heads) * slices * edge_blocks;
-  work.stream = double(visits + end) / q_blocks;
-  work.tail_stream = double(end);
-  work.groups = (bq == 64 ? heads : kv_heads) * q_blocks;
-  work.full_blocks = full;
-  return work;
+inline NaxPrefillWork nax_prefill_work(int q, int prefix, int heads, int groups, int bq, bool split) {
+  return nax_sequence_work({q, prefix + q}, heads,
+      {bq, 32, bq == 64 ? 1 : heads / groups}, split);
 }
 
 struct NaxGqaScore {
@@ -175,6 +155,17 @@ inline double nax_gqa_guarded_score(
   return (benefit - cost) / baseline.issued;
 }
 
+inline double nax_gqa_critical_savings(
+    int q, int heads, int cores, int heads_per_group,
+    const NaxPrefillWork& baseline, const NaxPrefillWork& grouped) {
+  constexpr int kGroupedQueryTile = 16;
+  return std::min(int64_t(cores), int64_t(heads))
+      * ((q % kNaxBQ + kGroupedQueryTile - 1) / kGroupedQueryTile)
+      * baseline.tail_stream
+      - std::min(int64_t(cores), baseline.groups)
+      * heads_per_group * grouped.tail_stream;
+}
+
 inline NaxGqaScore nax_gqa_work_score(
     int q, int prefix, int heads, int kv_heads, int page,
     int cores, bool upstream_split) {
@@ -236,11 +227,8 @@ inline NaxGqaScore nax_gqa_work_score(
     const double head_growth = double(heads_per_group) / kNarrowHeadLimit - 1;
     const double padding_savings =
         baseline.issued - baseline.active - grouped.issued + grouped.active;
-    const double critical_savings = std::min(int64_t(cores), int64_t(heads))
-        * ((q % kNaxBQ + kGroupedQueryTile - 1) / kGroupedQueryTile)
-        * baseline.tail_stream
-        - std::min(int64_t(cores), baseline.groups)
-        * heads_per_group * grouped.tail_stream;
+    const double critical_savings = nax_gqa_critical_savings(
+        q, heads, cores, heads_per_group, baseline, grouped);
     const double value = upstream_split
         ? nax_gqa_split_score(baseline, grouped, heads_per_group, head_growth,
                              padding_savings, critical_savings)
@@ -267,8 +255,58 @@ inline NaxConfig select_nax_config(
       query_tokens, max_seq_len - query_tokens, num_heads, num_kv_heads,
       block_size, gpu_cores, upstream_split);
   return choice.admit
-      ? NaxConfig{16, choice.heads_per_tg, 32 * choice.heads_per_tg}
+      ? NaxConfig{16, choice.heads_per_tg, 32 * choice.heads_per_tg, num_heads / num_kv_heads}
       : kNaxBaseline;
+}
+
+// Compare every compiled width with the route main would actually dispatch:
+// ordinary NAX for GQA8, and the established h1/h3/h6 policy for GQA6.
+inline NaxConfig select_nax_config(
+    NaxGeometry geometry, NaxSequence sequence, bool grouped_enabled,
+    bool bf16, bool unmasked, bool upstream_split, int gpu_cores) {
+  const auto upstream = select_nax_config(
+      geometry.heads, geometry.kv_heads, geometry.qk_dim, geometry.kernel_page,
+      sequence.query_tokens, 1, sequence.kv_tokens, 0,
+      grouped_enabled, bf16, unmasked, upstream_split, gpu_cores);
+  if (!grouped_enabled || !bf16 || !unmasked || geometry.qk_dim != 256 ||
+      geometry.value_dim != 256 || gpu_cores <= 0 || sequence.query_tokens <= 1 ||
+      sequence.kv_tokens < sequence.query_tokens || geometry.heads <= 0 ||
+      geometry.kv_heads <= 0 || geometry.heads % geometry.kv_heads)
+    return upstream;
+  const int ratio = geometry.heads / geometry.kv_heads;
+  if (!((ratio == 6 && geometry.kernel_page == 16) ||
+        (ratio == 8 && geometry.kernel_page == 32))) return upstream;
+  if (geometry.physical_page < geometry.kernel_page ||
+      geometry.physical_page % geometry.kernel_page ||
+      geometry.key_head_stride != 2 * geometry.qk_dim ||
+      geometry.key_token_stride != geometry.kv_heads * geometry.key_head_stride)
+    return upstream;
+
+  const auto resources = [&](NaxConfig cfg) {
+    return nax_prefill_resources(sequence, geometry, {cfg.BQ, 32, cfg.HEADS_PER_TG},
+                                 cfg.HEADS_PER_TG > 1 || upstream_split);
+  };
+  const auto cost = [&](NaxConfig cfg, const NaxPrefillResources& work) {
+    return nax_prefill_cost(work, geometry, {cfg.BQ, 32, cfg.HEADS_PER_TG},
+                            gpu_cores, upstream_split);
+  };
+  const auto reference = resources(upstream);
+  const double reference_cost = cost(upstream, reference);
+  auto best = upstream;
+  double best_cost = reference_cost;
+  const auto consider = [&](NaxConfig cfg) {
+    if (cfg.HEADS_PER_TG == upstream.HEADS_PER_TG) return;
+    const auto work = resources(cfg);
+    const double score = cost(cfg, work);
+    const double margin = nax_admission_margin(reference.work, work.work, gpu_cores);
+    if (score < best_cost && score < (1. - margin) * reference_cost) {
+      best = cfg;
+      best_cost = score;
+    }
+  };
+  if (upstream.HEADS_PER_TG > 1) consider(kNaxBaseline);
+  for (const auto cfg : nax_grouped_configs(ratio)) consider(cfg);
+  return best;
 }
 
 inline constexpr NaxConfig nax_config_for_pipeline(
@@ -306,8 +344,14 @@ inline std::string nax_name(
   std::string name = "paged_attention_nax_" + dtype +
       "_hs" + std::to_string(head_size) +
       "_bs" + std::to_string(block_size);
-  if (cfg.HEADS_PER_TG > 1)
-    name += cfg.HEADS_PER_TG == 6 ? "_gqa6_full" : "_gqa6_sub_full";
+  if (cfg.HEADS_PER_TG > 1) {
+    name += "_gqa" + std::to_string(cfg.GQA_RATIO);
+    if (cfg.HEADS_PER_TG == 2 || cfg.HEADS_PER_TG == 8)
+      name += "_h" + std::to_string(cfg.HEADS_PER_TG);
+    else if (cfg.HEADS_PER_TG == 3)
+      name += "_sub";
+    name += "_full";
+  }
   return name;
 }
 

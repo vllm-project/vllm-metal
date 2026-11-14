@@ -29,6 +29,7 @@ _MLA = _THIS_DIR / "mla.cpp"
 _INTERNAL = _THIS_DIR / "ops_internal.h"
 _MLX_PATCH = _THIS_DIR / "mlx_patch.cpp"
 _KERNELS = _THIS_DIR / "paged_attention_kernels.h"
+_NAX_WORK = _THIS_DIR / "nax_prefill_work.h"
 _DEVICE = _THIS_DIR / "metal_device.h"
 _DEVICE_SRC = _THIS_DIR / "metal_device.cpp"
 _BUILD = _THIS_DIR / "build.py"
@@ -398,6 +399,7 @@ def _input_hash() -> str:
         _INTERNAL,
         _MLX_PATCH,
         _KERNELS,
+        _NAX_WORK,
         _DEVICE,
         _DEVICE_SRC,
         _BUILD,
@@ -513,6 +515,7 @@ def _mps_input_hash() -> str:
     for path in (
         _MPS_DIR / "mps_ops.mm",
         _KERNELS,
+        _NAX_WORK,
         _DEVICE,
         _DEVICE_SRC,
         _BUILD,
