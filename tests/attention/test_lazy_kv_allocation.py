@@ -103,10 +103,11 @@ def test_attention_only_config_is_allocated_uninitialized():
     config = _attention_config()
     assert not config.needs_kv_cache_zeroing
     storage = KVCacheStorage(config)
-    assert (
-        storage.nbytes
-        == next(iter(storage.tensors.values())).untyped_storage().nbytes()
-    )
+    regions = {
+        t.untyped_storage().data_ptr(): t.untyped_storage().nbytes()
+        for t in storage.tensors.values()
+    }
+    assert storage.nbytes == sum(regions.values())
 
 
 def test_uniform_caches_skip_vllms_zero_filling_allocator(monkeypatch):
@@ -117,20 +118,21 @@ def test_uniform_caches_skip_vllms_zero_filling_allocator(monkeypatch):
     never goes through vLLM's zero-filling allocator, while a Mamba cache still
     does.
     """
-    delegated: list[KVCacheConfig] = []
-    original = storage_module.allocate_kv_cache
+    zeroed: list[bool] = []
+    original = storage_module._new_region
 
-    def spy(config, *args, **kwargs):
-        delegated.append(config)
-        return original(config, *args, **kwargs)
+    def spy(nbytes, *, zero):
+        zeroed.append(zero)
+        return original(nbytes, zero=zero)
 
-    monkeypatch.setattr(storage_module, "allocate_kv_cache", spy)
+    monkeypatch.setattr(storage_module, "_new_region", spy)
 
     KVCacheStorage(_attention_config())
-    assert delegated == []
+    assert zeroed and not any(zeroed)
 
+    zeroed.clear()
     KVCacheStorage(_hybrid_config())
-    assert len(delegated) == 1
+    assert zeroed and all(zeroed)
 
 
 def test_uninitialized_backing_matches_upstream_layout():
@@ -150,9 +152,15 @@ def test_uninitialized_backing_matches_upstream_layout():
         assert actual.shape == expected.shape
         assert actual.stride() == expected.stride()
         assert actual.dtype == expected.dtype
-        # Same placement inside the shared backing, which is what makes a
-        # block id address the same bytes on both allocations.
-        assert actual.storage_offset() - base == expected.storage_offset() - base
+        # Same placement as inside the one upstream allocation, with the
+        # region's start added back, which is what makes a block id address
+        # the same bytes on both layouts.
+        region = storage.region_index[actual.untyped_storage().data_ptr()]
+        placed = (
+            storage.region_offsets[region]
+            + actual.storage_offset() * actual.element_size()
+        )
+        assert placed == (expected.storage_offset() - base) * expected.element_size()
 
 
 def test_mamba_config_keeps_vllms_zero_filled_allocation():

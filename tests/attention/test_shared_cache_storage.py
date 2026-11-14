@@ -66,6 +66,7 @@ def test_strided_state_writes_share_upstream_backing():
     np.testing.assert_array_equal(np.array(conv[1][3]), 7)
     np.testing.assert_array_equal(np.array(recurrent[1][3]), 9)
     # Source Torch views see the same bytes, without a reverse conversion.
+    mx.synchronize()
     page = storage.tensors["s1"][3].flatten()
     assert torch.all(page[:16].view(torch.float16) == 7)
     assert torch.all(page[16:528].view(torch.float32) == 9)
@@ -107,9 +108,10 @@ def test_native_gdn_write_reaches_shared_state_readers(reader):
         np.testing.assert_array_equal(np.array(observed), expected)
     # Read the original backing before evaluating output, which could hide a
     # missing cache-owner dependency. The fp16 conv state occupies 16 bytes.
+    mx.synchronize()
     pages = storage.tensors["s0"].squeeze(dim=(1, 2))
     host_state = pages[:, 16:528].view(torch.float32).reshape(4, 1, 4, 32)
-    np.testing.assert_array_equal(host_state.numpy(), expected)
+    np.testing.assert_array_equal(host_state.cpu().numpy(), expected)
     assert not storage.tensors["s1"].any()
     np.testing.assert_array_equal(np.array(output), 1)
 
@@ -126,13 +128,16 @@ def test_copy_cycles_snapshot_sources_and_deduplicate_aliases(monkeypatch):
     storage.tensors["a0"][2].fill_(2)
     storage.tensors["a1"][1].fill_(3)
     storage.tensors["a1"][2].fill_(4)
+    torch.mps.synchronize()
     storage.copy_blocks([(1, 2), (2, 1)])
     mx.eval(*storage.buffers)
+    mx.synchronize()
     for layer, expected in (("a0", (2, 1)), ("a1", (4, 3))):
         assert torch.all(storage.tensors[layer][1] == expected[0])
         assert torch.all(storage.tensors[layer][2] == expected[1])
     storage.zero_blocks([2])
     mx.eval(*storage.buffers)
+    mx.synchronize()
     assert not storage.tensors["a0"][2].any()
     assert not storage.tensors["s1"][2].any()
     assert torch.all(storage.tensors["a0"][1] == 2)
@@ -174,6 +179,7 @@ def test_packed_kv_store_preserves_strides_and_shared_backing():
     )
     cache.replace_layer_cache(0, new_k, new_v)
     mx.eval(*storage.buffers)
+    mx.synchronize()
     assert torch.all(key[2, 3] == 3)
     assert torch.all(value[2, 3] == 5)
     assert torch.all(key[2, 2] == 0)
@@ -240,7 +246,8 @@ def test_budget_above_buffer_limit_uses_shared_regions(monkeypatch):
 
     assert storage.nbytes == budget == 2 * buffer_limit
     assert len(imported) == len(storage.buffers) == 2
-    assert len({tensor.untyped_storage().data_ptr() for tensor in imported}) == 1
+    # One allocation per region, each within the buffer limit.
+    assert len({tensor.untyped_storage().data_ptr() for tensor in imported}) == 2
     assert sum(buffer.nbytes for buffer in storage.buffers) == storage.nbytes
     assert storage.state_views(["s0", "s1"])[0][0].shape[0] == planned.num_blocks
 
@@ -249,15 +256,16 @@ def test_release_frees_backing_and_reallocate_rebinds_existing_views():
     storage = make_storage(num_blocks=64)
     views = storage.views([storage.tensors["a0"]])
     offsets = storage.region_offsets
-    before = mx.get_active_memory()
+    before = torch.mps.driver_allocated_memory()
 
     storage.release()
 
     assert storage.released
-    assert before - mx.get_active_memory() >= storage.nbytes
+    assert before - torch.mps.driver_allocated_memory() >= storage.nbytes
 
     storage.reallocate()
     storage.tensors["a0"].fill_(3)
+    torch.mps.synchronize()
 
     assert storage.region_offsets == offsets
     np.testing.assert_array_equal(np.array(views[0]), 3)
@@ -289,7 +297,9 @@ def test_state_gathers_read_slots_past_32_bit_offsets():
     raw = torch.empty((num_slots, page), dtype=torch.uint8)
     conv_t = raw.as_strided((num_slots, *conv_row), (page, conv_row[1], 1))
     rec_t = raw.as_strided((num_slots, *rec_row), (page, 32, 8, 1), storage_offset=64)
-    storage = SimpleNamespace(region_offsets=[0], buffers=[torch_to_mlx(raw)])
+    storage = SimpleNamespace(
+        region_index={raw.untyped_storage().data_ptr(): 0}, buffers=[torch_to_mlx(raw)]
+    )
     cache = PagedStateCache(
         [CacheViews(storage, [conv_t]), CacheViews(storage, [rec_t])]
     )

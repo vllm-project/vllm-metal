@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from bisect import bisect_right
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -17,10 +18,10 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
     create_kv_cache_views,
 )
-from vllm.v1.worker.utils import allocate_kv_cache
 
 from vllm_metal.tensor_bridge import (
     TORCH_TO_MLX_DTYPE,
+    mlx_to_torch,
     torch_to_mlx,
 )
 
@@ -48,15 +49,45 @@ def gather_cache_rows(cache: mx.array, ids: mx.array, block_stride: int) -> mx.a
     return rows
 
 
-def allocate_kv_cache_lazily(
+def region_offsets_of(config: KVCacheConfig) -> list[int]:
+    """Byte offsets where a layer's compact region starts, ascending.
+
+    Metal advertises LBNHC, so each distinct layer address begins a region that
+    runs to the next one. Cache groups overlay the same bytes, so a region can
+    serve layers of more than one group.
+    """
+    return sorted(
+        {
+            tensor.offset + i * tensor.layer_stride
+            for tensor in config.kv_cache_tensors
+            for i in range(len(tensor.layers))
+        }
+    )
+
+
+def _new_region(nbytes: int, *, zero: bool) -> torch.Tensor:
+    """One Metal buffer of exactly ``nbytes`` as a flat uint8 MPS tensor.
+
+    Not torch's allocator: it packs requests under 512 MiB into 1 GiB heaps.
+    """
+    from vllm_metal.metal import get_ops
+
+    region = mlx_to_torch(get_ops().new_shared_buffer(nbytes), "mps").view(-1)
+    if zero:
+        region.zero_()
+        torch.mps.synchronize()
+    return region
+
+
+def allocate_kv_cache_regions(
     config: KVCacheConfig,
     layout: KVCacheLayout,
     specs: Mapping[str, Any],
-) -> dict[str, torch.Tensor]:
-    """Allocate the KV backing store without committing its pages.
+) -> tuple[list[torch.Tensor], dict[str, torch.Tensor]]:
+    """Allocate one Metal buffer per region and view each layer inside its own.
 
-    ``vllm.v1.worker.utils.allocate_kv_cache`` fills the whole backing buffer
-    with zeros (``torch.zeros``). Metal runs on unified memory, so that memset
+    ``vllm.v1.worker.utils.allocate_kv_cache`` makes one allocation for the
+    whole pool and zero-fills it. Metal runs on unified memory, so that memset
     writes every page of a multi-GB pool and the entire pool becomes resident
     from the first step — even though a serving run only ever touches the
     blocks it actually allocates (a 16 GB Mac serving a 0.6B model pays ~5 GB
@@ -67,35 +98,43 @@ def allocate_kv_cache_lazily(
     is written) and mixed-precision caches (a block reinterpreted under another
     precision would decode stale bytes as NaN/Inf). Uniform-precision attention
     caches skip per-block zeroing upstream, and their kernels mask every slot
-    past the sequence length, so unwritten memory never reaches an output. Keep
-    vLLM's allocation verbatim in that case.
+    past the sequence length, so unwritten memory never reaches an output.
 
-    The layer views are built by vLLM's own :func:`create_kv_cache_views`, so
-    the layout (sizes, strides, offsets, dtype) is identical either way;
-    ``tests/attention/test_lazy_kv_allocation.py`` pins that equality.
+    The regions are Metal buffers MLX refers to but does not own, so they are
+    not wired and their pages are committed only when the GPU touches them
+    (#1198). Torch writes to them are asynchronous; synchronize before MLX
+    reads. The layer views come from vLLM's own :func:`create_kv_cache_views`,
+    so the layout matches the single-allocation one;
+    ``tests/attention/test_lazy_kv_allocation.py`` pins that.
     """
-    if config.needs_kv_cache_zeroing:
-        return allocate_kv_cache(config, torch.device("cpu"), layout)
-
     sizes = {tensor.size for tensor in config.kv_cache_tensors}
     if len(sizes) != 1:
         raise ValueError("KV cache tensors must share one backing allocation.")
-    backing = torch.empty(sizes.pop(), dtype=torch.int8, device="cpu")
+    nbytes = sizes.pop()
+    offsets = region_offsets_of(config)
+    ends = [*offsets[1:], nbytes]
+    regions = [
+        _new_region(end - start, zero=config.needs_kv_cache_zeroing)
+        for start, end in zip(offsets, ends, strict=True)
+    ]
     caches: dict[str, torch.Tensor] = {}
     for tensor in config.kv_cache_tensors:
         spec = specs[tensor.layers[0]]
-        if not spec.has_layer_views:
-            caches.update((name, backing) for name in tensor.layers)
-            continue
-        views = create_kv_cache_views(
-            backing,
-            spec,
-            config.num_blocks_of(tensor),
-            layout,
-            tensor,
-        )
-        caches.update(zip(tensor.layers, views, strict=True))
-    return caches
+        for i, name in enumerate(tensor.layers):
+            start = tensor.offset + i * tensor.layer_stride
+            region = regions[bisect_right(offsets, start) - 1]
+            if not spec.has_layer_views:
+                caches[name] = region
+                continue
+            (view,) = create_kv_cache_views(
+                region,
+                spec,
+                config.num_blocks_of(tensor),
+                layout,
+                replace(tensor, size=region.nbytes, layers=[name], offset=0),
+            )
+            caches[name] = view
+    return regions, caches
 
 
 class CacheViews(Sequence[mx.array]):
@@ -105,14 +144,13 @@ class CacheViews(Sequence[mx.array]):
         self.storage = storage
         self.descriptors = []
         for t in tensors:
-            byte_offset = t.storage_offset() * t.element_size()
-            region = bisect_right(storage.region_offsets, byte_offset) - 1
+            # Each region is its own allocation; the storage names the region.
             self.descriptors.append(
                 (
-                    region,
+                    storage.region_index[t.untyped_storage().data_ptr()],
                     tuple(t.shape),
                     tuple(t.stride()),
-                    (byte_offset - storage.region_offsets[region]) // t.element_size(),
+                    t.storage_offset(),
                     TORCH_TO_MLX_DTYPE[t.dtype],
                 )
             )
@@ -158,41 +196,31 @@ class KVCacheStorage:
 
     def _bind(self) -> None:
         config = self.config
-        self.tensors = allocate_kv_cache_lazily(
+        regions, self.tensors = allocate_kv_cache_regions(
             config,
             KVCacheLayout[config.kv_cache_layout],
             self.specs,
         )
-        first = next(iter(self.tensors.values()))
-        backing = first.untyped_storage()
-        raw = torch.empty(0, dtype=torch.uint8).set_(backing)
-        self.nbytes = backing.nbytes()
-        # Metal advertises LBNHC: each distinct layer address starts a compact
-        # region. Import views of those regions from vLLM's one allocation, so
-        # the full cache need not fit in a single Metal buffer.
-        self.region_offsets = sorted(
-            {
-                tensor.offset + i * tensor.layer_stride
-                for tensor in config.kv_cache_tensors
-                for i in range(len(tensor.layers))
-            }
-        )
-        ends = [*self.region_offsets[1:], self.nbytes]
+        self.nbytes = sum(region.nbytes for region in regions)
+        self.region_offsets = region_offsets_of(config)
+        self.region_index = {
+            region.untyped_storage().data_ptr(): i for i, region in enumerate(regions)
+        }
         self.buffers = [
-            torch_to_mlx(raw[start:end].view(config.num_blocks, -1))
-            for start, end in zip(self.region_offsets, ends, strict=True)
+            torch_to_mlx(region.view(config.num_blocks, -1)) for region in regions
         ]
         # CoW/zeroing cover physical bytes exactly once. Layer-outer layouts
-        # place a logical block in disjoint regions of this one allocation.
-        regions = {}
+        # place a logical block in disjoint regions.
+        pages = {}
         for tensor in config.kv_cache_tensors:
             for i, name in enumerate(tensor.layers):
                 offset = tensor.offset + i * tensor.layer_stride
+                region = regions[bisect_right(self.region_offsets, offset) - 1]
                 size = self.specs[name].page_size_bytes
-                regions[(offset, tensor.block_stride, size)] = torch.as_strided(
-                    raw, (config.num_blocks, size), (tensor.block_stride, 1), offset
+                pages[(offset, tensor.block_stride, size)] = torch.as_strided(
+                    region, (config.num_blocks, size), (tensor.block_stride, 1), 0
                 )
-        self.pages = CacheViews(self, list(regions.values()))
+        self.pages = CacheViews(self, list(pages.values()))
 
     @property
     def released(self) -> bool:

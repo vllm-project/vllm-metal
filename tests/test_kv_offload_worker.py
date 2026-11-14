@@ -56,8 +56,9 @@ def _roundtrip(
 def _backing_bytes(storage) -> np.ndarray:
     """A copy of vLLM's allocation, read through torch rather than MLX."""
     tensor = next(iter(storage.tensors.values()))
-    raw = torch.empty(0, dtype=torch.uint8).set_(tensor.untyped_storage())
-    return raw.numpy().copy()
+    raw = torch.empty(0, dtype=torch.uint8, device=tensor.device)
+    raw.set_(tensor.untyped_storage())
+    return raw.cpu().numpy()
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
