@@ -303,17 +303,31 @@ def test_explicit_cache_budget_must_fit_one_metal_buffer(mps_memory, limit, larg
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
 @pytest.mark.parametrize(
-    ("fused", "num_tokens", "hidden_size"),
+    ("fused", "num_tokens", "hidden_size", "float_weight"),
     [
-        (False, 4, 128),
-        (True, 4, 128),
-        (True, 1, 1024),
-        (True, 4, 1024),
-        (True, 3, 1028),
+        (False, 4, 128, False),
+        (True, 4, 128, False),
+        (True, 1, 1024, False),
+        (True, 4, 1024, False),
+        (True, 3, 1028, False),
+        (False, 1, 5120, True),
+        (True, 1, 5120, True),
+        (False, 3, 1028, True),
+        (True, 3, 1028, True),
     ],
-    ids=["plain", "residual", "decode", "batched-decode", "tail"],
+    ids=[
+        "plain",
+        "residual",
+        "decode",
+        "batched-decode",
+        "tail",
+        "qwen38-float-weight",
+        "qwen38-float-weight-residual",
+        "float-weight-tail",
+        "float-weight-residual-tail",
+    ],
 )
-def test_rms_norm_parity(dtype, fused, num_tokens, hidden_size):
+def test_rms_norm_parity(dtype, fused, num_tokens, hidden_size, float_weight):
     from vllm import ir
 
     import vllm_metal.pytorch_backend.normalization  # noqa: F401
@@ -325,6 +339,9 @@ def test_rms_norm_parity(dtype, fused, num_tokens, hidden_size):
     args[-2].copy_(
         torch.tensor([1.25, 1.75, 0.75, 1.5], dtype=dtype).repeat(hidden_size // 4)
     )
+    if float_weight:
+        args = list(args)
+        args[-2] = args[-2].float() + 0.00390625
     if fused:
         # This row distinguishes FP32 accumulation and cast-before-weight from
         # rounding the sum early or applying the learned weight before casting.
@@ -351,13 +368,51 @@ def test_rms_norm_parity(dtype, fused, num_tokens, hidden_size):
     torch.testing.assert_close(actual.cpu(), expected, **op.get_tolerance(dtype))
 
 
-@pytest.mark.parametrize("strided_arg", [0, 1, 2], ids=["input", "residual", "weight"])
-def test_residual_rms_norm_falls_back_for_noncontiguous_inputs(strided_arg):
+def test_rms_norm_direct_fp32_preserves_pytorch_path():
     from vllm import ir
 
     from vllm_metal.pytorch_backend import normalization
 
-    op = ir.ops.fused_add_rms_norm
+    op = ir.ops.rms_norm
+    args = op.generate_inputs(
+        num_tokens=2, hidden_size=8, dtype=torch.float32, device="cpu"
+    )
+    with op.set_priority(["native"]):
+        expected = op(*args)
+    gpu_args = tuple(x.to("mps") if isinstance(x, torch.Tensor) else x for x in args)
+    with patch.object(
+        normalization,
+        "_normalization_library",
+        side_effect=AssertionError("FP32 direct calls must stay on the PyTorch path"),
+    ) as kernel_loader:
+        # Match Omni's direct call, without the IR registry's supports_args check.
+        actual = normalization.rms_norm(*gpu_args)
+        kernel_loader.assert_not_called()
+    assert actual.dtype == torch.float32
+    torch.testing.assert_close(
+        actual.cpu(), expected, **op.get_tolerance(torch.float32)
+    )
+    for original, gpu_arg in zip(args[:-1], gpu_args[:-1], strict=True):
+        torch.testing.assert_close(gpu_arg.cpu(), original, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    ("fused", "strided_arg", "float_weight"),
+    [
+        (True, 0, False),
+        (True, 1, False),
+        (True, 2, False),
+        (False, 1, True),
+        (True, 0, True),
+    ],
+    ids=["input", "residual", "weight", "plain-float-weight", "residual-float-weight"],
+)
+def test_rms_norm_falls_back_for_noncontiguous_inputs(fused, strided_arg, float_weight):
+    from vllm import ir
+
+    from vllm_metal.pytorch_backend import normalization
+
+    op = ir.ops.fused_add_rms_norm if fused else ir.ops.rms_norm
     args = list(
         op.generate_inputs(
             num_tokens=4,
@@ -367,6 +422,8 @@ def test_residual_rms_norm_falls_back_for_noncontiguous_inputs(strided_arg):
             device="mps",
         )
     )
+    if float_weight:
+        args[-2] = args[-2].float() + 0.00390625
     source = args[strided_arg]
     storage = torch.empty(
         (*source.shape[:-1], source.shape[-1] * 2), device="mps", dtype=source.dtype
@@ -381,18 +438,20 @@ def test_residual_rms_norm_falls_back_for_noncontiguous_inputs(strided_arg):
         op.set_priority(["torch_mps", "native"]),
         patch.object(
             normalization,
-            "_add_rms_norm_kernel",
+            "_add_rms_norm_kernel" if fused else "_normalization_library",
             side_effect=AssertionError(
-                "Noncontiguous inputs must bypass the fused kernel"
+                "Noncontiguous inputs must bypass the Metal kernel"
             ),
         ) as kernel_loader,
     ):
         assert op.dispatch(*args).provider == "torch_mps"
         actual = op(*args)
         kernel_loader.assert_not_called()
-    for result, reference in zip(actual, expected, strict=True):
+    actual_rows = actual if fused else (actual,)
+    expected_rows = expected if fused else (expected,)
+    for result, reference in zip(actual_rows, expected_rows, strict=True):
         torch.testing.assert_close(
-            result.cpu(), reference, **op.get_tolerance(source.dtype)
+            result.cpu(), reference, **op.get_tolerance(args[0].dtype)
         )
     for arg, original in zip(args[:-1], before[:-1], strict=True):
         torch.testing.assert_close(arg.cpu(), original, atol=0, rtol=0)
