@@ -1717,3 +1717,20 @@ def test_qwen35_a_log_keeps_float32_under_bfloat16(tmp_path):
             np.array(a_log), hf[f"blk.{i}.ssm_a"], rtol=1e-6, atol=0
         )
         assert _gdn(model, i).dt_bias.dtype == mx.bfloat16
+
+
+@pytest.mark.parametrize("cut", [4, 109, 200])
+def test_truncated_header_raises_gguf_load_error(tmp_path, cut):
+    """A file cut inside the header must fail as GGUFLoadError, not IndexError.
+
+    gguf-py indexes an empty array when the tensor-info section is short; the
+    loader contract promises GGUFLoadError for every unreadable file.
+    """
+    gguf_path, cfg_dir = _build_dense_fixture(tmp_path, "qwen3", has_qk_norm=True)
+    data = Path(gguf_path).read_bytes()
+    assert cut < len(data)
+    truncated = tmp_path / "truncated.gguf"
+    truncated.write_bytes(data[:cut])
+
+    with pytest.raises(GGUFLoadError, match="Could not read GGUF file"):
+        GGUFModelLoader(truncated, config_dir=cfg_dir, target_dtype=mx.float32).load()
