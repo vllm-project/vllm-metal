@@ -9,9 +9,9 @@ from dataclasses import dataclass
 import mlx.core as mx
 import torch
 from vllm.v1.outputs import LogprobsTensors
-from vllm.v1.sample.sampler import Sampler
 
 from vllm_metal.tensor_bridge import mlx_to_torch
+from vllm_metal.v1.sampling import Sampler
 
 _LOGITS_LOGPROBS_MODES = ("raw_logits", "processed_logits")
 

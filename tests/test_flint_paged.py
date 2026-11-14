@@ -6,8 +6,8 @@ import pytest
 from mlx_lm.models import flint
 from mlx_lm.models.base import create_causal_mask
 
+from tests.stub_runner import make_kv_cache
 from vllm_metal.attention.attention_contracts import attention_contract_for
-from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
 from vllm_metal.attention.context import PagedAttentionContext
 from vllm_metal.attention.impls.sdpa import sdpa_forward
 
@@ -46,7 +46,7 @@ def test_paged_attention_matches_mlx_lm(layer_idx: int, window: int) -> None:
     # Checkpoint sinks are nonzero; the zero init would hide dropped sinks.
     attention.softmax_offset = mx.random.normal((_ARGS.num_attention_heads,))
     x = mx.random.normal((1, _SEQ_LEN, _ARGS.hidden_size))
-    cache = MetalPagedKVCache(
+    cache = make_kv_cache(
         num_layers=1,
         num_kv_heads=_ARGS.num_key_value_heads,
         head_dim=_ARGS.head_dim,

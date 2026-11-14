@@ -57,12 +57,18 @@ jobs:
           - name: qwen35-0.8b
             id: Qwen/Qwen3.5-0.8B
             revision: 2fc06364715b967f1860aea9cf38778875588b17
+            gguf_repo: unsloth/Qwen3.5-0.8B-GGUF
+            gguf_file: Qwen3.5-0.8B-Q6_K.gguf
+            gguf_revision: 6ab461498e2023f6e3c1baea90a8f0fe38ab64d0
     env:
       MACOSX_DEPLOYMENT_TARGET: '15.0'
       PARITY_GPU_MEMORY_UTILIZATION: '0.65'
       GLOO_SOCKET_IFNAME: lo0
       MODEL_ID: ${{ matrix.model.id }}
       MODEL_REVISION: ${{ matrix.model.revision }}
+      GGUF_REPO: ${{ matrix.model.gguf_repo }}
+      GGUF_FILE: ${{ matrix.model.gguf_file }}
+      GGUF_REVISION: ${{ matrix.model.gguf_revision }}
       TESTED_SHA: ${{ needs.resolve.outputs.sha }}
     defaults:
       run:
@@ -78,7 +84,7 @@ jobs:
         id: models
         with:
           path: ~/.cache/huggingface/hub
-          key: parity-hf-${{ runner.os }}-${{ matrix.model.name }}-${{ matrix.model.revision }}
+          key: parity-hf-${{ runner.os }}-${{ matrix.model.name }}-${{ matrix.model.revision }}${{ matrix.model.gguf_revision && format('-{0}', matrix.model.gguf_revision) || '' }}
       - name: Install the tested checkout
         id: install
         run: |
@@ -95,7 +101,7 @@ jobs:
           import os
           import platform
           import sys
-          from huggingface_hub import snapshot_download
+          from huggingface_hub import hf_hub_download, snapshot_download
           from vllm.platforms import current_platform
           assert type(current_platform).__name__ == "MetalPlatform", current_platform
           with open(os.environ["RUNNER_TEMP"] + "/parity/environment.txt", "a") as f:
@@ -106,6 +112,14 @@ jobs:
           model = snapshot_download(os.environ["MODEL_ID"], revision=os.environ["MODEL_REVISION"])
           with open(os.environ["GITHUB_ENV"], "a") as f:
               print(f"MODEL_PATH={model}", file=f)
+          if os.environ["GGUF_FILE"]:
+              gguf = hf_hub_download(
+                  os.environ["GGUF_REPO"],
+                  os.environ["GGUF_FILE"],
+                  revision=os.environ["GGUF_REVISION"],
+              )
+              with open(os.environ["GITHUB_ENV"], "a") as f:
+                  print(f"GGUF_PATH={gguf}", file=f)
           PY
       - uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
         if: success() && github.event_name == 'schedule' && steps.models.outputs.cache-hit != 'true'
@@ -117,6 +131,19 @@ jobs:
           source .venv-vllm-metal/bin/activate
           python tools/check_parity.py --model "$MODEL_PATH" --top-k 5 --max-tokens 20 \
             --batch-size 1 2 --output-dir "$RUNNER_TEMP/parity" \
+            --gpu-memory-utilization "$PARITY_GPU_MEMORY_UTILIZATION"
+      - name: Compare GGUF parity through HTTP serving
+        # Does not depend on the parity results, so it also runs when they fail.
+        if: >-
+          !cancelled() && matrix.model.name == 'qwen35-0.8b'
+          && steps.install.outcome == 'success'
+          && steps.checkpoint.outcome == 'success'
+        run: |
+          source .venv-vllm-metal/bin/activate
+          printf 'gguf=%s\n' "$GGUF_PATH" >> "$RUNNER_TEMP/parity/environment.txt"
+          # A quantized file against its dense source, so top-8 as in vllm-gguf-plugin.
+          python tools/check_parity.py --model "$GGUF_PATH" --reference-model "$MODEL_PATH" \
+            --top-k 8 --max-tokens 20 --batch-size 1 2 --output-dir "$RUNNER_TEMP/parity/gguf" \
             --gpu-memory-utilization "$PARITY_GPU_MEMORY_UTILIZATION"
       - name: Compare same-model speculative parity
         if: matrix.model.name == 'qwen3-0.6b'
