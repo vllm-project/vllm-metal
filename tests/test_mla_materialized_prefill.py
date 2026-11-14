@@ -10,6 +10,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 import pytest
+import torch
 
 from vllm_metal.attention import context as pac
 from vllm_metal.attention.caches.mla_cache import MLAPagedLatentCache
@@ -604,15 +605,16 @@ def test_shared_storage_matches_count_based_cache(
 
     monkeypatch.setattr("vllm_metal.envs.VLLM_METAL_MLA_KERNEL", kernel)
     monkeypatch.setattr(mla_mod, "_DECODE_BATCH_MIN_ROWS", 4)
-    allocate = storage_mod.allocate_kv_cache_lazily
+    allocate = storage_mod.allocate_kv_cache_regions
 
     def allocate_dirty(*args, **kwargs):
-        tensors = allocate(*args, **kwargs)
+        regions, tensors = allocate(*args, **kwargs)
         for tensor in tensors.values():
             tensor.fill_(float("nan"))
-        return tensors
+        torch.mps.synchronize()
+        return regions, tensors
 
-    monkeypatch.setattr(storage_mod, "allocate_kv_cache_lazily", allocate_dirty)
+    monkeypatch.setattr(storage_mod, "allocate_kv_cache_regions", allocate_dirty)
     inner, _, count_based = _make(num_blocks=16)
     runtime = initialize_mla_runtime(
         16, num_layers=1, kv_lora_rank=_KVL, rope_dim=_ROPE, block_size=_BLK

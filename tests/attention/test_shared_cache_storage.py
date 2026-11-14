@@ -246,7 +246,8 @@ def test_budget_above_buffer_limit_uses_shared_regions(monkeypatch):
 
     assert storage.nbytes == budget == 2 * buffer_limit
     assert len(imported) == len(storage.buffers) == 2
-    assert len({tensor.untyped_storage().data_ptr() for tensor in imported}) == 1
+    # One allocation per region, each within the buffer limit.
+    assert len({tensor.untyped_storage().data_ptr() for tensor in imported}) == 2
     assert sum(buffer.nbytes for buffer in storage.buffers) == storage.nbytes
     assert storage.state_views(["s0", "s1"])[0][0].shape[0] == planned.num_blocks
 
@@ -296,7 +297,9 @@ def test_state_gathers_read_slots_past_32_bit_offsets():
     raw = torch.empty((num_slots, page), dtype=torch.uint8)
     conv_t = raw.as_strided((num_slots, *conv_row), (page, conv_row[1], 1))
     rec_t = raw.as_strided((num_slots, *rec_row), (page, 32, 8, 1), storage_offset=64)
-    storage = SimpleNamespace(region_offsets=[0], buffers=[torch_to_mlx(raw)])
+    storage = SimpleNamespace(
+        region_index={raw.untyped_storage().data_ptr(): 0}, buffers=[torch_to_mlx(raw)]
+    )
     cache = PagedStateCache(
         [CacheViews(storage, [conv_t]), CacheViews(storage, [rec_t])]
     )
