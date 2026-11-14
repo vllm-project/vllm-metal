@@ -1995,3 +1995,44 @@ def test_runner_text_only_vlm_tower_connector_flag_has_no_effect(
         encoder=encoder,
     )
     assert set(manager.modules) == {"fc1", "fc2"}
+
+
+def test_manager_remove_adapter_clears_the_slot() -> None:
+    """Unloading one adapter frees its slot without disturbing the other."""
+    model = _TwoLinearModel()
+    model.fc2.weight = mx.array(np.eye(2, dtype=np.float32))
+    manager = model_manager_mod.MLXLoRAModelManager(
+        model=model,
+        lora_config=_lora_config_stub(max_loras=2, max_lora_rank=1, max_cpu_loras=2),
+        max_num_seqs=2,
+        max_num_batched_tokens=4,
+        dtype=mx.float32,
+    )
+    a1 = _make_adapter(
+        lora_id=1,
+        fc1_a=np.array([[1.0, 0.0]], dtype=np.float32),
+        fc1_b=np.array([[5.0], [0.0]], dtype=np.float32),
+    )
+    a2 = _make_adapter(
+        lora_id=2,
+        fc1_a=np.array([[0.0, 1.0]], dtype=np.float32),
+        fc1_b=np.array([[0.0], [7.0]], dtype=np.float32),
+    )
+    manager.add_adapter(a1)
+    manager.add_adapter(a2)
+    manager.activate_adapter(1)
+    manager.activate_adapter(2)
+    slot = manager.lora_index_to_id.index(1)
+
+    assert manager.remove_adapter(1) is True
+    assert manager.list_adapters() == {2}
+    assert 1 not in manager.lora_index_to_id
+    assert manager.modules["fc1"]._lora_ranks[slot] == 0
+
+    mapping = LoRAMapping(index_mapping=(2,), prompt_mapping=(2,))
+    manager.set_adapter_mapping(mapping)
+    out = np.array(model(mx.array(np.array([[0.0, 1.0]], dtype=np.float32))))
+    np.testing.assert_allclose(out, np.array([[0.0, 7.0]]), rtol=1e-5)
+
+    with pytest.raises(ValueError, match="not active"):
+        manager.set_adapter_mapping(LoRAMapping((1,), (1,)))
