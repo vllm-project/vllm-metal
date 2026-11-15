@@ -61,6 +61,16 @@ class _NegatedExp:
         return mx.log(-source)
 
 
+class _ShiftedByOne:
+    """The file stores ``x + 1`` (llama.cpp folds Gemma's ``1 + weight`` norm)."""
+
+    def source_shape(self, model_shape: tuple[int, ...]) -> tuple[int, ...]:
+        return model_shape
+
+    def apply(self, source: mx.array) -> mx.array:
+        return source - 1
+
+
 @dataclass(frozen=True)
 class GGUFArchSpec:
     """How llama.cpp stores one supported GGUF arch relative to mlx-lm."""
@@ -73,12 +83,16 @@ class GGUFArchSpec:
     param_aliases: Mapping[str, str] = field(default_factory=dict)
     # Per-layer GGUF tensor -> how llama.cpp changed its layout or values.
     layer_transforms: Mapping[str, GGUFPlainTransform] = field(default_factory=dict)
+    # Global GGUF tensor -> how llama.cpp changed its layout or values.
+    global_transforms: Mapping[str, GGUFPlainTransform] = field(default_factory=dict)
     # q/k rows stored in llama.cpp's interleaved RoPE layout.
     rope_permuted_qk: bool = False
     # Gated DeltaNet V heads tiled across the K heads instead of grouped.
     tiled_v_heads: bool = False
     # MTP blocks appended after the decoder, which mlx-lm has no module for.
     appended_mtp_blocks: bool = False
+    # token_embd cut to the tokenizer's tokens, so config vocab_size can exceed it.
+    trimmed_vocab: bool = False
 
 
 class GGUFModelAdapter:
@@ -106,6 +120,19 @@ class GGUFModelAdapter:
             },
             tiled_v_heads=True,
             appended_mtp_blocks=True,
+        ),
+        "gemma3": GGUFArchSpec(
+            config_model_types=frozenset({"gemma3_text"}),
+            layer_transforms={
+                "attn_norm.weight": _ShiftedByOne(),
+                "attn_q_norm.weight": _ShiftedByOne(),
+                "attn_k_norm.weight": _ShiftedByOne(),
+                "post_attention_norm.weight": _ShiftedByOne(),
+                "ffn_norm.weight": _ShiftedByOne(),
+                "post_ffw_norm.weight": _ShiftedByOne(),
+            },
+            global_transforms={"output_norm.weight": _ShiftedByOne()},
+            trimmed_vocab=True,
         ),
     }
 
@@ -218,6 +245,23 @@ class GGUFModelAdapter:
             if substring not in admitted
         )
 
+    @classmethod
+    def skeleton_config(
+        cls, config: dict[str, Any], *, arch: str, embedding_rows: int | None
+    ) -> dict[str, Any]:
+        """Return the config to build ``arch``'s skeleton from.
+
+        A trimmed-vocab arch takes ``vocab_size`` from the file's embedding rows,
+        as vllm-gguf-plugin does, on both the top-level and the text config.
+        """
+        if not cls._ARCH_SPECS[arch].trimmed_vocab or embedding_rows is None:
+            return config
+        skeleton = {**config, "vocab_size": embedding_rows}
+        text_config = config.get("text_config")
+        if isinstance(text_config, dict):
+            skeleton["text_config"] = {**text_config, "vocab_size": embedding_rows}
+        return skeleton
+
     @staticmethod
     def text_model(model: nn.Module) -> nn.Module:
         """Return the text model a GGUF fills (``language_model`` when wrapped)."""
@@ -280,9 +324,12 @@ class GGUFModelAdapter:
             permute_index={**rope_rows, **v_head_rows},
             column_index=v_head_columns,
             plain_transforms={
-                f"blk.{i}.{tensor}": transform
-                for i in range(num_hidden_layers)
-                for tensor, transform in spec.layer_transforms.items()
+                **spec.global_transforms,
+                **{
+                    f"blk.{i}.{tensor}": transform
+                    for i in range(num_hidden_layers)
+                    for tensor, transform in spec.layer_transforms.items()
+                },
             },
         )
 
