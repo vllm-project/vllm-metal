@@ -15,7 +15,7 @@ import pytest
 gguf = pytest.importorskip("gguf")
 
 from tests.gguf_kquant_fixtures import (  # noqa: E402
-    build_iq3xxs_blocks,
+    build_iq3_blocks,
     build_kquant_blocks,
 )
 from vllm_metal.gguf.raw_block import GGUFRawBlockTensor  # noqa: E402
@@ -55,7 +55,7 @@ def _make_raw_tensor(
     qtype: gguf.GGMLQuantizationType = GGMLQuantizationType.Q6_K,
 ) -> tuple:
     if qtype == GGMLQuantizationType.IQ3_XXS:
-        raw = build_iq3xxs_blocks(rows, cols)
+        raw = build_iq3_blocks(rows, cols, qtype)
     else:
         raw = build_kquant_blocks(rows, cols, qtype)
     qt = GGUFRawBlockTensor.from_raw_blocks(raw, (rows, cols), qtype)

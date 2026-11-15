@@ -25,7 +25,7 @@ gguf = pytest.importorskip("gguf")
 
 import vllm_metal.gguf.loader as gguf_loader  # noqa: E402
 from tests.gguf_kquant_fixtures import (  # noqa: E402
-    build_iq3s_blocks,
+    build_iq3_blocks,
     build_iq4_blocks,
     build_kquant_blocks,
 )
@@ -151,7 +151,7 @@ def _write_gguf(
             elif raw_dtype in (QT.IQ4_NL, QT.IQ4_XS):
                 raw = build_iq4_blocks(shape[0], shape[-1], raw_dtype)
             elif raw_dtype == QT.IQ3_S:
-                raw = build_iq3s_blocks(shape[0], shape[-1])
+                raw = build_iq3_blocks(shape[0], shape[-1], QT.IQ3_S)
             else:
                 quant_input = data.reshape(1, -1) if data.ndim == 1 else data
                 raw = gguf.quants.quantize(quant_input, raw_dtype)
