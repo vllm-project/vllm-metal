@@ -289,10 +289,47 @@ _DEQUANT_SOURCES: dict[GGMLQuantizationType, str] = {
     GGMLQuantizationType.Q6_K: _Q6K_DEQUANT_SOURCE,
     GGMLQuantizationType.IQ3_XXS: _IQ3XXS_DEQUANT_SOURCE,
 }
+_IQ3XXS_QMV_SOURCE = (
+    _QMV_PROLOGUE
+    + """
+        device const uint8_t* b =
+            blocks + ((size_t)row * blocks_per_row + blk) * 98;
+        float d = float(as_type<half>(((device const uint16_t*)b)[0]));
+        device const uint8_t* wa = b + 66 + 4 * (grp / 2);
+        uint aux = uint(wa[0]) | (uint(wa[1]) << 8) | (uint(wa[2]) << 16)
+            | (uint(wa[3]) << 24);
+        float db = d * (0.5f + float(aux >> 28)) * 0.5f;
+        // This 16-element half of the 32-element group uses sign chunks
+        // 2*(grp%2) and 2*(grp%2)+1, 7 bits each.
+        uint sh = 14 * (grp % 2);
+        uint s0 = kIqSigns[(aux >> sh) & 0x7F];
+        uint s1 = kIqSigns[(aux >> (sh + 7)) & 0x7F];
+        device const uint8_t* qs = b + 2 + grp * 4;
+        float w[16];
+        #pragma unroll
+        for (uint i = 0; i < 16; ++i) {
+            float mag = float(kIq3xxsGrid[uint(qs[i / 4]) * 4 + i % 4]);
+            uint s = (i < 8) ? s0 : s1;
+            w[i] = ((s >> (i % 8)) & 1) ? -mag : mag;
+        }
+        uint x_offset = blk * 256 + grp * 16;
+        for (uint batch = 0; batch < NB; ++batch) {
+            device const float* xg =
+                x + (size_t)batch * blocks_per_row * 256 + x_offset;
+            float part = 0.0f;
+            #pragma unroll
+            for (uint i = 0; i < 16; ++i) part += xg[i] * w[i];
+            acc[batch] += db * part;
+        }
+"""
+    + _QMV_EPILOGUE
+)
+
 _QMV_SOURCES: dict[GGMLQuantizationType, str] = {
     GGMLQuantizationType.Q2_K: _Q2K_QMV_SOURCE,
     GGMLQuantizationType.Q3_K: _Q3K_QMV_SOURCE,
     GGMLQuantizationType.Q6_K: _Q6K_QMV_SOURCE,
+    GGMLQuantizationType.IQ3_XXS: _IQ3XXS_QMV_SOURCE,
 }
 
 # Kernel names stay unique per qtype so Metal caches them separately.
@@ -312,6 +349,7 @@ _QMV_KERNELS: dict[GGMLQuantizationType, Any] = {
         input_names=["blocks", "x", "dims"],
         output_names=["y"],
         source=source,
+        header=_KERNEL_HEADERS.get(qtype, ""),
     )
     for qtype, source in _QMV_SOURCES.items()
 }
@@ -464,8 +502,7 @@ class GGUFRawBlockTensor:
         rows = flat.shape[0]
         if rows == 0:
             return mx.zeros((*lead, self.out_features), dtype=x.dtype)
-        # TODO(#1356): drop the membership check once IQ3_XXS has a qmv kernel.
-        if rows <= _QMV_MAX_BATCH and self.qweight_type in _QMV_KERNELS:
+        if rows <= _QMV_MAX_BATCH:
             out = self._qmv(flat.astype(mx.float32))
         else:
             # Dequantizing straight into x's dtype keeps the GEMM there; a

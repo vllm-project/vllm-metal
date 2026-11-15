@@ -55,8 +55,9 @@ missing, ambiguous, or shard-only matches also fail before model load.
   with that block skipped. MTP speculative decoding is not supported.
 - Supported qtypes: Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q2_K, Q3_K, Q4_K, Q5_K,
   Q6_K, IQ4_NL, IQ4_XS, IQ3_S, and IQ3_XXS, plus plain F32/F16/BF16 tensors,
-  mixed freely within one file, so llama.cpp's Q4_K_M, Q5_K_M and IQ3_M exports,
-  bartowski's Q4_K_L, and unsloth's UD-Q4_K_XL load. Remote reference tags
+  mixed freely within one file, so llama.cpp's Q4_K_M, Q5_K_M, IQ3_M and IQ3_XS
+  exports, bartowski's Q4_K_L, and unsloth's UD-Q4_K_XL load. IQ3_XXS exports
+  also carry IQ2_S tensors, so they do not load yet. Remote reference tags
   accept Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q2_K and Q2_K_S/M/L, Q3_K and
   Q3_K_S/M/L, Q4_K_S/M/L, Q5_K_S/M/L, Q6_K, Q6_K_L, IQ4_NL, IQ4_XS, IQ3_S,
   IQ3_M, and the plain types.
@@ -65,10 +66,9 @@ missing, ambiguous, or shard-only matches also fail before model load.
   also need more memory than their file size, so an IQ3_M file uses about as
   much as the same model's Q4_K_M.
 - Q2_K/Q3_K/Q6_K/IQ3_XXS weights stay in their GGUF blocks and run on custom
-  Metal kernels. IQ3_XXS has no fused kernel yet, so it always takes the
-  dequantize + GEMM path. For the others, small batches use a fused kernel on
-  the packed blocks, and larger ones, such as a prefill, dequantize a
-  transient dense copy of the weight for one GEMM and free it afterwards.
+  Metal kernels. Small batches use a fused kernel on the packed blocks, and
+  larger ones, such as a prefill, dequantize a transient dense copy of the
+  weight for one GEMM and free it afterwards.
 - When a tied model's file also carries `output.weight`, logits use it, as
   llama.cpp does: llama-quantize stores that table at the output qtype (for
   example Q6_K) even when `token_embd` uses a lower one. An `output.weight` in

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for the raw-block GGUF tensor and its Q2_K/Q3_K/Q6_K Metal kernels.
+"""Tests for the raw-block GGUF tensor and its Q2_K/Q3_K/Q6_K/IQ3_XXS kernels.
 
 K-quant fixtures are built as raw blocks field-by-field because gguf-py
 cannot quantize K-quants; ``gguf.quants.dequantize`` stays the authoritative
@@ -26,9 +26,8 @@ _RAW_QTYPES = [
     GGMLQuantizationType.Q2_K,
     GGMLQuantizationType.Q3_K,
     GGMLQuantizationType.Q6_K,
+    GGMLQuantizationType.IQ3_XXS,
 ]
-# IQ3_XXS has a dequant kernel but no qmv kernel yet, so it skips matmul tests.
-_DEQUANT_QTYPES = [*_RAW_QTYPES, GGMLQuantizationType.IQ3_XXS]
 
 
 def _spy_matmul_paths(monkeypatch) -> dict:
@@ -85,7 +84,7 @@ def test_contract_matches_logical_shape(qtype, bits, block_bytes):
     assert qt.packed_shape == (16, 512 // 256 * block_bytes)
 
 
-@pytest.mark.parametrize("qtype", _DEQUANT_QTYPES)
+@pytest.mark.parametrize("qtype", _RAW_QTYPES)
 def test_dequantize_matches_oracle_bit_exact(qtype):
     qt, oracle = _make_raw_tensor(qtype=qtype)
 
@@ -202,7 +201,7 @@ def test_matmul_empty_batch():
     assert out.dtype == mx.float16
 
 
-@pytest.mark.parametrize("qtype", _DEQUANT_QTYPES)
+@pytest.mark.parametrize("qtype", _RAW_QTYPES)
 def test_embedding_matches_oracle_rows_exactly(qtype):
     qt, oracle = _make_raw_tensor(qtype=qtype)
     ids = mx.array([[0, 5], [15, 0]], dtype=mx.int32)
@@ -223,7 +222,7 @@ def test_embedding_empty_ids():
     assert out.dtype == mx.float16
 
 
-@pytest.mark.parametrize("qtype", _DEQUANT_QTYPES)
+@pytest.mark.parametrize("qtype", _RAW_QTYPES)
 def test_permute_rows_matches_permuted_oracle(qtype):
     qt, oracle = _make_raw_tensor(qtype=qtype)
     perm = np.random.default_rng(5).permutation(qt.out_features)
