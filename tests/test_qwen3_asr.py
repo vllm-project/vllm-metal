@@ -14,6 +14,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 from transformers import WhisperFeatureExtractor
+from vllm.sampling_params import SamplingParams
 
 from vllm_metal.stt.audio import load_audio
 from vllm_metal.stt.detection import is_stt_model
@@ -472,6 +473,35 @@ class TestQwen3ASRModel:
 
 
 class TestGreedyDecodeStopping:
+    @pytest.mark.parametrize("budget", [1, 2])
+    @pytest.mark.parametrize("forced_language", [False, True])
+    def test_transcript_budget_stops_decode(self, budget, forced_language) -> None:
+        model = MagicMock()
+        model.config.eos_token_id = 2
+        prefix = [] if forced_language else [6, 8]
+        transcript = [7, 9]
+        logits = [
+            mx.eye(10)[None, token : token + 1] for token in [*prefix, *transcript, 2]
+        ]
+        model.prefill.return_value = (logits[0], None)
+        model.decode_step.side_effect = [(row, None) for row in logits[1:]]
+        transcriber = Qwen3ASRTranscriber(
+            model,
+            tokenizer=SimpleNamespace(
+                eos_token_id=3, encode=lambda *_args, **_kwargs: [8]
+            ),
+        )
+        sampling = STTSampling.from_request(
+            SamplingParams(temperature=0, max_tokens=budget), Sampler()
+        )
+
+        tokens = transcriber.decode_tokens(
+            mx.zeros((1, 4)), [1, 8] if forced_language else [1], sampling
+        )
+
+        assert tokens == [*prefix, *transcript[:budget]]
+        assert model.decode_step.call_count == len(prefix) + budget - 1
+
     @pytest.mark.parametrize("stop_token", [2, 3], ids=["model-eos", "tokenizer-eos"])
     @pytest.mark.parametrize("prefix", [[], [7]], ids=["prefill", "decode"])
     def test_stops_before_forwarding_eos(self, stop_token, prefix) -> None:
