@@ -14,7 +14,10 @@ import pytest
 
 gguf = pytest.importorskip("gguf")
 
-from tests.gguf_kquant_fixtures import build_kquant_blocks  # noqa: E402
+from tests.gguf_kquant_fixtures import (  # noqa: E402
+    build_iq3xxs_blocks,
+    build_kquant_blocks,
+)
 from vllm_metal.gguf.raw_block import GGUFRawBlockTensor  # noqa: E402
 
 GGMLQuantizationType = gguf.GGMLQuantizationType
@@ -24,6 +27,8 @@ _RAW_QTYPES = [
     GGMLQuantizationType.Q3_K,
     GGMLQuantizationType.Q6_K,
 ]
+# IQ3_XXS has a dequant kernel but no qmv kernel yet, so it skips matmul tests.
+_DEQUANT_QTYPES = [*_RAW_QTYPES, GGMLQuantizationType.IQ3_XXS]
 
 
 def _spy_matmul_paths(monkeypatch) -> dict:
@@ -50,7 +55,10 @@ def _make_raw_tensor(
     cols: int = 512,
     qtype: gguf.GGMLQuantizationType = GGMLQuantizationType.Q6_K,
 ) -> tuple:
-    raw = build_kquant_blocks(rows, cols, qtype)
+    if qtype == GGMLQuantizationType.IQ3_XXS:
+        raw = build_iq3xxs_blocks(rows, cols)
+    else:
+        raw = build_kquant_blocks(rows, cols, qtype)
     qt = GGUFRawBlockTensor.from_raw_blocks(raw, (rows, cols), qtype)
     oracle = gguf.quants.dequantize(raw, qtype).astype(np.float32)
     return qt, oracle
@@ -62,6 +70,7 @@ def _make_raw_tensor(
         (GGMLQuantizationType.Q2_K, 2, 84),
         (GGMLQuantizationType.Q3_K, 3, 110),
         (GGMLQuantizationType.Q6_K, 6, 210),
+        (GGMLQuantizationType.IQ3_XXS, 3, 98),
     ],
 )
 def test_contract_matches_logical_shape(qtype, bits, block_bytes):
@@ -76,7 +85,7 @@ def test_contract_matches_logical_shape(qtype, bits, block_bytes):
     assert qt.packed_shape == (16, 512 // 256 * block_bytes)
 
 
-@pytest.mark.parametrize("qtype", _RAW_QTYPES)
+@pytest.mark.parametrize("qtype", _DEQUANT_QTYPES)
 def test_dequantize_matches_oracle_bit_exact(qtype):
     qt, oracle = _make_raw_tensor(qtype=qtype)
 
@@ -193,7 +202,7 @@ def test_matmul_empty_batch():
     assert out.dtype == mx.float16
 
 
-@pytest.mark.parametrize("qtype", _RAW_QTYPES)
+@pytest.mark.parametrize("qtype", _DEQUANT_QTYPES)
 def test_embedding_matches_oracle_rows_exactly(qtype):
     qt, oracle = _make_raw_tensor(qtype=qtype)
     ids = mx.array([[0, 5], [15, 0]], dtype=mx.int32)
@@ -214,7 +223,7 @@ def test_embedding_empty_ids():
     assert out.dtype == mx.float16
 
 
-@pytest.mark.parametrize("qtype", _RAW_QTYPES)
+@pytest.mark.parametrize("qtype", _DEQUANT_QTYPES)
 def test_permute_rows_matches_permuted_oracle(qtype):
     qt, oracle = _make_raw_tensor(qtype=qtype)
     perm = np.random.default_rng(5).permutation(qt.out_features)
