@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Numerical and cache-layout coverage for the private P256/P512 GQA kernels.
+"""Numerical and cache-layout coverage for the private GQA kernels.
 
 Tests force each specialization without GPU core detection. Production
 selection and fallback are covered separately in test_gqa_decode_routing.py.
@@ -245,11 +245,8 @@ def test_private_gqa_partition_is_local_to_lazy_primitive():
     lengths = mx.array([513], dtype=mx.int32)
     outputs = [
         ops._gqa_paged_attention_for_test(
-            q, k, v, 128**-0.5, tables, lengths, 16, 513, part
-        )
-        for part in (256, 512)
-    ]
-    outputs.append(
+            q, k, v, 128**-0.5, tables, lengths, 16, 513, 256
+        ),
         ops.paged_attention_primitive(
             q,
             k,
@@ -263,9 +260,9 @@ def test_private_gqa_partition_is_local_to_lazy_primitive():
             16,
             513,
             -1,
-        )
-    )
-    for part, out in zip([256, 512, 0], outputs, strict=True):
+        ),
+    ]
+    for part, out in zip([256, 0], outputs, strict=True):
         mx.eval(out)
         assert ops.last_gqa_partition_size() == part
         assert np.allclose(np.array(out), 2, atol=2e-3)
@@ -286,13 +283,6 @@ def test_forced_partition_rejects_oversized_reducer(partition):
         ops._gqa_paged_attention_for_test(
             query, key, value, 128**-0.5, table, lengths, 16, n, partition
         )
-    # A larger partition fits the same history and still computes every token.
-    out = ops._gqa_paged_attention_for_test(
-        query, key, value, 128**-0.5, table, lengths, 16, n, 512
-    )
-    mx.eval(out)
-    assert ops.last_gqa_partition_size() == 512
-    np.testing.assert_allclose(np.array(out), 2, atol=2e-3)
 
 
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])

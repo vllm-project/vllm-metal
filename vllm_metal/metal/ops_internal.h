@@ -38,7 +38,7 @@ using hardware::gpu_core_count;
 // One measured dispatch table, also exposed read-only to numerical/routing
 // tests. Include the kernel page view so geometry and page admission cannot
 // drift independently. Model names are not routing inputs; the calibrated
-// device preference below is separate from functional geometry admission.
+// work budget below is separate from functional geometry admission.
 struct GqaDecodeGeometry {
   int num_heads;
   int num_kv_heads;
@@ -56,38 +56,23 @@ constexpr std::array<GqaDecodeGeometry, 7> kGqaDecodeGeometries = {{
 }};
 
 // Shared by production selection, private test dispatch and library checks.
-static_assert(kPartitionSize == 512,
-              "GQA partition list assumes the established 512-token split");
-constexpr std::array<int, 2> kGqaPartitionSizes = {512, 256};
+// One size: a query head walks its partition serially, so partitions are the
+// producer's only parallelism over context length, and 256 fills the GPU
+// sooner than the 512-token split-KV partition.
+constexpr int kGqaPartitionSize = 256;
 constexpr int64_t kGqaSimdGroupsPerCore = 33;
-// The ordinary GQA reducer specializes out the TurboQuant workspace, but
-// retains red_smem[2 * NUM_WARPS] (256 threads / 32 SIMD lanes). Reserve its
-// 64 bytes as well as the dynamic statistics; dispatch also checks the
-// compiled pipeline's actual static allocation before encoding the reducer.
-constexpr size_t kGqaReduceStaticMemoryBytes = 2 * (256 / 32) * sizeof(float);
-
-// M3 (10-core, g15g) batched calibration. Tighten short-context admission,
-// and avoid the slower P512 producer for measured long head256 layouts.
-// Single requests and other devices retain the existing selection.
-constexpr int kM3GqaGpuCores = 10;
-constexpr int kM3GqaShortHead128Batch = 6;
-constexpr int kM3GqaShortHead128MinContext = 704;
-constexpr int kM3GqaBlock16MinContext = 4096;
-constexpr int kM3GqaBlock32MinContext = 8192;
-constexpr size_t kM3GqaReducerMemoryBytes = 32 * 1024;
 
 // Bound partial outputs, both statistics and any compact-layout offsets.
 // This is a per-invocation ceiling, not a reservation or a process memory limit.
 constexpr size_t kGqaMaxScratchBytes = 512 * 1024 * 1024;
 // Immutable CPU metadata shared by every attention layer of one forward.
 // No device reads or geometry-dependent policy are captured here.
-using GqaPartitionOffsets = std::array<std::vector<int64_t>, 2>;
 struct GqaDecodeLengthPlan {
   int num_requests = 0;
   int max_length = 0;
   int64_t total_length = 0;
-  std::array<int64_t, 2> full_partitions = {};
-  std::shared_ptr<const GqaPartitionOffsets> partition_offsets;
+  int64_t full_partitions = 0;
+  std::shared_ptr<const std::vector<int64_t>> partition_offsets;
 
   bool operator==(const GqaDecodeLengthPlan& other) const {
     return num_requests == other.num_requests && max_length == other.max_length &&
@@ -111,25 +96,20 @@ template <typename Lengths>
 static GqaDecodeLengthPlan gqa_decode_length_plan(const Lengths& context_lens) {
   GqaDecodeLengthPlan plan;
   auto offsets = context_lens.size() > 1
-      ? std::make_shared<GqaPartitionOffsets>() : nullptr;
+      ? std::make_shared<std::vector<int64_t>>() : nullptr;
   if (offsets) {
-    for (auto& row : *offsets) {
-      row.reserve(context_lens.size() + 1);
-      row.push_back(0);
-    }
+    offsets->reserve(context_lens.size() + 1);
+    offsets->push_back(0);
   }
   for (int length : context_lens) {
     if (length <= 0) return {};
     ++plan.num_requests;
     plan.max_length = std::max(plan.max_length, length);
     plan.total_length += length;
-    for (size_t i = 0; i < kGqaPartitionSizes.size(); ++i) {
-      plan.full_partitions[i] += length / kGqaPartitionSizes[i];
-      if (offsets) {
-        auto& row = (*offsets)[i];
-        row.push_back(row.back() +
-            (int64_t(length) + kGqaPartitionSizes[i] - 1) / kGqaPartitionSizes[i]);
-      }
+    plan.full_partitions += length / kGqaPartitionSize;
+    if (offsets) {
+      offsets->push_back(offsets->back() +
+          (int64_t(length) + kGqaPartitionSize - 1) / kGqaPartitionSize);
     }
   }
   if (plan.num_requests > 0) plan.partition_offsets = std::move(offsets);
@@ -146,7 +126,7 @@ std::string gqa_decode_tq_kernel_name(
 int gqa_decode_plan_for_lengths(
     int num_heads, int num_kv_heads, int head_size,
     const GqaDecodeLengthPlan& plan, int gpu_cores, int block_size,
-    const std::string& gpu_arch = "", int max_seq_len = 0, bool turboquant = false);
+    int max_seq_len = 0);
 void init_library_path(const std::string& name, const std::string& path);
 void init_nax_library_path(const std::string& path);
 std::string dtype_to_metal(Dtype dt);
