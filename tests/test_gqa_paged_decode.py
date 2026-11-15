@@ -199,6 +199,53 @@ def test_gqa_partial_page_tails(dtype, part, n_tok, q, kv, head, block):
     _assert_close(out, ref, dtype)
 
 
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("part", GQA_PARTITIONS)
+@pytest.mark.parametrize(
+    "lengths,window",
+    [
+        pytest.param((2, 37), (1, 5), id="window-not-block-aligned"),
+        pytest.param((1, 17), (4, 0), id="window-covers-context"),
+        pytest.param((3, 9), (0, 7), id="window-inside-one-block"),
+        pytest.param(((3, 41), (0, 33), (1, 1), (2, 0)), (1, 23), id="ragged-batch"),
+    ],
+)
+@pytest.mark.parametrize("q,kv,head,block", GQA_GEOMETRIES)
+def test_windowed_gqa_matches_full_softmax_reference(
+    dtype, part, lengths, window, q, kv, head, block
+):
+    """Keys left of the window never contribute, wherever the window starts."""
+    rows = lengths if isinstance(lengths[0], tuple) else (lengths,)
+    out, ref = _run_primitive(
+        [n * part + extra for n, extra in rows],
+        dtype,
+        interleaved=True,
+        seed=1272,
+        num_query_heads=q,
+        num_kv_heads=kv,
+        head_size=head,
+        block_size=block,
+        sliding_window=window[0] * part + window[1],
+        test_partition=part,
+    )
+    assert _dispatch_family() == "gqa_decode"
+    assert get_ops().last_gqa_partition_size() == part
+    _assert_close(out, ref, dtype)
+
+
+@pytest.mark.parametrize("window", [0, -2])
+def test_private_gqa_entry_rejects_invalid_window(window):
+    with pytest.raises(ValueError, match="sliding_window"):
+        _run_primitive(
+            [65],
+            mx.float16,
+            interleaved=False,
+            seed=0,
+            sliding_window=window,
+            test_partition=256,
+        )
+
+
 @pytest.mark.parametrize("part", [0, 32, 64, 128, 1024])
 def test_private_gqa_entry_rejects_unshipped_partitions(part):
     with pytest.raises(ValueError, match="GQA test partition"):
@@ -283,6 +330,24 @@ def test_forced_partition_rejects_oversized_reducer(partition):
         ops._gqa_paged_attention_for_test(
             query, key, value, 128**-0.5, table, lengths, 16, n, partition
         )
+
+
+def test_windowed_partitions_cover_only_the_window():
+    """A window bounds the partition count, so the reducer fits any history."""
+    ops = get_ops()
+    n = 1048577
+    query = mx.ones((1, 16, 128), mx.float16)
+    key = mx.ones((1, 16, 2, 128), mx.float16)
+    value = mx.full(key.shape, 2, mx.float16)
+    table = mx.zeros((1, (n + 15) // 16), mx.int32)
+    lengths = mx.array([n], mx.int32)
+    # The same history overflows the P256 reducer without a window.
+    out = ops._gqa_paged_attention_for_test(
+        query, key, value, 128**-0.5, table, lengths, 16, n, 256, sliding_window=1000
+    )
+    mx.eval(out)
+    assert ops.last_gqa_partition_size() == 256
+    np.testing.assert_allclose(np.array(out), 2, atol=2e-3)
 
 
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])

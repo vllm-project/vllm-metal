@@ -568,7 +568,7 @@ static void dispatch_paged_attention_v2_reduce(
     const std::string& dt, bool use_sinks, const array* sinks,
     bool use_tq_fc, int partition_size = kPartitionSize,
     MTL::ComputePipelineState* rkernel = nullptr,
-    const array* partition_offsets = nullptr) {
+    const array* partition_offsets = nullptr, int visible_window = -1) {
   if (rkernel == nullptr) {
     rkernel = paged_attention_v2_reduce_kernel(
         d, dt, head_size, partition_size, use_sinks, use_tq_fc,
@@ -597,6 +597,8 @@ static void dispatch_paged_attention_v2_reduce(
   int32_t num_seqs_i = static_cast<int32_t>(num_seqs);
   enc.set_bytes(num_seqs_i, 8);
   if (partition_offsets != nullptr) enc.set_input_array(*partition_offsets, 9);
+  int32_t visible_window_i = static_cast<int32_t>(visible_window);
+  enc.set_bytes(visible_window_i, 10);
   enc.dispatch_threadgroups(
       MTL::Size::Make(num_heads, total_q_tokens, 1),
       MTL::Size::Make(256, 1, 1));
@@ -654,10 +656,13 @@ static bool gqa_decode_metadata_eligible(
   const bool gqa_cache_dtypes = m.use_turboquant
       ? gqa_turboquant
       : m.query_dtype == m.key_dtype && m.query_dtype == m.value_dtype;
+  // The windowed producer is reachable only through the private test entry
+  // until default routing admits sliding layers (#1272).
+  const bool gqa_window = m.sliding_window < 0
+      || (m.sliding_window > 0 && m.gqa_test_partition > 0 && !m.use_turboquant);
   return !has_prefill && m.window_seqlen_q <= 1 && gqa_decode_rows
       && (m.query_dtype == float16 || m.query_dtype == bfloat16)
-      && gqa_cache_dtypes && m.softcap <= 0.f && !m.use_sinks
-      && m.sliding_window < 0;
+      && gqa_cache_dtypes && m.softcap <= 0.f && !m.use_sinks && gqa_window;
 }
 
 // The single routing point selects execution paths from CPU metadata and lazy providers.
@@ -846,10 +851,15 @@ static PagedAttentionPlan select_paged_attention_route(
                 : m.gqa_length_plan,
             get_detected_gpu_cores(), m.block_size, m.max_seq_len);
 
+  // A windowed producer partitions only the visible span. Its rows hold at
+  // most ceil(window / partition) partitions, so it keeps the dense layout
+  // instead of offsets planned over whole contexts.
+  const bool gqa_windowed = gqa_partition_size > 0 && m.sliding_window > 0;
+  const int64_t visible_len = gqa_windowed
+      ? std::min(m.max_seq_len, m.sliding_window) : m.max_seq_len;
   const int64_t partitions = gqa_partition_size > 0
-      ? (static_cast<int64_t>(m.max_seq_len) + gqa_partition_size - 1) /
-            gqa_partition_size : 0;
-  const auto* offsets = gqa_partition_size > 0
+      ? (visible_len + gqa_partition_size - 1) / gqa_partition_size : 0;
+  const auto* offsets = gqa_partition_size > 0 && !gqa_windowed
       ? gqa_compact_offsets(m.gqa_length_plan, partitions) : nullptr;
   const bool compact = offsets != nullptr;
   const bool scratch_fits = gqa_partition_size > 0 && gqa_scratch_fits(
@@ -1029,6 +1039,9 @@ static void dispatch_paged_attention_gqa_decode(
   enc.set_bytes(g_max_blocks, 13);
   bind_paged_attn_strides(enc, arrays.query, arrays.key_cache, metadata.block_size);
   if (plan.compact) enc.set_input_array(*g_offsets, 18);
+  // Only the eligibility gate admits a window; the TurboQuant twin has none.
+  const int32_t window = metadata.sliding_window > 0 ? metadata.sliding_window : -1;
+  if (!tq) enc.set_bytes(window, 19);
   if (tq) bind_turboquant_buffers(enc, arrays);
   // One threadgroup per (partition, kv head, sequence); each simdgroup
   // owns one query head of the GQA group.
@@ -1042,7 +1055,7 @@ static void dispatch_paged_attention_gqa_decode(
       metadata.num_heads, metadata.head_size,
       gqa_num_partitions, encoding.dt, /*use_sinks=*/false, nullptr,
       /*use_tq_fc=*/tq, plan.gqa_partition_size, gqa_rkernel,
-      plan.compact ? &*g_offsets : nullptr);
+      plan.compact ? &*g_offsets : nullptr, window);
   return;
 }
 

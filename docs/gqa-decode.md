@@ -120,7 +120,11 @@ Every eligible call additionally requires:
   This is checked before allocating GQA scratch or encoding the producer;
   an oversized `max_seq_len` allocation bound falls back even when the actual
   KV lengths pass the work budget. The reducer reuses the checked pipeline.
-- No attention sinks, logit soft-capping or sliding window.
+- No attention sinks, logit soft-capping or sliding window. The producer
+  itself supports a sliding window: its partitions then cover only the
+  visible span, the last `window` tokens of each row, and the reduce counts
+  the same partitions. Only the private test entry reaches it until default
+  routing admits sliding layers.
 - A known, positive GPU core count.
 
 Other calls, including mixed batches without a decode-prefix plan, missing
@@ -316,10 +320,12 @@ enablement or performance claims of this routing policy:
    leaves some short-context head256 shapes on the established kernels even
    though the producer is faster there; a TurboQuant-specific budget could
    admit them. `tools/benchmark/tq_gqa_decode_benchmark.py` times the kernels.
-4. **Sliding windows:** bound loads and split selection by the actual visible
-   KV window. This is relevant to Gemma/Mistral-style attention, but their
-   geometries and other features such as sinks or soft-capping must also
-   satisfy the supported kernel contract.
+4. **Sliding windows:** the producer bounds its loads and partitions by the
+   visible window
+   ([#1272](https://github.com/vllm-project/vllm-metal/issues/1272)).
+   Admitting sliding layers in default routing still needs a work budget on
+   the visible length, the Gemma sliding-layer geometries, and serving
+   measurements. Sinks and soft-capping remain outside the kernel contract.
 5. **Speculative verification:** evaluate sharing KV across both grouped heads
    and multiple query rows. The existing verification kernel already shares
    KV across rows; compare against it while preserving causal masks and
