@@ -89,11 +89,21 @@ python tools/benchmark/state_scatter_benchmark.py --samples 9 --iterations 32 \
   --output state-scatter-results.json
 ```
 
-Native tests always run. Four optional cases skip only when TileLang or its
+Native tests always run. Six optional cases skip only when TileLang or its
 native extension is absent; broken installed integrations still fail. TileLang
 is not added to standard installation or CI. Tests use real KVCacheStorage
 allocations and cover backing bytes, padding, layer offsets, deferred updates,
-copy/zero and cross-stream readers.
+copy/zero and cross-stream readers. A separate boundary test uses a one-element
+storage offset in both source and destination views with vector-aligned row
+lengths. It checks the entire destination allocation and unchanged source for
+FP16 and FP32.
+
+The benchmark alternates source values between updates and the final value
+between samples. Zero samples refill the selected rows outside timing, so a
+missing clear cannot pass on data already cleared during warmup. The JSON
+records this protocol. The historical timings below used constant source
+values; compare candidates within the same protocol rather than treating new
+runs as direct before/after measurements of that table.
 
 Local measurements used Apple M4 (8 GPU cores, 16 GiB), macOS 26.0.1,
 SDK 26.2, Python 3.12.13, MLX 0.32.4 and the TileLang revision pinned above.
@@ -134,3 +144,31 @@ BF16, vision or speculative serving. See the
 [macOS benchmark procedure](benchmarking-macos.md) for serving measurements and
 [adapter documentation](https://github.com/tile-ai/tilelang/blob/2cdbb1e05efb6aee83590403274bedea31813a4b/examples/metal/README.mlx.md)
 for storage, stream and version constraints.
+
+## Vectorization and view alignment
+
+The pinned adapter disables vectorization because state views may start at an
+arbitrary element offset. Shape and stride alignment do not establish the
+alignment of the actual view pointer. Metal requires buffer offsets aligned
+to the generated argument type: `half2*`, `half4*` and `uint4*` require 4, 8
+and 16 bytes respectively. An FP16 view offset by one element supplies only
+2-byte alignment; even a correct result without validation does not make
+these vector bindings legal.
+
+[TileLang #4344](https://github.com/tile-ai/tilelang/issues/4344) tracks a
+compiler issue reproduced at the pinned revision: even an explicit
+`T.Buffer(..., align=2)` can lower to `uint4*` with vectorization enabled.
+A local compiler fix and layout experiments are not part of this integration.
+Before enabling vectorization, the adapter must provide truthful alignment
+information for source and destination views, and the compiler must honor it.
+State storage must remain shared; copying it to repair alignment is not safe.
+
+Run the view-boundary regression with Metal API validation enabled:
+
+```bash
+MTL_DEBUG_LAYER=1 python -m pytest tests/attention/test_shared_cache_storage.py \
+  -k unaligned -q
+```
+
+The pinned scalar path passes this check. Native remains the default until
+repeatable serving measurements justify a different dispatch policy.

@@ -37,18 +37,17 @@ def run(case, samples, iterations):
     strides = (stride, *(math.prod(row_shape[i + 1 :]) for i in range(len(row_shape))))
     ids = mx.array(list(range(1, count + 1)), dtype=mx.int32)
     np_dtype = np.float16 if dtype == mx.float16 else np.float32
-    rows = mx.array(np.full((count, *row_shape), 3, dtype=np_dtype))
+    rows = [
+        mx.array(np.full((count, *row_shape), value, dtype=np_dtype))
+        for value in (3, 5)
+    ]
     states = {}
     for backend in ("native", "tilelang"):
         raw = mx.full((offset + slots * stride + 1,), 7, dtype=dtype)
         pool = get_ops().as_strided(raw, (slots, *row_shape), strides, offset)
-        mx.eval(raw, pool, rows, ids)
+        mx.eval(raw, pool, *rows, ids)
         states[backend] = [raw, pool]
     expected = np.full((offset + slots * stride + 1,), 7, dtype=np_dtype)
-    for slot in range(1, count + 1):
-        expected[offset + slot * stride : offset + slot * stride + width] = (
-            0 if zero else 3
-        )
 
     result = {
         "case": name,
@@ -66,7 +65,7 @@ def run(case, samples, iterations):
         for b, kernel in kernels.items():
             for _ in range(3):
                 states[b][1] = kernel(
-                    states[b][1], rows, ids, strides=strides, zero=zero
+                    states[b][1], rows[0], ids, strides=strides, zero=zero
                 )
                 mx.eval(states[b][1])
         for sample in range(samples):
@@ -75,9 +74,19 @@ def run(case, samples, iterations):
             )
             for b in order:
                 pool = states[b][1]
+                if zero:
+                    # Refill outside timing so a skipped clear cannot pass.
+                    pool = kernels[b](pool, rows[1], ids, strides=strides)
+                    mx.eval(pool)
                 start = time.perf_counter_ns()
-                for _ in range(iterations):
-                    pool = kernels[b](pool, rows, ids, strides=strides, zero=zero)
+                for iteration in range(iterations):
+                    pool = kernels[b](
+                        pool,
+                        rows[(iteration + sample) % 2],
+                        ids,
+                        strides=strides,
+                        zero=zero,
+                    )
                     if mode == "synchronized":
                         mx.eval(pool)
                 submitted = time.perf_counter_ns()
@@ -91,6 +100,11 @@ def run(case, samples, iterations):
                         "final_wait_us": (end - submitted) / iterations / 1000,
                     }
                 )
+                value = 0 if zero else (3, 5)[(iterations - 1 + sample) % 2]
+                for slot in range(1, count + 1):
+                    expected[
+                        offset + slot * stride : offset + slot * stride + width
+                    ] = value
                 np.testing.assert_array_equal(np.array(states[b][0]), expected)
         result["modes"][mode] = {
             b: {
@@ -119,6 +133,7 @@ def main():
         "mlx": version("mlx"),
         "samples": args.samples,
         "iterations": args.iterations,
+        "protocol": "alternating update values; refill before each zero sample",
         "cases": [],
     }
     for case in CASES:

@@ -57,13 +57,10 @@ def make_storage(num_blocks=4):
     return KVCacheStorage(config)
 
 
-@pytest.mark.parametrize("backend", ["native", "tilelang"])
-@pytest.mark.parametrize("reader", ["storage", "cross_stream"])
-@pytest.mark.parametrize("layer_idx", [0, 1])
-def test_deferred_state_updates_preserve_shared_pages(
-    monkeypatch, backend, reader, layer_idx
-):
-    """Flush, copy and zero must retain page aliases and untouched bytes."""
+@pytest.fixture(params=["native", "tilelang"])
+def scatter_backend(request, monkeypatch):
+    backend = request.param
+    monkeypatch.setattr(state_scatter, "_implementation", state_scatter._native_scatter)
     if backend == "tilelang" and (
         importlib.util.find_spec("tilelang") is None
         or importlib.util.find_spec("_tilelang_mlx") is None
@@ -73,6 +70,38 @@ def test_deferred_state_updates_preserve_shared_pages(
         from vllm_metal.metal.tilelang_state_scatter import scatter
 
         monkeypatch.setattr(state_scatter, "_implementation", scatter)
+
+
+@pytest.mark.usefixtures("scatter_backend")
+@pytest.mark.parametrize("dtype", [mx.float16, mx.float32])
+def test_state_scatter_preserves_unaligned_view_boundaries(dtype):
+    """Vector-aligned row lengths do not imply aligned backing offsets."""
+    slots, width, padding, offset = 4, 512, 8, 1
+    stride = width + padding
+    raw = mx.full((offset + slots * stride + 1,), -1, dtype=dtype)
+    pool = get_ops().as_strided(raw, (slots, width), (stride, 1), offset)
+    source = mx.arange(2 * width + 2).astype(dtype)
+    rows = get_ops().as_strided(source, (2, width), (width, 1), offset)
+    ids = mx.array([3, 1], dtype=mx.int32)
+    mx.eval(raw, pool, source, rows, ids)
+
+    pool = state_scatter.scatter(pool, rows, ids, strides=(stride, 1))
+    mx.eval(pool)
+
+    expected = np.full(raw.size, -1, dtype=np.array(rows).dtype)
+    for row, slot in enumerate((3, 1)):
+        expected[offset + slot * stride : offset + slot * stride + width] = np.arange(
+            offset + row * width, offset + (row + 1) * width
+        )
+    np.testing.assert_array_equal(np.array(raw), expected)
+    np.testing.assert_array_equal(np.array(source), np.arange(2 * width + 2))
+
+
+@pytest.mark.usefixtures("scatter_backend")
+@pytest.mark.parametrize("reader", ["storage", "cross_stream"])
+@pytest.mark.parametrize("layer_idx", [0, 1])
+def test_deferred_state_updates_preserve_shared_pages(reader, layer_idx):
+    """Flush, copy and zero must retain page aliases and untouched bytes."""
     storage = make_storage()
     mx.eval(*storage.buffers)
     backing = next(iter(storage.tensors.values())).untyped_storage()
