@@ -186,89 +186,31 @@ static bool gqa_scratch_fits(
 }
 
 static const std::vector<int64_t>* gqa_compact_offsets(
-    const GqaDecodeLengthPlan& plan, int partition, int64_t max_partitions) {
+    const GqaDecodeLengthPlan& plan, int64_t max_partitions) {
   if (!plan.partition_offsets) return nullptr;
-  const auto& offsets = (*plan.partition_offsets)[partition == 512 ? 0 : 1];
+  const auto& offsets = *plan.partition_offsets;
   // Keep the existing layout when every row fills the dispatch stride.
   return offsets.back() < int64_t(plan.num_requests) * max_partitions
       ? &offsets : nullptr;
 }
 
-// Temporary compatibility policy for the measured M3 cases. Keep device
-// identity out of the common work rule; changing this policy is a separate step.
-static int apply_legacy_m3_gqa_policy(
-    int partition, int num_heads, int num_kv_heads, int head_size,
-    const GqaDecodeLengthPlan& plan, int block_size,
-    const std::string& architecture, int max_seq_len) {
-  if (architecture != "applegpu_g15g") return partition;
-
-  if (num_heads == 32 && num_kv_heads == 8 && head_size == 128 &&
-      plan.num_requests == kM3GqaShortHead128Batch &&
-      plan.max_length < kM3GqaShortHead128MinContext) return 0;
-  if (partition != 512 || head_size != 256) return partition;
-
-  const int minimum = block_size == 16
-      ? kM3GqaBlock16MinContext : kM3GqaBlock32MinContext;
-  if (plan.max_length < minimum) return partition;
-
-  // P512 passed the work gate, so P256 also has enough complete work.
-  // Include a caller's larger allocation bound in the reducer resource check.
-  const int64_t allocation_length = std::max(max_seq_len, plan.max_length);
-  const int64_t partitions256 = (allocation_length + 255) / 256;
-  if (!paged_reduce_memory_fits(kernels::paged_reduce_threadgroup_bytes(partitions256),
-                               kGqaReduceStaticMemoryBytes,
-                               kM3GqaReducerMemoryBytes)) return partition;
-  return 256;
-}
-
-// Performance selection only: the caller owns eligibility and resource checks.
-static int gqa_partition_for_work(
-    const GqaDecodeLengthPlan& plan, int num_heads, int gpu_cores,
-    bool turboquant) {
-  if (gpu_cores <= 0 || plan.num_requests == 0) return 0;
-  for (size_t i = 0; i < kGqaPartitionSizes.size(); ++i) {
-    // TurboQuant producers measured faster at P256 than P512 below 64K
-    // tokens on M5 and M1 Max, so keep the existing P256-only policy.
-    if (turboquant && kGqaPartitionSizes[i] != 256) continue;
-    if (plan.full_partitions[i] * num_heads >= kGqaSimdGroupsPerCore * gpu_cores)
-      return kGqaPartitionSizes[i];
-  }
-  return 0;
-}
-
-static int gqa_decode_partition_for_lengths(
+int gqa_decode_plan_for_lengths(
     int num_heads, int num_kv_heads, int head_size,
     const GqaDecodeLengthPlan& plan, int gpu_cores, int block_size,
-    const std::string& gpu_arch, int max_seq_len, bool turboquant) {
+    int max_seq_len) {
   // This table is the calibrated default scope, not a claim that every
   // unlisted geometry is mathematically unsupported by the kernel.
   if (!gqa_decode_geometry_supported(
           num_heads, num_kv_heads, head_size, block_size)) return 0;
-  const int partition = gqa_partition_for_work(
-      plan, num_heads, gpu_cores, turboquant);
-  if (partition == 0 || plan.num_requests == 1 ||
-      gpu_cores != kM3GqaGpuCores) return partition;
-
-  const auto& architecture = gpu_arch.empty()
-      ? metal::device(Device::gpu).get_architecture() : gpu_arch;
-  return apply_legacy_m3_gqa_policy(
-      partition, num_heads, num_kv_heads, head_size, plan, block_size,
-      architecture, max_seq_len);
-}
-
-int gqa_decode_plan_for_lengths(
-    int num_heads, int num_kv_heads, int head_size,
-    const GqaDecodeLengthPlan& plan, int gpu_cores, int block_size,
-    const std::string& gpu_arch, int max_seq_len, bool turboquant) {
-  const int partition = gqa_decode_partition_for_lengths(num_heads, num_kv_heads,
-      head_size, plan, gpu_cores, block_size, gpu_arch, max_seq_len, turboquant);
-  if (partition == 0) return 0;
+  // Performance admission: a work budget of complete partitions per GPU core.
+  if (gpu_cores <= 0 || plan.num_requests == 0 ||
+      plan.full_partitions * num_heads < kGqaSimdGroupsPerCore * gpu_cores) return 0;
   const int64_t length = std::max(max_seq_len, plan.max_length);
-  const int64_t partitions = (length + partition - 1) / partition;
+  const int64_t partitions = (length + kGqaPartitionSize - 1) / kGqaPartitionSize;
   // Every admitted GQA dtype stores a two-byte partial output.
   return gqa_scratch_fits(plan.num_requests, num_heads, partitions, head_size, 2,
-                         gqa_compact_offsets(plan, partition, partitions))
-      ? partition : 0;
+                         gqa_compact_offsets(plan, partitions))
+      ? kGqaPartitionSize : 0;
 }
 
 // Load a precompiled .metallib instead of compiling its source. Uses MLX's
@@ -743,12 +685,11 @@ struct PagedAttentionPlan {
 };
 
 template <typename PrepareDecode, typename PrepareEncoder,
-          typename GetGpuCores, typename GetDetectedGpuCores, typename GetArchitecture>
+          typename GetGpuCores, typename GetDetectedGpuCores>
 static PagedAttentionPlan select_paged_attention_route(
     const PagedAttentionMetadata& metadata,
     PrepareDecode prepare_decode, PrepareEncoder prepare_encoder,
-    GetGpuCores get_gpu_cores, GetDetectedGpuCores get_detected_gpu_cores,
-    GetArchitecture get_architecture) {
+    GetGpuCores get_gpu_cores, GetDetectedGpuCores get_detected_gpu_cores) {
   const auto& m = metadata;
 
   // Tiled kernel for prefill batches, matching vLLM Triton's 2D/3D dispatch
@@ -903,14 +844,13 @@ static PagedAttentionPlan select_paged_attention_route(
             num_seqs == 1 && m.decode_only_rows == 0
                 ? gqa_decode_length_plan(std::array<int, 1>{m.max_seq_len})
                 : m.gqa_length_plan,
-            get_detected_gpu_cores(), m.block_size, get_architecture(), m.max_seq_len,
-            m.use_turboquant);
+            get_detected_gpu_cores(), m.block_size, m.max_seq_len);
 
   const int64_t partitions = gqa_partition_size > 0
       ? (static_cast<int64_t>(m.max_seq_len) + gqa_partition_size - 1) /
             gqa_partition_size : 0;
   const auto* offsets = gqa_partition_size > 0
-      ? gqa_compact_offsets(m.gqa_length_plan, gqa_partition_size, partitions) : nullptr;
+      ? gqa_compact_offsets(m.gqa_length_plan, partitions) : nullptr;
   const bool compact = offsets != nullptr;
   const bool scratch_fits = gqa_partition_size > 0 && gqa_scratch_fits(
       total_q_tokens, m.num_heads, partitions, m.head_size, m.item_size, offsets);
@@ -1283,8 +1223,7 @@ static void dispatch_paged_attention_v2_online(
         encoding.library = encoding.device->get_library("paged_attention_v2_kern");
         encoding.encoder = &metal::get_command_encoder(s);
       },
-      gpu_core_count, detected_gpu_core_count,
-      [&]() -> const std::string& { return encoding.device->get_architecture(); });
+      gpu_core_count, detected_gpu_core_count);
 
   MTL::ComputePipelineState* gqa_rkernel = nullptr;
   if (plan.route == PagedAttentionRoute::GqaDecode) {
