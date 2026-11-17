@@ -105,9 +105,8 @@ Sleep levels mean something different on unified memory than on a GPU:
   well under a second, and the prefix cache starts empty.
 - `llm.sleep(level=0)` followed by `llm.release_kv_cache_memory()` also frees
   the KV cache. Restore it with `llm.wake_up(tags=["kv_cache"])`.
-- The amount freed is the whole KV pool, not only the blocks in use. The pool
-  is resident again at wake if it keeps the zero fill, otherwise once requests
-  run again.
+- Either way the whole KV pool is freed. The pool takes that memory again at
+  wake or with the first request after wake.
 - With [KV offloading](kv_offloading.md), sleep also frees the host pool. It
   comes back empty at wake. Prompts already on the disk tier still restore.
 
@@ -136,54 +135,29 @@ sliding layers to release old blocks. This can improve long-context capacity,
 but not necessarily generation speed. Use `--disable-hybrid-kv-cache-manager`
 for dense allocation.
 
-The KV pool is allocated without a zero fill where it can be. vLLM's allocator
-zero-fills the backing store, which on unified memory commits every page of the
-pool at startup; vllm-metal requests the same layout without the fill whenever
-vLLM does not require it (uniform-precision attention caches —
-`KVCacheConfig.needs_kv_cache_zeroing` covers Mamba state and mixed-precision
-caches, which keep the zero fill).
-Skipping the fill does not keep the pool out of memory on a server. The first
-use of a layer makes that layer's whole buffer resident, so the whole pool is
-resident once a request has run every layer, idle blocks included. The worker
-also raises the MLX wired limit at startup, and then the pool is resident by
-the time the server is ready
-([#1198](https://github.com/vllm-project/vllm-metal/issues/1198)). Without the
-fill, process RSS does not show it. Plan for the pool to hold its full size in
-RAM. With automatic sizing the pool and the weights together are about the
-`--gpu-memory-utilization` fraction (default 0.92) of Metal's recommended
-working set. A slot a request never writes never
-reaches an output — the attention kernels mask every position past the sequence
-length — so the missing zero fill does not change results. MLA's batched decode
-also zeroes padded latent rows before attention.
+Plan for the KV pool as RAM the server holds at its full size, even when
+requests use little of it. Expect the whole pool in memory at startup or after
+the first request
+([#1198](https://github.com/vllm-project/vllm-metal/issues/1198)). The memory
+reported for the process (RSS) can show less than this.
 
-`--gpu-memory-utilization` does not account for other processes. Two servers
-given the same fraction each plan for the full amount.
+With automatic sizing, the pool and the model weights together take about the
+`--gpu-memory-utilization` fraction (default 0.92) of the memory macOS
+recommends for GPU use (Metal's recommended working set). To leave room for
+other applications, lower the fraction or set a smaller pool with
+`--kv-cache-memory-bytes`. Each server sizes itself as if it were alone, so two
+servers at the same fraction each plan for that full fraction.
 
-Because of that, the planner checks the plan against the machine before serving:
-`VLLM_METAL_KV_COMMIT_PROBE` (on by default) forces a bounded sample of the
-planned pool resident at startup — `min(capacity, 512 MiB)`, one write per
-page — and reads back how much memory was free and how much the kernel
-compressed or wrote to swap to make room. macOS answers pressure with the
-compressor first and the swap file once that fills, so paging is read from both
-cumulative counters (`vm_stat` `Compressions` and `Swapouts`): not from swap
-occupancy, which rises and falls within a probe and so can hide the writes, and
-not from psutil's `swap_memory().sout`, which on macOS is the `Pageouts`
-counter — it moves for file writeback and can stay put while the kernel is
-swapping. The `vm_stat` read has a five-second timeout; if the command is
-missing, fails, hangs or prints something unexpected, startup stops with an
-error that names `VLLM_METAL_KV_COMMIT_PROBE=0` as the opt-out, because a
-default-on safety check must not pass silently.
-The sample lives in its own mapping and is dropped as soon as the probe returns,
-so it leaves nothing resident behind — the touch itself is transient, which a
-process's peak-RSS counter will see but steady state will not. If the kernel
-paged to back the sample, the machine has no headroom to give and the pool is
-sized down to what is free, less a reserve of `max(1 GiB, 1/16 of the
-recommended working set)` and less the memory the engine holds outside the pool
-— the TurboQuant prefill workspace, and the KV offload host pool
-(`--kv-offloading-size`), which is pageable but the same RAM — with a warning.
-The budget keeps the full byte count: vLLM chooses its own grouped layout from
-the bytes it is handed. If free memory is merely below the plan, the pool keeps
-its capacity and a warning is logged. Make the pool smaller when that warning
-appears. The probe samples at most 512 MiB, so passing it does not show that a
-larger pool fits. Set `VLLM_METAL_KV_COMMIT_PROBE=0` to skip the touch and use
-the configured cache budget.
+By default, vllm-metal tests a sample of the planned pool, up to 512 MiB,
+against the machine at startup:
+
+- If macOS has to compress or swap memory to hold the sample, the pool can be
+  sized down, with a warning. Where a pool set with `--kv-cache-memory-bytes`
+  would be sized down, startup stops with an error instead.
+- If the log says the pool is larger than this machine's free memory, the pool
+  keeps its size. Make the pool smaller or close other applications.
+- If memory statistics cannot be read, startup stops with an error.
+
+The test covers a sample, so leave headroom even when no warning appears. Set
+`VLLM_METAL_KV_COMMIT_PROBE=0` to skip the test and keep the planned pool
+size.
