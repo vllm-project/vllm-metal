@@ -142,7 +142,8 @@ def test_prefill_quantization_formats(
     args, kwargs = recorded_ops[0]
     assert not kwargs.get("use_turboquant", False)
     assert kwargs["window_seqlen_q"] == case.ctx.verify_window_q == 1
-    assert kwargs["nax_split_hint"] == 0  # Two full Q blocks retain the original loop.
+    # With NAX, two full Q blocks retain the original loop.
+    assert kwargs.get("nax_split_hint") == (0 if get_ops().nax_ready() else None)
     assert args[1].dtype == dtype
     assert args[1].shape == (17, 16, 2, 128)
 
@@ -166,7 +167,7 @@ def test_prefill_strided_translated_pages(
     assert_parity(case)
     args, kwargs = recorded_ops[0]
     assert not kwargs.get("use_turboquant", False)
-    assert kwargs["nax_split_hint"] == 1
+    assert kwargs.get("nax_split_hint") == (1 if get_ops().nax_ready() else None)
     kb = args[9]
     # Only ceil(valid KV / kernel block) pages, even if the scheduler page
     # contains many unused sub-blocks and the input table has spare capacity.
