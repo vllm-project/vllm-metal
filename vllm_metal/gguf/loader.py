@@ -484,6 +484,17 @@ class GGUFModelLoader:
                 f"model {param_path!r}."
             )
 
+    @classmethod
+    def read_vocab_header(cls, gguf_path: str | Path) -> tuple[str, int | None]:
+        """The file's architecture and ``token_embd`` rows, read without the weights."""
+        try:
+            reader = gguf.GGUFReader(str(gguf_path))
+        except (ValueError, OSError) as exc:
+            raise GGUFLoadError(
+                f"Could not read GGUF file {str(gguf_path)!r}: {exc}"
+            ) from exc
+        return cls._gguf_arch(reader), cls._embedding_rows(reader)
+
     @staticmethod
     def _embedding_rows(reader: Any) -> int | None:
         """Rows of the file's ``token_embd.weight``, or ``None`` when absent."""

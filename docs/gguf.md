@@ -50,8 +50,6 @@ missing, ambiguous, or shard-only matches also fail before model load.
   (`qwen35`), and Gemma 3 (`gemma3`).
 - Gemma 3 serves text only. Point `--tokenizer` at the 1B text config or a 4B+
   `Gemma3ForConditionalGeneration` repository, such as `google/gemma-3-4b-it`.
-  llama.cpp trims the embedding table to the tokenizer's 262144 tokens, so the
-  model's vocabulary follows the file rather than the config's 262208.
 - Qwen3.5 serves text only and images are refused. Point `--tokenizer` at the
   `Qwen3_5ForConditionalGeneration` repository, such as `Qwen/Qwen3.5-9B`.
   vllm-metal does not load `mmproj` files. Files that embed a

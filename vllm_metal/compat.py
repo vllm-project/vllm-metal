@@ -929,6 +929,9 @@ def ensure_mlx_lm_gemma3_config_only_sanitize() -> None:
     via ``tree_unflatten`` and fails on ``.pop("vision_tower", None)``. With no
     weights there is nothing to strip, so only the text model's sanitize runs;
     it still drops ``lm_head`` to tie the head.
+
+    TODO: remove when the pinned mlx_lm's ``gemma3.Model.sanitize`` accepts
+    empty weights.
     """
     from mlx_lm.models import gemma3
 

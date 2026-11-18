@@ -246,20 +246,42 @@ class GGUFModelAdapter:
         )
 
     @classmethod
+    def trimmed_vocab_arch(cls, config_model_type: str) -> str | None:
+        """The GGUF arch of a trimmed-vocab family, or ``None`` for any other config."""
+        arch = cls._config_model_type_to_gguf_arch(config_model_type)
+        spec = cls._ARCH_SPECS.get(arch)
+        return arch if spec is not None and spec.trimmed_vocab else None
+
+    @classmethod
+    def vocab_overrides(
+        cls, config: dict[str, Any], *, arch: str, embedding_rows: int | None
+    ) -> dict[str, Any]:
+        """Config values that set ``vocab_size`` to the file's embedding rows.
+
+        Only a trimmed-vocab arch needs them, as vllm-gguf-plugin does; the text
+        config gets the value too when the config has one.
+        """
+        if not cls._ARCH_SPECS[arch].trimmed_vocab or embedding_rows is None:
+            return {}
+        overrides: dict[str, Any] = {"vocab_size": embedding_rows}
+        if isinstance(config.get("text_config"), dict):
+            overrides["text_config"] = {"vocab_size": embedding_rows}
+        return overrides
+
+    @classmethod
     def skeleton_config(
         cls, config: dict[str, Any], *, arch: str, embedding_rows: int | None
     ) -> dict[str, Any]:
-        """Return the config to build ``arch``'s skeleton from.
-
-        A trimmed-vocab arch takes ``vocab_size`` from the file's embedding rows,
-        as vllm-gguf-plugin does, on both the top-level and the text config.
-        """
-        if not cls._ARCH_SPECS[arch].trimmed_vocab or embedding_rows is None:
-            return config
-        skeleton = {**config, "vocab_size": embedding_rows}
-        text_config = config.get("text_config")
-        if isinstance(text_config, dict):
-            skeleton["text_config"] = {**text_config, "vocab_size": embedding_rows}
+        """Return the config to build ``arch``'s skeleton from."""
+        overrides = cls.vocab_overrides(
+            config, arch=arch, embedding_rows=embedding_rows
+        )
+        skeleton = {**config, **overrides}
+        if "text_config" in overrides:
+            skeleton["text_config"] = {
+                **config["text_config"],
+                **overrides["text_config"],
+            }
         return skeleton
 
     @staticmethod

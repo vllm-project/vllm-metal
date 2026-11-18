@@ -1878,3 +1878,30 @@ def test_gemma3_quantized_file_loads_source_norms(tmp_path):
         np.testing.assert_allclose(
             np.array(value), hf[_gemma3_gguf_name(path)], rtol=0, atol=1e-6
         )
+
+
+@pytest.mark.parametrize(
+    ("config", "arch", "expected"),
+    [
+        pytest.param(
+            {"model_type": "gemma3_text"},
+            "gemma3",
+            {"vocab_size": 256},
+            id="gemma3-text",
+        ),
+        pytest.param(
+            {"model_type": "gemma3", "text_config": {"vocab_size": 262208}},
+            "gemma3",
+            {"vocab_size": 256, "text_config": {"vocab_size": 256}},
+            id="gemma3-multimodal",
+        ),
+        pytest.param({"model_type": "qwen3"}, "qwen3", {}, id="untrimmed"),
+    ],
+)
+def test_vocab_overrides_follow_the_file_and_config_shape(config, arch, expected):
+    # A text_config is only set where the config has one: adding it to a
+    # text-only config would plant a bogus attribute on the HF config.
+    assert (
+        GGUFModelAdapter.vocab_overrides(config, arch=arch, embedding_rows=256)
+        == expected
+    )
