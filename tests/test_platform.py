@@ -41,7 +41,6 @@ import vllm_metal.compat as compat
 import vllm_metal.config as vm_config
 import vllm_metal.platform as platform_module
 from tests.stub_runner import make_gemma4_mixed_attention_runner
-from vllm_metal import _apply_model_runner_default
 from vllm_metal.config import reset_config
 from vllm_metal.platform import MetalPlatform
 from vllm_metal.v1.cache_policy import WorkerCachePlanner
@@ -315,7 +314,6 @@ class TestMetalPlatform:
         backend: str,
         diffusion: bool,
     ) -> None:
-        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
         monkeypatch.setenv("VLLM_METAL_BACKEND", backend)
         monkeypatch.setattr(MetalPlatform, "_serves_diffusion", diffusion)
 
@@ -624,21 +622,6 @@ class TestMetalPlatform:
         with pytest.raises(ValueError, match="too high for pipeline_parallel_size"):
             MetalPlatform.check_and_update_config(vllm_config)
 
-    @pytest.mark.parametrize("watermark", [False, True])
-    def test_mlx_rejects_explicit_v1_model_runner(
-        self, monkeypatch: pytest.MonkeyPatch, watermark: bool
-    ) -> None:
-        """Reject the opt-out even if upstream watermarking forces V2."""
-        monkeypatch.setenv("VLLM_METAL_BACKEND", "mlx")
-        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
-        _apply_model_runner_default()
-
-        with pytest.raises(
-            ValueError,
-            match=r"MLX Model Runner V1 has been removed.*Unset .*VLLM_USE_V2_MODEL_RUNNER=1",
-        ):
-            VllmConfig(watermark_config=WatermarkConfig(key=0) if watermark else None)
-
     def test_check_and_update_config_rejects_pipeline_with_speculative_decoding(
         self,
     ) -> None:
@@ -734,38 +717,14 @@ class TestMetalPlatform:
         with pytest.raises(NotImplementedError, match="single process"):
             MetalPlatform.check_and_update_config(vllm_config)
 
-    @pytest.mark.parametrize("runner_env", [None, "1"], ids=["default", "explicit"])
-    def test_mlx_uses_v2_model_runner_without_triton(
-        self, monkeypatch: pytest.MonkeyPatch, runner_env: str | None
-    ) -> None:
-        """Registration selects V2 before upstream config resolves the runner."""
-        if runner_env is None:
-            monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
-        else:
-            monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", runner_env)
-        monkeypatch.setenv("VLLM_METAL_BACKEND", "mlx")
-        monkeypatch.setattr("vllm.config.vllm.HAS_TRITON", False)
-        _apply_model_runner_default()
-
-        config = VllmConfig(
-            parallel_config=ParallelConfig(
-                distributed_executor_backend="mp",
-            )
-        )
-
-        assert config.use_v2_model_runner
-        assert config.parallel_config.worker_cls == "vllm_metal.v1.worker.MetalWorker"
-
     @pytest.mark.parametrize("async_scheduling", [None, True, False])
-    def test_v2_pipeline_parallelism_requires_synchronous_scheduling(
+    def test_pipeline_parallelism_requires_synchronous_scheduling(
         self,
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
         async_scheduling: bool | None,
     ) -> None:
-        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
         monkeypatch.setenv("VLLM_METAL_BACKEND", "mlx")
-        monkeypatch.setattr("vllm.config.vllm.HAS_TRITON", False)
 
         config = VllmConfig(
             parallel_config=ParallelConfig(
@@ -779,7 +738,6 @@ class TestMetalPlatform:
             ),
         )
 
-        assert config.use_v2_model_runner
         assert config.scheduler_config.async_scheduling is False
         assert ("Metal requires synchronous scheduling" in caplog.text) == (
             async_scheduling is not False
@@ -790,7 +748,6 @@ class TestMetalPlatform:
     def test_metal_rejects_unsupported_replay(
         self, monkeypatch: pytest.MonkeyPatch, backend: str, flag: str
     ) -> None:
-        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
         monkeypatch.setenv("VLLM_METAL_BACKEND", backend)
         config = self._platform_config(model_config=SimpleNamespace(**{flag: True}))
 
@@ -801,9 +758,7 @@ class TestMetalPlatform:
     def test_metal_rejects_watermarking(
         self, monkeypatch: pytest.MonkeyPatch, backend: str
     ) -> None:
-        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
         monkeypatch.setenv("VLLM_METAL_BACKEND", backend)
-        monkeypatch.setattr("vllm.config.vllm.HAS_TRITON", False)
 
         with pytest.raises(
             NotImplementedError, match="watermark_config is not supported on Metal"
@@ -814,9 +769,7 @@ class TestMetalPlatform:
     def test_metal_rejects_prefill_context_parallelism(
         self, monkeypatch: pytest.MonkeyPatch, backend: str
     ) -> None:
-        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
         monkeypatch.setenv("VLLM_METAL_BACKEND", backend)
-        monkeypatch.setattr("vllm.config.vllm.HAS_TRITON", False)
 
         with pytest.raises(
             NotImplementedError,
@@ -1579,7 +1532,6 @@ class TestMetalPlatform:
         (vllm#48341) before the platform hook runs; Metal proposers hand
         drafts back synchronously via take_draft_token_ids().
         """
-        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
         vllm_config = self._platform_config(
             speculative_config=SimpleNamespace(
                 method="draft_model",
@@ -2086,7 +2038,6 @@ class TestMetalPlatform:
             text_config={"hidden_size": 2048, "full_attn_idxs": [1]},
         ).save_pretrained(tmp_path)
         monkeypatch.setitem(vars(platform_module.envs), "VLLM_METAL_BACKEND", "mps")
-        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
         monkeypatch.setattr(vm_config.get_config(), "multimodal_mode", metal_mode)
         config = EngineArgs(
             model=str(tmp_path),
@@ -2118,7 +2069,6 @@ class TestMetalPlatform:
         environ = {k: v for k, v in os.environ.items() if "WATERMARK" not in k}
         monkeypatch.setattr(os, "environ", environ | exported)
         monkeypatch.setitem(vars(platform_module.envs), "VLLM_METAL_BACKEND", "mps")
-        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
         EngineArgs(
             model=str(tmp_path),
             dtype="bfloat16",

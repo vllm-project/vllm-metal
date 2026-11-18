@@ -901,8 +901,7 @@ def resolve_draft_dims(
     Delegates to ``ModelConfig``'s own accessors rather than re-deriving GQA
     head-count and head-size fallbacks from raw ``hf_config`` fields --
     ``get_head_size()``/``get_num_kv_heads()`` already handle those (and the
-    MLA-becomes-MQA case), the same way upstream's own
-    ``SpecDecodeBaseProposer`` reads them off its ``draft_model_config``.
+    MLA-becomes-MQA case).
 
     Raises :class:`NotImplementedError` if the draft model uses sliding-window
     or hybrid attention.  ``_draft_layer_specs`` unconditionally emits

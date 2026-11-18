@@ -541,14 +541,7 @@ class MetalPlatform(Platform):
         """
         envs.validate_environment()
 
-        import vllm.envs as vllm_envs
-
         backend = envs.VLLM_METAL_BACKEND
-        if backend == "mlx" and vllm_envs.VLLM_USE_V2_MODEL_RUNNER is False:
-            raise ValueError(
-                "MLX Model Runner V1 has been removed. Unset "
-                "VLLM_USE_V2_MODEL_RUNNER or set VLLM_USE_V2_MODEL_RUNNER=1."
-            )
 
         from vllm_metal.compat import ensure_vllm_bytelevel_tokenizer_patch
 
@@ -957,11 +950,11 @@ class MetalPlatform(Platform):
             parallel_config.pipeline_parallel_size > 1
             and scheduler_config.async_scheduling
         ):
-            # V2 auto-enables async before this hook; an explicit True is
+            # vLLM auto-enables async before this hook; an explicit True is
             # indistinguishable by now, so both must be overridden.
             logger.warning(
                 "Pipeline parallelism on Metal requires synchronous scheduling; "
-                "disabling async scheduling for Model Runner V2."
+                "disabled async_scheduling."
             )
             scheduler_config.async_scheduling = False
 

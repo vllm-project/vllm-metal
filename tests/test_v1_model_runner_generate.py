@@ -10,7 +10,6 @@ import mlx.core as mx
 import numpy as np
 import pytest
 import torch
-from vllm.config import VllmConfig
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import (
@@ -4993,11 +4992,8 @@ class TestRequestAdmission:
     def test_readmission_continues_from_prefill_tokens(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
         generator = torch.Generator().manual_seed(0)
         runner = self._preempted_runner(generator)
-        runner.vllm_config = VllmConfig()
-        assert runner.vllm_config.use_v2_model_runner
         runner._paged_attention_runtime = Mock(spec=SDPAPagedAttentionRuntime)
         runner._paged_scheduler_group_indices = (0,)
         runner._request_states["r"].block_ids = [[0, 1]]

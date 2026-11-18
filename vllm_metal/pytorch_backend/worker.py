@@ -24,14 +24,7 @@ _mps_low_watermark_default: str | None = None
 def configure_mps(config, *, omni=False):
     global _mps_low_watermark_default
 
-    from vllm import envs as vllm_envs
     from vllm.config.compilation import CompilationMode, CUDAGraphMode
-
-    from vllm_metal import envs
-
-    if envs.VLLM_METAL_BACKEND == "mps":
-        if vllm_envs.VLLM_USE_V2_MODEL_RUNNER is not True:
-            raise ValueError("Experimental MPS requires VLLM_USE_V2_MODEL_RUNNER=1")
 
     if omni:
         from vllm.config import DeviceConfig

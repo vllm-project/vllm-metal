@@ -5,10 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tests.scheduler_helpers import (
-    assert_v2_model_runner,
-    track_preemptions_and_resumptions,
-)
+from tests.scheduler_helpers import track_preemptions_and_resumptions
 
 
 def _scheduler_output(*, new=(), running=(), preempted=(), finished=()):
@@ -72,17 +69,3 @@ def test_custom_resumption_key():
     scheduler.schedule()
 
     assert stats == {"preemptions": 1, "resumed": 1}
-
-
-@pytest.mark.parametrize("use_v2", [False, True], ids=["rejected", "accepted"])
-def test_assert_v2_model_runner(use_v2):
-    llm = SimpleNamespace(
-        llm_engine=SimpleNamespace(
-            vllm_config=SimpleNamespace(use_v2_model_runner=use_v2)
-        )
-    )
-    if use_v2:
-        assert_v2_model_runner(llm)
-    else:
-        with pytest.raises(AssertionError, match="Model Runner V2"):
-            assert_v2_model_runner(llm)

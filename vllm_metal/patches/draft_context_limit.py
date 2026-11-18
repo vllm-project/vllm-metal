@@ -21,7 +21,7 @@ def _metal_runner_falls_back(vllm_config: Any) -> bool:
 def register() -> None:
     """Skip vLLM's clamp of max_model_len to a shorter draft model on Metal.
 
-    vLLM 0.33 lowers max_model_len to the draft's because its V2 GPU runner
+    vLLM lowers max_model_len to the draft's because its GPU model runner
     cannot skip speculation past the draft's context. MetalModelRunner decodes
     those requests without drafts (#850), so the target keeps its context.
     Remove when vLLM lets the runner declare that it skips speculation there.

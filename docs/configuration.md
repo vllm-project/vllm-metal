@@ -1,13 +1,5 @@
 # Configuration
 
-## Model Runner
-
-Both the MLX and experimental PyTorch MPS backends require Model Runner V2.
-MLX uses `MetalModelRunner` with vLLM's V2 configuration and scheduler contract.
-Leave `VLLM_USE_V2_MODEL_RUNNER` unset (Metal defaults it to `1`) or set it to `1`.
-MLX Model Runner V1 has been removed: `VLLM_USE_V2_MODEL_RUNNER=0` fails at
-configuration time.
-
 ## Environment Variables
 
 vllm-metal validates these variables when the engine configuration is created and reports every invalid value together, so a typo fails the startup. Boolean switches treat `1` as on and any other value as off.
