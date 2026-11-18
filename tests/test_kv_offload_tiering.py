@@ -14,7 +14,7 @@ from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 from vllm.v1.kv_offload.tiering.base import TransferJob
 
 from tests.kv_offload_helpers import (
-    gpu_spec,
+    device_ptrs,
     make_region,
     make_storage,
     make_turboquant_storage,
@@ -61,7 +61,9 @@ def test_memoryview_round_trips_chunk_rows(turboquant: bool) -> None:
     try:
         randomize(storage)
         original = snapshot_blocks(storage, [3, 4])
-        assert worker.submit_store(1, gpu_spec([3, 4]), CPULoadStoreSpec([1]))
+        assert worker.submit_store(
+            1, device_ptrs(worker, [3, 4]), CPULoadStoreSpec([1])
+        )
 
         # Address rows as tiering/fs/io.py does. Move chunk 1 to chunk 3, so
         # a carve that disagrees with the view cannot cancel out.
@@ -73,7 +75,7 @@ def test_memoryview_round_trips_chunk_rows(turboquant: bool) -> None:
         flat[row : 2 * row] = b"\x00" * row
 
         zero_blocks(storage, [3, 4])
-        assert worker.submit_load(2, CPULoadStoreSpec([3]), gpu_spec([3, 4]))
+        assert worker.submit_load(2, CPULoadStoreSpec([3]), device_ptrs(worker, [3, 4]))
         for a, b in zip(original, snapshot_blocks(storage, [3, 4]), strict=True):
             np.testing.assert_array_equal(a, b)
     finally:
@@ -185,13 +187,14 @@ def test_released_pool_round_trips_after_reuse() -> None:
     scheduler = _attach(storage, None, engine_id)
     try:
         randomize(storage)
-        assert worker.submit_store(1, gpu_spec([3, 4]), CPULoadStoreSpec([1]))
+        ptrs = device_ptrs(worker, [3, 4])
+        assert worker.submit_store(1, ptrs, CPULoadStoreSpec([1]))
         worker.release_host_pool()
         worker.restore_host_pool()
 
         randomize(storage, seed=1)
         original = snapshot_blocks(storage, [3, 4])
-        assert worker.submit_store(2, gpu_spec([3, 4]), CPULoadStoreSpec([1]))
+        assert worker.submit_store(2, ptrs, CPULoadStoreSpec([1]))
         row = scheduler.total_size_bytes // NUM_CHUNKS
         assert bytes(scheduler._base[row : 2 * row].numpy()) == bytes(
             worker.region._base[row : 2 * row].numpy()
@@ -199,7 +202,7 @@ def test_released_pool_round_trips_after_reuse() -> None:
         assert any(scheduler._base[row : 2 * row].numpy())
 
         zero_blocks(storage, [3, 4])
-        assert worker.submit_load(3, CPULoadStoreSpec([1]), gpu_spec([3, 4]))
+        assert worker.submit_load(3, CPULoadStoreSpec([1]), ptrs)
         for a, b in zip(original, snapshot_blocks(storage, [3, 4]), strict=True):
             np.testing.assert_array_equal(a, b)
     finally:
