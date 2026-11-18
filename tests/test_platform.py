@@ -1147,22 +1147,6 @@ class TestMetalPlatform:
 
         MetalPlatform.check_and_update_config(vllm_config)
 
-    def test_check_and_update_config_rejects_heterogeneous_draft_vocab(self) -> None:
-        """A draft vocabulary that differs from the target is unsupported.
-
-        Upstream stopped verifying equal vocab sizes when the flag is set, so the
-        proposer would otherwise verify draft ids against the target vocabulary
-        with no mapping.
-        """
-        vllm_config = self._dp_vllm_config()
-        vllm_config.parallel_config.data_parallel_size = 1
-        vllm_config.speculative_config = SimpleNamespace(
-            method="draft_model", use_heterogeneous_vocab=True
-        )
-
-        with pytest.raises(NotImplementedError, match="heterogeneous draft vocabulary"):
-            MetalPlatform.check_and_update_config(vllm_config)
-
     def test_check_and_update_config_rejects_clipped_spec_decode_padding(
         self,
     ) -> None:

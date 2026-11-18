@@ -733,19 +733,6 @@ class MetalPlatform(Platform):
                 )
 
         speculative_config = vllm_config.speculative_config
-        # Upstream skips verify_equal_vocab_size_if_draft_model() when this is set,
-        # so a draft model with a different vocabulary reaches the proposer, which
-        # verifies draft ids against the target vocabulary with no mapping.
-        if (
-            speculative_config is not None
-            and speculative_config.use_heterogeneous_vocab
-        ):
-            raise NotImplementedError(
-                "vllm-metal does not support speculative decoding with a "
-                "heterogeneous draft vocabulary (use_heterogeneous_vocab). Use a "
-                "draft model that shares the target vocabulary."
-            )
-
         # Upstream's scheduler pads a newly admitted decode request to the uniform
         # speculative width, then still clips it to long_prefill_token_threshold,
         # leaving num_speculative_tokens placeholder drafts against fewer scheduled

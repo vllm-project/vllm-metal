@@ -72,7 +72,6 @@ def configure_mps(config, *, omni=False):
         or spec.draft_sample_method != "greedy"
         or spec.rejection_sample_method != "standard"
         or spec.enable_adaptive_verification
-        or spec.parallel_drafting
         or model.has_inner_state
         or config.watermark_config is not None
     ):
