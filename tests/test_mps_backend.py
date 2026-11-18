@@ -252,6 +252,42 @@ def test_cache_budget_leaves_room_for_the_profiled_step(mps_memory, step):
             MPSWorker.determine_available_memory(worker)
 
 
+@pytest.mark.parametrize(
+    ("limit", "step", "budget"),
+    [
+        # PyTorch would allocate the 1,620 MiB left as 1,632 MiB.
+        (4 << 30, 300 << 20, 1600 << 20),
+        # 1,010 MiB + 12,345 bytes: the next bucket, 1,024 MiB, reaches
+        # maxBufferLength, so only the 2 MiB heap rounding applies.
+        (1 << 30, (910 << 20) - 12345, 1010 << 20),
+        # 51 MiB + 12,345 bytes: buckets this small are finer than 2 MiB.
+        (4 << 30, (1869 << 20) - 12345, 50 << 20),
+    ],
+    ids=["bucket", "near-buffer-limit", "below-64-mib"],
+)
+def test_cache_budget_is_not_rounded_up_by_pytorch(mps_memory, limit, step, budget):
+    from vllm_metal.pytorch_backend.worker import MPSWorker
+
+    mps_memory(limit)
+    worker = _profiled_worker(0.5, step)
+    assert MPSWorker.determine_available_memory(worker) == budget
+
+
+def test_cache_budget_is_allocated_exactly():
+    from vllm_metal.pytorch_backend.mps_ops import _load_mps_module
+    from vllm_metal.pytorch_backend.worker import _round_down_for_mps_allocator
+
+    budget = _round_down_for_mps_allocator(
+        (600 << 20) + 12345, _load_mps_module().max_buffer_length()
+    )
+    torch.mps.synchronize()
+    torch.mps.empty_cache()
+    buffer = torch.empty(budget, dtype=torch.uint8, device="mps")
+    allocated = torch.mps.current_allocated_memory()
+    del buffer
+    assert allocated - torch.mps.current_allocated_memory() == budget
+
+
 @BUFFER_LIMITS
 def test_cache_budget_fits_one_metal_buffer(mps_memory, limit, largest):
     """Upstream puts all KV layers in one buffer, so the budget must fit in it."""

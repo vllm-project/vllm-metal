@@ -4,6 +4,7 @@
 import os
 
 import torch
+from vllm.utils.math_utils import prev_power_of_2, round_down
 from vllm.utils.torch_utils import set_random_seed
 
 from vllm_metal.pytorch_backend.attention import MPSAttentionBackend
@@ -13,6 +14,22 @@ from vllm_metal.v1.worker import MetalWorker, init_worker_distributed_environmen
 
 # PyTorch's MPS allocator rounds large heaps up to this size (kRoundLarge).
 _MPS_HEAP_ALIGNMENT = 2 << 20
+# It also rounds a buffer over 1 MiB up to a multiple of 1/32 of the largest
+# power of two not above it, unless the result would reach maxBufferLength or
+# cross a heap tier (10 or 512 MiB; rounding down there costs at most 6 MiB).
+_MPS_BUCKETS_PER_POWER_OF_TWO = 32
+
+
+def _round_down_for_mps_allocator(size, max_buffer_length):
+    granule = max(
+        prev_power_of_2(size) // _MPS_BUCKETS_PER_POWER_OF_TWO, _MPS_HEAP_ALIGNMENT
+    )
+    bucket = round_down(size, granule)
+    if bucket + granule >= max_buffer_length:
+        # The next bucket reaches maxBufferLength, so PyTorch skips bucketing
+        # above `bucket`; only its heap rounds those sizes up to 2 MiB.
+        return round_down(size, _MPS_HEAP_ALIGNMENT)
+    return bucket
 
 
 def configure_mps(config, *, omni=False):
@@ -150,7 +167,9 @@ class MPSWorker(MetalWorker):
             raise ValueError(
                 "MPS model and activation allowance exceed the memory budget"
             )
-        return min(available, max_buffer)
+        # vLLM allocates the KV cache as one buffer of at most this size, and
+        # PyTorch rounds that buffer up to at most this size.
+        return _round_down_for_mps_allocator(min(available, max_buffer), limit)
 
     def synchronize_device(self):
         torch.mps.synchronize()
