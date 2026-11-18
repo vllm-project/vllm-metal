@@ -510,7 +510,6 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
             total_num_scheduled_tokens=sum(num_scheduled_tokens.values()),
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             scheduled_encoder_inputs={},
-            num_common_prefix_blocks=[],
             finished_req_ids=set(),
             free_encoder_mm_hashes=[],
             num_invalid_spec_tokens=num_invalid_spec_tokens,
@@ -1728,9 +1727,7 @@ class TestV1MetalModelRunnerExecuteModel:
             scheduled_new_reqs=scheduled_new_reqs or [],
             scheduled_cached_reqs=CachedRequestData(
                 req_ids=req_ids,
-                resumed_req_ids=set(),
                 new_token_ids=[],
-                all_token_ids={},
                 new_block_ids=[None] * len(req_ids),
                 num_computed_tokens=[0] * len(req_ids),
                 num_output_tokens=[0] * len(req_ids),
@@ -1740,7 +1737,6 @@ class TestV1MetalModelRunnerExecuteModel:
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens or {},
             num_invalid_spec_tokens=num_invalid_spec_tokens,
             scheduled_encoder_inputs={},
-            num_common_prefix_blocks=[],
             finished_req_ids=finished_req_ids or set(),
             free_encoder_mm_hashes=[],
             preempted_req_ids=set(),
@@ -1754,6 +1750,7 @@ class TestV1MetalModelRunnerExecuteModel:
         return NewRequestData(
             req_id=req_id,
             prompt_token_ids=[1],
+            prefill_token_ids=[1],
             mm_features=[],
             sampling_params=SamplingParams(),
             pooling_params=None,
@@ -2218,7 +2215,6 @@ class TestV1MetalModelRunnerGDNLifecycle:
             scheduled_spec_decode_tokens={},
             num_invalid_spec_tokens=None,
             scheduled_encoder_inputs=scheduled_encoder_inputs or {},
-            num_common_prefix_blocks=[],
             finished_req_ids=set(),
             free_encoder_mm_hashes=[],
             preempted_req_ids=preempted_req_ids or set(),
@@ -2568,7 +2564,6 @@ class TestStartPagedForwardSelectiveLogits:
             total_num_scheduled_tokens=sum(num_scheduled_tokens.values()),
             scheduled_spec_decode_tokens=spec_tokens or {},
             scheduled_encoder_inputs={},
-            num_common_prefix_blocks=[],
             finished_req_ids=set(),
             free_encoder_mm_hashes=[],
             num_invalid_spec_tokens=None,
@@ -3384,7 +3379,6 @@ class TestPipelineGateSpecDecodeDerivation:
             total_num_scheduled_tokens=0,
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             scheduled_encoder_inputs={},
-            num_common_prefix_blocks=[],
             finished_req_ids=set(),
             free_encoder_mm_hashes=[],
             num_invalid_spec_tokens=None,
@@ -3394,9 +3388,7 @@ class TestPipelineGateSpecDecodeDerivation:
     def _cached_decode_output(self, req_id: str) -> SchedulerOutput:
         cached = CachedRequestData(
             req_ids=[req_id],
-            resumed_req_ids=set(),
             new_token_ids=[[7]],
-            all_token_ids={},
             new_block_ids=[None],
             num_computed_tokens=[1],
             num_output_tokens=[1],
@@ -3408,7 +3400,6 @@ class TestPipelineGateSpecDecodeDerivation:
             total_num_scheduled_tokens=1,
             scheduled_spec_decode_tokens={},
             scheduled_encoder_inputs={},
-            num_common_prefix_blocks=[],
             finished_req_ids=set(),
             free_encoder_mm_hashes=[],
             num_invalid_spec_tokens=None,
@@ -3653,7 +3644,6 @@ class TestDeferredDecodeSampleThreading:
             total_num_scheduled_tokens=len(decode_reqs),
             scheduled_spec_decode_tokens={},
             scheduled_encoder_inputs={},
-            num_common_prefix_blocks=[],
             finished_req_ids=set(),
             free_encoder_mm_hashes=[],
             num_invalid_spec_tokens=None,
@@ -4088,9 +4078,7 @@ class TestDeferredDecodeSampleThreading:
         runner._submit_deferred_decode_sample()
         cached = CachedRequestData(
             req_ids=["r0", "r1"],
-            resumed_req_ids=set(),
             new_token_ids=[[7], [7]],
-            all_token_ids={},
             new_block_ids=[None, None],
             num_computed_tokens=[2, 2],
             num_output_tokens=[2, 2],
@@ -4102,7 +4090,6 @@ class TestDeferredDecodeSampleThreading:
             total_num_scheduled_tokens=2,
             scheduled_spec_decode_tokens={},
             scheduled_encoder_inputs={},
-            num_common_prefix_blocks=[],
             finished_req_ids=set(),
             free_encoder_mm_hashes=[],
             num_invalid_spec_tokens=None,
@@ -4362,7 +4349,6 @@ class TestIntermediateBodyOnlyForward:
             total_num_scheduled_tokens=sum(scheduled.values()),
             scheduled_spec_decode_tokens={},
             scheduled_encoder_inputs={},
-            num_common_prefix_blocks=[],
             finished_req_ids=set(),
             free_encoder_mm_hashes=[],
             num_invalid_spec_tokens=None,
@@ -4877,9 +4863,7 @@ class TestStateBlockIdLifecycle:
         runner._update_cached_request_blocks(
             CachedRequestData(
                 req_ids=["r"],
-                resumed_req_ids=set(),
                 new_token_ids=[],
-                all_token_ids={},
                 new_block_ids=[([12], [22], [32], [42])],
                 num_computed_tokens=[1],
                 num_output_tokens=[0],
@@ -4951,7 +4935,6 @@ class TestRequestAdmission:
             total_num_scheduled_tokens=num_scheduled_tokens,
             scheduled_spec_decode_tokens={},
             scheduled_encoder_inputs={},
-            num_common_prefix_blocks=[],
             finished_req_ids=set(),
             free_encoder_mm_hashes=[],
             preempted_req_ids=preempted_req_ids or set(),
@@ -4963,8 +4946,6 @@ class TestRequestAdmission:
     ) -> CachedRequestData:
         return CachedRequestData(
             req_ids=["r"],
-            resumed_req_ids=set(),
-            all_token_ids={},
             new_block_ids=[None],
             num_computed_tokens=[num_computed_tokens],
             num_output_tokens=[len(token_ids) - 4],
@@ -5274,9 +5255,7 @@ class TestRequestAdmission:
         continuation = self._scheduler_output(None, 2)
         continuation.scheduled_cached_reqs = CachedRequestData(
             req_ids=["r"],
-            resumed_req_ids=set(),
             new_token_ids=[],
-            all_token_ids={},
             new_block_ids=[None],
             num_computed_tokens=[4],
             num_output_tokens=[2],
@@ -5313,9 +5292,7 @@ class TestRequestAdmission:
         cached = self._scheduler_output(None, 1)
         cached.scheduled_cached_reqs = CachedRequestData(
             req_ids=["r"],
-            resumed_req_ids=set(),
             new_token_ids=[[7]],
-            all_token_ids={},
             new_block_ids=[None],
             num_computed_tokens=[6],
             num_output_tokens=[3],

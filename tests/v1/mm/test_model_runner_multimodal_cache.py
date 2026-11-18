@@ -38,9 +38,7 @@ def _cached_reqs(req_ids: list[str] | None = None) -> CachedRequestData:
     ids = req_ids or []
     return CachedRequestData(
         req_ids=ids,
-        resumed_req_ids=set(),
         new_token_ids=[],
-        all_token_ids={},
         new_block_ids=[None] * len(ids),
         num_computed_tokens=[0] * len(ids),
         num_output_tokens=[0] * len(ids),
@@ -67,7 +65,6 @@ def _scheduler_output(
         total_num_scheduled_tokens=sum(num_scheduled_tokens.values()),
         scheduled_spec_decode_tokens={},
         scheduled_encoder_inputs=scheduled_encoder_inputs or {},
-        num_common_prefix_blocks=[],
         finished_req_ids=finished_req_ids or set(),
         free_encoder_mm_hashes=free_encoder_mm_hashes or [],
         preempted_req_ids=preempted_req_ids or set(),
@@ -79,6 +76,7 @@ def _new_request(req_id: str, features: list[MultiModalFeatureSpec]) -> NewReque
     return NewRequestData(
         req_id=req_id,
         prompt_token_ids=[1],
+        prefill_token_ids=[1],
         mm_features=features,
         sampling_params=None,
         pooling_params=None,
