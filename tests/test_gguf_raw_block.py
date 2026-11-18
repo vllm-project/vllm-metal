@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for the raw-block GGUF tensor and its Q2_K/Q3_K/Q6_K Metal kernels.
+"""Tests for the raw-block GGUF tensor and its Q2_K/Q3_K/Q6_K/IQ3_XXS kernels.
 
 K-quant fixtures are built as raw blocks field-by-field because gguf-py
 cannot quantize K-quants; ``gguf.quants.dequantize`` stays the authoritative
@@ -14,7 +14,10 @@ import pytest
 
 gguf = pytest.importorskip("gguf")
 
-from tests.gguf_kquant_fixtures import build_kquant_blocks  # noqa: E402
+from tests.gguf_kquant_fixtures import (  # noqa: E402
+    build_iq3_blocks,
+    build_kquant_blocks,
+)
 from vllm_metal.gguf.raw_block import GGUFRawBlockTensor  # noqa: E402
 
 GGMLQuantizationType = gguf.GGMLQuantizationType
@@ -23,6 +26,7 @@ _RAW_QTYPES = [
     GGMLQuantizationType.Q2_K,
     GGMLQuantizationType.Q3_K,
     GGMLQuantizationType.Q6_K,
+    GGMLQuantizationType.IQ3_XXS,
 ]
 
 
@@ -50,7 +54,10 @@ def _make_raw_tensor(
     cols: int = 512,
     qtype: gguf.GGMLQuantizationType = GGMLQuantizationType.Q6_K,
 ) -> tuple:
-    raw = build_kquant_blocks(rows, cols, qtype)
+    if qtype == GGMLQuantizationType.IQ3_XXS:
+        raw = build_iq3_blocks(rows, cols, qtype)
+    else:
+        raw = build_kquant_blocks(rows, cols, qtype)
     qt = GGUFRawBlockTensor.from_raw_blocks(raw, (rows, cols), qtype)
     oracle = gguf.quants.dequantize(raw, qtype).astype(np.float32)
     return qt, oracle
@@ -62,6 +69,7 @@ def _make_raw_tensor(
         (GGMLQuantizationType.Q2_K, 2, 84),
         (GGMLQuantizationType.Q3_K, 3, 110),
         (GGMLQuantizationType.Q6_K, 6, 210),
+        (GGMLQuantizationType.IQ3_XXS, 3, 98),
     ],
 )
 def test_contract_matches_logical_shape(qtype, bits, block_bytes):
