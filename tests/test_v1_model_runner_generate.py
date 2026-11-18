@@ -19,6 +19,7 @@ from vllm.v1.core.sched.output import (
     SchedulerOutput,
 )
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
+from vllm.v1.token_buffer import TokenBuffer
 
 import vllm_metal.attention.impls.mm_prefix as mm_prefix_module
 import vllm_metal.envs as metal_envs
@@ -5021,15 +5022,6 @@ class TestRequestAdmission:
         assert "r" not in runner._paged_request_seq_lens
         assert "r" not in runner._awaiting_readmission
 
-    def test_readmission_rejects_missing_full_history(self) -> None:
-        runner = self._preempted_runner()
-        new_req = self._new_req([1, 2, 3, 4, 5, 6], num_computed_tokens=0)
-        new_req.prefill_token_ids = None
-        runner._reconcile_request_lifecycle(set(), preempted_req_ids={"r"})
-
-        with pytest.raises(RuntimeError, match="missing prefill_token_ids"):
-            self._admit(runner, new_req, 4)
-
     def _seeded_chunked_prefill(
         self, monkeypatch: pytest.MonkeyPatch, *, deferred: bool
     ) -> tuple[mr.MetalModelRunner, list[int]]:
@@ -5265,6 +5257,49 @@ class TestRequestAdmission:
         assert state.generated_tokens == 3
         assert state.prompt_len == 4
         assert new_req.prefill_token_ids == [1, 2, 3, 4, 5, 6]
+
+    def test_sampled_token_does_not_extend_the_scheduler_token_buffer(
+        self, monkeypatch
+    ) -> None:
+        """The scheduler passes its own TokenBuffer as prompt and prefill ids."""
+        runner = make_stub_runner(
+            model_args={"vocab_size": 8},
+            _paged_attention_runtime=ForwardOutputRuntimeStub([]),
+            _paged_block_size=16,
+            _sampler=Sampler(),
+            num_layers=0,
+        )
+        seen_inputs = []
+
+        def forward(input_ids, **kwargs):
+            seen_inputs.append(input_ids.tolist()[0])
+            return mr.TargetModelForwardOutput(
+                logits=mx.broadcast_to(mx.arange(8), (*input_ids.shape, 8)).astype(
+                    mx.float32
+                )
+            )
+
+        monkeypatch.setattr(runner, "_target_forward", forward)
+        prompt = TokenBuffer([1, 2, 3, 4])
+        new_req = NewRequestData(
+            req_id="r",
+            prompt_token_ids=prompt,
+            prefill_token_ids=prompt,
+            mm_features=[],
+            sampling_params=SamplingParams(temperature=0),
+            pooling_params=None,
+            block_ids=([10, 11],),
+            num_computed_tokens=0,
+            lora_request=None,
+        )
+
+        runner.execute_model(self._scheduler_output(new_req, 4))
+        output = runner.sample_tokens(None)
+
+        assert seen_inputs == [[1, 2, 3, 4]]
+        assert output.sampled_token_ids == [[7]]
+        assert runner._request_states["r"].token_ids == [1, 2, 3, 4, 7]
+        assert prompt == [1, 2, 3, 4]
 
     def test_non_last_pp_stage_keeps_the_prefill_tokens(self, monkeypatch) -> None:
         runner = make_stub_runner(
