@@ -224,6 +224,7 @@ class KVCacheStorage:
             binding = SimpleNamespace(
                 get_state_shape=lambda spec=spec: spec.shapes,
                 get_state_dtype=lambda spec=spec: spec.dtypes,
+                state_alignment=spec.state_alignment,
             )
             MambaBase.bind_kv_cache(binding, self.tensors[name])
             states.append(binding.kv_cache)
