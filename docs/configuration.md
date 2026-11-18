@@ -101,6 +101,9 @@ Sleep levels mean something different on unified memory than on a GPU:
   pool is allocated lazily.
 - With [KV offloading](kv_offloading.md), sleep also frees the host pool. It
   comes back empty at wake. Prompts already on the disk tier still restore.
+  Keep `reset_connector=True` (the default) for `sleep` and
+  `release_kv_cache_memory` with KV offloading: with `False`, vLLM keeps its
+  index of the freed pool, so prompts restored from it after wake can be wrong.
 
 Sleep mode supports dense, hybrid and MLA models on the MLX backend.
 Supported speculative decoding methods are `ngram`, `draft_model`, `dflash` and
