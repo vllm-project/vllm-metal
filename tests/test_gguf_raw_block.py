@@ -288,3 +288,86 @@ def test_matmul_rejects_wrong_last_dim():
 
     with pytest.raises(ValueError, match="matmul expects last dim"):
         qt.matmul(x)
+
+
+# --- MoE experts stacked as row blocks ----------------------------------------
+
+_NUM_EXPERTS = 4
+
+
+def _make_expert_tensor(qtype: gguf.GGMLQuantizationType) -> tuple:
+    """Four 8-row experts stacked in one tensor, plus their (E, rows, in) oracle."""
+    qt, oracle = _make_raw_tensor(rows=_NUM_EXPERTS * 8, qtype=qtype)
+    return qt, oracle.reshape(_NUM_EXPERTS, 8, qt.in_features)
+
+
+def _gather_oracle(x: mx.array, indices: mx.array, experts: np.ndarray) -> mx.array:
+    w = mx.array(experts).swapaxes(-1, -2)
+    return mx.gather_mm(x, w, rhs_indices=indices, stream=mx.cpu)
+
+
+def _assert_close_to(out: mx.array, expected: mx.array) -> None:
+    mx.eval(out, expected)
+    ref_max = float(mx.max(mx.abs(expected)))
+    np.testing.assert_allclose(
+        np.array(out), np.array(expected), rtol=0, atol=ref_max * 4e-5
+    )
+
+
+@pytest.mark.parametrize("qtype", _RAW_QTYPES)
+@pytest.mark.parametrize(("tokens", "dequantizes"), [(1, False), (4, False), (5, True)])
+def test_gather_matmul_matches_expert_oracle(monkeypatch, qtype, tokens, dequantizes):
+    # SwitchGLU's unsorted call: x (B, L, 1, 1, in) routed by indices (B, L, k).
+    # Four experts cap gather QMV at 8 (token, expert) assignments; 5 x top-2
+    # is 10.
+    qt, experts = _make_expert_tensor(qtype)
+    calls = _spy_matmul_paths(monkeypatch)
+    x = mx.random.normal((1, tokens, 1, 1, qt.in_features))
+    indices = mx.random.randint(0, _NUM_EXPERTS, (1, tokens, 2))
+
+    out = qt.gather_matmul(x, indices, num_experts=_NUM_EXPERTS)
+
+    assert out.shape == (1, tokens, 2, 1, 8)
+    assert calls["gemm"] == int(dequantizes)
+    _assert_close_to(out, _gather_oracle(x, indices, experts))
+
+
+# 4 tokens x top-2 runs gather QMV and 5 the dense arm; tolerances as for matmul.
+@pytest.mark.parametrize("tokens", [4, 5])
+@pytest.mark.parametrize(
+    ("dtype", "rel_tol"), [(mx.float16, 4e-3), (mx.bfloat16, 8e-3)]
+)
+@pytest.mark.parametrize("qtype", _RAW_QTYPES)
+def test_gather_matmul_low_precision_matches_expert_oracle(
+    dtype, rel_tol, tokens, qtype
+):
+    qt, experts = _make_expert_tensor(qtype)
+    x = mx.random.normal((1, tokens, 1, 1, qt.in_features)).astype(dtype)
+    indices = mx.random.randint(0, _NUM_EXPERTS, (1, tokens, 2))
+
+    out = qt.gather_matmul(x, indices, num_experts=_NUM_EXPERTS)
+    expected = _gather_oracle(x.astype(mx.float32), indices, experts)
+    mx.eval(out, expected)
+
+    assert out.dtype == dtype
+    ref_max = float(mx.max(mx.abs(expected)))
+    np.testing.assert_allclose(
+        np.array(out.astype(mx.float32)),
+        np.array(expected),
+        rtol=0,
+        atol=ref_max * rel_tol,
+    )
+
+
+# 8 assignments run gather QMV and 80 the dense arm.
+@pytest.mark.parametrize("assignments", [8, 80])
+@pytest.mark.parametrize("qtype", _RAW_QTYPES)
+def test_gather_matmul_sorted_matches_expert_oracle(qtype, assignments):
+    # SwitchGLU sorts 64+ assignments into x (N, 1, in) with ascending indices.
+    qt, experts = _make_expert_tensor(qtype)
+    x = mx.random.normal((assignments, 1, qt.in_features))
+    indices = mx.sort(mx.random.randint(0, _NUM_EXPERTS, (assignments,)))
+
+    out = qt.gather_matmul(x, indices, num_experts=_NUM_EXPERTS, sorted_indices=True)
+
+    _assert_close_to(out, _gather_oracle(x, indices, experts))

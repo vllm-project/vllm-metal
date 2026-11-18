@@ -411,17 +411,17 @@ class TestMetalPlatform:
     def test_sleep_mode_is_available(self) -> None:
         assert MetalPlatform.is_sleep_mode_available()
 
-    def test_check_and_update_config_rejects_sleep_mode_with_block_drafting(
+    def test_check_and_update_config_rejects_sleep_mode_with_mtp_drafting(
         self,
     ) -> None:
         vllm_config = self._platform_config(
             model_config=SimpleNamespace(enable_sleep_mode=True),
-            speculative_config=SimpleNamespace(method="dflash"),
+            speculative_config=SimpleNamespace(method="mtp"),
         )
-        with pytest.raises(NotImplementedError, match="only n-gram and draft-model"):
+        with pytest.raises(NotImplementedError, match="Sleep mode.*method='mtp'"):
             MetalPlatform.check_and_update_config(vllm_config)
 
-    @pytest.mark.parametrize("method", ["ngram", "draft_model"])
+    @pytest.mark.parametrize("method", ["ngram", "draft_model", "dflash", "dspark"])
     def test_sleep_mode_accepts_drafters_without_private_kv(self, method) -> None:
         """Their KV, if any, is a view of the storage that sleep re-creates."""
         vllm_config = self._platform_config(
@@ -439,6 +439,12 @@ class TestMetalPlatform:
         )
         with pytest.raises(NotImplementedError, match="MLX backend only"):
             MetalPlatform.check_and_update_config(vllm_config)
+
+    def test_check_and_update_config_accepts_mps_config_without_model(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("vllm_metal.envs.VLLM_METAL_BACKEND", "mps")
+        MetalPlatform.check_and_update_config(self._platform_config())
 
     def test_validate_request_accepts_min_p(self) -> None:
         MetalPlatform.validate_request({}, SamplingParams(min_p=0.2))
@@ -2101,10 +2107,12 @@ class TestMetalPlatform:
         ],
         ids=["unset", "low-exported", "high-exported"],
     )
-    def test_mps_sizes_heaps_to_requests_by_default(
+    def test_mps_worker_sizes_heaps_to_requests_by_default(
         self, tmp_path, monkeypatch, exported
     ) -> None:
         from transformers import Qwen3Config
+
+        from vllm_metal.pytorch_backend import worker as worker_module
 
         Qwen3Config(
             architectures=["Qwen3ForCausalLM"], hidden_size=64, head_dim=64
@@ -2113,15 +2121,37 @@ class TestMetalPlatform:
         monkeypatch.setattr(os, "environ", environ | exported)
         monkeypatch.setitem(vars(platform_module.envs), "VLLM_METAL_BACKEND", "mps")
         monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
-        EngineArgs(
+        config = EngineArgs(
             model=str(tmp_path),
             dtype="bfloat16",
             skip_tokenizer_init=True,
             max_model_len=128,
         ).create_engine_config()
-        watermarks = {k: v for k, v in os.environ.items() if "WATERMARK" in k}
+
+        def watermarks():
+            return {k: v for k, v in os.environ.items() if "WATERMARK" in k}
+
+        assert watermarks() == exported
+
+        monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+        monkeypatch.setattr(
+            worker_module, "init_worker_distributed_environment", lambda *_: None
+        )
+        monkeypatch.setattr(worker_module, "set_random_seed", lambda _: None)
+        worker_module.MPSWorker.init_device(
+            SimpleNamespace(
+                vllm_config=config,
+                cache_config=config.cache_config,
+                model_config=config.model_config,
+                is_omni=False,
+                rank=0,
+                local_rank=0,
+                distributed_init_method="unused",
+                model_runner_cls=lambda _: None,
+            )
+        )
         # An exported low watermark always wins.
-        assert watermarks == {"PYTORCH_MPS_LOW_WATERMARK_RATIO": "0.01"} | exported
+        assert watermarks() == {"PYTORCH_MPS_LOW_WATERMARK_RATIO": "0.01"} | exported
 
     def test_kept_multimodal_config_normalizes_pixels_on_the_host(
         self, monkeypatch: pytest.MonkeyPatch

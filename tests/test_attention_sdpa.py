@@ -32,6 +32,7 @@ from vllm.v1.kv_cache_interface import (
 )
 
 import vllm_metal.attention.impls.sdpa as sdpa_mod
+from tests.stub_runner import make_kv_cache
 from vllm_metal.attention.attention_contracts import (
     AttentionContract,
     attention_contract_for,
@@ -811,7 +812,7 @@ class TestSDPAForward:
             return out
 
         inner.o_proj = o_proj
-        cache = MetalPagedKVCache(
+        cache = make_kv_cache(
             num_layers=1,
             num_kv_heads=_N_KV_HEADS,
             head_dim=_HEAD_DIM,
@@ -841,7 +842,7 @@ class TestSDPAForward:
         )
         inner = DeepseekAttention(args)
         x = mx.zeros((1, 2, 16), dtype=mx.float16)
-        cache = MetalPagedKVCache(
+        cache = make_kv_cache(
             num_layers=1,
             num_kv_heads=2,
             head_dim=4,
@@ -906,6 +907,15 @@ class TestSDPAForward:
         """The environment escape hatch and scheduler decode count reach native code."""
         from vllm_metal import envs
 
+        # Built first: creating the storage's VllmConfig also reads the switch.
+        cache = make_kv_cache(
+            num_layers=1,
+            num_kv_heads=_N_KV_HEADS,
+            head_dim=_HEAD_DIM,
+            num_blocks=1,
+            block_size=8,
+            dtype=mx.float16,
+        )
         monkeypatch.setenv("VLLM_METAL_DISABLE_GQA_DECODE", str(int(disabled)))
         read_env = MagicMock(
             wraps=envs.environment_variables["VLLM_METAL_DISABLE_GQA_DECODE"]
@@ -918,14 +928,6 @@ class TestSDPAForward:
         monkeypatch.setattr(spy, "paged_attention_capabilities", capability_query)
         inner = _make_inner()
         inner.o_proj = lambda out: out
-        cache = MetalPagedKVCache(
-            num_layers=1,
-            num_kv_heads=_N_KV_HEADS,
-            head_dim=_HEAD_DIM,
-            num_blocks=1,
-            block_size=8,
-            dtype=mx.float16,
-        )
         ctx = _make_ctx(_SEQ_LEN)
         ctx.num_decode_requests = 1
         x = mx.ones((_BATCH, _SEQ_LEN, _HIDDEN), dtype=mx.float16)
@@ -982,7 +984,7 @@ class TestSDPAForward:
         monkeypatch.setattr(spy, "paged_attention_capabilities", query)
         inner = _make_inner()
         inner.o_proj = lambda out: out
-        cache = MetalPagedKVCache(
+        cache = make_kv_cache(
             num_layers=1,
             num_kv_heads=_N_KV_HEADS,
             head_dim=_HEAD_DIM,
@@ -1049,7 +1051,7 @@ class TestSDPAForward:
         spy = _TurboQuantRoutingOpsSpy()
         inner = _make_inner(head_dim=head_dim)
         inner.o_proj = lambda out: out
-        cache = MetalPagedKVCache(
+        cache = make_kv_cache(
             num_layers=1,
             num_kv_heads=_N_KV_HEADS,
             head_dim=head_dim,
@@ -1109,7 +1111,7 @@ class TestSDPAForward:
         monkeypatch.setattr(sdpa_mod, "nax_tile_work", work)
         inner = _make_inner()
         inner.o_proj = lambda out: out
-        cache = MetalPagedKVCache(
+        cache = make_kv_cache(
             num_layers=1,
             num_kv_heads=_N_KV_HEADS,
             head_dim=_HEAD_DIM,
@@ -1227,7 +1229,7 @@ class TestSDPAForward:
         Unregistered scale-less modules must continue to fail before dispatch.
         """
         actual_kv_heads = 1
-        cache = MetalPagedKVCache(
+        cache = make_kv_cache(
             num_layers=2,
             num_kv_heads=_N_KV_HEADS,
             head_dim=_HEAD_DIM,
@@ -1325,7 +1327,7 @@ class TestSDPAForward:
 
     def test_gpt_oss_scale_and_sinks_reach_kernel(self) -> None:
         """GPT-OSS exposes ``sm_scale`` and per-head attention sinks."""
-        cache = MetalPagedKVCache(
+        cache = make_kv_cache(
             num_layers=1,
             num_kv_heads=_N_KV_HEADS,
             head_dim=_HEAD_DIM,
@@ -1437,7 +1439,7 @@ class TestSDPAForward:
 
     def _run_capturing_softcap(self, inner: SimpleNamespace) -> float:
         """Drive ``sdpa_forward`` and return the softcap the kernel received."""
-        cache = MetalPagedKVCache(
+        cache = make_kv_cache(
             num_layers=1,
             num_kv_heads=_N_KV_HEADS,
             head_dim=_HEAD_DIM,
@@ -1522,7 +1524,7 @@ class TestSDPAForward:
 
     def test_shared_kv_path_does_not_rebind_cache_arrays(self) -> None:
         """Shared-KV attention must read the existing cache without writing."""
-        cache = MetalPagedKVCache(
+        cache = make_kv_cache(
             num_layers=1,
             num_kv_heads=_N_KV_HEADS,
             head_dim=_HEAD_DIM,
@@ -1530,8 +1532,8 @@ class TestSDPAForward:
             block_size=8,
             dtype=mx.float16,
         )
-        original_k_cache = cache.key_caches[0]
-        original_v_cache = cache.value_caches[0]
+        storage = cache.key_caches.storage
+        buffers = list(storage.buffers)
 
         inner = SimpleNamespace(
             n_heads=_N_HEADS,
@@ -1576,14 +1578,14 @@ class TestSDPAForward:
                 inner, x, ctx, cache, layer_idx=0, shared_kv=(shared_k, shared_v)
             )
 
-        assert cache.key_caches[0] is original_k_cache
-        assert cache.value_caches[0] is original_v_cache
-        assert captured["key_cache"] is original_k_cache
-        assert captured["value_cache"] is original_v_cache
+        # A cache write would rebind the shared backing's buffers.
+        assert all(a is b for a, b in zip(storage.buffers, buffers, strict=True))
+        assert mx.array_equal(captured["key_cache"], cache.key_caches[0]).item()
+        assert mx.array_equal(captured["value_cache"], cache.value_caches[0]).item()
 
     def test_read_existing_kv_path_does_not_rebind_cache_arrays(self) -> None:
         """MTP cache-read mode must not write new K/V into the target cache."""
-        cache = MetalPagedKVCache(
+        cache = make_kv_cache(
             num_layers=1,
             num_kv_heads=_N_KV_HEADS,
             head_dim=_HEAD_DIM,
@@ -1591,8 +1593,8 @@ class TestSDPAForward:
             block_size=8,
             dtype=mx.float16,
         )
-        original_k_cache = cache.key_caches[0]
-        original_v_cache = cache.value_caches[0]
+        storage = cache.key_caches.storage
+        buffers = list(storage.buffers)
 
         inner = SimpleNamespace(
             n_heads=_N_HEADS,
@@ -1636,10 +1638,10 @@ class TestSDPAForward:
             sdpa_forward(inner, x, ctx, cache, layer_idx=0, read_existing_kv=True)
 
         assert prepare_mock.call_args.kwargs["read_existing_kv"] is True
-        assert cache.key_caches[0] is original_k_cache
-        assert cache.value_caches[0] is original_v_cache
-        assert captured["key_cache"] is original_k_cache
-        assert captured["value_cache"] is original_v_cache
+        # A cache write would rebind the shared backing's buffers.
+        assert all(a is b for a, b in zip(storage.buffers, buffers, strict=True))
+        assert mx.array_equal(captured["key_cache"], cache.key_caches[0]).item()
+        assert mx.array_equal(captured["value_cache"], cache.value_caches[0]).item()
 
 
 class TestBidirectionalDispatch:
@@ -1944,7 +1946,7 @@ class TestLfm3Attention:
         attention = Attention(config, layer_type)
         attention.set_dtype(dtype)
         reference_cache = RotatingKVCache(max_size=4) if window > 0 else KVCache()
-        cache = MetalPagedKVCache(
+        cache = make_kv_cache(
             num_layers=1,
             num_kv_heads=1,
             head_dim=64,
@@ -2011,7 +2013,7 @@ class TestPhiAttention:
 
         assert sdpa_mod.is_sdpa(inner)
 
-        cache = MetalPagedKVCache(
+        cache = make_kv_cache(
             num_layers=1,
             num_kv_heads=n_kv_heads,
             head_dim=head_dim,

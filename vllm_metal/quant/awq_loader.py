@@ -1,12 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """AWQ load owner for vllm-metal.
 
-Encapsulates the entry-point preflight, the ``mlx_lm.utils.load_model`` invocation with a
-normalized ``model_config={"quantization_config": ...}`` kwarg, and the
-post-load alignment of non-quantized floating params. ``ModelLifecycle``
-delegates the entire AWQ branch to instances of this class so quantization
-policy stays cohesive in one place rather than leaking into the generic loader
-flow.
+Encapsulates the entry-point preflight and the ``mlx_lm.utils.load_model``
+invocation with a normalized ``model_config={"quantization_config": ...}``
+kwarg. ``ModelLifecycle`` delegates the entire AWQ branch to instances of
+this class so quantization policy stays cohesive in one place rather than
+leaking into the generic loader flow.
 
 GPTQ checkpoints are explicitly rejected at the entry point. mlx-lm's
 ``_transform_awq_weights`` accepts ``quant_method="gptq"`` at the
@@ -23,12 +22,8 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-import mlx.core as mx
-import mlx.nn as nn
 from huggingface_hub import hf_hub_download
-from mlx.utils import tree_flatten
 from mlx_lm.utils import load_model as mlx_lm_load_model
-from vllm.logger import init_logger
 
 from vllm_metal.quant.awq_config import (
     UnsupportedQuantizationConfigError,
@@ -36,22 +31,14 @@ from vllm_metal.quant.awq_config import (
 )
 from vllm_metal.utils import resolve_mlx_lm_model_path
 
-logger = init_logger(__name__)
-
-
-# AWQ-transform output buffer names. Their dtype is owned by the upstream
-# transform (typically fp16) and must not be touched by the post-load
-# alignment, even on MLX-quantize-protocol leaves.
-_AWQ_QUANT_BUFFER_NAMES = ("scales", "biases")
-
 
 class AWQQuantLoader:
     """Owner for the AWQ load flow.
 
     Construct via :meth:`for_model`, which inspects the checkpoint's
     ``config.json`` and returns ``None`` when the checkpoint is not AWQ.
-    Lifecycle dispatches the quantized branch to this owner so post-load
-    alignment policy does not bleed into generic loader code paths.
+    Lifecycle dispatches the quantized branch to this owner so quantization
+    policy does not bleed into generic loader code paths.
     """
 
     def __init__(self, normalized_quant_config: Mapping[str, Any]) -> None:
@@ -74,8 +61,7 @@ class AWQQuantLoader:
         GPTQ checkpoints raise :class:`UnsupportedQuantizationConfigError`
         rather than returning ``None``: the loader does not silently take
         ownership of a quantized checkpoint that is outside the v1
-        support claim, and falling through to the generic loader would
-        bypass the dtype-alignment contract this owner enforces.
+        support claim.
 
         Raises:
             UnsupportedQuantizationConfigError: AWQ but outside v1 scope,
@@ -95,15 +81,14 @@ class AWQQuantLoader:
             return None
         return cls(normalize_quant_config(raw_qc))
 
-    def load(
-        self,
-        model_path: str,
-        *,
-        target_dtype: Any,
-        revision: str | None = None,
-    ) -> Any:
-        """Run ``mlx_lm.utils.load_model`` with the normalized quant config, then align
-        non-quantized floating params to ``target_dtype``.
+    def load(self, model_path: str, *, revision: str | None = None) -> Any:
+        """Run ``mlx_lm.utils.load_model`` with the normalized quant config.
+
+        The model keeps the dtype mlx-lm loads it in, the checkpoint's
+        scales dtype (typically fp16), like any other MLX-LM checkpoint;
+        the runtime dtype sets the KV cache. Casting the other floating
+        params to a different runtime dtype makes MLX promote every
+        quantized layer's output to float32.
 
         ``model_path`` is the (possibly compatibility-adapted) path that
         the lifecycle resolves via ``_mlx_lm_compatible_model_path``; the
@@ -112,12 +97,6 @@ class AWQQuantLoader:
         resolved_path = resolve_mlx_lm_model_path(model_path, revision=revision)
         model, _ = mlx_lm_load_model(
             resolved_path, model_config=self._mlx_lm_model_config
-        )
-        n_cast = self._align_non_quantized_dtypes(model, target_dtype)
-        logger.info(
-            "AWQ load: aligned %d non-quantized floating params to %s",
-            n_cast,
-            target_dtype,
         )
         return model
 
@@ -142,9 +121,9 @@ class AWQQuantLoader:
         ``OSError``) are intentionally NOT caught here. A transient Hub
         failure or a malformed repo id should surface to the caller, not
         silently demote an AWQ checkpoint to the generic loader path,
-        which would bypass the dtype-alignment contract this owner
-        enforces. The local-directory branch above is the single
-        legitimate "no config" case and remains a silent ``None``.
+        which would bypass the preflight. The local-directory branch above
+        is the single legitimate "no config" case and remains a silent
+        ``None``.
         """
         model_path = Path(model_name)
         if model_path.is_dir():
@@ -166,65 +145,3 @@ class AWQQuantLoader:
             if isinstance(nested, dict):
                 return nested
         return None
-
-    @staticmethod
-    def _is_mlx_quantized_module(module: Any) -> bool:
-        """Whether ``module`` follows the MLX quantize protocol.
-
-        The protocol's defining surface is the instance-level ``bits`` and
-        ``group_size`` attributes set during construction. This duck-typed
-        check covers ``mlx.nn.QuantizedLinear`` /
-        ``mlx.nn.QuantizedEmbedding`` together with the mlx_lm peers
-        ``QuantizedSwitchLinear`` (MoE) and ``QuantizedMultiLinear`` (MLA),
-        none of which subclass ``nn.QuantizedLinear``. An ``isinstance``
-        check would silently misclassify those as plain modules and let
-        their AWQ-transform ``scales`` / ``biases`` be cast to the runtime
-        dtype. A separate import dependency on the mlx_lm peers would make
-        the alignment fragile across mlx_lm versions; the protocol
-        attributes are stable.
-        """
-        return hasattr(module, "bits") and hasattr(module, "group_size")
-
-    @staticmethod
-    def _align_non_quantized_dtypes(model: Any, target_dtype: Any) -> int:
-        """Cast floating-dtype params on leaf modules to ``target_dtype``.
-        Returns the number of cast tensors.
-
-        The AWQ transform produces ``scales`` and ``biases`` parameters at
-        the transform's dtype (typically fp16) for every MLX-quantize-protocol
-        leaf: ``nn.QuantizedLinear``, ``nn.QuantizedEmbedding``, and the
-        mlx_lm MoE / MLA peers. Those buffers are exempt from alignment.
-
-        Surrounding floating params follow the engine's runtime dtype:
-        layer norms, embeddings (when not quantized), and the quantized
-        layer's own ordinary ``bias`` (Qwen2 q/k/v projections, MoE
-        per-expert biases, etc.). Without aligning the regular ``bias``
-        the projection emits mixed-dtype activations into a bf16 KV cache
-        / sampler.
-        """
-        # `tree_flatten` is overloaded `list[tuple[str, Any]] | dict[str, Any]`
-        # depending on the `destination` kwarg; with `destination=None`
-        # (default) it returns the list. Narrow at runtime so mypy can
-        # unpack the tuples.
-        leaves = tree_flatten(model.leaf_modules(), is_leaf=nn.Module.is_module)
-        assert isinstance(leaves, list)
-
-        n_cast = 0
-        for _path, module in leaves:
-            is_quantized = AWQQuantLoader._is_mlx_quantized_module(module)
-            updates = {}
-            for name, value in module.parameters().items():
-                if is_quantized and name in _AWQ_QUANT_BUFFER_NAMES:
-                    continue
-                dtype = getattr(value, "dtype", None)
-                if dtype is None:
-                    continue
-                if not mx.issubdtype(dtype, mx.floating):
-                    continue
-                if dtype == target_dtype:
-                    continue
-                updates[name] = value.astype(target_dtype)
-            if updates:
-                module.update(updates)
-                n_cast += len(updates)
-        return n_cast

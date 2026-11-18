@@ -45,13 +45,12 @@ from vllm.v1.outputs import (
     LogprobsTensors,
     ModelRunnerOutput,
 )
-from vllm.v1.sample.logits_processor import LOGITSPROCS_GROUP
-from vllm.v1.sample.sampler import Sampler
 from vllm.v1.worker.gpu.kv_connector import (
     NO_OP_KV_CONNECTOR,
     ActiveKVConnector,
     KVConnector,
 )
+from vllm.v1.worker.gpu.sample.logits_processor.loader import LOGITSPROCS_GROUP
 
 from vllm_metal import envs
 from vllm_metal.attention.context import (
@@ -125,6 +124,7 @@ from vllm_metal.v1.proposer import (
     MetalProposer,
     ProposeContext,
 )
+from vllm_metal.v1.sampling import Sampler
 from vllm_metal.v1.sampling_batch import (
     SamplingBatch,
     create_request_generator,
@@ -1017,8 +1017,7 @@ class MetalModelRunner:
 
         Called by the worker after ``initialize_kv_cache`` when a KV connector
         is configured. Only the SDPA and MLA runtimes' ``KVCacheStorage`` is
-        registered. Hybrid and count-based (draft model) caches have no layout
-        the connector can address.
+        registered. Hybrid caches have no layout the connector can address.
         """
         from vllm_metal.attention.runtime.mla import MLAPagedAttentionRuntime
         from vllm_metal.attention.runtime.sdpa import SDPAPagedAttentionRuntime
@@ -1649,6 +1648,18 @@ class MetalModelRunner:
                     DecoderPoolingBackend,
                     self._pooling_backend,
                 )
+                # A checkpoint whose model config is not causal (d3's
+                # noncausal_full_attention) scores the prompt with the whole
+                # input in view: one bidirectional block per prefill segment.
+                # Linear (GDN) layers keep their recurrence, so only
+                # full-attention layers take the block.
+                hf_config = getattr(self.model_config, "hf_config", None)
+                if ctx is not None and not getattr(hf_config, "is_causal", True):
+                    ctx.bidi_layer_kinds = frozenset({"full"})
+                    ctx.segment_bidi_ranges = [
+                        [(pr.start_pos, pr.start_pos + len(pr.token_ids))]
+                        for pr in prefill_reqs
+                    ]
                 pooling_hidden_states = decoder_pooling_backend.forward_packed(
                     input_ids,
                     offset_caches,

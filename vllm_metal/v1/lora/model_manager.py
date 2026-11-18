@@ -204,16 +204,15 @@ class MLXLoRAModelManager:
         if lora_id not in self._registered:
             raise ValueError(f"LoRA adapter {lora_id} is not registered")
 
+        # Check capacity and validate weights before replacing the cached adapter.
         slot = self._slot_for_adapter(lora_id)
         if slot is None:
-            slot = 0
+            slot = self._next_activation_slot()
         prepared = self._prepare_adapter_update(adapter, slot)
 
         self._registered[lora_id] = adapter
         self._registered.touch(lora_id)
         if self._slot_for_adapter(lora_id) is None:
-            slot = self._next_activation_slot()
-            prepared = self._prepare_adapter_update(adapter, slot)
             self._activate_prepared(lora_id, slot, prepared)
         else:
             self._commit_adapter_update(lora_id, slot, prepared)

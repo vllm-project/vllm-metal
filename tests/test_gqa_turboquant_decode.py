@@ -190,7 +190,7 @@ def test_value_bit_widths(v_bits) -> None:
     out, established, reference = _run(
         kv_lens=[1100],
         geometry=(16, 2, 256, 32),
-        partition=512,
+        partition=256,
         dtype=mx.float16,
         v_bits=v_bits,
     )

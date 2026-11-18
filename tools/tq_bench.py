@@ -31,11 +31,18 @@ import math
 import sys
 import time
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import mlx.core as mx
 
-from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
-from vllm_metal.attention.caches.turboquant import get_v_centroids
+from vllm_metal.attention.caches.turboquant import (
+    BLOCK_SIZE as TQ_GROUP_SIZE,
+)
+from vllm_metal.attention.caches.turboquant import (
+    QUANT_PARAMS,
+    get_v_centroids,
+    packed_dim,
+)
 from vllm_metal.metal import get_ops
 
 # -----------------------------------------------------------------------------
@@ -94,29 +101,38 @@ def _time_dispatch_only(fn, warmup: int = 3, iters: int = 200) -> float:
 # -----------------------------------------------------------------------------
 
 
-def _make_tq_cache(num_blocks: int) -> MetalPagedKVCache:
-    return MetalPagedKVCache(
-        num_layers=1,
-        num_kv_heads=NUM_KV_HEADS,
-        head_dim=HEAD_DIM,
-        num_blocks=num_blocks,
-        block_size=BLOCK_SIZE,
-        dtype=mx.float16,
-        turboquant=True,
-        k_quant=K_QUANT,
+def _make_tq_cache(
+    num_blocks: int, num_kv_heads: int = NUM_KV_HEADS
+) -> SimpleNamespace:
+    """Zeroed single-layer TurboQuant K/V and scale arrays."""
+    shape = (num_blocks, BLOCK_SIZE, num_kv_heads)
+    groups = HEAD_DIM // TQ_GROUP_SIZE
+    cache = SimpleNamespace(
+        key_caches=[
+            mx.zeros(
+                (*shape, packed_dim(HEAD_DIM, K_BITS)), QUANT_PARAMS[K_QUANT]["dtype"]
+            )
+        ],
+        value_caches=[mx.zeros((*shape, packed_dim(HEAD_DIM, V_BITS)), mx.uint8)],
+        key_scale_caches=[mx.zeros((*shape, groups), mx.float16)],
+        value_scale_caches=[mx.zeros((*shape, groups), mx.float16)],
+        key_zero_caches=[mx.zeros((*shape, groups), mx.float16)],
     )
+    mx.eval(vars(cache))
+    return cache
 
 
-def _make_fp_cache(num_blocks: int) -> MetalPagedKVCache:
-    return MetalPagedKVCache(
-        num_layers=1,
-        num_kv_heads=NUM_KV_HEADS,
-        head_dim=HEAD_DIM,
-        num_blocks=num_blocks,
-        block_size=BLOCK_SIZE,
-        dtype=mx.float16,
-        turboquant=False,
+def _make_fp_cache(
+    num_blocks: int, num_kv_heads: int = NUM_KV_HEADS
+) -> SimpleNamespace:
+    """Zeroed single-layer fp16 K/V arrays."""
+    shape = (num_blocks, BLOCK_SIZE, num_kv_heads, HEAD_DIM)
+    cache = SimpleNamespace(
+        key_caches=[mx.zeros(shape, mx.float16)],
+        value_caches=[mx.zeros(shape, mx.float16)],
     )
+    mx.eval(vars(cache))
+    return cache
 
 
 # -----------------------------------------------------------------------------
@@ -402,28 +418,11 @@ def bench_paged_attention(
         # Allocate enough blocks for ctx tokens (+1 query slot).
         num_blocks = (ctx + BLOCK_SIZE - 1) // BLOCK_SIZE + 4
 
-        cache_tq = MetalPagedKVCache(
-            num_layers=1,
-            num_kv_heads=num_kv_heads,
-            head_dim=HEAD_DIM,
-            num_blocks=num_blocks,
-            block_size=BLOCK_SIZE,
-            dtype=mx.float16,
-            turboquant=True,
-            k_quant=K_QUANT,
-        )
-        cache_fp: MetalPagedKVCache | None = None
+        cache_tq = _make_tq_cache(num_blocks, num_kv_heads)
+        cache_fp: SimpleNamespace | None = None
         measure_fp = skip_fp_above is None or ctx <= skip_fp_above
         if measure_fp:
-            cache_fp = MetalPagedKVCache(
-                num_layers=1,
-                num_kv_heads=num_kv_heads,
-                head_dim=HEAD_DIM,
-                num_blocks=num_blocks,
-                block_size=BLOCK_SIZE,
-                dtype=mx.float16,
-                turboquant=False,
-            )
+            cache_fp = _make_fp_cache(num_blocks, num_kv_heads)
 
         k_fill = mx.random.normal(shape=(ctx, num_kv_heads, HEAD_DIM)).astype(
             mx.float16

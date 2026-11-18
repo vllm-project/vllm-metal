@@ -41,7 +41,7 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
 )
 
-from vllm_metal.gguf.source import RemoteGGUFReference
+from vllm_metal.gguf.source import GGUFLoadSource, RemoteGGUFReference
 
 __all__ = ["GGUFEngineIntegration", "MetalGGUFConfig", "register"]
 
@@ -238,17 +238,50 @@ class GGUFEngineIntegration:
                         f"Cannot serve GGUF model with quantization={self.quantization!r}; "
                         "leave quantization unset or use 'gguf'."
                     )
+                vocab_overrides = GGUFLoadSource.vocab_overrides(
+                    self.model_weights or gguf_model,
+                    config_source,
+                    cache_dir=self.download_dir,
+                    revision=self.revision,
+                    token=self.hf_token,
+                )
                 self.quantization = "gguf"
                 if not self.model_weights:
                     self.model_weights = gguf_model
                 if self.served_model_name is None:
                     self.served_model_name = [gguf_model]
                 self.model = config_source
+                if vocab_overrides:
+                    self.hf_overrides = cls._with_vocab_overrides(
+                        self.hf_overrides, vocab_overrides
+                    )
             return original(self, *args, **kwargs)
 
         EngineArgs.create_model_config = create_model_config
         arg_utils_module.get_model_path = get_model_path
         EngineArgs._metal_gguf_patched = True
+
+    @staticmethod
+    def _with_vocab_overrides(
+        hf_overrides: Any, vocab_overrides: dict[str, Any]
+    ) -> Any:
+        """Add the file's vocab to ``hf_overrides``; the user's own values win.
+
+        A callable ``hf_overrides`` (Python API only) is left as given.
+        """
+        if callable(hf_overrides):
+            return hf_overrides
+        user = dict(hf_overrides or {})
+        merged = {**vocab_overrides, **user}
+        if (
+            isinstance(user.get("text_config"), dict)
+            and "text_config" in vocab_overrides
+        ):
+            merged["text_config"] = {
+                **vocab_overrides["text_config"],
+                **user["text_config"],
+            }
+        return merged
 
     @classmethod
     def _patch_speculator_probe(cls) -> None:

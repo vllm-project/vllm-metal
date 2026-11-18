@@ -1,8 +1,8 @@
 # Supported Models
 
 vllm-metal supports text language models and a small set of native multimodal
-models on Apple Silicon. Multimodal support is currently vision-only and runs on
-the paged backend.
+models on Apple Silicon. For speech and image generation through vLLM-Omni,
+see [Omni](omni.md).
 
 ## Legend
 
@@ -35,10 +35,15 @@ The MLX backend has experimental text-only pooling support. See
 validation guidance. The reranker requires Qwen3 sequence-classification
 `hf_overrides`.
 
+D3 (Decision 3.0) answers choice, yes/no, and score questions about text or JSON.
+See [Structured decisions](structured_decisions.md) for supported checkpoints
+and `/v1/systemone` usage.
+
 | Model | MLX | PyTorch MPS | Runner | Example checkpoint |
 | --- | --- | --- | --- | --- |
 | Qwen3-Embedding | 🔵 | | `pooling` / `embed` (paged) | `mlx-community/Qwen3-Embedding-0.6B-8bit` |
 | Qwen3-Reranker | 🔵 | | `pooling` / `classify` (paged) | `mku64/Qwen3-Reranker-0.6B-mlx-8Bit` |
+| d3 (Decision 3.0) | 🔵 | | `pooling` / `classify` + `/v1/systemone` (text-only) | `vllm-sr/d3-nano` |
 | BGE-M3 | 🔵 | | `pooling` / `embed`, `token_classify` (encoder) | `BAAI/bge-m3` |
 | Multilingual E5 Base | 🔵 | | `pooling` / `embed` (encoder) | `intfloat/multilingual-e5-base` |
 | EmbeddingGemma 2 | 🔵 | | `pooling` / `embed` (text encoder, `--language-model-only`) | `google/embeddinggemma-2` |
@@ -125,13 +130,14 @@ GGUF checkpoints serve by detection like AWQ, with no env flag:
 vllm-metal's GGUF engine integration sets `quantization=gguf` from the file
 (vLLM 0.24 moved its in-tree GGUF support to the CUDA/ROCm-only
 [vllm-gguf-plugin](https://github.com/vllm-project/vllm-gguf-plugin)). Dense
-`qwen2`/`qwen3`/`llama`/`mistral` and text-only Qwen3.5 (`qwen35`) checkpoints
-load from a local `.gguf` (including llama.cpp's Q4_K_M and Q5_K_M exports) or a
-remote `repo_id:quant` reference and stay quantized in memory. See
+`qwen2`/`qwen3`/`llama`/`mistral`, Qwen3 MoE (`qwen3moe`), and text-only
+Qwen3.5 (`qwen35`) and Gemma 3 (`gemma3`) checkpoints load from a local `.gguf`
+(including llama.cpp's Q4_K_M and Q5_K_M exports) or a remote `repo_id:quant`
+reference and stay quantized in memory. See
 [GGUF](gguf.md) for the supported qtypes, exclusions, and serve examples.
 Verified end-to-end on Qwen3-0.6B, Llama-3.2-1B-Instruct, and
-Mistral-7B-Instruct-v0.3 in Q8_0 and Q4_K_M, and on Qwen3.5-0.8B Q8_0, 4B
-Q5_K_M, and 9B Q4_K_M
+Mistral-7B-Instruct-v0.3 in Q8_0 and Q4_K_M, on Qwen3.5-0.8B Q8_0, 4B
+Q5_K_M, and 9B Q4_K_M, and on Gemma 3 4B Q4_K_M
 ([#415](https://github.com/vllm-project/vllm-metal/issues/415),
 [#761](https://github.com/vllm-project/vllm-metal/issues/761)).
 

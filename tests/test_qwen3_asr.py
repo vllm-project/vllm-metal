@@ -14,7 +14,6 @@ import mlx.core as mx
 import numpy as np
 import pytest
 from transformers import WhisperFeatureExtractor
-from vllm.v1.sample.sampler import Sampler
 
 from vllm_metal.stt.audio import load_audio
 from vllm_metal.stt.detection import is_stt_model
@@ -33,6 +32,7 @@ from vllm_metal.stt.qwen3_asr.model import (
 )
 from vllm_metal.stt.qwen3_asr.transcriber import Qwen3ASRTranscriber
 from vllm_metal.stt.sampling import STTSampling
+from vllm_metal.v1.sampling import Sampler
 
 
 class TestQwen3ASRConfigAdaptation:

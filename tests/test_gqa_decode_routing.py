@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""P256/P512 production selection and fallback, verified after native evaluation.
+"""GQA production selection and fallback, verified after native evaluation.
 
 Kernel correctness is covered independently in test_gqa_paged_decode.py.
 Tests inject core counts only when hardware detection is unavailable.
@@ -384,31 +384,31 @@ def _assert_mixed_matches_standalone(inputs, lengths, family, partition, **routi
 
 
 @pytest.mark.parametrize(
-    "lengths,partition,dtype",
-    [([4096], 256, mx.float16), ([4096, 4353], 512, mx.bfloat16)],
-    ids=["single-p256", "ragged-p512"],
+    "lengths,dtype",
+    [([4096], mx.float16), ([4096, 4353], mx.bfloat16)],
+    ids=["single", "ragged"],
 )
-def test_mixed_decode_prefix_uses_gqa(mixed_family, lengths, partition, dtype):
-    # At eight cores, one 4K row selects P256; two rows supply enough P512 work.
+def test_mixed_decode_prefix_uses_gqa(mixed_family, lengths, dtype):
+    # At eight cores, one 4K row already clears the work budget.
     inputs = _mixed_inputs(lengths, dtype=dtype)
     plan = get_ops().gqa_decode_length_plan(lengths)
     with _gpu_cores(8):
         _assert_mixed_matches_standalone(
-            inputs, lengths, mixed_family, partition, gqa_length_plan=plan
+            inputs, lengths, mixed_family, 256, gqa_length_plan=plan
         )
 
 
 @pytest.mark.parametrize(
-    "geometry,cache_block,dtype,partition",
+    "geometry,cache_block,dtype",
     [
-        ((24, 4, 256, 16), 784, mx.float16, 512),
-        ((24, 4, 256, 32), 800, mx.bfloat16, 512),
-        ((16, 2, 256, 32), 1056, mx.bfloat16, 256),
+        ((24, 4, 256, 16), 784, mx.float16),
+        ((24, 4, 256, 32), 800, mx.bfloat16),
+        ((16, 2, 256, 32), 1056, mx.bfloat16),
     ],
     ids=["block16", "block32-800", "block32"],
 )
 def test_mixed_decode_prefix_reads_translated_pages(
-    mixed_family, geometry, cache_block, dtype, partition
+    mixed_family, geometry, cache_block, dtype
 ):
     lengths = [4096, 4097]
     inputs = _mixed_inputs(
@@ -417,7 +417,7 @@ def test_mixed_decode_prefix_reads_translated_pages(
     plan = get_ops().gqa_decode_length_plan(lengths)
     with _gpu_cores(8):
         _assert_mixed_matches_standalone(
-            inputs, lengths, mixed_family, partition, gqa_length_plan=plan
+            inputs, lengths, mixed_family, 256, gqa_length_plan=plan
         )
 
 
@@ -515,7 +515,7 @@ def _run_long_turboquant_decode(*, gqa_disabled: bool) -> tuple[mx.array, mx.arr
 
 
 def test_turboquant_takes_p256_with_dequantized_reference() -> None:
-    """TurboQuant decode takes the GQA producer at P256, even where P512 qualifies."""
+    """TurboQuant decode takes the GQA producer."""
     out, ref = _run_long_turboquant_decode(gqa_disabled=False)
     assert _dispatch_family() == "gqa_decode"
     assert get_ops().last_gqa_partition_size() == 256
@@ -623,7 +623,7 @@ def test_unknown_core_count_or_empty_length_is_not_eligible(
 @pytest.mark.parametrize("q,kv,head,block", GQA_GEOMETRIES)
 @pytest.mark.parametrize("n", [131072, 131073, 262145, 524289, 1048576])
 def test_policy_has_no_fixed_long_context_ceiling(q, kv, head, block, n):
-    assert get_ops().gqa_decode_partition_size(q, kv, head, n, 40, block) == 512
+    assert get_ops().gqa_decode_partition_size(q, kv, head, n, 40, block) == 256
 
 
 @pytest.mark.parametrize(
@@ -652,17 +652,11 @@ def test_policy_rejects_unmeasured_geometries(q, kv, head, block):
 
 @pytest.mark.parametrize("q,kv,head,block", GQA_GEOMETRIES)
 def test_default_partition_thresholds(q, kv, head, block):
-    thresholds = {32: [10752, 21504], 24: [14080, 28160], 16: [21248, 42496]}[q]
+    threshold = {32: 10752, 24: 14080, 16: 21248}[q]
     ops = get_ops()
-    for previous, part, threshold in zip([0, 256], [256, 512], thresholds, strict=True):
-        assert (
-            ops.gqa_decode_partition_size(q, kv, head, threshold - 1, 40, block)
-            == previous
-        )
-        assert ops.gqa_decode_partition_size(q, kv, head, threshold, 40, block) == part
-        assert (
-            ops.gqa_decode_partition_size(q, kv, head, threshold + 1, 40, block) == part
-        )
+    assert ops.gqa_decode_partition_size(q, kv, head, threshold - 1, 40, block) == 0
+    assert ops.gqa_decode_partition_size(q, kv, head, threshold, 40, block) == 256
+    assert ops.gqa_decode_partition_size(q, kv, head, threshold + 1, 40, block) == 256
 
 
 @pytest.mark.parametrize("q,kv,head,block", GQA_GEOMETRIES)
@@ -688,7 +682,7 @@ def test_default_partition_executes_and_matches_oracle(
         block_size=block,
         num_decode_requests=1,
     )
-    expected = part if offset >= 0 else (0 if part == 256 else part // 2)
+    expected = part if offset >= 0 else 0
     if expected:
         assert _dispatch_family() == "gqa_decode"
     else:

@@ -109,12 +109,6 @@ def configure_mps(config, *, omni=False):
     config.compilation_config.mode = CompilationMode.NONE
     config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
     model.enforce_eager = True
-    # Below its low watermark (1.4x the recommended working set by default),
-    # PyTorch packs 10-512 MiB buffers into 1 GiB heaps and keeps them cached.
-    # Past it, heaps match the request and free ones are reclaimed. Loading the
-    # weights crosses 1% of the working set, so the profiled step sizes its
-    # heaps the way serving does.
-    os.environ.setdefault("PYTORCH_MPS_LOW_WATERMARK_RATIO", "0.01")
 
 
 class MPSWorker(MetalWorker):
@@ -127,6 +121,13 @@ class MPSWorker(MetalWorker):
         if not torch.backends.mps.is_available():
             raise RuntimeError("The experimental backend requires PyTorch MPS")
         configure_mps(self.vllm_config, omni=self.is_omni)
+        # Below its low watermark (1.4x the recommended working set by default),
+        # PyTorch packs 10-512 MiB buffers into 1 GiB heaps and keeps them cached.
+        # Past it, heaps match the request and free ones are reclaimed. Loading
+        # the weights crosses 1% of the working set, so the profiled step sizes
+        # its heaps the way serving does. PyTorch reads the variable when this
+        # process's allocator starts.
+        os.environ.setdefault("PYTORCH_MPS_LOW_WATERMARK_RATIO", "0.01")
         self.device = torch.device("mps:0")
         init_worker_distributed_environment(
             self.vllm_config,

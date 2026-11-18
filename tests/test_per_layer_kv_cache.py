@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import logging
 from dataclasses import asdict
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -235,100 +234,6 @@ def merged_full_attention_config() -> tuple[KVCacheConfig, tuple[str, ...]]:
     groups = get_kv_cache_groups(vllm_config_for_kv_grouping(), specs)
     assert len(groups) == 1
     return config_from_vllm_groups(groups, 3), names
-
-
-class TestMetalPagedKVCachePerLayer:
-    """MetalPagedKVCache with heterogeneous per-layer shapes."""
-
-    def test_heterogeneous_shapes_allocate_correctly(self) -> None:
-        """Each layer's cache tensor matches its requested shape."""
-        kv_heads = [16, 4]
-        head_dims = [256, 512]
-        num_blocks = 4
-        block_size = 16
-
-        cache = MetalPagedKVCache(
-            num_layers=2,
-            num_kv_heads=kv_heads[0],
-            head_dim=head_dims[0],
-            num_blocks=num_blocks,
-            block_size=block_size,
-            dtype=mx.bfloat16,
-            kv_heads_per_layer=kv_heads,
-            head_dim_per_layer=head_dims,
-        )
-
-        assert cache.key_caches[0].shape == (num_blocks, block_size, 16, 256)
-        assert cache.key_caches[1].shape == (num_blocks, block_size, 4, 512)
-        assert cache.value_caches[0].shape == (num_blocks, block_size, 16, 256)
-        assert cache.value_caches[1].shape == (num_blocks, block_size, 4, 512)
-
-    def test_uniform_per_layer_matches_scalar(self) -> None:
-        """Uniform per-layer lists produce identical shapes to scalar params."""
-        num_layers = 4
-        num_kv_heads = 8
-        head_dim = 128
-        num_blocks = 2
-        block_size = 16
-
-        scalar_cache = MetalPagedKVCache(
-            num_layers=num_layers,
-            num_kv_heads=num_kv_heads,
-            head_dim=head_dim,
-            num_blocks=num_blocks,
-            block_size=block_size,
-        )
-        per_layer_cache = MetalPagedKVCache(
-            num_layers=num_layers,
-            num_kv_heads=num_kv_heads,
-            head_dim=head_dim,
-            num_blocks=num_blocks,
-            block_size=block_size,
-            kv_heads_per_layer=[num_kv_heads] * num_layers,
-            head_dim_per_layer=[head_dim] * num_layers,
-        )
-
-        for i in range(num_layers):
-            assert (
-                scalar_cache.key_caches[i].shape == per_layer_cache.key_caches[i].shape
-            )
-
-    def test_length_mismatch_raises(self) -> None:
-        """Mismatched list lengths are caught early."""
-        with pytest.raises(ValueError, match="kv_heads_per_layer length"):
-            MetalPagedKVCache(
-                num_layers=2,
-                num_kv_heads=8,
-                head_dim=128,
-                num_blocks=1,
-                block_size=16,
-                kv_heads_per_layer=[8, 8, 8],
-            )
-
-    def test_heterogeneous_dense_log_reports_per_layer_bytes(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """E4B-shaped unique layers log 2.8 MB, not the old all-512 4.7 MB."""
-        head_dims = [512 if (index + 1) % 6 == 0 else 256 for index in range(24)]
-        with caplog.at_level(logging.INFO):
-            MetalPagedKVCache(
-                num_layers=24,
-                num_kv_heads=2,
-                head_dim=512,
-                num_blocks=3,
-                block_size=16,
-                dtype=mx.bfloat16,
-                kv_heads_per_layer=[2] * 24,
-                head_dim_per_layer=head_dims,
-            )
-        messages = [
-            record.message
-            for record in caplog.records
-            if record.message.startswith("KV cache:")
-        ]
-        assert len(messages) == 1, messages
-        assert "KV cache: 2.8 MB" in messages[0]
-        assert "4.7 MB" not in messages[0]
 
 
 class TestCachePolicyPerLayerBytes:

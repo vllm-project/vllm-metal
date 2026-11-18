@@ -193,7 +193,8 @@ def summarize(directory: Path, *, model: str, revision: str, sha: str) -> str:
         f"### {model}",
         f"\nCommit: `{sha}`  \nCheckpoint revision: `{revision}`\n",
         "Greedy output parity, 40 prompts, 20 output tokens, checkpoint precision. "
-        "TOP_K_MATCH is mutual top-5 membership at the first divergence; "
+        "TOP_K_MATCH is mutual top-5 membership at the first divergence "
+        "(top-8 where marked); "
         "comparisons overlap and are not additive.\n",
         "| Comparison | B | EXACT | TOP_K_MATCH | FAIL | Result |",
         "|---|---:|---:|---:|---:|---|",
@@ -214,6 +215,13 @@ def summarize(directory: Path, *, model: str, revision: str, sha: str) -> str:
         path = directory / f"batch-{batch}.json"
         report = json.loads(path.read_text())["comparison"] if path.exists() else None
         row("Native → HTTP target", batch, report)
+    if model == "Qwen/Qwen3.5-0.8B":
+        for batch in (1, 2):
+            path = directory / f"gguf/batch-{batch}.json"
+            report = (
+                json.loads(path.read_text())["comparison"] if path.exists() else None
+            )
+            row("Native → HTTP GGUF Q6_K (top-8)", batch, report)
     if model == "Qwen/Qwen3-0.6B":
         path = directory / "speculative/summary.json"
         comparisons = (
