@@ -107,7 +107,7 @@ class MPSWorker(MetalWorker):
         # so colocated Omni stages would all get the last stage's budget.
         if not any(env in os.environ for env in _MPS_WATERMARK_ENVS):
             os.environ[_MPS_WATERMARK_ENVS[0]] = str(
-                self.cache_config.gpu_memory_utilization
+                self.cache_config.resolved_gpu_memory_utilization
             )
         self.device = torch.device("mps:0")
         init_worker_distributed_environment(
