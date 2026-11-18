@@ -921,6 +921,34 @@ def ensure_lfm2_vl_torch_outputs(model_type: str | None) -> None:
     logger.debug("LFM2-VL processor output will be converted to torch tensors")
 
 
+def ensure_mlx_lm_gemma3_config_only_sanitize() -> None:
+    """Let mlx-lm build a Gemma 3 multimodal model from its config alone.
+
+    The GGUF loader builds a weightless skeleton, so ``load_model`` calls
+    ``sanitize({})``. mlx-lm's ``gemma3.Model.sanitize`` turns that into a list
+    via ``tree_unflatten`` and fails on ``.pop("vision_tower", None)``. With no
+    weights there is nothing to strip, so only the text model's sanitize runs;
+    it still drops ``lm_head`` to tie the head.
+
+    TODO: remove when the pinned mlx_lm's ``gemma3.Model.sanitize`` accepts
+    empty weights.
+    """
+    from mlx_lm.models import gemma3
+
+    original = gemma3.Model.sanitize
+    if getattr(original, "_metal_config_only", False):
+        return
+
+    @wraps(original)
+    def sanitize(self: Any, weights: dict[str, Any]) -> dict[str, Any]:
+        if weights:
+            return original(self, weights)
+        return self.language_model.sanitize(weights)
+
+    sanitize._metal_config_only = True
+    gemma3.Model.sanitize = sanitize
+
+
 @contextmanager
 def headless_load_scope(*, enabled: bool = True) -> Iterator[None]:
     """Mark the wrapped model load as never reading the LM head.
