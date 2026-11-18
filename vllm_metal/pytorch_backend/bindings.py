@@ -11,6 +11,7 @@ def register_kernel_overrides():
     from vllm_metal.pytorch_backend import input_ops, sampling, speculative_ops
 
     module = "vllm.v1.worker.gpu.spec_decode.rejection_sampler"
+    draft_module = "vllm.v1.worker.gpu.spec_decode.target_dependent_ar.speculator"
     sample_module = "vllm.v1.worker.gpu.sample"
     register_kernels(
         {
@@ -18,6 +19,9 @@ def register_kernel_overrides():
             f"{sample_module}.min_p._min_p_kernel": sampling.min_p,
             f"{module}._gather_draft_sampled_kernel": speculative_ops.gather_draft_sampled,
             f"{module}._flatten_sampled_kernel": speculative_ops.flatten_sampled,
+            f"{draft_module}._prepare_decode_inputs_kernel": (
+                speculative_ops.prepare_decode_inputs
+            ),
             f"{sample_module}.prompt_logprob._prompt_logprobs_token_ids_kernel": (
                 input_ops.prompt_logprobs_token_ids
             ),
@@ -63,7 +67,6 @@ def _install_speculative_ops():
 
     rejection_sampler.compute_topk_scores = runtime.compute_topk_scores
     speculator.prepare_prefill_inputs = speculative_ops.prepare_prefill_inputs
-    speculator.prepare_decode_inputs = speculative_ops.prepare_decode_inputs
     speculator.update_draft_inputs = speculative_ops.update_draft_inputs
     rejection_sampler.rejection_sample = speculative_ops.rejection_sample
     rejection_sampler.get_num_sampled_and_rejected = (

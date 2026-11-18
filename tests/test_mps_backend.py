@@ -740,6 +740,53 @@ def _check_chunked_verification(logprobs):
         assert chunked_scores.cu_num_generated_tokens == scores.cu_num_generated_tokens
 
 
+def test_eagle3_draft_decode_inputs_run_on_mps(run_in_spawn_process):
+    run_in_spawn_process(_check_eagle3_draft_decode_inputs)
+
+
+def _check_eagle3_draft_decode_inputs():
+    from vllm.v1.worker.gpu.spec_decode.eagle.speculator import EagleSpeculator
+
+    from vllm_metal.pytorch_backend.bindings import register_kernel_overrides
+
+    register_kernel_overrides()
+    device = torch.device("mps")
+    buffers = SimpleNamespace(
+        input_ids=torch.zeros(4, dtype=torch.int32, device=device),
+        positions=torch.tensor([5, 9, 7, 7], device=device),
+        query_start_loc=torch.full((5,), 7, dtype=torch.int32, device=device),
+        seq_lens=torch.full((4,), 7, dtype=torch.int32, device=device),
+    )
+    speculator = SimpleNamespace(
+        draft_tokens=torch.tensor([[11, 0], [12, 0], [0, 0], [0, 0]], device=device),
+        input_buffers=buffers,
+        sample_src_positions=torch.tensor([3, 4, 0, 0], device=device),
+        max_model_len=10,
+        max_num_reqs=4,
+        advance_draft_positions=True,
+    )
+    batch = SimpleNamespace(
+        seq_lens=torch.tensor([6, 10, 0, 0], dtype=torch.int32, device=device)
+    )
+    num_rejected = torch.tensor([1, 0], dtype=torch.int32, device=device)
+
+    EagleSpeculator._prepare_decode_inputs(
+        speculator,
+        batch,
+        num_rejected,
+        num_reqs=2,
+        skip_attn=False,
+        batch_desc=None,
+    )
+
+    assert buffers.input_ids.tolist() == [11, 12, 0, 0]
+    # The second request is at max_model_len, so its position and length clamp.
+    assert buffers.positions.tolist() == [6, 9, 7, 7]
+    assert buffers.seq_lens.tolist() == [6, 10, 0, 0]
+    assert buffers.query_start_loc.tolist() == [0, 1, 2, 2, 2]
+    assert speculator.sample_src_positions.tolist() == [4, 5, 0, 0]
+
+
 def test_mrope_positions_preserve_ragged_prefill_and_decode():
     from vllm_metal.pytorch_backend.input_ops import prepare_rope_positions
 
