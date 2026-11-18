@@ -13,6 +13,7 @@ import mlx.core as mx
 import pytest
 
 from tests.gqa_test_utils import (
+    GQA_PARTITION_SIZE,
     _assert_close,
     _assert_fallback,
     _dispatch_family,
@@ -22,7 +23,6 @@ from tests.gqa_test_utils import (
 )
 from tests.test_gqa_paged_decode import (
     GQA_GEOMETRIES,
-    GQA_PARTITIONS,
     GQA_SIMD_GROUPS_PER_CORE,
     NUM_QUERY_HEADS,
 )
@@ -73,7 +73,7 @@ def _require_grid(kv_len: int, query_heads: int) -> None:
     cores = get_ops().detected_gpu_core_count()
     if cores <= 0:
         pytest.skip("GPU core count unavailable: GQA conservatively disabled")
-    if (kv_len // min(GQA_PARTITIONS)) * query_heads < GQA_SIMD_GROUPS_PER_CORE * cores:
+    if (kv_len // GQA_PARTITION_SIZE) * query_heads < GQA_SIMD_GROUPS_PER_CORE * cores:
         pytest.skip("This boundary is below the GQA grid guard on this GPU")
 
 
@@ -84,8 +84,7 @@ def _eligible_context(query_heads: int = NUM_QUERY_HEADS, minimum: int = 32768) 
     # Round to whole partitions; this helper only sizes positive-test inputs.
     # Expected shape/length decisions are explicit in the boundary tests.
     partitions = (GQA_SIMD_GROUPS_PER_CORE * cores + query_heads - 1) // query_heads
-    n = max(minimum, partitions * min(GQA_PARTITIONS))
-    return n
+    return max(minimum, partitions * GQA_PARTITION_SIZE)
 
 
 def test_core_count_override_restores_hardware_detection() -> None:
@@ -605,11 +604,11 @@ _ADMISSION_AT_CORE_COUNT = {
         for cores, minimum in _ADMISSION_AT_CORE_COUNT[geometry[0]].items()
     ],
 )
-def test_shape_and_device_performance_gate(q, kv, head, block, cores, minimum):
+def test_partition_threshold_by_core_count(q, kv, head, block, cores, minimum):
     ops = get_ops()
-    assert not ops.gqa_decode_shape_eligible(q, kv, head, minimum - 1, cores, block)
-    assert ops.gqa_decode_shape_eligible(q, kv, head, minimum, cores, block)
-    assert ops.gqa_decode_shape_eligible(q, kv, head, minimum + 1, cores, block)
+    assert ops.gqa_decode_partition_size(q, kv, head, minimum - 1, cores, block) == 0
+    assert ops.gqa_decode_partition_size(q, kv, head, minimum, cores, block) == 256
+    assert ops.gqa_decode_partition_size(q, kv, head, minimum + 1, cores, block) == 256
 
 
 @pytest.mark.parametrize("q,kv,head,block", GQA_GEOMETRIES)
@@ -617,7 +616,7 @@ def test_shape_and_device_performance_gate(q, kv, head, block, cores, minimum):
 def test_unknown_core_count_or_empty_length_is_not_eligible(
     q, kv, head, block, n, cores
 ):
-    assert not get_ops().gqa_decode_shape_eligible(q, kv, head, n, cores, block)
+    assert get_ops().gqa_decode_partition_size(q, kv, head, n, cores, block) == 0
 
 
 @pytest.mark.parametrize("q,kv,head,block", GQA_GEOMETRIES)
@@ -646,31 +645,18 @@ def test_policy_has_no_fixed_long_context_ceiling(q, kv, head, block, n):
     ],
 )
 def test_policy_rejects_unmeasured_geometries(q, kv, head, block):
-    assert not get_ops().gqa_decode_shape_eligible(q, kv, head, 65536, 40, block)
     assert get_ops().gqa_decode_partition_size(q, kv, head, 65536, 40, block) == 0
 
 
 @pytest.mark.parametrize("q,kv,head,block", GQA_GEOMETRIES)
-def test_default_partition_thresholds(q, kv, head, block):
-    threshold = {32: 10752, 24: 14080, 16: 21248}[q]
-    ops = get_ops()
-    assert ops.gqa_decode_partition_size(q, kv, head, threshold - 1, 40, block) == 0
-    assert ops.gqa_decode_partition_size(q, kv, head, threshold, 40, block) == 256
-    assert ops.gqa_decode_partition_size(q, kv, head, threshold + 1, 40, block) == 256
-
-
-@pytest.mark.parametrize("q,kv,head,block", GQA_GEOMETRIES)
-@pytest.mark.parametrize("part", GQA_PARTITIONS)
 @pytest.mark.parametrize("offset", [-1, 0])
-def test_default_partition_executes_and_matches_oracle(
-    q, kv, head, block, part, offset
-):
+def test_default_partition_executes_and_matches_oracle(q, kv, head, block, offset):
     # Both dtypes and partial tails are covered by the forced-kernel suite.
     ops = get_ops()
     cores = ops.detected_gpu_core_count()
     if cores <= 0:
         pytest.skip("GPU core count unavailable")
-    threshold = part * ((GQA_SIMD_GROUPS_PER_CORE * cores + q - 1) // q)
+    threshold = GQA_PARTITION_SIZE * ((GQA_SIMD_GROUPS_PER_CORE * cores + q - 1) // q)
     out, ref = _run_primitive(
         [threshold + offset],
         mx.bfloat16,
@@ -682,7 +668,7 @@ def test_default_partition_executes_and_matches_oracle(
         block_size=block,
         num_decode_requests=1,
     )
-    expected = part if offset >= 0 else 0
+    expected = GQA_PARTITION_SIZE if offset >= 0 else 0
     if expected:
         assert _dispatch_family() == "gqa_decode"
     else:

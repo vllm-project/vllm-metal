@@ -631,7 +631,7 @@ struct PagedAttentionMetadata {
   int max_decode_context_len;
   int decode_only_rows;
   bool gqa_disabled;
-  int gqa_test_partition;
+  bool force_gqa;
   int nax_split_hint;
   int nax_prefill_split_hint;
 };
@@ -838,7 +838,7 @@ static PagedAttentionPlan select_paged_attention_route(
           m.num_heads, m.num_kv_heads, m.head_size, m.block_size);
 
   const int gqa_partition_size = !gqa_supported ? 0
-      : m.gqa_test_partition > 0 ? m.gqa_test_partition
+      : m.force_gqa ? kGqaPartitionSize
       : gqa_decode_plan_for_lengths(
             m.num_heads, m.num_kv_heads, m.head_size,
             num_seqs == 1 && m.decode_only_rows == 0
@@ -1172,7 +1172,7 @@ static void dispatch_paged_attention_v2_online(
     int num_decode_tokens = 0,
     int max_decode_context_len = 0,
     int decode_only_rows = 0, bool gqa_disabled = false,
-    int gqa_test_partition = 0,
+    bool force_gqa = false,
     const GqaDecodeLengthPlan& gqa_length_plan = {},
     int nax_split_hint = -1, int nax_prefill_split_hint = -1) {
   int head_size = static_cast<int>(query.shape(2));
@@ -1202,7 +1202,7 @@ static void dispatch_paged_attention_v2_online(
   metadata.max_decode_context_len = max_decode_context_len;
   metadata.decode_only_rows = decode_only_rows;
   metadata.gqa_disabled = gqa_disabled;
-  metadata.gqa_test_partition = gqa_test_partition;
+  metadata.force_gqa = force_gqa;
   metadata.nax_split_hint = nax_split_hint;
   metadata.nax_prefill_split_hint = nax_prefill_split_hint;
   const PagedAttentionArrays arrays{
@@ -1304,7 +1304,7 @@ static void dispatch_paged_attention_mixed(
       metadata.use_turboquant, metadata.k_bits, metadata.v_bits, arrays.sinks, nullptr,
       metadata.num_decode_requests, metadata.num_decode_tokens,
       metadata.max_decode_context_len,
-      metadata.num_decode_tokens, metadata.gqa_disabled, 0,
+      metadata.num_decode_tokens, metadata.gqa_disabled, /*force_gqa=*/false,
       prefix_plan ? metadata.gqa_length_plan : GqaDecodeLengthPlan{});
   // Keep the decode prefix's GQA selection visible in the diagnostics.
   const int decode_partition = g_last_gqa_partition.load(std::memory_order_relaxed);
@@ -1355,7 +1355,7 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
       int window_seqlen_q = 1, bool use_sinks = false,
       bool use_mm_prefix = false, int num_decode_requests = -1,
       int num_decode_tokens = 0, int max_decode_context_len = 0,
-      bool gqa_disabled = false, int gqa_test_partition = 0,
+      bool gqa_disabled = false, bool force_gqa = false,
       const GqaDecodeLengthPlan& gqa_length_plan = {},
       int nax_split_hint = -1, int nax_prefill_split_hint = -1)
       : UnaryPrimitive(stream),
@@ -1368,7 +1368,7 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
         num_decode_requests_(num_decode_requests),
         num_decode_tokens_(num_decode_tokens),
         max_decode_context_len_(max_decode_context_len),
-        gqa_disabled_(gqa_disabled), gqa_test_partition_(gqa_test_partition),
+        gqa_disabled_(gqa_disabled), force_gqa_(force_gqa),
         gqa_length_plan_(gqa_length_plan), nax_split_hint_(nax_split_hint),
         nax_prefill_split_hint_(nax_prefill_split_hint) {}
 
@@ -1403,7 +1403,7 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
         stream(),
         ks, vs, kz, vc, use_turboquant_, k_bits_, v_bits_, sk, mp,
         num_decode_requests_, num_decode_tokens_, max_decode_context_len_,
-        0, gqa_disabled_, gqa_test_partition_, gqa_length_plan_,
+        0, gqa_disabled_, force_gqa_, gqa_length_plan_,
         nax_split_hint_, nax_prefill_split_hint_);
   }
 
@@ -1426,7 +1426,7 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
         && rhs->num_decode_tokens_ == num_decode_tokens_
         && rhs->max_decode_context_len_ == max_decode_context_len_
         && rhs->gqa_disabled_ == gqa_disabled_
-        && rhs->gqa_test_partition_ == gqa_test_partition_
+        && rhs->force_gqa_ == force_gqa_
         && rhs->gqa_length_plan_ == gqa_length_plan_
         && rhs->nax_split_hint_ == nax_split_hint_
         && rhs->nax_prefill_split_hint_ == nax_prefill_split_hint_;
@@ -1449,7 +1449,7 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
   int num_decode_tokens_;
   int max_decode_context_len_;
   bool gqa_disabled_;
-  int gqa_test_partition_;
+  bool force_gqa_;
   GqaDecodeLengthPlan gqa_length_plan_;
   int nax_split_hint_;
   int nax_prefill_split_hint_;
@@ -1473,7 +1473,7 @@ array paged_attention_primitive_fn(
     int num_decode_requests,
     int num_decode_tokens,
     int max_decode_context_len, bool gqa_disabled,
-    int gqa_test_partition,
+    bool force_gqa,
     const std::optional<GqaDecodeLengthPlan>& gqa_length_plan,
     int nax_split_hint, int nax_prefill_split_hint) {
   if (nax_split_hint < -1 || nax_split_hint > 1)
@@ -1638,7 +1638,7 @@ array paged_attention_primitive_fn(
       block_size, max_seq_len, sliding_window,
       use_turboquant, k_bits, v_bits, window_seqlen_q, sinks != nullptr,
       mm_prefix_ranges != nullptr, num_decode_requests, num_decode_tokens,
-      max_decode_context_len, gqa_disabled, gqa_test_partition, lengths,
+      max_decode_context_len, gqa_disabled, force_gqa, lengths,
       nax_split_hint, nax_prefill_split_hint);
   std::vector<array> inputs = {query, key_cache, value_cache,
                                block_tables, seq_lens, cu_seqlens_q};

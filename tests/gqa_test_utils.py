@@ -10,6 +10,7 @@ from tools.attention_bench_utils import attention_tolerances
 from vllm_metal.metal import get_ops
 
 NUM_QUERY_HEADS, NUM_KV_HEADS, HEAD_SIZE, BLOCK_SIZE = 32, 8, 128, 16
+GQA_PARTITION_SIZE = 256
 
 
 def _primitive(
@@ -188,7 +189,7 @@ def _run_primitive(
     sink_value: float | None = None,
     turboquant: bool = False,
     native_reference: bool = False,
-    test_partition: int | None = None,
+    force_gqa: bool = False,
     gqa_lengths: list[int] | None = None,
 ) -> tuple[mx.array, mx.array]:
     mx.random.seed(seed)
@@ -229,9 +230,12 @@ def _run_primitive(
     mx.eval(key_cache, value_cache, query, block_tables, kv_lens_arr, cu_seqlens_q)
 
     key_ref, value_ref = key_cache, value_cache
+    length_plan = (
+        get_ops().gqa_decode_length_plan(gqa_lengths)
+        if gqa_lengths is not None
+        else None
+    )
     quant_kwargs = {}
-    if gqa_lengths is not None:
-        quant_kwargs["gqa_length_plan"] = get_ops().gqa_decode_length_plan(gqa_lengths)
     if turboquant:
         from vllm_metal.attention.caches.turboquant import (
             get_v_centroids,
@@ -261,7 +265,7 @@ def _run_primitive(
         )
         mx.eval(key_cache, value_cache, k_scale, k_zero, v_scale, key_ref, value_ref)
 
-    if test_partition is not None:
+    if force_gqa:
         out = get_ops()._gqa_paged_attention_for_test(
             query,
             key_cache,
@@ -271,8 +275,7 @@ def _run_primitive(
             kv_lens_arr,
             block_size,
             max_kv_len,
-            test_partition,
-            **quant_kwargs,
+            gqa_length_plan=length_plan,
         )
     else:
         out = get_ops().paged_attention_primitive(
@@ -293,6 +296,7 @@ def _run_primitive(
             num_decode_tokens=num_decode_tokens,
             max_decode_context_len=max_decode_context_len,
             gqa_disabled=gqa_disabled,
+            gqa_length_plan=length_plan,
             sinks=sinks,
             **quant_kwargs,
         )
