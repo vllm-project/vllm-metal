@@ -17,7 +17,8 @@ from tests.gqa_test_utils import (
     _assert_close,
     _assert_fallback,
     _dispatch_family,
-    _interleaved_table,
+    _mixed_call,
+    _mixed_inputs,
     _primitive,
     _run_primitive,
 )
@@ -26,7 +27,6 @@ from tests.test_gqa_paged_decode import (
     GQA_SIMD_GROUPS_PER_CORE,
     NUM_QUERY_HEADS,
 )
-from vllm_metal.attention.block_tables import build_block_tables
 from vllm_metal.metal import get_ops
 
 
@@ -287,61 +287,6 @@ def _gpu_cores(count: int):
         yield
     finally:
         _restore_test_gpu_cores()
-
-
-def _mixed_inputs(
-    decode_lengths,
-    prefill_kv=2,
-    *,
-    geometry=(32, 8, 128, 16),
-    dtype=mx.bfloat16,
-    cache_block=None,
-):
-    """Decode rows followed by two prefill rows, with disjoint shuffled pages."""
-    q_heads, kv_heads, head, block = geometry
-    page_size = cache_block or block
-    lengths = [*decode_lengths, prefill_kv]
-    counts = [-(-n // page_size) for n in lengths]
-    order = _interleaved_table(sum(counts))
-    pages, offset = [], 0
-    for count in counts:
-        pages.append(order[offset : offset + count])
-        offset += count
-    tables, kernel_block = build_block_tables(pages, page_size)
-    assert kernel_block == block
-    shape = (sum(counts), page_size, kv_heads, head)
-    if cache_block is None:
-        key = mx.random.normal(shape).astype(dtype)
-        value = mx.random.normal(shape).astype(dtype)
-    else:
-        raw = mx.random.normal((*shape[:-1], 2 * head)).astype(dtype)
-        strides = (page_size * kv_heads * 2 * head, kv_heads * 2 * head, 2 * head, 1)
-        key = get_ops().as_strided(raw, shape, strides, 0)
-        value = get_ops().as_strided(raw, shape, strides, head)
-    rows = len(decode_lengths)
-    return {
-        "query": mx.random.normal((rows + 2, q_heads, head)).astype(dtype),
-        "key_cache": key,
-        "value_cache": value,
-        "num_kv_heads": kv_heads,
-        "scale": head**-0.5,
-        "softcap": 0.0,
-        "block_tables": tables,
-        "seq_lens": mx.array(lengths, mx.int32),
-        "cu_seqlens_q": mx.array([*range(rows + 1), rows + 2], mx.int32),
-        "block_size": block,
-        "max_seq_len": max(lengths),
-        "sliding_window": -1,
-        "num_decode_requests": rows,
-        "num_decode_tokens": rows,
-        "max_decode_context_len": max(decode_lengths),
-    }
-
-
-def _mixed_call(inputs, **overrides):
-    out = get_ops().paged_attention_primitive(**(inputs | overrides))
-    mx.eval(out)
-    return out
 
 
 def _assert_mixed_matches_standalone(inputs, lengths, family, partition, **routing):
