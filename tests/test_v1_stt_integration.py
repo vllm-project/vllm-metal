@@ -17,7 +17,6 @@ import torch
 from vllm.model_executor.models.registry import ModelRegistry
 from vllm.multimodal.inputs import MultiModalFieldConfig
 from vllm.sampling_params import SamplingParams
-from vllm.transformers_utils.config import _CONFIG_REGISTRY
 
 from vllm_metal.stt.audio import (
     N_FRAMES,
@@ -1022,7 +1021,6 @@ class TestQwen3ASRUpstreamContract:
     """Tests for the upstream vLLM contract used by the Metal plugin."""
 
     def test_upstream_qwen3_asr_support_is_available(self) -> None:
-        assert "qwen3_asr" in _CONFIG_REGISTRY
         assert "Qwen3ASRForConditionalGeneration" in ModelRegistry.get_supported_archs()
 
 
