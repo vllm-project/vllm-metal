@@ -1765,7 +1765,6 @@ class TestV1MetalModelRunnerExecuteModel:
 
         assert out is not None
         assert out.req_ids == []
-        assert out.req_id_to_index == {}
         assert out.sampled_token_ids == []
         assert runner._execute_model_state is None
 

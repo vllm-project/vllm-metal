@@ -278,7 +278,6 @@ class _ExecutionBatch:
         """Build ``ModelRunnerOutput`` from this completed batch."""
         return ModelRunnerOutput(
             req_ids=self.req_ids,
-            req_id_to_index=self.req_id_to_index,
             sampled_token_ids=self.sampled_tokens,
             logprobs=self.merged_logprobs(),
             prompt_logprobs_dict=dict(self.prompt_logprobs_dict),

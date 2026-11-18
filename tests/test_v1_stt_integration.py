@@ -319,7 +319,6 @@ class TestExecuteSTTProtocol:
         output = runner._pending_output
         assert output is not None
         assert output.req_ids == ["r1", "r2"]
-        assert output.req_id_to_index == {"r1": 0, "r2": 1}
 
 
 class TestExtractAudioFeaturesFormats:
