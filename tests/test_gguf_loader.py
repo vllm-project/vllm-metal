@@ -9,6 +9,7 @@ completeness, and fail-fast rejection of unsupported files.
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -147,7 +148,9 @@ def _write_gguf(
         elif kind == "q" or qtype is not None:
             raw_dtype = qtype or quant_type
             if raw_dtype in (QT.Q2_K, QT.Q3_K, QT.Q4_K, QT.Q5_K, QT.Q6_K):
-                raw = build_kquant_blocks(shape[0], shape[-1], raw_dtype)
+                rows = math.prod(shape[:-1])
+                raw = build_kquant_blocks(rows, shape[-1], raw_dtype)
+                raw = raw.reshape(*shape[:-1], -1)
             elif raw_dtype in (QT.IQ4_NL, QT.IQ4_XS):
                 raw = build_iq4_blocks(shape[0], shape[-1], raw_dtype)
             elif raw_dtype == QT.IQ3_S:
@@ -593,7 +596,7 @@ def test_resolve_arch_rejects_unsupported_gguf_archs(gguf_arch, config_model_typ
 
     assert str(unsupported.value) == (
         f"Architecture {gguf_arch!r} is not supported; the GGUF loader supports "
-        "['gemma3', 'llama', 'qwen2', 'qwen3', 'qwen35']."
+        "['gemma3', 'llama', 'qwen2', 'qwen3', 'qwen35', 'qwen3moe']."
     )
 
 
@@ -632,6 +635,138 @@ def test_rejects_out_of_scope_moe_tensor_under_llama_arch(tmp_path, moe_tensor):
             config_dir=cfg_dir,
             target_dtype=mx.float32,
         ).load()
+
+
+# --- qwen3moe ---------------------------------------------------------------
+
+_QWEN3MOE_LIVE_TO_GGUF_LAYER = {
+    "self_attn.q_proj.weight": "attn_q.weight",
+    "self_attn.k_proj.weight": "attn_k.weight",
+    "self_attn.v_proj.weight": "attn_v.weight",
+    "self_attn.o_proj.weight": "attn_output.weight",
+    "self_attn.q_norm.weight": "attn_q_norm.weight",
+    "self_attn.k_norm.weight": "attn_k_norm.weight",
+    "input_layernorm.weight": "attn_norm.weight",
+    "post_attention_layernorm.weight": "ffn_norm.weight",
+    "mlp.gate.weight": "ffn_gate_inp.weight",
+    "mlp.switch_mlp.gate_proj.weight": "ffn_gate_exps.weight",
+    "mlp.switch_mlp.up_proj.weight": "ffn_up_exps.weight",
+    "mlp.switch_mlp.down_proj.weight": "ffn_down_exps.weight",
+}
+_QWEN3MOE_LIVE_TO_GGUF_GLOBAL = {
+    "model.embed_tokens.weight": "token_embd.weight",
+    "model.norm.weight": "output_norm.weight",
+}
+
+
+def _qwen3moe_config() -> dict:
+    return {
+        **_tiny_config("qwen3_moe"),
+        **_KQUANT_CONFIG,
+        "num_experts": 4,
+        "num_experts_per_tok": 2,
+        "moe_intermediate_size": 256,
+        "decoder_sparse_step": 1,
+        "mlp_only_layers": [],
+        "norm_topk_prob": True,
+    }
+
+
+def _build_qwen3moe_fixture(
+    tmp_path: Path, *, expert_type: QT, down_type: QT
+) -> tuple[str, str]:
+    """A tiny qwen3moe GGUF whose experts mix qtypes like llama.cpp's Q4_K_M."""
+    config = _qwen3moe_config()
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    d = _dims(config)
+    experts, moe_inter = config["num_experts"], config["moe_intermediate_size"]
+    specs = _dense_tensor_specs(config, has_qk_norm=True, with_bias=False)
+    overrides = {}
+    for i in range(d["layers"]):
+        p = f"blk.{i}."
+        for dense in ("ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"):
+            del specs[p + dense]
+        specs[p + "ffn_gate_inp.weight"] = ("f", (experts, d["h"]))
+        specs[p + "ffn_gate_exps.weight"] = ("q", (experts, moe_inter, d["h"]))
+        specs[p + "ffn_up_exps.weight"] = ("q", (experts, moe_inter, d["h"]))
+        specs[p + "ffn_down_exps.weight"] = ("q", (experts, d["h"], moe_inter))
+        overrides[p + "ffn_gate_exps.weight"] = expert_type
+        overrides[p + "ffn_up_exps.weight"] = expert_type
+        overrides[p + "ffn_down_exps.weight"] = down_type
+    gguf_path = tmp_path / "qwen3moe.gguf"
+    _write_gguf(gguf_path, "qwen3moe", specs, quant_overrides=overrides)
+    return str(gguf_path), str(tmp_path)
+
+
+def _qwen3moe_reference(gguf_path: str, cfg_dir: str) -> nn.Module:
+    """mlx-lm's qwen3_moe holding the file's weights dequantized by gguf-py."""
+    model, _ = mlx_lm_utils.load_model(Path(cfg_dir), lazy=True, strict=False)
+    weights = []
+    for path, _ in tree_flatten(model.parameters()):
+        if path.startswith("model.layers."):
+            _, _, layer, leaf = path.split(".", 3)
+            name = f"blk.{layer}.{_QWEN3MOE_LIVE_TO_GGUF_LAYER[leaf]}"
+        else:
+            name = _QWEN3MOE_LIVE_TO_GGUF_GLOBAL[path]
+        weights.append((path, mx.array(_gguf_dense(gguf_path, name))))
+    model.load_weights(weights)
+    model.eval()
+    return model
+
+
+@pytest.mark.parametrize(
+    ("expert_type", "down_type"),
+    [
+        pytest.param(QT.Q8_0, QT.Q8_0, id="q8_0"),
+        pytest.param(QT.Q4_K, QT.Q6_K, id="q4_k_m"),
+        pytest.param(QT.Q2_K, QT.Q3_K, id="q2_k"),
+    ],
+)
+# 2 tokens x top-2 stays under the 4-expert gather-QMV cap (8 assignments); 40
+# tokens also crosses SwitchGLU's sort threshold (64 assignments).
+@pytest.mark.parametrize("num_tokens", [2, 40])
+def test_qwen3moe_blocks_match_dequantized_source_model(
+    tmp_path, expert_type, down_type, num_tokens
+):
+    # Feed each MoE block the same input so routing is identical; whole-model
+    # logits would compound the quantized attention's fp32 differences into
+    # router near-ties.
+    gguf_path, cfg_dir = _build_qwen3moe_fixture(
+        tmp_path, expert_type=expert_type, down_type=down_type
+    )
+    reference = _qwen3moe_reference(gguf_path, cfg_dir)
+    model = GGUFModelLoader(
+        gguf_path, config_dir=cfg_dir, target_dtype=mx.float32
+    ).load()
+    x = mx.random.normal((1, num_tokens, _qwen3moe_config()["hidden_size"]))
+
+    assert _gguf_module_histogram(model).get("GGUFSwitchLinear") == 2 * 3
+    for layer, ref_layer in zip(
+        model.model.layers, reference.model.layers, strict=True
+    ):
+        out, expected = layer.mlp(x), ref_layer.mlp(x)
+        mx.eval(out, expected)
+        ref_max = float(mx.max(mx.abs(expected)))
+        np.testing.assert_allclose(
+            np.array(out), np.array(expected), rtol=0, atol=ref_max * 4e-5
+        )
+    _assert_forward_vocab_shape(model)
+
+
+def test_qwen3moe_rejects_expert_shape_mismatch(tmp_path):
+    gguf_path, cfg_dir = _build_qwen3moe_fixture(
+        tmp_path, expert_type=QT.Q8_0, down_type=QT.Q8_0
+    )
+    config = {**_qwen3moe_config(), "moe_intermediate_size": 512}
+    (Path(cfg_dir) / "config.json").write_text(json.dumps(config))
+
+    with pytest.raises(GGUFLoadError) as excinfo:
+        GGUFModelLoader(gguf_path, config_dir=cfg_dir, target_dtype=mx.float32).load()
+
+    assert str(excinfo.value) == (
+        "GGUF tensor 'blk.0.ffn_gate_exps.weight' dims (1024, 256) != model "
+        "'model.layers.0.mlp.switch_mlp.gate_proj' (2048, 256)."
+    )
 
 
 def _rope_inv_index(out_features, n_head):

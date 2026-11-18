@@ -847,7 +847,6 @@ def test_remote_load_source_rejects_unsupported_tag_before_download(
 @pytest.mark.parametrize(
     ("model_type", "architecture"),
     [
-        ("qwen3_moe", "Qwen3MoeForCausalLM"),
         ("phi3", "Phi3ForCausalLM"),
         ("qwen3_5_moe", "Qwen3_5MoeForConditionalGeneration"),
         ("qwen3_5_text", "Qwen3_5ForCausalLM"),
