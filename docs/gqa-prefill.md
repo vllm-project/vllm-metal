@@ -19,6 +19,12 @@ Grouped execution requires a predicted cost more than 10% below ordinary
 NAX. The lowest eligible cost wins. Compact and interleaved caches use the
 same rule, including larger physical pages translated to the kernel page size.
 
+The tile counts follow the shader geometry. The weights for guarded tiles,
+shared KV reads and wider threadgroups were calibrated against paired GPU
+timings at fixed widths on 10-, 20- and 40-core M5 GPUs. We checked the
+10% margin against 5% and 15% on held-out shapes. It applies only when
+choosing grouped NAX over ordinary NAX.
+
 The selector uses the existing query shape and host KV length bound. Serving
 supplies the sequence length. A loose bound in a direct native call can change
 the width estimate. The shader reads the actual lengths and guards partial
