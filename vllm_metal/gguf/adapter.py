@@ -79,7 +79,7 @@ class GGUFArchSpec:
     config_model_types: frozenset[str] = frozenset()
     # Out-of-scope substrings this arch's own tensors carry.
     admitted_substrings: frozenset[str] = frozenset()
-    # Live parameter name -> the name llama.cpp converts it under.
+    # Live parameter-path segment -> the name llama.cpp converts it under.
     param_aliases: Mapping[str, str] = field(default_factory=dict)
     # Per-layer GGUF tensor -> how llama.cpp changed its layout or values.
     layer_transforms: Mapping[str, GGUFPlainTransform] = field(default_factory=dict)
@@ -133,6 +133,11 @@ class GGUFModelAdapter:
             },
             global_transforms={"output_norm.weight": _ShiftedByOne()},
             trimmed_vocab=True,
+        ),
+        "qwen3moe": GGUFArchSpec(
+            config_model_types=frozenset({"qwen3_moe"}),
+            admitted_substrings=frozenset({"_exps", "ffn_gate_inp"}),
+            param_aliases={"switch_mlp": "experts"},
         ),
     }
 
@@ -468,9 +473,7 @@ class GGUFModelAdapter:
     @staticmethod
     def _converted_name(mlx_name: str, spec: GGUFArchSpec) -> str:
         """Return the name llama.cpp converts a live parameter under."""
-        module_path, _, param_name = mlx_name.rpartition(".")
-        converted = spec.param_aliases.get(param_name)
-        return mlx_name if converted is None else f"{module_path}.{converted}"
+        return ".".join(spec.param_aliases.get(p, p) for p in mlx_name.split("."))
 
     @staticmethod
     def _normalize_arch(name: str) -> str:

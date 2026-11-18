@@ -517,6 +517,47 @@ class GGUFMLXQuantizedTensor:
         )
         return out.astype(x.dtype)
 
+    def gather_matmul(
+        self,
+        x: mx.array,
+        indices: mx.array,
+        *,
+        num_experts: int,
+        sorted_indices: bool = False,
+    ) -> mx.array:
+        """Compute x @ dequantize(W_e).T for each expert e that indices selects.
+        Treats this tensor as a stack of experts.
+
+        ``sorted_indices`` may allow for a faster implementation if passed indices
+        are sorted.
+
+        ``x`` may be float16, bfloat16, or float32. ``indices`` may be any integer
+        dtype and is not bounds-checked. ``sorted_indices`` is passed through to
+        ``gather_qmm``, which trusts it. The result has the same dtype as ``x``
+        (``mx.gather_qmm`` may promote ``x`` against the stored scales to float32,
+        so it is cast back).
+
+        See ``GGUFTensor.gather_matmul`` for what input and output shapes are used in
+        a MoE forward pass.
+        """
+
+        def by_expert(array: mx.array) -> mx.array:
+            return array.reshape(num_experts, -1, array.shape[-1])
+
+        out = mx.gather_qmm(
+            x,
+            by_expert(self.qweight),
+            scales=by_expert(self.scales),
+            biases=by_expert(self.biases),
+            rhs_indices=indices,
+            transpose=True,
+            group_size=_GROUP_SIZE,
+            bits=self.bits,
+            mode=_QUANT_MODE,
+            sorted_indices=sorted_indices,
+        )
+        return out.astype(x.dtype)
+
     def embedding(self, ids: mx.array, output_dtype: mx.Dtype) -> mx.array:
         """Gather and dequantize embedding rows for ``ids``.
 

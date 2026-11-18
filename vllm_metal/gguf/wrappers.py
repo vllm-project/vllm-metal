@@ -85,6 +85,38 @@ class GGUFLinear(nn.Module):
         )
 
 
+class GGUFSwitchLinear(nn.Module):
+    """Quantized MoE experts: a drop-in for mlx-lm's ``SwitchLinear``.
+
+    ``SwitchGLU`` calls it as ``(x, indices, sorted_indices=...)``; the tensor's
+    rows hold the experts stacked, ``out_features // num_experts`` rows each.
+    """
+
+    def __init__(self, tensor: GGUFTensor, num_experts: int) -> None:
+        super().__init__()
+        self.tensor = tensor
+        self.num_experts = num_experts
+        self.freeze()
+
+    def __call__(
+        self, x: mx.array, indices: mx.array, sorted_indices: bool = False
+    ) -> mx.array:
+        return self.tensor.gather_matmul(
+            x, indices, num_experts=self.num_experts, sorted_indices=sorted_indices
+        )
+
+    def eval_arrays(self) -> None:
+        """Materialize the packed quant arrays hidden behind the wrapper."""
+        self.tensor.eval_arrays()
+
+    def _extra_repr(self) -> str:
+        return (
+            f"input_dims={self.tensor.in_features}, "
+            f"output_dims={self.tensor.out_features // self.num_experts}, "
+            f"num_experts={self.num_experts}"
+        )
+
+
 class GGUFEmbedding(nn.Module):
     """A quantized embedding table; ``as_linear`` reuses it for a tied lm_head.
 
