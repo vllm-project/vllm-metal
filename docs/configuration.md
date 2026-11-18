@@ -52,12 +52,13 @@ wins. Outputs are unaffected.
 
 ## PyTorch MPS Allocator Watermark
 
-On the PyTorch MPS backend the plugin defaults
-`PYTORCH_MPS_LOW_WATERMARK_RATIO` to the effective memory fraction
+On the PyTorch MPS backend each worker process defaults
+`PYTORCH_MPS_LOW_WATERMARK_RATIO` to its effective memory fraction
 (`--gpu-memory-utilization`), so PyTorch starts returning cached heaps once
-the pool passes the configured budget. PyTorch's own default is 1.4 times the
-recommended working set, which an 8 GB Mac cannot reach before Metal runs out
-of memory. Exporting either `PYTORCH_MPS_LOW_WATERMARK_RATIO` or
+the pool passes the configured budget. Colocated Omni stages each use their
+own stage's fraction. PyTorch's own default is 1.4 times the recommended
+working set, which an 8 GB Mac cannot reach before Metal runs out of memory.
+Exporting either `PYTORCH_MPS_LOW_WATERMARK_RATIO` or
 `PYTORCH_MPS_HIGH_WATERMARK_RATIO` yourself leaves both untouched.
 
 ## Multimodal Serve Modes

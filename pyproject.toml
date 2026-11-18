@@ -71,6 +71,7 @@ dependencies = [
 
 [project.optional-dependencies]
 omni = [
+    "step-audio2==1.0.0",
     "vllm-omni @ git+https://github.com/vllm-project/vllm-omni@b6d3f8e72e51dd0fff0a8ef9f7cfb448b85ac6cc",
 ]
 build = [
