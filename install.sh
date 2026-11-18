@@ -114,7 +114,8 @@ install_vllm() {
   local vllm_release_tag="$1"
   local vllm_version="${vllm_release_tag#v}"
   local download_tag="$vllm_release_tag"
-  # SCAFFOLDING: remove when .github/vllm-release-tag.commit moves past v0.33.0.
+  # SCAFFOLDING: remove when the latest stable vllm-metal release's
+  # .github/vllm-release-tag.commit no longer reads v0.33.0.
   # vLLM published v0.33.0 on tag v0.33.0rc3 (same commit); the wheel is 0.33.0.
   if [[ "$vllm_release_tag" == "v0.33.0" ]]; then
     download_tag="v0.33.0rc3"
