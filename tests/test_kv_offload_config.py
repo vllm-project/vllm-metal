@@ -33,7 +33,7 @@ def _base_config(**cache_overrides) -> SimpleNamespace:
         prefix_caching_hash_algo="sha256",
         cache_dtype="auto",
         # Read by _pick_mb_buffer_default (#637).
-        gpu_memory_utilization=0.9,
+        resolved_gpu_memory_utilization=0.9,
         # Populated by --kv-cache-dtype turboquant_*; Metal rejects it up
         # front (TurboQuant runs off --additional-config).
         kv_cache_dtype_skip_layers=[],

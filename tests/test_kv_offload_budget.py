@@ -31,7 +31,9 @@ def _planner(
     worker = MetalWorker.__new__(MetalWorker)
     worker.model_runner = runner  # type: ignore[assignment]
     worker.cache_config = SimpleNamespace(
-        block_size=16, gpu_memory_utilization=0.5, num_gpu_blocks_override=None
+        block_size=16,
+        resolved_gpu_memory_utilization=0.5,
+        num_gpu_blocks_override=None,
     )
     worker.vllm_config = SimpleNamespace(
         cache_config=worker.cache_config,

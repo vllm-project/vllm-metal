@@ -249,7 +249,7 @@ def test_cache_budget_handles_model_dimensions(mps_memory, config_name, fields, 
     hf = getattr(transformers, config_name)(**fields)
     worker = SimpleNamespace(
         cache_config=SimpleNamespace(
-            kv_cache_memory_bytes=None, gpu_memory_utilization=0.5
+            kv_cache_memory_bytes=None, resolved_gpu_memory_utilization=0.5
         ),
         model_config=SimpleNamespace(
             hf_text_config=hf, get_hidden_size=lambda: hf.hidden_size
@@ -278,7 +278,7 @@ def test_cache_budget_fits_one_metal_buffer(mps_memory, limit, largest):
     hf = transformers.Qwen3Config(hidden_size=64, intermediate_size=192)
     worker = SimpleNamespace(
         cache_config=SimpleNamespace(
-            kv_cache_memory_bytes=None, gpu_memory_utilization=0.9
+            kv_cache_memory_bytes=None, resolved_gpu_memory_utilization=0.9
         ),
         model_config=SimpleNamespace(hf_text_config=hf, get_hidden_size=lambda: 64),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=8),

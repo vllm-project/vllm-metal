@@ -1343,7 +1343,7 @@ class MetalPlatform(Platform):
             return
         desired = _pick_mb_buffer_default(
             total_memory_bytes=psutil.virtual_memory().total,
-            memory_fraction=vllm_config.cache_config.gpu_memory_utilization,
+            memory_fraction=vllm_config.cache_config.resolved_gpu_memory_utilization,
             max_num_batched_tokens=(
                 vllm_config.scheduler_config.max_num_batched_tokens
             ),

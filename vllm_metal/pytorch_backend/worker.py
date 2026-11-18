@@ -110,7 +110,7 @@ def configure_mps(config, *, omni=False):
     if high_env not in os.environ and (
         current is None or current == _mps_low_watermark_default
     ):
-        desired = str(config.cache_config.gpu_memory_utilization)
+        desired = str(config.cache_config.resolved_gpu_memory_utilization)
         os.environ[low_env] = desired
         _mps_low_watermark_default = desired
 
@@ -174,7 +174,7 @@ class MPSWorker(MetalWorker):
         # Like the MLX backend, budget against the GPU working set, not RAM.
         budget = int(
             torch.mps.recommended_max_memory()
-            * self.cache_config.gpu_memory_utilization
+            * self.cache_config.resolved_gpu_memory_utilization
         )
         available = budget - torch.mps.driver_allocated_memory() - reserve
         if available <= 0:
