@@ -133,6 +133,13 @@ class Qwen3ASRConfig:
     @classmethod
     def from_dict(cls, d: dict) -> Qwen3ASRConfig:
         """Create config from config.json using the upstream schema owner."""
+        if "thinker_config" not in d:
+            raise ValueError(
+                "vllm-metal does not support Transformers-format Qwen3-ASR "
+                "checkpoints such as Qwen/Qwen3-ASR-0.6B-hf: the MLX model loads the "
+                "original checkpoint layout. Use an original checkpoint such as "
+                "Qwen/Qwen3-ASR-0.6B."
+            )
         # Original checkpoints nest their fields; flatten them as vLLM does.
         top = dict(d)
         thinker = top.pop("thinker_config")

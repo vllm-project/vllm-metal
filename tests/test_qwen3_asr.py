@@ -6,6 +6,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import re
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -118,6 +119,25 @@ class TestQwen3ASRConfigFromDict:
         config = Qwen3ASRConfig.from_dict(_QWEN3_ASR_17B)
 
         assert config.eos_token_id == Qwen3ASRConfig.eos_token_id
+
+    def test_transformers_format_checkpoint_is_rejected(self) -> None:
+        # Qwen/Qwen3-ASR-0.6B-hf keeps its configs at the top level.
+        transformers_format = {
+            "model_type": "qwen3_asr",
+            "audio_config": {"model_type": "qwen3_asr_encoder"},
+            "text_config": {"model_type": "qwen3"},
+        }
+
+        with pytest.raises(
+            ValueError,
+            match=re.escape(
+                "vllm-metal does not support Transformers-format Qwen3-ASR "
+                "checkpoints such as Qwen/Qwen3-ASR-0.6B-hf: the MLX model loads the "
+                "original checkpoint layout. Use an original checkpoint such as "
+                "Qwen/Qwen3-ASR-0.6B."
+            ),
+        ):
+            Qwen3ASRConfig.from_dict(transformers_format)
 
 
 class TestCNNOutputLengths:
