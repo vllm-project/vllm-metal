@@ -18,12 +18,9 @@ _MPS_WATERMARK_ENVS = (
     "PYTORCH_MPS_LOW_WATERMARK_RATIO",
     "PYTORCH_MPS_HIGH_WATERMARK_RATIO",
 )
-_mps_low_watermark_default: str | None = None
 
 
 def configure_mps(config, *, omni=False):
-    global _mps_low_watermark_default
-
     from vllm import envs as vllm_envs
     from vllm.config.compilation import CompilationMode, CUDAGraphMode
 
@@ -100,19 +97,6 @@ def configure_mps(config, *, omni=False):
     config.compilation_config.mode = CompilationMode.NONE
     config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
     model.enforce_eager = True
-    # PyTorch proactively reclaims cached heaps past its low watermark, 1.4x the
-    # recommended working set by default. Metal runs out before that on small
-    # Macs, so start reclaiming at the configured budget instead.
-    low_env, high_env = _MPS_WATERMARK_ENVS
-    current = os.environ.get(low_env)
-    # Set the default when absent, or update it when it still matches the
-    # default we installed.
-    if high_env not in os.environ and (
-        current is None or current == _mps_low_watermark_default
-    ):
-        desired = str(config.cache_config.gpu_memory_utilization)
-        os.environ[low_env] = desired
-        _mps_low_watermark_default = desired
 
 
 class MPSWorker(MetalWorker):
@@ -125,6 +109,16 @@ class MPSWorker(MetalWorker):
         if not torch.backends.mps.is_available():
             raise RuntimeError("The experimental backend requires PyTorch MPS")
         configure_mps(self.vllm_config, omni=self.is_omni)
+        # PyTorch proactively reclaims cached heaps past its low watermark, 1.4x
+        # the recommended working set by default. Metal runs out before that on
+        # small Macs, so start reclaiming at the configured budget instead.
+        # PyTorch reads the variable when this process's allocator starts. Set it
+        # here, not in the frontend: workers inherit the frontend's environment,
+        # so colocated Omni stages would all get the last stage's budget.
+        if not any(env in os.environ for env in _MPS_WATERMARK_ENVS):
+            os.environ[_MPS_WATERMARK_ENVS[0]] = str(
+                self.cache_config.gpu_memory_utilization
+            )
         self.device = torch.device("mps:0")
         init_worker_distributed_environment(
             self.vllm_config,
