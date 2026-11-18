@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 import torch
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+from vllm.v1.token_buffer import TokenBuffer
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.states import RequestState
 
@@ -119,6 +120,19 @@ def test_gather_clears_rows_left_by_larger_batch():
 
     assert view.tolist() == [[3, 3, 3]]
     assert tables.input_block_tables[0][1:].count_nonzero().item() == 0
+
+
+def test_token_buffer_prompts_reach_request_state(state):
+    # The scheduler admits prompts as TokenBuffers, which vLLM stages by reference.
+    state.add_request("a", 3, TokenBuffer([5, 6, 7]), 1, 4)
+    state.add_request("b", 2, TokenBuffer([8, 9]), 0, 4)
+    slots = [state.req_id_to_index[req_id] for req_id in ("a", "b")]
+
+    state.apply_staged_writes()
+
+    assert state.all_token_ids.gpu[slots, :3].tolist() == [[5, 6, 7], [8, 9, 0]]
+    assert state.total_len.gpu[slots].tolist() == [3, 2]
+    assert state.num_computed_tokens.gpu[slots].tolist() == [1, 0]
 
 
 def test_post_update_stores_drafts_by_request_slot(state):
