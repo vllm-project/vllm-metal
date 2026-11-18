@@ -66,7 +66,7 @@ static void record_nax_prefill_dispatch(
       key_block_stride = static_cast<int32_t>(block_size * key_cache.strides()[1]);
     }
     g_nax_prefill_trace[g_nax_prefill_trace_size++] = {
-        cfg.HEADS_PER_TG > 1 ? "nax_gqa6_prefill" : "nax_prefill",
+        paged_dispatch_name(nax_prefill_dispatch_family(cfg)),
         query.dtype() == bfloat16 ? "bfloat16" : "float16",
         static_cast<int>(query.shape(0)), static_cast<int>(query.shape(1)),
         num_kv_heads, static_cast<int>(query.shape(2)), block_size, num_seqs,
@@ -383,12 +383,18 @@ static void dispatch_paged_attention_nax(
   int head_size  = static_cast<int>(query.shape(2));
   int num_seqs   = static_cast<int>(cu_seqlens_q.shape(0)) - 1;
   int num_heads = static_cast<int>(query.shape(1));
-  auto cfg = kernels::select_nax_config(
-      num_heads, num_kv_heads, head_size, block_size, total_q_tokens,
-      num_seqs, max_seq_len, q_block_offset, nax_gqa_prefill_enabled_,
-      query.dtype() == bfloat16,
-      sliding_window < 0 && softcap <= 0.0f && sinks == nullptr, split_full,
-      detected_gpu_core_count());
+  auto cfg = kernels::kNaxBaseline;
+  if (nax_gqa_prefill_enabled_ && num_seqs == 1 && q_block_offset == 0 &&
+      query.dtype() == bfloat16 && sliding_window < 0 && softcap <= 0.0f && !sinks) {
+    const kernels::NaxGeometry geometry{
+        num_heads, num_kv_heads, head_size, static_cast<int>(value_cache.shape(3)),
+        block_size, static_cast<int>(key_cache.shape(1)),
+        key_cache.strides()[2], key_cache.strides()[1]};
+    // Serving supplies the sequence length. A direct caller may give a loose
+    // upper bound: only the width estimate uses it; shaders read seq_lens.
+    cfg = kernels::select_nax_config(
+        geometry, {total_q_tokens, max_seq_len}, split_full, detected_gpu_core_count());
+  }
   auto make_plan = [&](kernels::NaxConfig config) {
     return make_nax_attention_plan(
         query.dtype(), total_q_tokens, head_size, num_seqs,
@@ -419,7 +425,7 @@ static void dispatch_paged_attention_nax(
     kernel = load_kernel();
   }
   if (cfg.HEADS_PER_TG > 1) {
-    record_paged_dispatch(PagedDispatch::NaxGqa6Prefill, 0, 0, cfg.HEADS_PER_TG);
+    record_paged_dispatch(nax_prefill_dispatch_family(cfg), 0, 0, cfg.HEADS_PER_TG);
   } else if (g_dispatch_diagnostics_enabled.load(std::memory_order_relaxed)) {
     g_last_nax_split.store(plan.split_full ? 1 : 0, std::memory_order_relaxed);
     g_last_nax_heads_per_tg.store(cfg.HEADS_PER_TG, std::memory_order_relaxed);
