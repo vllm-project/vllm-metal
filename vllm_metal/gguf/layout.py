@@ -43,6 +43,22 @@ class GGUFColumnPermutedTensor:
         """``x @ W.T`` for the logical weight, gathering ``x`` into stored order."""
         return self.tensor.matmul(mx.take(x, self._stored_order, axis=-1))
 
+    def gather_matmul(
+        self,
+        x: mx.array,
+        indices: mx.array,
+        *,
+        num_experts: int,
+        sorted_indices: bool = False,
+    ) -> mx.array:
+        """Expert gather matmul for the logical weight, as :meth:`matmul`."""
+        return self.tensor.gather_matmul(
+            mx.take(x, self._stored_order, axis=-1),
+            indices,
+            num_experts=num_experts,
+            sorted_indices=sorted_indices,
+        )
+
     def embedding(self, ids: mx.array, output_dtype: mx.Dtype) -> mx.array:
         """Gather and dequantize logical rows: stored rows, columns reordered."""
         rows = self.tensor.embedding(ids, output_dtype)

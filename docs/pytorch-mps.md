@@ -20,7 +20,7 @@ Greedy decoding and seeded sampling with temperature, top-k, top-p, and min-p
 are supported. Output-token and prompt logprobs are supported; explicit token-ID
 scoring is not yet supported.
 
-For speech and image generation, see [Omni](omni.md).
+For speech and image generation and duplex conversations, see [Omni](omni.md).
 
 ## EAGLE3 speculative decoding
 

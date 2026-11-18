@@ -2241,10 +2241,12 @@ class TestMetalPlatform:
         ],
         ids=["unset", "low-exported", "high-exported"],
     )
-    def test_mps_reclaims_cached_heaps_at_the_memory_budget(
+    def test_mps_worker_reclaims_cached_heaps_at_its_own_budget(
         self, tmp_path, monkeypatch, exported
     ) -> None:
         from transformers import Qwen3Config
+
+        from vllm_metal.pytorch_backend import worker as worker_module
 
         Qwen3Config(
             architectures=["Qwen3ForCausalLM"], hidden_size=64, head_dim=64
@@ -2252,16 +2254,40 @@ class TestMetalPlatform:
         environ = {k: v for k, v in os.environ.items() if "WATERMARK" not in k}
         monkeypatch.setattr(os, "environ", environ | exported)
         monkeypatch.setitem(vars(platform_module.envs), "VLLM_METAL_BACKEND", "mps")
-        EngineArgs(
+        config = EngineArgs(
             model=str(tmp_path),
             dtype="bfloat16",
             skip_tokenizer_init=True,
             max_model_len=128,
             gpu_memory_utilization=0.5,
         ).create_engine_config()
-        watermarks = {k: v for k, v in os.environ.items() if "WATERMARK" in k}
+
+        def watermarks():
+            return {k: v for k, v in os.environ.items() if "WATERMARK" in k}
+
+        # Workers inherit the frontend's environment, so a budget exported here
+        # would reach every colocated Omni stage.
+        assert watermarks() == exported
+
+        monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+        monkeypatch.setattr(
+            worker_module, "init_worker_distributed_environment", lambda *_: None
+        )
+        monkeypatch.setattr(worker_module, "set_random_seed", lambda _: None)
+        worker_module.MPSWorker.init_device(
+            SimpleNamespace(
+                vllm_config=config,
+                cache_config=config.cache_config,
+                model_config=config.model_config,
+                is_omni=False,
+                rank=0,
+                local_rank=0,
+                distributed_init_method="unused",
+                model_runner_cls=lambda _: None,
+            )
+        )
         # An exported watermark always wins.
-        assert watermarks == (exported or {"PYTORCH_MPS_LOW_WATERMARK_RATIO": "0.5"})
+        assert watermarks() == (exported or {"PYTORCH_MPS_LOW_WATERMARK_RATIO": "0.5"})
 
     def test_kept_multimodal_config_normalizes_pixels_on_the_host(
         self, monkeypatch: pytest.MonkeyPatch
