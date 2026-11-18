@@ -860,10 +860,11 @@ def test_gdn_state_carries_across_chunked_prefill_and_decode(pooled):
             start += t.numel()
     untouched = [t[2].clone() for t in layer.kv_cache]
     qkv = torch.randn(76, channels, device="mps")
-    b, a = torch.randn(2, 76, v_heads, device="mps")
+    ba = torch.randn(76, 2 * v_heads, device="mps")
+    b, a = ba.chunk(2, dim=-1)
 
     def step(lo, hi, decode, resumed):
-        # A padded decode row rides along with every prefill; it must stay zero.
+        # A padded decode row rides along with every prefill; it must stay untouched.
         x = torch.cat([qkv[:1] * 0, qkv[lo:hi]])
         md = SimpleNamespace(
             num_decodes=2 if decode else 1,
@@ -874,16 +875,11 @@ def test_gdn_state_carries_across_chunked_prefill_and_decode(pooled):
             non_spec_query_start_loc=torch.tensor([0, 1, 1 + hi - lo], device="mps"),
             has_initial_state=torch.tensor([False, resumed], device="mps"),
         )
-        out = torch.zeros(len(x), v_heads, v_dim, device="mps")
-        _gdn_core(
-            layer,
-            x,
-            torch.cat([b[:1], b[lo:hi]]),
-            torch.cat([a[:1], a[lo:hi]]),
-            out,
-            md,
-        )
-        assert torch.equal(out[0], torch.zeros_like(out[0]))
+        # vLLM's GDN forward passes strided b/a views and an uninitialized output.
+        step_b, step_a = torch.cat([ba[:1], ba[lo:hi]]).chunk(2, dim=-1)
+        out = torch.full((len(x), v_heads, v_dim), float("nan"), device="mps")
+        _gdn_core(layer, x, step_b, step_a, out, md)
+        assert out[0].isnan().all()
         return out[1:].cpu()
 
     got = torch.cat(
