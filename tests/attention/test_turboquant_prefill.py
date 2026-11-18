@@ -2,6 +2,7 @@
 """Exercise production routing, fused cache writes and native TQ attention."""
 
 import gc
+import os
 from contextlib import nullcontext
 from unittest.mock import patch
 
@@ -253,8 +254,10 @@ def test_dequantized_gqa6_uses_subset_lengths_and_compact_cache(
     (prefill, _), (_, compressed) = recorded_ops
     assert prefill[0].shape[0] == 144 and prefill[10] == 400
     assert compressed["use_turboquant"]
+    grouped = os.environ.get("VLLM_METAL_NAX_GQA_PREFILL", "1") == "1"
+    expected = ("nax_gqa6_prefill", 3, 256) if grouped else ("nax_prefill", 1, 256)
     assert [(e["family"], e["HEADS_PER_TG"], e["key_head_stride"]) for e in events] == [
-        ("nax_gqa6_prefill", 3, 256)
+        expected
     ]
 
 
