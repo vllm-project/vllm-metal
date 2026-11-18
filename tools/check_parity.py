@@ -4,7 +4,8 @@
 
 Generate one native reference, then compare individual and batched requests.
 Speculative modes observe target verification in isolated engine workers;
-ordinary parity uses HTTP serving. Both use the same checkpoint and input IDs.
+ordinary parity uses HTTP serving. Both use the same input IDs and, unless
+--reference-model is set, the same checkpoint.
 
 Parity checks may be unreliable for MoE models. When mismatches occur,
 investigate routing flips between experts with nearly tied scores.
@@ -127,6 +128,16 @@ def mlx_generate(
     return results
 
 
+def local_checkpoint(name: str) -> str:
+    """Return a local path, downloading a Hugging Face repo id first."""
+    if not Path(name).exists():
+        from huggingface_hub import snapshot_download
+
+        name = snapshot_download(name)
+    # resolve() would follow a cached GGUF symlink to a blob without .gguf.
+    return str(Path(name).absolute())
+
+
 @contextmanager
 def serving(
     model: str,
@@ -224,6 +235,7 @@ def check_parity(
     trust_remote_code: bool = False,
     speculative_config: dict | None = None,
     reference_backend: str = "mlx-lm",
+    reference_model: str | None = None,
 ) -> bool:
     """Generate one reference, then compare every request batch size on one server."""
     if not prompts or not batch_sizes or min(batch_sizes) < 1:
@@ -235,11 +247,8 @@ def check_parity(
     summary.write_text(
         "| Prompts/request | EXACT | TOP_K_MATCH | FAIL | Exit |\n|---|---:|---:|---:|---:|\n"
     )
-    if not Path(model).is_dir():
-        from huggingface_hub import snapshot_download
-
-        model = snapshot_download(model)
-    model = str(Path(model).resolve())
+    model = local_checkpoint(model)
+    reference_model = local_checkpoint(reference_model) if reference_model else model
     env = os.environ.copy()
     if env.get("VLLM_METAL_BACKEND", "mlx") == "mps":
         env["PYTORCH_ENABLE_MPS_FALLBACK"] = "0"
@@ -257,7 +266,7 @@ def check_parity(
                 sys.executable,
                 str(Path(__file__).resolve()),
                 "--model",
-                model,
+                reference_model,
                 "--max-tokens",
                 str(max_tokens),
                 "--reference-backend",
@@ -274,6 +283,10 @@ def check_parity(
         )
     reference = json.loads(reference_path.read_text())
     max_model_len = max(len(row["input_ids"]) for row in reference) + max_tokens
+    # vllm-metal reads a GGUF model's config from --tokenizer.
+    tokenizer_args = (
+        ["--tokenizer", reference_model] if reference_model != model else None
+    )
     passed = True
     print("Starting vLLM server...", flush=True)
     with serving(
@@ -286,6 +299,7 @@ def check_parity(
         additional_config,
         trust_remote_code,
         speculative_config=speculative_config,
+        extra_args=tokenizer_args,
     ) as base_url:
         for size in batch_sizes:
             print(f"Prompts/request: {size}", flush=True)
@@ -413,6 +427,11 @@ def main() -> None:
     )
     parser.add_argument("--model", required=True)
     parser.add_argument(
+        "--reference-model",
+        help="Checkpoint for the native reference, also the server's --tokenizer, "
+        "such as the source of a GGUF --model (default: --model)",
+    )
+    parser.add_argument(
         "--reference-backend",
         choices=["mlx-lm", "mlx-vlm"],
         default="mlx-lm",
@@ -504,6 +523,8 @@ def main() -> None:
             parser.error("--generate-reference cannot be combined with --method")
         if args.trust_remote_code:
             parser.error("--trust-remote-code cannot be combined with --method")
+        if args.reference_model:
+            parser.error("--reference-model cannot be combined with --method")
         sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
         from tools import speculative_parity
 
@@ -550,6 +571,7 @@ def main() -> None:
         args.trust_remote_code,
         speculative_config=args.speculative_config,
         reference_backend=args.reference_backend,
+        reference_model=args.reference_model,
     )
     raise SystemExit(0 if passed else 1)
 

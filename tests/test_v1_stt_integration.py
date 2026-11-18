@@ -18,7 +18,6 @@ from vllm.model_executor.models.registry import ModelRegistry
 from vllm.multimodal.inputs import MultiModalFieldConfig
 from vllm.sampling_params import SamplingParams
 from vllm.transformers_utils.config import _CONFIG_REGISTRY
-from vllm.v1.sample.sampler import Sampler
 
 from vllm_metal.stt.audio import (
     N_FRAMES,
@@ -42,6 +41,7 @@ from vllm_metal.stt.whisper import WhisperConfig
 from vllm_metal.stt.whisper.adapter import WhisperRuntimeAdapter
 from vllm_metal.stt.whisper.transcriber import WhisperTranscriber
 from vllm_metal.v1 import sampling_batch
+from vllm_metal.v1.sampling import Sampler
 from vllm_metal.v1.stt_model_runner import STTModelRunner
 
 

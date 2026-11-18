@@ -593,7 +593,7 @@ def test_resolve_arch_rejects_unsupported_gguf_archs(gguf_arch, config_model_typ
 
     assert str(unsupported.value) == (
         f"Architecture {gguf_arch!r} is not supported; the GGUF loader supports "
-        "['llama', 'qwen2', 'qwen3', 'qwen35']."
+        "['gemma3', 'llama', 'qwen2', 'qwen3', 'qwen35']."
     )
 
 
@@ -1717,3 +1717,191 @@ def test_qwen35_a_log_keeps_float32_under_bfloat16(tmp_path):
             np.array(a_log), hf[f"blk.{i}.ssm_a"], rtol=1e-6, atol=0
         )
         assert _gdn(model, i).dt_bias.dtype == mx.bfloat16
+
+
+# Two layers with sliding_window_pattern 2: layer 0 slides, layer 1 is global.
+_GEMMA3_TEXT_CONFIG = {
+    "model_type": "gemma3_text",
+    "hidden_size": 64,
+    "intermediate_size": 128,
+    "num_hidden_layers": 2,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "head_dim": 16,
+    "query_pre_attn_scalar": 16,
+    "vocab_size": 256,
+    "rms_norm_eps": 1e-6,
+    "sliding_window": 4,
+    "sliding_window_pattern": 2,
+    "max_position_embeddings": 512,
+}
+
+# GGUF tensor (after ``blk.N.``) -> mlx-lm parameter (after ``layers.N.``).
+_GEMMA3_LAYER_TENSORS = {
+    "attn_norm.weight": "input_layernorm.weight",
+    "attn_q.weight": "self_attn.q_proj.weight",
+    "attn_k.weight": "self_attn.k_proj.weight",
+    "attn_v.weight": "self_attn.v_proj.weight",
+    "attn_output.weight": "self_attn.o_proj.weight",
+    "attn_q_norm.weight": "self_attn.q_norm.weight",
+    "attn_k_norm.weight": "self_attn.k_norm.weight",
+    "post_attention_norm.weight": "post_attention_layernorm.weight",
+    "ffn_norm.weight": "pre_feedforward_layernorm.weight",
+    "ffn_gate.weight": "mlp.gate_proj.weight",
+    "ffn_up.weight": "mlp.up_proj.weight",
+    "ffn_down.weight": "mlp.down_proj.weight",
+    "post_ffw_norm.weight": "post_feedforward_layernorm.weight",
+}
+# Gemma 3 ties its head, so llama.cpp writes no output.weight.
+_GEMMA3_GLOBAL_TENSORS = {
+    "token_embd.weight": "model.embed_tokens.weight",
+    "output_norm.weight": "model.norm.weight",
+}
+_GEMMA3_LIVE_TO_GGUF_LAYER = {
+    live: kind for kind, live in _GEMMA3_LAYER_TENSORS.items()
+}
+_GEMMA3_LIVE_TO_GGUF_GLOBAL = {
+    live: name for name, live in _GEMMA3_GLOBAL_TENSORS.items()
+}
+
+
+def _gemma3_gguf_name(param_path: str) -> str:
+    """Live mlx-lm parameter path -> the GGUF tensor llama.cpp writes for it."""
+    if not param_path.startswith("model.layers."):
+        return _GEMMA3_LIVE_TO_GGUF_GLOBAL[param_path]
+    _, _, layer, leaf = param_path.split(".", 3)
+    return f"blk.{layer}.{_GEMMA3_LIVE_TO_GGUF_LAYER[leaf]}"
+
+
+def _build_gemma3_fixture(
+    tmp_path: Path, *, quant_type
+) -> tuple[str, str, dict[str, np.ndarray]]:
+    """Write a tiny Gemma 3 text config and the GGUF llama.cpp converts it to.
+
+    llama.cpp stores every ``*norm.weight`` as ``1 + weight`` in F32. Returns
+    ``(gguf_path, config_dir, hf)``; ``hf`` maps each GGUF name to its source value.
+    """
+    (tmp_path / "config.json").write_text(json.dumps(_GEMMA3_TEXT_CONFIG))
+    skeleton, _ = mlx_lm_utils.load_model(tmp_path, lazy=True, strict=False)
+    rng = np.random.default_rng(0)
+    hf = {}
+    for path, param in tree_flatten(skeleton.parameters()):
+        shape = tuple(param.shape)
+        value = rng.standard_normal(shape)
+        if path.endswith("norm.weight"):
+            value = 0.1 * value  # Gemma norms scale by 1 + weight
+        elif len(shape) > 1 and "embed_tokens" not in path:
+            value = value / np.sqrt(shape[1])
+        hf[_gemma3_gguf_name(path)] = value.astype(np.float32)
+    values = {
+        name: value + 1 if name.endswith("norm.weight") else value
+        for name, value in hf.items()
+    }
+    specs = {
+        name: ("f" if name.endswith("norm.weight") else "q", value.shape)
+        for name, value in values.items()
+    }
+    gguf_path = tmp_path / "gemma3.gguf"
+    _write_gguf(gguf_path, "gemma3", specs, quant_type=quant_type, values=values)
+    return str(gguf_path), str(tmp_path), hf
+
+
+def _gemma3_source_model(cfg_dir: str, hf: dict[str, np.ndarray]) -> nn.Module:
+    """The dense mlx-lm model the fixture's GGUF was converted from."""
+    model, _ = mlx_lm_utils.load_model(Path(cfg_dir), lazy=True, strict=False)
+    params = [path for path, _ in tree_flatten(model.parameters())]
+    model.load_weights(
+        [(path, mx.array(hf[_gemma3_gguf_name(path)])) for path in params]
+    )
+    model.eval()
+    return model
+
+
+def test_gemma3_loads_the_model_it_was_converted_from(tmp_path):
+    # Every norm, the final one included, drops llama.cpp's +1 and the text
+    # config pairs with the gemma3 arch, so a plain file loads back exactly.
+    gguf_path, cfg_dir, hf = _build_gemma3_fixture(tmp_path, quant_type=QT.F32)
+    tokens = mx.array([[1, 2, 3, 4, 5, 6, 7, 8]])
+    expected = np.array(_gemma3_source_model(cfg_dir, hf)(tokens))
+
+    model = GGUFModelLoader(
+        gguf_path, config_dir=cfg_dir, target_dtype=mx.float32
+    ).load()
+    logits = np.array(model(tokens))
+
+    np.testing.assert_allclose(
+        logits, expected, rtol=0, atol=float(np.abs(expected).max()) * 1e-6
+    )
+
+
+def test_gemma3_multimodal_config_loads_trimmed_vocab(tmp_path):
+    # 4B+ ship a Gemma3ForConditionalGeneration config whose vocab_size counts
+    # 64 rows past the tokenizer; llama.cpp trims token_embd to the tokenizer.
+    # Like the real configs, it has no top-level vocab_size, so mlx-lm's
+    # default (262208) overrides the text one.
+    gguf_path, cfg_dir, hf = _build_gemma3_fixture(tmp_path, quant_type=QT.F32)
+    tokens = mx.array([[1, 2, 3, 4, 5, 6, 7, 8]])
+    expected = np.array(_gemma3_source_model(cfg_dir, hf)(tokens))
+    padded_vocab = _GEMMA3_TEXT_CONFIG["vocab_size"] + 64
+    multimodal = {
+        "model_type": "gemma3",
+        "architectures": ["Gemma3ForConditionalGeneration"],
+        "text_config": {**_GEMMA3_TEXT_CONFIG, "vocab_size": padded_vocab},
+    }
+    (tmp_path / "config.json").write_text(json.dumps(multimodal))
+
+    model = GGUFModelLoader(
+        gguf_path, config_dir=cfg_dir, target_dtype=mx.float32
+    ).load()
+    logits = np.array(model(tokens))
+
+    np.testing.assert_allclose(
+        logits, expected, rtol=0, atol=float(np.abs(expected).max()) * 1e-6
+    )
+
+
+def test_gemma3_quantized_file_loads_source_norms(tmp_path):
+    # llama.cpp's exports keep the shifted norms plain next to quantized weights.
+    gguf_path, cfg_dir, hf = _build_gemma3_fixture(tmp_path, quant_type=QT.Q8_0)
+
+    model = GGUFModelLoader(
+        gguf_path, config_dir=cfg_dir, target_dtype=mx.float32
+    ).load()
+
+    norms = [
+        (path, value)
+        for path, value in tree_flatten(model.parameters())
+        if path.endswith("norm.weight")
+    ]
+    assert len(norms) == 1 + 6 * _GEMMA3_TEXT_CONFIG["num_hidden_layers"]
+    for path, value in norms:
+        np.testing.assert_allclose(
+            np.array(value), hf[_gemma3_gguf_name(path)], rtol=0, atol=1e-6
+        )
+
+
+@pytest.mark.parametrize(
+    ("config", "arch", "expected"),
+    [
+        pytest.param(
+            {"model_type": "gemma3_text"},
+            "gemma3",
+            {"vocab_size": 256},
+            id="gemma3-text",
+        ),
+        pytest.param(
+            {"model_type": "gemma3", "text_config": {"vocab_size": 262208}},
+            "gemma3",
+            {"vocab_size": 256, "text_config": {"vocab_size": 256}},
+            id="gemma3-multimodal",
+        ),
+        pytest.param({"model_type": "qwen3"}, "qwen3", {}, id="untrimmed"),
+    ],
+)
+def test_vocab_overrides_follow_the_file_and_config_shape(config, arch, expected):
+    # A text_config is only set where the config has one: adding it to a
+    # text-only config would plant a bogus attribute on the HF config.
+    assert (
+        GGUFModelAdapter.vocab_overrides(config, arch=arch, embedding_rows=256)
+        == expected
+    )

@@ -95,7 +95,9 @@ def test_mlx_lm_snapshot_preserves_provider_revision_and_filters(
         expected.return_value
     )
     expected.assert_called_once_with(
-        "org/model", revision="release-tag", allow_patterns=DEFAULT_ALLOW_PATTERNS
+        "org/model",
+        revision="release-tag",
+        allow_patterns=[*DEFAULT_ALLOW_PATTERNS, "readout.safetensors"],
     )
     unused.assert_not_called()
 

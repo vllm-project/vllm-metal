@@ -2770,10 +2770,7 @@ instantiate_paged_attention_v2(half, char, uchar, 32);
   instantiate_gqa_decode_inner(type, 256, 16, partition_size);               \
   instantiate_gqa_decode_inner(type, 256, 32, partition_size);
 
-instantiate_gqa_decode(bfloat16_t, VLLM_METAL_PARTITION_SIZE);
-instantiate_gqa_decode(half, VLLM_METAL_PARTITION_SIZE);
-
-// Smaller GQA partitions and matching reducers for the default selector.
+// One GQA partition size with matching reducers (kGqaPartitionSize).
 // Established per-token and split-KV kernels remain at their original size.
 instantiate_gqa_decode(bfloat16_t, 256);
 instantiate_gqa_decode(half, 256);
@@ -2827,8 +2824,6 @@ instantiate_gqa_decode(half, 256);
   instantiate_gqa_decode_tq_cache(type, char, partition_size);                 \
   instantiate_gqa_decode_tq_cache(type, uchar, partition_size);
 
-instantiate_gqa_decode_tq(bfloat16_t, VLLM_METAL_PARTITION_SIZE);
-instantiate_gqa_decode_tq(half, VLLM_METAL_PARTITION_SIZE);
 instantiate_gqa_decode_tq(bfloat16_t, 256);
 instantiate_gqa_decode_tq(half, 256);
 

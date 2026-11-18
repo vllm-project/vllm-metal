@@ -17,7 +17,7 @@ vllm-metal validates these variables when the engine configuration is created an
 | `VLLM_MLX_DEVICE` | `gpu` | MLX device (`gpu` or `cpu`) |
 | `VLLM_METAL_DISABLE_NAX` | `0` | Emergency override for automatic M5 NAX prefill attention. Set to `1` to force the non-NAX fallback. |
 | `VLLM_METAL_NAX_GQA_PREFILL` | `1` | Automatically select three- or six-head grouped NAX prefill on the MLX backend for single-sequence causal attention without sliding windows, softcap or sinks, using BF16, head dimension 256, GQA ratio 6 and 16-token kernel pages. The work-based selector compares query and KV lengths, query/KV heads, detected GPU cores and the actual upstream pipeline. Unsupported features, mixed batches/suffix offsets, unknown capacity or insufficient pipeline limits retain upstream. Extra six-head admission uses complete groups per GPU core and full-tile work coverage for power-of-two KV-head layouts; its guarded-query allowance is calibrated only at 10 cores. Other layouts retain the existing work score; total KV length has no fixed 32K admission cap. Complete tiles omit bounds checks while partial Q/KV tiles remain guarded. Set `0` to retain upstream NAX. Read once at worker startup; restart after changing it. `VLLM_METAL_DISABLE_NAX=1` disables all NAX. |
-| `VLLM_METAL_DISABLE_GQA_DECODE` | `0` | Set to `1` to keep eligible ordinary decode on the established per-token / split-KV kernels. Automatic GQA routing uses the [supported geometries, kernel pages and batch planning rules](gqa-decode.md), requiring 33 complete-partition SIMD groups per detected GPU core. It normally prefers the largest eligible 256/512-token partition; calibrated 10-core M3 guards narrow short-context admission and prefer P256 for supported head256 batches at longer contexts. This switch only disables the optimization. |
+| `VLLM_METAL_DISABLE_GQA_DECODE` | `0` | Set to `1` to keep eligible ordinary decode on the established per-token / split-KV kernels. Automatic GQA routing uses the [supported geometries, kernel pages and batch planning rules](gqa-decode.md), requiring 33 SIMD groups of complete 256-token partitions per detected GPU core. This switch only disables the optimization. |
 | `VLLM_METAL_TQ_PREFILL` | `auto` | Materialize eligible TurboQuant prefills when NAX is available. `1` explicitly enables the tiled fallback on other GPUs; `0` keeps compressed attention. Set before worker startup. |
 | `VLLM_METAL_TQ_PREFILL_MAX_MIB` | `auto` | TurboQuant prefill workspace, reserved inside `gpu_memory_utilization` before KV sizing. `auto` caps the device allowance by model and scheduler limits for non-speculative serving, and can fall below 256 MiB. A number sets an explicit MiB limit; `0` disables materialization. See [automatic sizing and memory bounds](turboquant.md#prefill-acceleration). |
 | `VLLM_METAL_MULTIMODAL_MODE` | `auto` | Multimodal serve mode: `auto` uses the compatibility allowlist (Gemma 4 gets the vision sidecar when its checkpoint allows); `multimodal-native` disables overrides; `text-only` forces the text-only path for every multimodal checkpoint |
@@ -105,8 +105,8 @@ Sleep levels mean something different on unified memory than on a GPU:
   well under a second, and the prefix cache starts empty.
 - `llm.sleep(level=0)` followed by `llm.release_kv_cache_memory()` also frees
   the KV cache. Restore it with `llm.wake_up(tags=["kv_cache"])`.
-- The amount freed is the part of the KV pool that was in use, because the
-  pool is allocated lazily.
+- Either way the whole KV pool is freed. The pool takes that memory again at
+  wake or with the first request after wake.
 - With [KV offloading](kv_offloading.md), sleep also frees the host pool. It
   comes back empty at wake. Prompts already on the disk tier still restore.
 
@@ -135,61 +135,29 @@ sliding layers to release old blocks. This can improve long-context capacity,
 but not necessarily generation speed. Use `--disable-hybrid-kv-cache-manager`
 for dense allocation.
 
-The KV pool is allocated lazily. vLLM's allocator zero-fills the backing store,
-which on unified memory commits every page of the pool at startup; vllm-metal
-requests the same layout without the fill whenever vLLM does not require it
-(uniform-precision attention caches — `KVCacheConfig.needs_kv_cache_zeroing`
-covers Mamba state and mixed-precision caches, which keep the zero fill). Pages
-are then committed only as blocks are used, so `--gpu-memory-utilization` sizes
-the *capacity* the engine may reach rather than the resident footprint it pays
-for immediately: a 16 GB Mac can give the cache a multi-GB budget while a short
-request only occupies the blocks it writes. A slot a request never writes never
-reaches an output — the attention kernels mask every position past the sequence
-length — so the missing zero fill does not change results. MLA's batched decode
-also zeroes padded latent rows before attention.
+Plan for the KV pool as RAM the server holds at its full size, even when
+requests use little of it. Expect the whole pool in memory at startup or after
+the first request
+([#1198](https://github.com/vllm-project/vllm-metal/issues/1198)). The memory
+reported for the process (RSS) can show less than this.
 
-Unified memory means the pool is not a reservation either way. Nothing pins it:
-`mx.set_wired_limit()` covers MLX-allocated buffers, not this torch allocation
-that MLX imports in place, so the kernel may compress or swap any of its pages
-as soon as something else wants the RAM — zeros from the fill or KV from a
-request alike. The fill decides when the pages become resident, not whether the
-OS can take them back. Resident KV is bounded by the blocks in use, so a run
-that fills the pool peaks at the footprint the eager fill would have committed,
-and a run that leaves blocks idle never pays for them. The difference is when
-the pages are asked for: the fill paid up front, before the first request, while
-a lazy pool faults them in during serving — a long prefill can demand hundreds
-of megabytes at once, at the moment the MLX working set is also at its peak.
-Faulting a page in under pressure is satisfied from the compressor or swap — it
-costs latency, it does not raise an allocation error — and a machine that
-exhausts both ends the process the same way it would end a startup zero-fill.
-`--gpu-memory-utilization` therefore bounds cache capacity rather than
-admission: two processes sized against the same free memory will both claim it,
-where the eager fill's resident pages at least showed up as used.
+With automatic sizing, the pool and the model weights together take about the
+`--gpu-memory-utilization` fraction (default 0.92) of the memory macOS
+recommends for GPU use (Metal's recommended working set). To leave room for
+other applications, lower the fraction or set a smaller pool with
+`--kv-cache-memory-bytes`. Each server sizes itself as if it were alone, so two
+servers at the same fraction each plan for that full fraction.
 
-Because of that, the planner checks the plan against the machine before serving:
-`VLLM_METAL_KV_COMMIT_PROBE` (on by default) forces a bounded sample of the
-planned pool resident at startup — `min(capacity, 512 MiB)`, one write per
-page — and reads back how much memory was free and how much the kernel
-compressed or wrote to swap to make room. macOS answers pressure with the
-compressor first and the swap file once that fills, so paging is read from both
-cumulative counters (`vm_stat` `Compressions` and `Swapouts`): not from swap
-occupancy, which rises and falls within a probe and so can hide the writes, and
-not from psutil's `swap_memory().sout`, which on macOS is the `Pageouts`
-counter — it moves for file writeback and can stay put while the kernel is
-swapping. The `vm_stat` read has a five-second timeout; if the command is
-missing, fails, hangs or prints something unexpected, startup stops with an
-error that names `VLLM_METAL_KV_COMMIT_PROBE=0` as the opt-out, because a
-default-on safety check must not pass silently.
-The sample lives in its own mapping and is dropped as soon as the probe returns,
-so it leaves nothing resident behind — the touch itself is transient, which a
-process's peak-RSS counter will see but steady state will not. If the kernel
-paged to back the sample, the machine has no headroom to give and the pool is
-sized down to what is free, less a reserve of `max(1 GiB, 1/16 of the
-recommended working set)` and less the memory the engine holds outside the pool
-— the TurboQuant prefill workspace, and the KV offload host pool
-(`--kv-offloading-size`), which is pageable but the same RAM — with a warning.
-The budget keeps the full byte count: vLLM chooses its own grouped layout from
-the bytes it is handed. If free memory is merely below the plan, the pool keeps
-its capacity and the shortfall is logged: a plan is a cap, and only the blocks
-requests actually write are ever backed. Set `VLLM_METAL_KV_COMMIT_PROBE=0` to
-skip the touch and use the configured cache budget.
+By default, vllm-metal tests a sample of the planned pool, up to 512 MiB,
+against the machine at startup:
+
+- If macOS has to compress or swap memory to hold the sample, the pool can be
+  sized down, with a warning. Where a pool set with `--kv-cache-memory-bytes`
+  would be sized down, startup stops with an error instead.
+- If the log says the pool is larger than this machine's free memory, the pool
+  keeps its size. Make the pool smaller or close other applications.
+- If memory statistics cannot be read, startup stops with an error.
+
+The test covers a sample, so leave headroom even when no warning appears. Set
+`VLLM_METAL_KV_COMMIT_PROBE=0` to skip the test and keep the planned pool
+size.

@@ -1542,7 +1542,10 @@ def test_worker_manager_reloads_requested_adapter_after_cache_eviction(
     np.testing.assert_array_equal(_active_fc1_lora_b(manager, 3), [3.0, 0.0])
 
 
-def test_worker_manager_add_adapter_load_inplace_replaces_weights(monkeypatch) -> None:
+@pytest.mark.parametrize("active", [False, True])
+def test_worker_manager_add_adapter_load_inplace_replaces_weights(
+    monkeypatch, active: bool
+) -> None:
     """Re-adding the same lora_int_id with load_inplace=True must swap weights."""
     manager = _make_worker_manager()
     v1 = _make_adapter(
@@ -1566,8 +1569,48 @@ def test_worker_manager_add_adapter_load_inplace_replaces_weights(monkeypatch) -
 
     # With load_inplace=True, the new weights must replace the old in the slot.
     state[7] = v2
+    if not active:
+        manager.set_active_adapters(set(), None)
     assert manager.add_adapter(_stub_lora_request(7, load_inplace=True)) is True
     np.testing.assert_array_equal(_active_fc1_lora_b(manager, 7), [5.0, 0.0])
+
+
+def test_worker_manager_failed_reload_preserves_inactive_adapter(monkeypatch) -> None:
+    """Rejected activation must not replace a cached adapter's working weights."""
+    model = _TwoLinearModel()
+    manager = worker_manager_mod.MetalWorkerLoRAManager(
+        model=model,
+        lora_config=_lora_config_stub(max_loras=1, max_lora_rank=1, max_cpu_loras=2),
+        max_num_seqs=1,
+        max_num_batched_tokens=2,
+        dtype=mx.float32,
+    )
+    state = {
+        lora_id: _make_adapter(
+            lora_id,
+            fc1_a=np.array([[1.0, 0.0]], dtype=np.float32),
+            fc1_b=np.array([[value], [0.0]], dtype=np.float32),
+        )
+        for lora_id, value in ((7, 3.0), (1, 1.0))
+    }
+    _patch_loader(monkeypatch, state)
+    manager.add_adapter(_stub_lora_request(7))
+    manager.add_adapter(_stub_lora_request(1))
+    manager.pin_adapter(1)
+    state[7] = _make_adapter(
+        7,
+        fc1_a=np.array([[1.0, 0.0]], dtype=np.float32),
+        fc1_b=np.array([[5.0], [0.0]], dtype=np.float32),
+    )
+
+    with pytest.raises(RuntimeError, match="All resident LoRA slots are pinned"):
+        manager.add_adapter(_stub_lora_request(7, load_inplace=True))
+
+    manager.remove_adapter(1)
+    manager.set_active_adapters(
+        {_stub_lora_request(7)}, LoRAMapping(index_mapping=(7,), prompt_mapping=(7,))
+    )
+    np.testing.assert_array_equal(np.array(model.fc1(mx.array([[1.0, 0.0]]))), [[3, 0]])
 
 
 def test_worker_manager_load_inplace_failure_restores_previous_adapter(

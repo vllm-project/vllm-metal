@@ -17,6 +17,7 @@ from huggingface_hub import snapshot_download
 from mlx.utils import tree_flatten
 from mlx_lm.utils import load_config, load_model
 
+from vllm_metal.compat import ensure_mlx_lm_gemma3_config_only_sanitize
 from vllm_metal.gguf.adapter import (
     GGUFLoadError,
     GGUFModelAdapter,
@@ -125,7 +126,11 @@ class GGUFModelLoader:
 
         # Build the mlx-lm skeleton lazily; the GGUF replaces every parameter of
         # its text model, so the skeleton's own weights are never materialized.
-        model = self._build_skeleton(config)
+        model = self._build_skeleton(
+            GGUFModelAdapter.skeleton_config(
+                config, arch=arch, embedding_rows=self._embedding_rows(reader)
+            )
+        )
         text_model = GGUFModelAdapter.text_model(model)
         tied = bool(getattr(text_model.args, "tie_word_embeddings", False))
         self._preflight_deferred_output(reader, tied=tied)
@@ -207,6 +212,7 @@ class GGUFModelLoader:
         skeleton_config = {
             key: value for key, value in config.items() if key not in _QUANTIZATION_KEYS
         }
+        ensure_mlx_lm_gemma3_config_only_sanitize()
         with TemporaryDirectory(prefix="vllm-metal-gguf-") as config_only_dir:
             (Path(config_only_dir) / "config.json").write_text(
                 json.dumps(skeleton_config)
@@ -477,6 +483,25 @@ class GGUFModelLoader:
                 f"GGUF tensor {name!r} shape {actual} != expected {expected} for "
                 f"model {param_path!r}."
             )
+
+    @classmethod
+    def read_vocab_header(cls, gguf_path: str | Path) -> tuple[str, int | None]:
+        """The file's architecture and ``token_embd`` rows, read without the weights."""
+        try:
+            reader = gguf.GGUFReader(str(gguf_path))
+        except (ValueError, OSError) as exc:
+            raise GGUFLoadError(
+                f"Could not read GGUF file {str(gguf_path)!r}: {exc}"
+            ) from exc
+        return cls._gguf_arch(reader), cls._embedding_rows(reader)
+
+    @staticmethod
+    def _embedding_rows(reader: Any) -> int | None:
+        """Rows of the file's ``token_embd.weight``, or ``None`` when absent."""
+        for tensor in reader.tensors:
+            if tensor.name == "token_embd.weight":
+                return GGUFModelLoader._logical_shape(tensor)[0]
+        return None
 
     @staticmethod
     def _gguf_arch(reader: Any) -> str:

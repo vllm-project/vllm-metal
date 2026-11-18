@@ -12,11 +12,11 @@ import numpy as np
 import pytest
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
-from vllm.v1.sample.sampler import Sampler
 
 import vllm_metal.v1.model_runner as mr
 import vllm_metal.v1.structured_output as so
 from tests.stub_runner import make_stub_runner
+from vllm_metal.v1.sampling import Sampler
 from vllm_metal.v1.spec_decode import SpeculativeDecodeController
 from vllm_metal.v1.structured_output import MetalStructuredOutputApplier
 
