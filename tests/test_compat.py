@@ -276,13 +276,16 @@ class TestApplyCompatPatches:
         ]
 
 
-_METADATA_ARCHS = frozenset(
-    {
-        "Lfm3ForCausalLM",
-        "Lfm3VlForConditionalGeneration",
-        "Lfm3AudioForConditionalGeneration",
-    }
-)
+# vLLM's own LFM3 registrations (vllm/model_executor/models/registry.py).
+_VLLM_LFM3 = {
+    "Lfm3ForCausalLM": "vllm.model_executor.models.lfm3:Lfm3ForCausalLM",
+    "Lfm3VlForConditionalGeneration": (
+        "vllm.model_executor.models.lfm3_vl:Lfm3VlForConditionalGeneration"
+    ),
+    "Lfm3AudioForConditionalGeneration": (
+        "vllm.model_executor.models.lfm3_audio:Lfm3AudioForConditionalGeneration"
+    ),
+}
 
 
 class TestModelMetadataCompat:
@@ -296,39 +299,50 @@ class TestModelMetadataCompat:
         monkeypatch.setattr(platforms, "current_platform", MetalPlatform())
 
     @pytest.fixture
-    def without_metadata(self, monkeypatch):
-        """Hide the fallback architecture registrations."""
+    def registry(self, monkeypatch):
+        """vLLM's model registry with its own LFM3 entries, restored after the test.
+
+        Any earlier test that loads vLLM's general plugins has already run
+        ``register_model_compat`` on the shared registry.
+        """
         from vllm.model_executor.models import ModelRegistry
 
         monkeypatch.setattr(ModelRegistry, "models", dict(ModelRegistry.models))
-        for arch in _METADATA_ARCHS:
-            ModelRegistry.models.pop(arch, None)
+        for architecture, model_cls in _VLLM_LFM3.items():
+            ModelRegistry.register_model(architecture, model_cls)
         return ModelRegistry
 
-    def test_missing_model_metadata_loads(self, without_metadata) -> None:
-        compat.register_model_compat()
-        compat.register_model_compat()
-
-        assert _METADATA_ARCHS <= set(without_metadata.get_supported_archs())
-
-    @pytest.mark.parametrize("architecture", sorted(_METADATA_ARCHS))
-    def test_existing_registrations_are_kept(
-        self, without_metadata, architecture
+    @pytest.mark.parametrize(
+        ("architecture", "expected"),
+        [
+            ("Lfm3ForCausalLM", _VLLM_LFM3["Lfm3ForCausalLM"]),
+            (
+                "Lfm3VlForConditionalGeneration",
+                "vllm_metal.patches.lfm3_registry:Lfm3VlForConditionalGeneration",
+            ),
+            (
+                "Lfm3AudioForConditionalGeneration",
+                "vllm_metal.patches.lfm3_audio_registry:"
+                "Lfm3AudioForConditionalGeneration",
+            ),
+        ],
+        ids=["text-stays-native", "vl", "audio"],
+    )
+    def test_mlx_overrides_only_lfm3_vl_and_audio(
+        self, registry, architecture, expected
     ) -> None:
-        without_metadata.register_model(
-            architecture, "vllm.model_executor.models.llama:LlamaForCausalLM"
-        )
-
+        compat.register_model_compat()
         compat.register_model_compat()
 
-        assert without_metadata.models[architecture].class_name == "LlamaForCausalLM"
+        registered = registry.models[architecture]
+        assert f"{registered.module_name}:{registered.class_name}" == expected
 
     @pytest.mark.parametrize(
         ("is_metal", "backend"),
         [(False, "mlx"), (True, "mps")],
     )
-    def test_other_platforms_and_backends_keep_models_unregistered(
-        self, without_metadata, monkeypatch, is_metal, backend
+    def test_other_platforms_and_backends_keep_vllms_native_lfm3(
+        self, registry, monkeypatch, is_metal, backend
     ) -> None:
         import vllm.platforms as platforms
         from vllm.platforms.cpu import CpuPlatform
@@ -339,7 +353,12 @@ class TestModelMetadataCompat:
 
         compat.register_model_compat()
 
-        assert _METADATA_ARCHS.isdisjoint(without_metadata.get_supported_archs())
+        registered = {
+            architecture: f"{entry.module_name}:{entry.class_name}"
+            for architecture, entry in registry.models.items()
+            if architecture in _VLLM_LFM3
+        }
+        assert registered == _VLLM_LFM3
 
 
 def _install_fake_qwen35_modules(monkeypatch, *, include_moe: bool):
