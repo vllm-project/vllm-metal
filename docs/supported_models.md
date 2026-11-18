@@ -59,8 +59,8 @@ unsupported; leave `--video-pruning-rate` unset.
 | Qwen3.5 / 3.6 (dense and MoE) | 🔵 | | native multimodal paged generation | image and video input; FP8 and GGUF checkpoints stay text-only | `mlx-community/Qwen3.5-4B-MLX-4bit` |
 | PaddleOCR-VL | 🔵 | | native multimodal paged generation | image input, no video | `PaddlePaddle/PaddleOCR-VL-1.6` |
 | LFM2-VL / LFM2.5-VL | 🔵 | 🔵 | native multimodal paged generation on the ShortConv text tower | image input, no video; one tile grid plus thumbnail per image; needs a checkpoint packaged for Transformers, which the MLX conversions are not | `LiquidAI/LFM2.5-VL-1.6B` |
-| LFM3-VL | 🔵 | | native multimodal paged generation on the LFM3 text tower | image input, no video; needs `--trust-remote-code`; the image processor comes from mlx-vlm | `LiquidAI/LFM3-VL-2B-MLX-4bit` |
-| LFM3-Audio | 🔵 | | native multimodal paged generation on the LFM3 text tower | audio input to text, clips up to 30 seconds; needs `--trust-remote-code`; no speech output | `LiquidAI/LFM3-Audio-2B-MLX-4bit` |
+| LFM3-VL | 🔵 | | native multimodal paged generation on the LFM3 text tower | image input, no video; the image processor comes from mlx-vlm | `LiquidAI/LFM3-VL-2B-MLX-4bit` |
+| LFM3-Audio | 🔵 | | native multimodal paged generation on the LFM3 text tower | audio input to text, clips up to 30 seconds; no speech output | `LiquidAI/LFM3-Audio-2B-MLX-4bit` |
 | Gemma 4 | 🔵 | | mlx_lm text backbone + mlx-vlm encoder sidecar, paged generation | image input; audio and video input on E2B/E4B; bidirectional attention inside image blocks on sliding-window layers | `mlx-community/unsloth-gemma-4-26B-A4B-it-qat-oQ4`, `mlx-community/gemma-4-e2b-it-4bit` (audio, video) |
 
 Gemma 4 keeps its text path exactly as on the text-only table (mlx_lm model,
@@ -162,7 +162,7 @@ and TurboQuant are not validated.
 | Qwen3.5 / 3.6 / 3.8 | ✅ | 🔵 | Hybrid SDPA + GDN linear (3.6 adds MoE) | 🔵 | `mlx-community/Qwen3.8-27B-8bit` |
 | Qwen3-Next | ✅ | | Hybrid SDPA + GDN linear | 🔵 | `mlx-community/Qwen3-Next-80B-A3B-Instruct-8bit` |
 | LFM2 / LFM2.5 | ✅ | 🔵 | Hybrid SDPA + ShortConv | ✅ | `LiquidAI/LFM2.5-1.2B-Instruct` |
-| LFM3 | 🔵 | | Hybrid full/sliding SDPA + ShortConv | ✅ | `LiquidAI/LFM3-1.7B-MLX-4bit` (needs `--trust-remote-code`) |
+| LFM3 | 🔵 | | Hybrid full/sliding SDPA + ShortConv | ✅ | `LiquidAI/LFM3-1.7B-MLX-4bit` |
 | Nemotron-H (Nemotron 3.5 Lightning) | 🔵 | | Hybrid SDPA + Mamba-2 (MoE) | ❌ | `mlx-community/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-4bit` |
 | Granite 4.0-h-micro | 🔵 | | Hybrid SDPA + Mamba-2 | ❌ | `mlx-community/granite-4.0-h-micro-4bit` |
 | Gemma 4 | ✅ | | GQA + per-layer sliding window + YOCO | ✅ | `mlx-community/gemma-4-e2b-it-4bit` |
