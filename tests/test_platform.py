@@ -63,6 +63,24 @@ _TINY_NEMOTRON_H_CONFIG = {
     "vocab_size": 256,
     "max_position_embeddings": 4096,
 }
+_TINY_QWEN3_5_TEXT_CONFIG = {
+    "architectures": ["Qwen3_5ForCausalLM"],
+    "model_type": "qwen3_5_text",
+    "hidden_size": 64,
+    "intermediate_size": 128,
+    "num_hidden_layers": 4,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "head_dim": 16,
+    "vocab_size": 256,
+    "max_position_embeddings": 4096,
+    "linear_num_value_heads": 4,
+    "linear_num_key_heads": 2,
+    "linear_key_head_dim": 16,
+    "linear_value_head_dim": 16,
+    "linear_conv_kernel_dim": 4,
+    "full_attention_interval": 4,
+}
 
 
 @pytest.fixture(autouse=True)
@@ -437,6 +455,20 @@ class TestMetalPlatform:
         )
         with pytest.raises(NotImplementedError, match="MLX backend only"):
             MetalPlatform.check_and_update_config(vllm_config)
+
+    @pytest.mark.parametrize(
+        ("requested", "expected"), [(None, 16), (64, 64)], ids=["default", "explicit"]
+    )
+    def test_unset_block_size_defaults_to_16_and_an_explicit_one_stays(
+        self, requested: int | None, expected: int
+    ) -> None:
+        vllm_config = self._platform_config(
+            cache_config=CacheConfig(block_size=requested)
+        )
+
+        MetalPlatform.check_and_update_config(vllm_config)
+
+        assert vllm_config.cache_config.block_size == expected
 
     def test_check_and_update_config_accepts_mps_config_without_model(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1734,6 +1766,74 @@ class TestMetalPlatform:
             cache_config.mamba_cache_mode,
             cache_config.mamba_block_size,
         ) == (False, "none", 4096)
+
+    def test_handshake_rerun_keeps_the_block_size_the_kv_cache_was_sized_with(
+        self, tmp_path
+    ) -> None:
+        """EngineCoreProc reruns VllmConfig.__post_init__ after the KV cache is sized,
+        and the scheduler reads the block size on every step."""
+        allocated_block_size = 544  # A hybrid's mamba-aligned attention block size.
+        (tmp_path / "config.json").write_text(json.dumps(_TINY_NEMOTRON_H_CONFIG))
+        reset_config()
+        try:
+            vllm_config = EngineArgs(
+                model=str(tmp_path), max_model_len=4096
+            ).create_engine_config()
+            vllm_config.cache_config.block_size = allocated_block_size
+            vllm_config.cache_config.num_gpu_blocks = 100
+
+            vllm_config.__post_init__()
+        finally:
+            reset_config()
+
+        assert vllm_config.cache_config.block_size == allocated_block_size
+
+    def test_handshake_rerun_keeps_an_aligned_mamba_block_size(self, tmp_path) -> None:
+        """In align mode vLLM keeps mamba_block_size equal to block_size."""
+        allocated_block_size = 544  # A hybrid's mamba-aligned attention block size.
+        (tmp_path / "config.json").write_text(json.dumps(_TINY_QWEN3_5_TEXT_CONFIG))
+        reset_config()
+        try:
+            vllm_config = EngineArgs(
+                model=str(tmp_path), max_model_len=4096, enable_prefix_caching=True
+            ).create_engine_config()
+            cache_config = vllm_config.cache_config
+            cache_config.block_size = allocated_block_size
+            cache_config.mamba_block_size = allocated_block_size
+            cache_config.num_gpu_blocks = 100
+
+            vllm_config.__post_init__()
+        finally:
+            reset_config()
+
+        assert cache_config.mamba_cache_mode == "align"
+        assert (cache_config.block_size, cache_config.mamba_block_size) == (
+            allocated_block_size,
+            allocated_block_size,
+        )
+
+    def test_prefix_caching_off_keeps_a_mamba_block_size_equal_to_vllms_default(
+        self, tmp_path
+    ) -> None:
+        """With prefix caching off, vLLM fills mamba_block_size from max_model_len,
+        which can equal its own block size default without coming from it."""
+        (tmp_path / "config.json").write_text(json.dumps(_TINY_NEMOTRON_H_CONFIG))
+        reset_config()
+        try:
+            vllm_config = EngineArgs(
+                model=str(tmp_path),
+                max_model_len=CacheConfig.DEFAULT_BLOCK_SIZE,
+                enable_prefix_caching=False,
+            ).create_engine_config()
+        finally:
+            reset_config()
+
+        cache_config = vllm_config.cache_config
+        assert (
+            cache_config.block_size,
+            cache_config.mamba_cache_mode,
+            cache_config.mamba_block_size,
+        ) == (16, "none", CacheConfig.DEFAULT_BLOCK_SIZE)
 
     @pytest.mark.parametrize("model_type", ["nemotron_h", "granitemoehybrid"])
     def test_check_and_update_config_downgrades_prefix_caching_for_slot_keyed_families(

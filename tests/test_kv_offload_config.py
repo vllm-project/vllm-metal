@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from vllm.config import AuxOutputConfig
+from vllm.config import AuxOutputConfig, CacheConfig
 
 from vllm_metal.config import reset_config
 from vllm_metal.platform import MetalPlatform
@@ -26,7 +26,11 @@ _CONFIG_LOGGER = "vllm_metal.v1.kv_offload.config"
 
 def _base_config(**cache_overrides) -> SimpleNamespace:
     cache_config = SimpleNamespace(
-        block_size=None,
+        # What vLLM fills for an unset --block-size before the platform hook.
+        block_size=CacheConfig.DEFAULT_BLOCK_SIZE,
+        user_specified_block_size=False,
+        mamba_block_size=None,
+        num_gpu_blocks=None,
         enable_prefix_caching=False,
         kv_offloading_size=None,
         kv_offloading_backend="native",

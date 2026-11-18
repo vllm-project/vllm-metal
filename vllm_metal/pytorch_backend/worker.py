@@ -77,8 +77,6 @@ def configure_mps(config, *, omni=False):
         or config.watermark_config is not None
     ):
         raise NotImplementedError("MPS speculation currently supports greedy EAGLE3")
-    if config.cache_config.block_size is None:
-        config.cache_config.block_size = 16
     block_size = config.cache_config.block_size
     # The engine core resets a hybrid model's block size to its smallest
     # group's, which is max_model_len for mamba groups.

@@ -560,6 +560,25 @@ class MetalPlatform(Platform):
         parallel_config = vllm_config.parallel_config
         model_config = vllm_config.model_config
 
+        # vLLM fills an unset block size with its own default before this hook;
+        # Metal's drafters and the MPS backend read it before
+        # update_block_size_for_backend runs, so set Metal's size now. The engine
+        # reruns this hook after sizing the KV cache, and that size must stay.
+        cache_config = vllm_config.cache_config
+        if (
+            not cache_config.user_specified_block_size
+            and cache_config.num_gpu_blocks is None
+        ):
+            from vllm_metal.attention.synthetic_backend import MetalBackend
+
+            # With prefix caching on, vLLM fills an unset mamba_block_size with it too.
+            if (
+                cache_config.enable_prefix_caching
+                and cache_config.mamba_block_size == cache_config.block_size
+            ):
+                cache_config.mamba_block_size = MetalBackend.PREFERRED_BLOCK_SIZE
+            cache_config.block_size = MetalBackend.PREFERRED_BLOCK_SIZE
+
         if parallel_config.prefill_context_parallel_size > 1:
             raise NotImplementedError(
                 "Prefill context parallelism (prefill_context_parallel_size > 1) "
@@ -1404,12 +1423,11 @@ class MetalPlatform(Platform):
             )
 
         # Delegate the rest to upstream. With our ``_find_non_ssm_backends``
-        # returning ``[MetalBackend]`` (which advertises ``MultipleOf(16)``),
-        # vLLM's Phase 1 picks a kernel-aligned default of 16 for non-hybrid
-        # models (matching the kernel sweet spot), and Phase 2
-        # (``_align_hybrid_block_size``) handles hybrid alignment. The kernel
-        # layer (``pick_kernel_block_size``) validates the final
-        # ``block_size`` at request time.
+        # returning ``[MetalBackend]`` (which advertises ``MultipleOf(16)`` and
+        # prefers 16), vLLM's Phase 1 picks 16 for non-hybrid models (the kernel
+        # sweet spot), and Phase 2 (``_align_hybrid_block_size``) handles hybrid
+        # alignment. The kernel layer (``pick_kernel_block_size``) validates the
+        # final ``block_size`` at request time.
         cache_config = vllm_config.cache_config
         user_block_size = (
             cache_config.block_size if cache_config.user_specified_block_size else None
