@@ -173,6 +173,25 @@ class TestGdnPlanDecision:
         assert plan.geometry.value_head_dim == 16
         assert plan.geometry.key_head_dim == 32
 
+    def test_tensor_parallel_shapes_match_vllm_gdn_calculator(self) -> None:
+        plan = build_gdn_hybrid_plan(GDN_ARGS, 8, STATE_DTYPES).for_tensor_parallel(2)
+        expected = MambaStateShapeCalculator.gated_delta_net_state_shape(
+            tp_world_size=2,
+            num_k_heads=2,
+            num_v_heads=4,
+            head_k_dim=32,
+            head_v_dim=16,
+            conv_kernel_size=3,
+        )
+
+        spec = plan.state_cache_spec(
+            mamba_block_size=2048,
+            page_size_padded=None,
+            mamba_cache_mode="none",
+        )
+
+        assert spec.shapes == expected
+
 
 class TestGdnPlanRejection:
     @pytest.mark.parametrize(

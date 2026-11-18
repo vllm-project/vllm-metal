@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import mlx.core as mx
 import torch
@@ -175,6 +176,47 @@ def test_hybrid_mamba_spec_reserves_one_state_block_per_request() -> None:
     assert cdiv(prompt_tokens, attention_block_size) == 3
     assert spec.block_size == max_model_len
     assert cdiv(prompt_tokens, spec.block_size) == 1
+
+
+def test_tensor_parallel_spec_holds_one_rank_share() -> None:
+    """After shard(), the spec sizes this rank's KV heads and GDN state."""
+    group = SimpleNamespace(size=lambda: 2)
+    model = Mock(spec=["shard"])
+    runner = make_stub_runner(
+        model_config=SimpleNamespace(
+            runner_type="generate",
+            get_head_size=lambda: 128,
+            max_model_len=2048,
+            is_hybrid=True,
+        ),
+        model=model,
+        num_layers=2,
+        hybrid_runtime_plan=make_gdn_hybrid_plan(
+            2,
+            [1],
+            conv_kernel_dim=4,
+            conv_dim=64,
+            num_v_heads=2,
+            value_head_dim=64,
+            key_head_dim=64,
+        ),
+        num_kv_heads=2,
+        head_dim=128,
+        kv_cache_dtype=mx.float16,
+        cache_config=SimpleNamespace(
+            block_size=544,
+            mamba_page_size_padded=None,
+            mamba_block_size=2048,
+            mamba_cache_mode="none",
+        ),
+    )
+
+    runner.apply_tensor_parallel(group)
+
+    model.shard.assert_called_once_with(group)
+    specs = runner._cache_policy.get_kv_cache_spec()
+    assert specs["layers.1.self_attn"].num_kv_heads == 1
+    assert specs["layers.0.linear_attn"].shapes == ((3, 32), (1, 64, 64))
 
 
 def test_bailing_hybrid_emits_mla_and_kda_specs() -> None:

@@ -1151,6 +1151,39 @@ class TestGDNPagedAttentionWrapperLazyKernels:
         assert out.shape == (1, 2, inner.num_v_heads * inner.head_v_dim)
 
 
+class TestProjectOutput:
+    def test_sharded_out_proj_is_reduced_over_its_group(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """shard() leaves out_proj row-parallel and reduces in the module's own
+        forward, which the wrapper replaces."""
+        inner = _TinyGDNInner()
+        inner.sharding_group = object()
+        reductions: list[object] = []
+
+        def all_sum(x: mx.array, *, group: object) -> mx.array:
+            reductions.append(group)
+            return x * 2
+
+        monkeypatch.setattr(mx.distributed, "all_sum", all_sum)
+        wrapper = GDNPagedAttentionWrapper(
+            inner, layer_idx=0, cache_idx=0, state_cache=_make_state_cache()
+        )
+        state = attention_linear._GDNForwardState(
+            x=mx.zeros((1, 2, inner.conv_dim)),
+            cu_seqlens=[0, 2],
+            num_requests=1,
+            total_tokens=2,
+            slot_ids=[0],
+            num_decode_requests=0,
+        )
+
+        out = wrapper._project_output(mx.ones((2, 1, 4)), mx.zeros((1, 2, 1, 4)), state)
+
+        assert reductions == [inner.sharding_group]
+        np.testing.assert_array_equal(np.array(out), np.full((1, 2, 4), 2.0))
+
+
 class TestSplitAndNormalize:
     @pytest.mark.parametrize(
         "dtype,rtol",

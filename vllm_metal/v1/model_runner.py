@@ -469,6 +469,8 @@ class MetalModelRunner:
         # both to this stage's local slice under pipeline parallelism).
         self.num_layers: int = 0
         self.num_kv_cache_layers: int = 0
+        # Set by ModelLifecycle too; apply_tensor_parallel keeps this rank's share.
+        self.num_kv_heads: int = 0
 
         # Per-layer KV cache shapes (None = uniform across layers)
         self.kv_heads_per_layer: list[int] | None = None
@@ -494,6 +496,9 @@ class MetalModelRunner:
         # PP-aware forward wrapper for this stage, built in apply_pipeline_split
         # when pp.size > 1; stays None on the single-stage path.
         self._pp_model: PipelinedModel | None = None
+        # Tensor-parallel group (set by the worker when tensor_parallel_size > 1);
+        # load_model shards the model across it.
+        self.tp_group: mx.distributed.Group | None = None
 
         # Structured-output bitmask applier for the paged path.
         self._structured_output_applier = MetalStructuredOutputApplier(
@@ -698,12 +703,14 @@ class MetalModelRunner:
             return
         if self._diffusion is not None:
             validate_diffusion_model(self.model)
-        # Prune non-owned layers adjacent to the (lazy) load, before LoRA setup or
-        # cache profiling materialize weights. No-op on the single-stage path.
+        # Prune non-owned layers or shard weights adjacent to the (lazy) load, before
+        # LoRA setup or cache profiling materialize weights. No-op on a single rank.
         if self.pp is not None:
             self.apply_pipeline_split(self.pp)
-        # Wraps modules in place, so it runs after the split prunes
-        # non-owned layers (load -> split -> install; ordering test pins it).
+        if self.tp_group is not None:
+            self.apply_tensor_parallel(self.tp_group)
+        # Wraps modules in place, so it runs after the split or shard
+        # (load -> split/shard -> install; ordering test pins it).
         self._model_lifecycle.install_decode_dispatch()
         # Resolve the intermediate-forward capability once; unsupported
         # models keep the full-logits forward on every step.
@@ -880,6 +887,33 @@ class MetalModelRunner:
         # forward (recv -> local layers -> final norm + head on the last stage);
         # the runner owns the downstream send (see the PP branch in the forward).
         self._pp_model = PipelinedModel(self._forward_model, pp)
+
+    def apply_tensor_parallel(self, group: mx.distributed.Group) -> None:
+        """Shard the loaded model across ``group`` and localize its head counts.
+
+        Runs right after the lazy load, like ``apply_pipeline_split``. The KV
+        heads and recurrent state are divided as vLLM's ``get_num_kv_heads``
+        and ``MambaStateShapeCalculator`` divide them.
+        """
+        if (
+            not hasattr(self.model, "shard")
+            or self.is_mla
+            or self._is_pooling
+            or self._is_vlm
+        ):
+            raise NotImplementedError(
+                "Tensor parallelism on Metal requires a text generation model "
+                "whose MLX class implements shard(); MLA / pooling / VLM "
+                "(multimodal) configs are not supported under TP yet (got "
+                f"{type(self.model).__name__})."
+            )
+        self.model.shard(group)
+        tp_size = group.size()
+        self.num_kv_heads = max(1, self.num_kv_heads // tp_size)
+        if self.hybrid_runtime_plan is not None:
+            self.hybrid_runtime_plan = self.hybrid_runtime_plan.for_tensor_parallel(
+                tp_size
+            )
 
     def _submit_paged_forward_outputs(
         self,

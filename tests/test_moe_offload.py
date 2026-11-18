@@ -170,7 +170,7 @@ class TestPlatformGuards:
     @pytest.mark.parametrize(
         ("field", "value", "match"),
         [
-            ("pipeline_parallel_size", 2, "pipeline parallelism"),
+            ("world_size", 2, "pipeline or tensor parallelism"),
             ("lora_config", SimpleNamespace(), "LoRA"),
             ("speculative_config", SimpleNamespace(method="ngram"), "speculative"),
         ],
@@ -180,12 +180,12 @@ class TestPlatformGuards:
 
         vllm_config = SimpleNamespace(
             model_config=SimpleNamespace(runner_type="generate"),
-            parallel_config=SimpleNamespace(pipeline_parallel_size=1),
+            parallel_config=SimpleNamespace(world_size=1),
             lora_config=None,
             speculative_config=None,
         )
-        if field == "pipeline_parallel_size":
-            vllm_config.parallel_config.pipeline_parallel_size = value
+        if field == "world_size":
+            vllm_config.parallel_config.world_size = value
         else:
             setattr(vllm_config, field, value)
 
@@ -197,7 +197,7 @@ class TestPlatformGuards:
 
         vllm_config = SimpleNamespace(
             model_config=SimpleNamespace(runner_type="generate"),
-            parallel_config=SimpleNamespace(pipeline_parallel_size=1),
+            parallel_config=SimpleNamespace(world_size=1),
             lora_config=None,
             speculative_config=None,
         )

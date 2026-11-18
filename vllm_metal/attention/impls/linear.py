@@ -522,4 +522,9 @@ class GDNPagedAttentionWrapper(nn.Module):
         inner = self._inner
         out = y_flat.reshape(1, state.total_tokens, inner.num_v_heads, inner.head_v_dim)
         out = inner.norm(out, z)
-        return inner.out_proj(out.reshape(1, state.total_tokens, -1))
+        out = inner.out_proj(out.reshape(1, state.total_tokens, -1))
+        # mlx-lm's shard() leaves out_proj row-parallel and reduces in the
+        # module's own forward, which this wrapper replaces.
+        if (group := getattr(inner, "sharding_group", None)) is not None:
+            out = mx.distributed.all_sum(out, group=group)
+        return out
