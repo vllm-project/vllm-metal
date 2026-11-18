@@ -155,7 +155,7 @@ def test_block_drafting_rejects_kv_offloading(method, prefix_caching, source):
         kv_offloading_size=1.0 if source == "size" else None,
     )
     vllm_config.speculative_config = SimpleNamespace(
-        method=method, use_heterogeneous_vocab=False, num_speculative_tokens=3
+        method=method, custom_method=None, num_speculative_tokens=3
     )
     if source not in (None, "size"):
         vllm_config.kv_transfer_config = SimpleNamespace(

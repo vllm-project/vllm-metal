@@ -628,6 +628,21 @@ class MetalPlatform(Platform):
 
         logger.debug("Metal config: %s", config)
 
+        speculative_config = vllm_config.speculative_config
+        # vLLM moves a plugin's method name to custom_method and sets method to
+        # its base, if any (vllm#63205).
+        if (
+            backend == "mlx"
+            and speculative_config is not None
+            and speculative_config.custom_method is not None
+        ):
+            raise NotImplementedError(
+                "vllm-metal does not support custom speculative method "
+                f"{speculative_config.custom_method!r}: the MLX backend runs only "
+                "its own drafters, never a plugin's speculator. Use a built-in "
+                "method such as ngram or draft_model."
+            )
+
         if model_config is not None and model_config.enable_sleep_mode:
             cls._check_sleep_mode_config(vllm_config, backend)
         if config.moe_expert_cache_bytes:
@@ -732,7 +747,6 @@ class MetalPlatform(Platform):
                     "--additional-config '{\"turboquant\": true}'."
                 )
 
-        speculative_config = vllm_config.speculative_config
         # Upstream's scheduler pads a newly admitted decode request to the uniform
         # speculative width, then still clips it to long_prefill_token_threshold,
         # leaving num_speculative_tokens placeholder drafts against fewer scheduled

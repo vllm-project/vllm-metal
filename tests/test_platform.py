@@ -36,11 +36,15 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     SlidingWindowSpec,
 )
+from vllm.v1.worker.gpu.spec_decode import speculator_config
+from vllm.v1.worker.gpu.spec_decode.ngram.config import NgramSpeculatorConfig
+from vllm.v1.worker.gpu.spec_decode.speculator_config import SpeculatorConfig
 
 import vllm_metal.compat as compat
 import vllm_metal.config as vm_config
 import vllm_metal.platform as platform_module
 from tests.stub_runner import make_gemma4_mixed_attention_runner
+from tests.tiny_configs import TINY_QWEN3_CONFIG
 from vllm_metal.config import reset_config
 from vllm_metal.platform import MetalPlatform
 from vllm_metal.v1.cache_policy import WorkerCachePlanner
@@ -95,6 +99,18 @@ def _isolate_mb_buffer_default(monkeypatch):
         os.environ.pop("MLX_MAX_MB_PER_BUFFER", None)
     else:
         os.environ["MLX_MAX_MB_PER_BUFFER"] = saved
+
+
+class _PluginSpeculatorConfig(SpeculatorConfig):
+    """A plugin's own speculator, registered the way a vLLM general plugin does."""
+
+    speculator_class = "vllm.v1.worker.gpu.spec_decode.speculator.BaseSpeculator"
+
+
+class _PluginNgramSpeculatorConfig(NgramSpeculatorConfig):
+    """A plugin speculator that builds on vLLM's ngram setup."""
+
+    speculator_class = "vllm.v1.worker.gpu.spec_decode.speculator.BaseSpeculator"
 
 
 class TestMetalPlatform:
@@ -233,7 +249,7 @@ class TestMetalPlatform:
         config = self._platform_config(
             speculative_config=SimpleNamespace(
                 method="dspark",
-                use_heterogeneous_vocab=False,
+                custom_method=None,
                 num_speculative_tokens=7,
             ),
         )
@@ -432,7 +448,7 @@ class TestMetalPlatform:
     ) -> None:
         vllm_config = self._platform_config(
             model_config=SimpleNamespace(enable_sleep_mode=True),
-            speculative_config=SimpleNamespace(method="mtp"),
+            speculative_config=SimpleNamespace(method="mtp", custom_method=None),
         )
         with pytest.raises(NotImplementedError, match="Sleep mode.*method='mtp'"):
             MetalPlatform.check_and_update_config(vllm_config)
@@ -678,7 +694,7 @@ class TestMetalPlatform:
                 long_prefill_token_threshold=0,
             ),
             speculative_config=SimpleNamespace(
-                use_heterogeneous_vocab=False,
+                custom_method=None,
                 num_speculative_tokens=3,
                 method="ngram",
             ),
@@ -1068,7 +1084,7 @@ class TestMetalPlatform:
                 self._dp_vllm_config(
                     speculative_config=SimpleNamespace(
                         method="ngram",
-                        use_heterogeneous_vocab=False,
+                        custom_method=None,
                         num_speculative_tokens=3,
                     )
                 )
@@ -1147,6 +1163,55 @@ class TestMetalPlatform:
 
         MetalPlatform.check_and_update_config(vllm_config)
 
+    @pytest.mark.parametrize(
+        "config_cls",
+        [_PluginSpeculatorConfig, _PluginNgramSpeculatorConfig],
+        ids=["own-speculator", "on-ngram"],
+    )
+    def test_check_and_update_config_rejects_custom_speculative_methods(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path, config_cls
+    ) -> None:
+        # Registered for this test only, the way upstream's own tests do it.
+        monkeypatch.setattr(speculator_config, "_CUSTOM_CONFIGS", {})
+        speculator_config.register_speculative_method("metal_test_plugin", config_cls)
+        (tmp_path / "config.json").write_text(json.dumps(TINY_QWEN3_CONFIG))
+        engine_args = EngineArgs(
+            model=str(tmp_path),
+            max_model_len=128,
+            skip_tokenizer_init=True,
+            speculative_config={
+                "method": "metal_test_plugin",
+                "num_speculative_tokens": 3,
+            },
+        )
+
+        reset_config()
+        try:
+            with pytest.raises(
+                NotImplementedError,
+                match=re.escape(
+                    "vllm-metal does not support custom speculative method "
+                    "'metal_test_plugin': the MLX backend runs only its own "
+                    "drafters, never a plugin's speculator. Use a built-in method "
+                    "such as ngram or draft_model."
+                ),
+            ):
+                engine_args.create_engine_config()
+        finally:
+            reset_config()
+
+    def test_check_and_update_config_does_not_refuse_custom_speculative_methods_on_mps(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("vllm_metal.envs.VLLM_METAL_BACKEND", "mps")
+        vllm_config = self._platform_config(
+            speculative_config=SimpleNamespace(
+                method="eagle3", custom_method="my_plugin"
+            )
+        )
+
+        MetalPlatform.check_and_update_config(vllm_config)
+
     def test_check_and_update_config_rejects_clipped_spec_decode_padding(
         self,
     ) -> None:
@@ -1159,7 +1224,7 @@ class TestMetalPlatform:
         vllm_config = self._dp_vllm_config(
             speculative_config=SimpleNamespace(
                 method="ngram",
-                use_heterogeneous_vocab=False,
+                custom_method=None,
                 num_speculative_tokens=5,
             )
         )
@@ -1551,7 +1616,7 @@ class TestMetalPlatform:
         vllm_config = self._platform_config(
             speculative_config=SimpleNamespace(
                 method="draft_model",
-                use_heterogeneous_vocab=False,
+                custom_method=None,
                 num_speculative_tokens=3,
             ),
             scheduler_config=SimpleNamespace(async_scheduling=True),
@@ -1585,7 +1650,7 @@ class TestMetalPlatform:
                 ),
                 speculative_config=SimpleNamespace(
                     method="draft_model",
-                    use_heterogeneous_vocab=False,
+                    custom_method=None,
                     num_speculative_tokens=2,
                 ),
             )
@@ -1620,7 +1685,7 @@ class TestMetalPlatform:
                 ),
                 speculative_config=SimpleNamespace(
                     method="ngram",
-                    use_heterogeneous_vocab=False,
+                    custom_method=None,
                     num_speculative_tokens=3,
                 ),
                 model_type="nemotron_h",
@@ -1653,7 +1718,7 @@ class TestMetalPlatform:
                 ),
                 speculative_config=SimpleNamespace(
                     method="ngram",
-                    use_heterogeneous_vocab=False,
+                    custom_method=None,
                     num_speculative_tokens=3,
                 ),
             )
@@ -1686,7 +1751,7 @@ class TestMetalPlatform:
                 ),
                 speculative_config=SimpleNamespace(
                     method="ngram",
-                    use_heterogeneous_vocab=False,
+                    custom_method=None,
                     num_speculative_tokens=3,
                 ),
             )
