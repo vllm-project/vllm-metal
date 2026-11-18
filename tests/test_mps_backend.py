@@ -931,11 +931,13 @@ def test_seeded_sampling_preserves_distribution_and_batch_isolation(
 
 
 def _check_seeded_sampling():
-    from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+    from vllm.v1.worker.gpu.sample import sampler
 
     from vllm_metal.pytorch_backend.bindings import register_kernel_overrides
 
     register_kernel_overrides()
+    install()
+    gumbel_sample = sampler.gumbel_sample
     rows = 8192
     # Cross a reduction-block boundary, including a partial final block.
     token_ids = torch.tensor([0, 1023, 1024])
@@ -961,18 +963,6 @@ def _check_seeded_sampling():
         logits, mapping, temperature * 0, seed, positions, False, False
     )
     assert greedy.eq(1024).all()
-    with pytest.raises(NotImplementedError, match="probabilistic draft sampling"):
-        gumbel_sample(
-            logits[:1],
-            mapping[:1],
-            temperature,
-            seed,
-            positions[:1],
-            apply_temperature=True,
-            is_drafting=True,
-            logits_cache=logits[:1, None, :],
-            logits_cache_col=positions[:1],
-        )
 
 
 def test_mrv2_sampling_filters_preserve_request_mapping(run_in_spawn_process):

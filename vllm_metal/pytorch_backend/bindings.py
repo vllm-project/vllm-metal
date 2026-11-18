@@ -14,7 +14,6 @@ def register_kernel_overrides():
     sample_module = "vllm.v1.worker.gpu.sample"
     register_kernels(
         {
-            f"{sample_module}.gumbel._gumbel_sample_kernel": sampling.gumbel_sample,
             f"{sample_module}.gumbel._temperature_kernel": sampling.temperature,
             f"{sample_module}.min_p._min_p_kernel": sampling.min_p,
             f"{module}._gather_draft_sampled_kernel": speculative_ops.gather_draft_sampled,
@@ -91,7 +90,7 @@ def install():
     from vllm.v1.worker.gpu import buffer_utils, model_runner
     from vllm.v1.worker.gpu.sample import prompt_logprob, sampler
 
-    from vllm_metal.pytorch_backend import runtime
+    from vllm_metal.pytorch_backend import runtime, sampling
     from vllm_metal.pytorch_backend.models.qwen3_5 import install as install_qwen3_5
 
     if getattr(buffer_utils, "_metal_installed", False):
@@ -110,13 +109,13 @@ def install():
         vit_attn_wrappers.torch_sdpa_wrapper
     )
 
-    # MRV2 0.32 uses these CUDA names even with an MPS device. Use native
+    # MRV2 uses these CUDA names even with an MPS device. Use native
     # PyTorch objects; partial avoids duplicate Dynamo handler registration.
     torch.cuda.Stream = torch.Stream
     torch.cuda.Event = partial(torch.Event, device="mps")
     torch.cuda.current_stream = partial(torch.accelerator.current_stream)
     torch.cuda.set_stream = partial(torch.accelerator.set_stream)
-    # Explicit vLLM 0.32 bindings for the supported single-device path.
+    # Explicit vLLM bindings for the supported single-device path.
     buffer_utils.NonUvaBuffer = runtime.MPSStagingBuffer
     model_runner.async_tensor_h2d = runtime.copy_to_device
     buffer_utils.StagedWriteTensor.apply_write = runtime.staged_write
@@ -124,6 +123,7 @@ def install():
 
     _install_input_ops()
     _install_speculative_ops()
+    sampler.gumbel_sample = sampling.gumbel_sample
     sampler.compute_topk_scores = runtime.compute_topk_scores
     prompt_logprob.compute_topk_scores = runtime.compute_topk_scores
     # Unlike upstream's Triton kernels, this scorer materializes fp32 logprobs:
