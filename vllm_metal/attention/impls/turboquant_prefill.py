@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import cached_property
 from typing import TYPE_CHECKING
 
 import mlx.core as mx
@@ -171,8 +172,12 @@ class _AttentionBatch:
     seq_lens: mx.array
     cu_seqlens_q: mx.array
     max_seq_len: int
-    # KV-tile counts for the NAX pipeline choice (dequantized prefill only).
-    nax_work: NaxTileWork | None = None
+    cu_seqlens_cpu: list[int]
+    context_lens_cpu: list[int]
+
+    @cached_property
+    def nax_work(self) -> NaxTileWork:
+        return nax_tile_work(self.cu_seqlens_cpu, self.context_lens_cpu)
 
 
 @dataclass(frozen=True, eq=False)
@@ -334,7 +339,8 @@ def _turboquant_prefill_plan(
                 meta.seq_lens,
                 meta.cu_seqlens_q,
                 meta.max_seq_len,
-                nax_tile_work(cu_seqlens, ctx.context_lens),
+                cu_seqlens,
+                ctx.context_lens,
             )
         indices = [q for i in ids for q in range(cu_seqlens[i], cu_seqlens[i + 1])]
         query_order.extend(indices)
@@ -348,7 +354,8 @@ def _turboquant_prefill_plan(
             mx.array(kv_lens, dtype=mx.int32),
             mx.array(cu, dtype=mx.int32),
             max(kv_lens),
-            nax_tile_work(cu, kv_lens),
+            cu,
+            kv_lens,
         )
 
     tables = mx.array([row + [0] * (table_width - len(row)) for row in rows], mx.int32)
