@@ -354,6 +354,11 @@ class MetalPlatform(Platform):
                 "prompt_logprob_token_ids is not supported on Metal.",
                 parameter="prompt_logprob_token_ids",
             )
+        if params.prompt_logprob_start and envs.VLLM_METAL_BACKEND == "mlx":
+            raise VLLMValidationError(
+                "prompt_logprob_start is not supported on the MLX backend.",
+                parameter="prompt_logprob_start",
+            )
 
         unsupported_controls = [
             name

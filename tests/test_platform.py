@@ -359,6 +359,40 @@ class TestMetalPlatform:
             )
         assert exc_info.value.parameter == "prompt_logprob_token_ids"
 
+    @pytest.mark.parametrize("diffusion", [False, True])
+    def test_validate_request_rejects_prompt_logprob_start_on_mlx(
+        self, monkeypatch: pytest.MonkeyPatch, diffusion: bool
+    ) -> None:
+        monkeypatch.setenv("VLLM_METAL_BACKEND", "mlx")
+        monkeypatch.setattr(MetalPlatform, "_serves_diffusion", diffusion)
+        params = SamplingParams(
+            temperature=0, prompt_logprobs=1, prompt_logprob_start=2
+        )
+
+        with pytest.raises(
+            VLLMValidationError,
+            match=re.escape(
+                "prompt_logprob_start is not supported on the MLX backend."
+            ),
+        ) as exc_info:
+            MetalPlatform.validate_request({}, params)
+        assert exc_info.value.parameter == "prompt_logprob_start"
+
+    @pytest.mark.parametrize(
+        ("backend", "start"), [("mlx", 0), ("mps", 2)], ids=["mlx-first-row", "mps"]
+    )
+    def test_validate_request_allows_prompt_logprob_start_zero_on_mlx_and_any_on_mps(
+        self, monkeypatch: pytest.MonkeyPatch, backend: str, start: int
+    ) -> None:
+        monkeypatch.setenv("VLLM_METAL_BACKEND", backend)
+
+        MetalPlatform.validate_request(
+            {},
+            SamplingParams(
+                temperature=0, prompt_logprobs=1, prompt_logprob_start=start
+            ),
+        )
+
     @pytest.mark.parametrize(
         ("pooling_params", "parameter", "message"),
         [
