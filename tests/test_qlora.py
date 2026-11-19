@@ -122,6 +122,27 @@ def test_can_wrap_qlora_rejects_quantized_embedding() -> None:
     assert not can_wrap_qlora(embed)
 
 
+def test_can_wrap_qlora_rejects_custom_quantized_embedding() -> None:
+    """Custom quantized embeddings (Hadamard / 1-bit) expose as_linear and must not be wrapped."""
+
+    class _FakeCustomQuantEmbedding(nn.Module):
+        bits = 2
+        group_size = 128
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = mx.zeros((64, 8), dtype=mx.uint32)
+            self.scales = mx.ones((64, 1), dtype=mx.float16)
+
+        def __call__(self, x: mx.array) -> mx.array:
+            return x
+
+        def as_linear(self, x: mx.array) -> mx.array:
+            return x
+
+    assert not can_wrap_qlora(_FakeCustomQuantEmbedding())
+
+
 def test_can_wrap_qlora_requires_scales_on_duck_type() -> None:
     """Do not accept non-linear callables just because they carry AWQ attrs."""
 

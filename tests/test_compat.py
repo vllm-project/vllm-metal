@@ -1216,3 +1216,51 @@ class TestD3WeightLayoutTransform:
         weights = {"model.embed_tokens.weight": "W-embed", "lm_head.weight": "W-head"}
 
         assert compat._d3_weight_layout(None, weights) == weights
+
+
+class TestPrismHadamardQwen35ConfigPatch:
+    """Verify prism_hadamard_qwen35 AutoConfig registration and defaults."""
+
+    def test_auto_config_loads_vlm_and_text_only_and_pickles(self, tmp_path) -> None:
+        import pickle
+
+        from transformers import AutoConfig
+
+        compat._patch_transformers_prism_hadamard_qwen35_config()
+
+        vlm_dir = tmp_path / "vlm"
+        vlm_dir.mkdir()
+        (vlm_dir / "config.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "model_type": "prism_hadamard_qwen35",
+                    "text_config": {"model_type": "qwen3_5_text", "hidden_size": 512},
+                    "vision_config": {"model_type": "qwen3_5", "hidden_size": 128},
+                }
+            ),
+            encoding="utf-8",
+        )
+        vlm_cfg = AutoConfig.from_pretrained(str(vlm_dir))
+        assert vlm_cfg.model_type == "prism_hadamard_qwen35"
+        assert vlm_cfg.architectures == ["Qwen3_5ForConditionalGeneration"]
+        assert vlm_cfg.text_config.model_type == "qwen3_5_text"
+
+        restored = pickle.loads(pickle.dumps(vlm_cfg))
+        assert restored.model_type == "prism_hadamard_qwen35"
+        assert restored.architectures == ["Qwen3_5ForConditionalGeneration"]
+
+        text_dir = tmp_path / "text_only"
+        text_dir.mkdir()
+        (text_dir / "config.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "model_type": "prism_hadamard_qwen35",
+                    "text_config": {"model_type": "qwen3_5_text", "hidden_size": 512},
+                }
+            ),
+            encoding="utf-8",
+        )
+        text_cfg = AutoConfig.from_pretrained(str(text_dir))
+        assert text_cfg.architectures == ["Qwen3_5ForCausalLM"]

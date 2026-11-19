@@ -1063,7 +1063,9 @@ _QWEN3_VL_FRAME_TOKEN_IDS = {
 
 
 class TestBuildMultimodalAdapter:
-    @pytest.mark.parametrize("model_type", ["qwen3_5", "qwen3_5_moe"])
+    @pytest.mark.parametrize(
+        "model_type", ["prism_hadamard_qwen35", "qwen3_5", "qwen3_5_moe"]
+    )
     def test_builds_qwen35_adapter_from_loaded_vlm(self, model_type: str) -> None:
         vision_tower = object()
         language_model = _Qwen35LanguageModelStub()

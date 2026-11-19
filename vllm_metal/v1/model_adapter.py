@@ -418,7 +418,7 @@ _TEXT_BACKBONE_OVERRIDE_MODEL_TYPES: frozenset[str] = _GEMMA4_MODEL_TYPES | {
 }
 # mlx-vlm's qwen3_5_moe shares qwen3_5's multimodal adapter contract.
 _QWEN3_VL_MODEL_TYPES: frozenset[str] = frozenset(
-    {"qwen3_5", "qwen3_5_moe", "qwen3_vl"}
+    {"prism_hadamard_qwen35", "qwen3_5", "qwen3_5_moe", "qwen3_vl"}
 )
 _QWEN3_VL_ARCHITECTURES: frozenset[str] = frozenset(
     {
