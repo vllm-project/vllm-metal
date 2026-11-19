@@ -12,6 +12,7 @@ from vllm.v1.attention.backend import (
     AttentionType,
 )
 
+from vllm_metal.pytorch_backend.input_ops import token_rows
 from vllm_metal.pytorch_backend.mps_ops import get_mps_ops
 
 
@@ -23,6 +24,7 @@ class MPSAttentionMetadata(AttentionMetadata):
     cu_seqlens: torch.Tensor
     max_seq_len: int
     window_seqlen_q: int = 1
+    block_ranges: torch.Tensor | None = None
 
 
 class MPSAttentionBackend(AttentionBackend):
@@ -40,6 +42,10 @@ class MPSAttentionBackend(AttentionBackend):
 
     @classmethod
     def supports_sliding_window(cls):
+        return True
+
+    @classmethod
+    def supports_non_causal(cls):
         return True
 
     @staticmethod
@@ -60,8 +66,17 @@ class MPSAttentionMetadataBuilder(AttentionMetadataBuilder[MPSAttentionMetadata]
         # MRv2 supplies these flags on CPU. As on MLX, any true prefill keeps
         # the batch on the prefill route; only decode/verification uses windows.
         window_seqlen_q = 1
+        block_ranges = None
+        if not m.causal and m.max_query_len > 1:
+            offsets, rows = token_rows(m.query_start_loc, m.num_actual_tokens)
+            starts = m.seq_lens - m.query_start_loc.diff()
+            query_positions = starts[rows] + offsets - m.query_start_loc[rows]
+            block_ranges = torch.stack(
+                (query_positions, m.seq_lens[rows] - 1), dim=-1
+            ).to(torch.int32)
         if (
-            m.max_query_len > 1
+            m.causal
+            and m.max_query_len > 1
             and m.is_prefilling is not None
             and not m.is_prefilling.any()
         ):
@@ -73,6 +88,7 @@ class MPSAttentionMetadataBuilder(AttentionMetadataBuilder[MPSAttentionMetadata]
             m.query_start_loc,
             m.max_seq_len,
             window_seqlen_q,
+            block_ranges,
         )
 
 
@@ -98,7 +114,7 @@ class MPSAttentionImpl(AttentionImpl[MPSAttentionMetadata]):
             or kv_sharing_target_layer_name is not None
         ):
             raise NotImplementedError(
-                "MPS requires causal attention with a supported head size, "
+                "MPS requires decoder attention with a supported head size, "
                 "without ALiBi or cross-layer KV sharing"
             )
         self.num_heads = num_heads
@@ -109,6 +125,16 @@ class MPSAttentionImpl(AttentionImpl[MPSAttentionMetadata]):
         self.logits_soft_cap = logits_soft_cap or 0.0
         self.kv_cache_dtype = kv_cache_dtype
         self.ops = get_mps_ops()
+
+    def do_kv_cache_update(self, layer, key, value, kv_cache, slot_mapping):
+        kv_cache = kv_cache.transpose(1, 2)
+        self.ops.reshape_and_cache(
+            key,
+            value,
+            kv_cache[..., : self.head_size],
+            kv_cache[..., self.head_size :],
+            slot_mapping,
+        )
 
     def forward(
         self,
@@ -129,6 +155,16 @@ class MPSAttentionImpl(AttentionImpl[MPSAttentionMetadata]):
             return output.zero_()
         # Upstream's LBNHC cache is [block, head, token, K+V].
         kv_cache = kv_cache.transpose(1, 2)
+        ranges = m.block_ranges
+        if ranges is not None and self.sliding_window >= 0:
+            # Upstream noncausal SWA uses a symmetric per-query window.
+            ranges = torch.stack(
+                (
+                    ranges[:, 0],
+                    torch.minimum(ranges[:, 1], ranges[:, 0] + self.sliding_window - 1),
+                ),
+                dim=-1,
+            )
         self.ops.forward(
             query.contiguous(),
             key,
@@ -145,5 +181,6 @@ class MPSAttentionImpl(AttentionImpl[MPSAttentionMetadata]):
             self.sliding_window,
             self.logits_soft_cap,
             m.window_seqlen_q,
+            ranges,
         )
         return output

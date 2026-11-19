@@ -36,6 +36,20 @@ Output logprobs are supported. Parallel drafting, probabilistic sampling, and
 hybrid recurrent targets are not supported. Measure draft length on your workload;
 more draft tokens do not always improve throughput.
 
+## DFlash speculative decoding
+
+Use a matching DFlash draft with the same dense FP16/BF16 target restrictions:
+
+```bash
+VLLM_METAL_BACKEND=mps PYTORCH_ENABLE_MPS_FALLBACK=0 \
+  vllm serve Qwen/Qwen3-8B --dtype bfloat16 \
+  --speculative-config '{"method":"dflash","model":"z-lab/Qwen3-8B-DFlash-b16","num_speculative_tokens":7}'
+```
+
+Use greedy requests (`temperature=0`). Asynchronous scheduling and output-token
+logprobs are supported. DFlash2, adaptive verification, probabilistic sampling,
+and hybrid recurrent targets are not supported.
+
 ## Models
 
 - Use `model_impl="auto"` and vLLM's resolver. Keep model definitions and weight
