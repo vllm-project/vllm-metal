@@ -14,6 +14,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 from transformers import WhisperFeatureExtractor
+from vllm.sampling_params import SamplingParams
 
 from vllm_metal.stt.audio import load_audio
 from vllm_metal.stt.detection import is_stt_model
@@ -496,6 +497,66 @@ class TestGreedyDecodeStopping:
 
         assert tokens == prefix
         assert model.decode_step.call_count == len(prefix)
+
+    def test_forced_language_prompt_starts_transcript_budget(self) -> None:
+        """An <asr_text> already in the prompt must start the transcript count.
+
+        Upstream Qwen3-ASR appends ``language {lang}<asr_text>`` to the prompt
+        when a language is forced, so the tag is never generated in the decode
+        loop. The transcript budget must still apply from the first generated
+        token, otherwise the loop decodes past the request's max_tokens.
+        """
+        model = MagicMock()
+        model.config.eos_token_id = 2
+        logits = [mx.eye(10)[None, token : token + 1] for token in [7, 9, 2]]
+        model.prefill.return_value = (logits[0], None)
+        model.decode_step.side_effect = [(row, None) for row in logits[1:]]
+        transcriber = Qwen3ASRTranscriber(
+            model,
+            tokenizer=SimpleNamespace(
+                eos_token_id=3, encode=lambda *_args, **_kwargs: [8]
+            ),
+        )
+        sampling = STTSampling.from_request(
+            SamplingParams(temperature=0, max_tokens=1), Sampler()
+        )
+
+        # Token 8 is <asr_text>; it is already in the forced-language prompt.
+        tokens = transcriber.decode_tokens(mx.zeros((1, 4)), [1, 8], sampling)
+
+        assert tokens == [7]
+        assert model.decode_step.call_count == 0
+
+    def test_earlier_asr_text_tag_does_not_start_transcript_budget(self) -> None:
+        """Only a trailing <asr_text> starts the budget, not one in context.
+
+        Automatic-language prompts may contain the tag earlier without ending
+        in it; those requests still generate a language prefix before the tag,
+        and that prefix must stay outside the transcript budget.
+        """
+        model = MagicMock()
+        model.config.eos_token_id = 2
+        # Generated sequence: language prefix (5), <asr_text> (8), transcript
+        # (7, 9), EOS (2). Budget is 1, so counting must begin at the generated
+        # tag rather than at the first token.
+        logits = [mx.eye(10)[None, token : token + 1] for token in [5, 8, 7, 9, 2]]
+        model.prefill.return_value = (logits[0], None)
+        model.decode_step.side_effect = [(row, None) for row in logits[1:]]
+        transcriber = Qwen3ASRTranscriber(
+            model,
+            tokenizer=SimpleNamespace(
+                eos_token_id=3, encode=lambda *_args, **_kwargs: [8]
+            ),
+        )
+        sampling = STTSampling.from_request(
+            SamplingParams(temperature=0, max_tokens=1), Sampler()
+        )
+
+        # Tag 8 is present but not the last prompt token.
+        tokens = transcriber.decode_tokens(mx.zeros((1, 4)), [1, 8, 9], sampling)
+
+        assert tokens == [5, 8, 7]
+        assert model.decode_step.call_count == 2
 
 
 class TestPostProcessOutput:
