@@ -322,14 +322,15 @@ int main(int argc, char** argv) {
   }
   NaxGeometry g{};
   NaxSequence s{};
-  int cores, capacity;
+  int cores, capacity, value_dim, token_stride;
   bool split;
   std::cout << std::setprecision(17);
   while (std::cin >> g.heads >> g.kv_heads >> g.qk_dim >> g.kernel_page >> g.physical_page
                   >> g.key_head_stride >> s.query_tokens >> s.kv_tokens >> cores
-                  >> split >> capacity) {
-    g.value_dim = g.qk_dim;
-    g.key_token_stride = g.kv_heads * g.key_head_stride;
+                  >> split >> capacity >> value_dim >> token_stride) {
+    g.value_dim = value_dim ? value_dim : g.qk_dim;
+    g.key_token_stride = token_stride
+        ? token_stride : int64_t(g.kv_heads) * g.key_head_stride;
     const auto choice = select_nax_config(g, s, split, cores);
     const auto cfg = nax_config_for_pipeline(choice, capacity);
     std::cout << cfg.BQ << ' ' << cfg.HEADS_PER_TG << ' ' << cfg.NUM_THREADS;
@@ -421,6 +422,9 @@ def _nax_plan_config(
     cores=40,
     split=0,
     capacity=256,
+    value_dim=0,
+    token_stride=0,
+    kv_tokens=None,
 ):
     fields = (
         heads,
@@ -430,10 +434,12 @@ def _nax_plan_config(
         physical,
         stride,
         q,
-        prefix + q,
+        prefix + q if kv_tokens is None else kv_tokens,
         cores,
         split,
         capacity,
+        value_dim,
+        token_stride,
     )
     result = subprocess.run(
         [str(binary)],
@@ -478,6 +484,14 @@ def _nax_plan_config(
         ({"stride": 384}, (64, 1, 128)),
         ({"physical": 33}, (64, 1, 128)),
         ({"dim": 512}, (64, 1, 128)),
+        # Pin the ten-percent admission margin just below, just above and at
+        # equality: grouped costs of 89.71%, 90.49% and exactly 90% of ordinary NAX.
+        ({"split": 1, "q": 289, "prefix": 2495, "stride": 256}, (16, 2, 64)),
+        ({"split": 1, "q": 289, "prefix": 2496, "stride": 256}, (64, 1, 128)),
+        ({"split": 1, "q": 257, "prefix": 1601, "stride": 256}, (64, 1, 128)),
+        ({"value_dim": 512}, (64, 1, 128)),
+        ({"token_stride": 1023}, (64, 1, 128)),
+        ({"kv_tokens": 15}, (64, 1, 128)),
         ({"page": 8}, (64, 1, 128)),
         ({"heads": 17}, (64, 1, 128)),
         ({"kv": 0}, (64, 1, 128)),
@@ -522,7 +536,7 @@ def test_one_cost_comparison_selects_the_width_for_both_cache_layouts(
     ]
     output = subprocess.check_output(
         [str(nax_policy_binary), "rank"],
-        input="\n".join(" ".join(map(str, row)) for _, row in cases),
+        input="\n".join(" ".join(map(str, row + (0, 0))) for _, row in cases),
         text=True,
     )
     for (ratio, case), line in zip(cases, output.splitlines(), strict=True):
