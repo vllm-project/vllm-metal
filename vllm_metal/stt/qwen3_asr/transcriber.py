@@ -71,7 +71,13 @@ class Qwen3ASRTranscriber:
         mx.eval(logits)
 
         output_tokens: list[int] = []
-        transcript_len: int | None = None
+        # A forced-language prompt ends with <asr_text> (upstream
+        # get_generation_prompt appends it), so the transcript starts at the
+        # first generated token rather than whenever the tag is generated.
+        # A tag earlier in the prompt context must not start the count.
+        transcript_len: int | None = (
+            0 if prompt_token_ids[-1] == asr_text_token else None
+        )
         for step in range(max_tokens):
             if step:
                 token_input = mx.array([[output_tokens[-1]]], dtype=mx.int32)
