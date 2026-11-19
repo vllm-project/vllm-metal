@@ -122,7 +122,7 @@ class TestNgramProposePropose:
         state = _request_state([1, 2, 3, 1, 2, 3, 1, 2])
         ctx = _context(decode_reqs=[("r0", state)])
 
-        drafts = proposer.propose(ctx)
+        drafts = proposer.propose(ctx)[0]
 
         assert drafts is not None
         assert drafts.req_ids == ["r0"]
@@ -136,7 +136,7 @@ class TestNgramProposePropose:
             num_speculative_tokens=1,
         )
 
-        drafts = proposer.propose(ctx)
+        drafts = proposer.propose(ctx)[0]
 
         assert drafts is not None
         assert drafts.req_ids == ["r0"]
@@ -150,7 +150,7 @@ class TestNgramProposePropose:
             num_speculative_tokens=0,
         )
 
-        assert proposer.propose(ctx) is None
+        assert proposer.propose(ctx)[0] is None
 
     def test_no_match_returns_none(self) -> None:
         # Non-repeating context shorter than the n-gram window: no draft.
@@ -158,7 +158,7 @@ class TestNgramProposePropose:
         state = _request_state([7, 8, 9])
         ctx = _context(decode_reqs=[("r0", state)])
 
-        assert proposer.propose(ctx) is None
+        assert proposer.propose(ctx)[0] is None
 
     @pytest.mark.parametrize("positional_cap,max_tokens", [(1, None), (1, 5), (3, 3)])
     def test_draft_caps_take_the_tighter_bound(
@@ -171,7 +171,7 @@ class TestNgramProposePropose:
         state.sampling_params.max_tokens = max_tokens
         ctx = _context(decode_reqs=[("r0", state)], draft_caps={"r0": positional_cap})
 
-        drafts = proposer.propose(ctx)
+        drafts = proposer.propose(ctx)[0]
 
         assert drafts is not None
         assert drafts.req_ids == ["r0"]
@@ -186,14 +186,14 @@ class TestNgramProposePropose:
         capped = _context(decode_reqs=[("r0", state)], draft_caps={"r0": 0})
 
         for _ in range(2 * ngram_mod._MAX_CONSECUTIVE_MISSES):
-            assert proposer.propose(capped) is None
+            assert proposer.propose(capped)[0] is None
 
         assert "r0" not in proposer._cooldown
         assert proposer._miss_streak.get("r0", 0) == 0
         assert "r0" not in proposer._pending
 
         uncapped = _context(decode_reqs=[("r0", state)])
-        drafts = proposer.propose(uncapped)
+        drafts = proposer.propose(uncapped)[0]
         assert drafts is not None
         assert drafts.draft_token_ids == [[3, 1, 2]]
 
@@ -209,7 +209,7 @@ class TestNgramProposePropose:
         state.sampling_params = SamplingParams(temperature=0.0, max_tokens=4)
         state.generated_tokens = generated_tokens
 
-        drafts = proposer.propose(_context(decode_reqs=[("r0", state)]))
+        drafts = proposer.propose(_context(decode_reqs=[("r0", state)]))[0]
         if expected_draft:
             assert drafts is not None
             assert drafts.req_ids == ["r0"]
@@ -220,7 +220,7 @@ class TestNgramProposePropose:
         assert proposer._miss_streak.get("r0", 0) == 0
 
     def test_empty_context_returns_none(self) -> None:
-        assert _proposer().propose(_context()) is None
+        assert _proposer().propose(_context())[0] is None
 
     def test_skips_request_without_sampled_tokens(self) -> None:
         proposer = _proposer(prompt_lookup_min=2)
@@ -228,7 +228,7 @@ class TestNgramProposePropose:
         # An empty sampled-ids entry marks a row that did not decode this step.
         ctx = _context(decode_reqs=[("r0", state)], decode_token_ids=[[]])
 
-        assert proposer.propose(ctx) is None
+        assert proposer.propose(ctx)[0] is None
 
     @pytest.mark.parametrize("temperature,max_tokens", [(0.8, 16), (0.0, 1)])
     def test_skips_ineligible_request(self, temperature, max_tokens) -> None:
@@ -237,7 +237,7 @@ class TestNgramProposePropose:
         state.sampling_params.max_tokens = max_tokens
         ctx = _context(decode_reqs=[("r0", state)])
 
-        assert proposer.propose(ctx) is None
+        assert proposer.propose(ctx)[0] is None
 
     @pytest.mark.parametrize("max_tokens,expected_draft", [(16, [6, 4, 5]), (2, [])])
     def test_finalized_prefill_respects_output_budget(
@@ -255,7 +255,7 @@ class TestNgramProposePropose:
             request_states={"p0": state},
         )
 
-        drafts = proposer.propose(ctx)
+        drafts = proposer.propose(ctx)[0]
 
         if expected_draft:
             assert drafts is not None
@@ -274,7 +274,7 @@ class TestNgramProposePropose:
             request_states={"p0": state},
         )
 
-        assert proposer.propose(ctx) is None
+        assert proposer.propose(ctx)[0] is None
 
     def test_mixed_batch_drops_unmatched_keeps_matched(self) -> None:
         proposer = _proposer(prompt_lookup_min=2, prompt_lookup_max=3)
@@ -282,7 +282,7 @@ class TestNgramProposePropose:
         unmatched = _request_state([7, 8, 9])
         ctx = _context(decode_reqs=[("r0", matched), ("r1", unmatched)])
 
-        drafts = proposer.propose(ctx)
+        drafts = proposer.propose(ctx)[0]
 
         # Only the matched request appears; the kernel returned [] for r1.
         assert drafts is not None
@@ -299,7 +299,7 @@ class TestNgramProposePropose:
         # Drop the middle row; distinct histories expose any shifted IDs.
         ctx = _context(decode_reqs=[("r0", short), ("r1", last), ("r2", full)])
 
-        drafts = proposer.propose(ctx)
+        drafts = proposer.propose(ctx)[0]
 
         assert drafts is not None
         assert drafts.req_ids == ["r0", "r2"]
@@ -317,7 +317,7 @@ class TestNgramProposePropose:
             request_states={"r0": state},
         )
 
-        drafts = proposer.propose(ctx)
+        drafts = proposer.propose(ctx)[0]
 
         assert drafts is not None
         assert drafts.req_ids == ["r0"]
@@ -340,12 +340,12 @@ class TestNgramMissThrottle:
             proposer._ngram, "propose", return_value=[[]]
         ) as mock_propose:
             for _ in range(ngram_mod._MAX_CONSECUTIVE_MISSES):
-                assert proposer.propose(ctx) is None
+                assert proposer.propose(ctx)[0] is None
             calls_before_throttle = mock_propose.call_count
 
             # One more miss would be the (N+1)th in a row: by now the request
             # should be on cooldown and skipped before ever reaching the kernel.
-            assert proposer.propose(ctx) is None
+            assert proposer.propose(ctx)[0] is None
             assert mock_propose.call_count == calls_before_throttle
 
     def test_capped_streak_returns_to_cooldown_after_one_more_miss(self) -> None:
@@ -397,7 +397,7 @@ class TestNgramMissThrottle:
 
             # The kernel finds something...
             mock_propose.return_value = [[99]]
-            drafts = proposer.propose(ctx)
+            drafts = proposer.propose(ctx)[0]
             assert drafts is not None
             # ...and the engine genuinely accepts it (appends exactly what
             # was proposed to committed history).
@@ -444,7 +444,7 @@ class TestNgramMissThrottle:
 
         with patch.object(proposer._ngram, "propose", return_value=[[]]):
             for _ in range(2 * ngram_mod._MAX_CONSECUTIVE_MISSES):
-                assert proposer.propose(ctx) is None
+                assert proposer.propose(ctx)[0] is None
 
         assert "r0" not in proposer._cooldown
         assert proposer._miss_streak.get("r0", 0) == 0
@@ -492,7 +492,7 @@ class TestNgramMissThrottle:
         with patch.object(
             proposer._ngram, "propose", return_value=[[1]]
         ) as mock_propose:
-            drafts = proposer.propose(ctx)
+            drafts = proposer.propose(ctx)[0]
         assert drafts is not None
         mock_propose.assert_called_once()
 
@@ -522,7 +522,7 @@ class TestNgramMissThrottle:
         with patch.object(
             proposer._ngram, "propose", return_value=[[42]]
         ) as mock_propose:
-            drafts = proposer.propose(new_ctx)
+            drafts = proposer.propose(new_ctx)[0]
 
         # The new request must be evaluated fresh, not skipped as if it
         # were still the old, throttled one.
@@ -555,7 +555,7 @@ class TestNgramMissThrottle:
             finished_req_ids={"r0"},
             num_speculative_tokens=0,
         )
-        assert proposer.propose(disabled_ctx) is None  # K=0, nothing drafted
+        assert proposer.propose(disabled_ctx)[0] is None  # K=0, nothing drafted
         assert "r0" not in proposer._cooldown  # cleanup must still happen
         assert "r0" not in proposer._miss_streak
 
@@ -564,7 +564,7 @@ class TestNgramMissThrottle:
         with patch.object(
             proposer._ngram, "propose", return_value=[[42]]
         ) as mock_propose:
-            drafts = proposer.propose(enabled_ctx)
+            drafts = proposer.propose(enabled_ctx)[0]
         assert drafts is not None
         mock_propose.assert_called_once()
 
@@ -578,7 +578,7 @@ class TestNgramMissThrottle:
         ctx = _context(decode_reqs=[("r0", state)])
 
         with patch.object(proposer._ngram, "propose", return_value=[[99]]):
-            drafts = proposer.propose(ctx)
+            drafts = proposer.propose(ctx)[0]
         assert drafts is not None
         assert "r0" in proposer._pending
 
@@ -608,7 +608,7 @@ class TestNgramMissThrottle:
         )
 
         with patch.object(proposer._ngram, "propose", side_effect=[[[99]], [[]]]):
-            drafts = proposer.propose(ctx)
+            drafts = proposer.propose(ctx)[0]
             assert drafts is not None
             assert proposer._pending["r0"] == (3, (99,))
 

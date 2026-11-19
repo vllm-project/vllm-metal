@@ -197,9 +197,7 @@ class TestSpecDecodePolicy:
         self, generated, max_tokens, eligible
     ) -> None:
         state = _request_state(generated_tokens=generated, max_tokens=max_tokens)
-        assert (
-            SpeculativeDecodeController().can_draft_greedy("r0", state, [1]) is eligible
-        )
+        assert SpeculativeDecodeController().can_draft("r0", state, [1]) is eligible
 
     @pytest.mark.parametrize(
         "params",
@@ -213,15 +211,15 @@ class TestSpecDecodePolicy:
         self, params: SamplingParams
     ) -> None:
         state = SimpleNamespace(sampling_params=params, generated_tokens=1)
-        assert not SpeculativeDecodeController().can_draft_greedy("r0", state, [1])
+        assert not SpeculativeDecodeController().can_draft("r0", state, [1])
 
     def test_min_tokens_request_is_drafted_once_reached(self) -> None:
         params = SamplingParams(temperature=0.0, min_tokens=2)
         controller = SpeculativeDecodeController()
         pending = SimpleNamespace(sampling_params=params, generated_tokens=1)
         reached = SimpleNamespace(sampling_params=params, generated_tokens=2)
-        assert not controller.can_draft_greedy("r0", pending, [1])
-        assert controller.can_draft_greedy("r0", reached, [1])
+        assert not controller.can_draft("r0", pending, [1])
+        assert controller.can_draft("r0", reached, [1])
 
     @pytest.mark.parametrize(
         "sampled,ignore_eos,stop_tokens,eligible",
@@ -250,10 +248,7 @@ class TestSpecDecodePolicy:
             temperature=0, ignore_eos=ignore_eos, stop_token_ids=stop_tokens
         )
         state.sampling_params.update_from_generation_config({}, eos_token_id=2)
-        assert (
-            SpeculativeDecodeController().can_draft_greedy("r0", state, sampled)
-            is eligible
-        )
+        assert SpeculativeDecodeController().can_draft("r0", state, sampled) is eligible
 
     @pytest.mark.parametrize(
         "token_id,eligible", [(2, False), (8, True)], ids=["eos", "live"]
@@ -501,7 +496,7 @@ class TestVerifyGreedySpecDecode:
             generated_tokens=1,
         )
 
-        assert not SpeculativeDecodeController().can_draft_greedy("r0", state, [1])
+        assert not SpeculativeDecodeController().can_draft("r0", state, [1])
 
     def test_accepts_all_drafts_and_emits_bonus_token(self) -> None:
         segment = PagedDecodeSegment(

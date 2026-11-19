@@ -155,7 +155,7 @@ class NgramProposer(NoOwnKVProposer):
         # they are dropped when its id finishes.
         del req_ids
 
-    def propose(self, ctx: ProposeContext) -> DraftTokenIds | None:
+    def propose(self, ctx: ProposeContext) -> tuple[DraftTokenIds | None, None]:
         # Bookkeeping runs unconditionally, before the num_speculative_tokens
         # check: a step with drafting disabled still needs finished ids
         # pruned and pending drafts resolved, or a request id reused in a
@@ -165,7 +165,7 @@ class NgramProposer(NoOwnKVProposer):
         self._resolve_pending(ctx)
 
         if ctx.num_speculative_tokens <= 0:
-            return None
+            return None, None
 
         drafting = list(
             self._controller.draft_eligible_requests(
@@ -178,7 +178,7 @@ class NgramProposer(NoOwnKVProposer):
             )
         )
         if not drafting:
-            return None
+            return None, None
 
         drafting = [
             (req_id, state)
@@ -186,7 +186,7 @@ class NgramProposer(NoOwnKVProposer):
             if not self._on_cooldown(req_id)
         ]
         if not drafting:
-            return None
+            return None, None
 
         # Upstream marks a row "active" by a non-empty sampled-ids entry; the
         # match itself reads only token_ids_cpu[i, :num_tokens_no_spec[i]]. We
@@ -240,9 +240,9 @@ class NgramProposer(NoOwnKVProposer):
             draft_token_ids.append(list(draft))
 
         if not req_ids:
-            return None
+            return None, None
 
-        return DraftTokenIds(req_ids=req_ids, draft_token_ids=draft_token_ids)
+        return DraftTokenIds(req_ids=req_ids, draft_token_ids=draft_token_ids), None
 
     # -- miss-streak throttling ----------------------------------------------
 

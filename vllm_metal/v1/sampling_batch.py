@@ -379,6 +379,58 @@ class SamplingBatch:
         return sorted_desc, sorted_idx
 
     @classmethod
+    def processed_probabilities(
+        cls,
+        logits_2d: mx.array,
+        sampling_params_list: Sequence[SamplingParams],
+    ) -> mx.array:
+        """Return temperature- and filter-adjusted probabilities in vocab order."""
+        if logits_2d.ndim != 2 or logits_2d.shape[0] != len(sampling_params_list):
+            raise ValueError("Expected one logits row per sampling parameter set")
+
+        greedy_rows = [
+            sp.temperature < GREEDY_TEMPERATURE_EPS for sp in sampling_params_list
+        ]
+        if any(greedy_rows):
+            greedy_ids = mx.argmax(logits_2d, axis=-1)
+            greedy_probs = (
+                mx.arange(logits_2d.shape[1])[None, :] == greedy_ids[:, None]
+            ).astype(mx.float32)
+            if all(greedy_rows):
+                return greedy_probs
+
+        temperatures = mx.array(
+            [
+                1.0 if greedy else sp.temperature
+                for sp, greedy in zip(sampling_params_list, greedy_rows, strict=True)
+            ],
+            dtype=mx.float32,
+        )
+        scaled_logits = logits_2d.astype(mx.float32) / temperatures[:, None]
+        sorted_logits, sorted_ids = cls._sorted_candidate_logits(
+            scaled_logits,
+            [
+                0 if greedy else sp.top_k
+                for sp, greedy in zip(sampling_params_list, greedy_rows, strict=True)
+            ],
+            [
+                1.0 if greedy else sp.top_p
+                for sp, greedy in zip(sampling_params_list, greedy_rows, strict=True)
+            ],
+            [
+                0.0 if greedy else sp.min_p
+                for sp, greedy in zip(sampling_params_list, greedy_rows, strict=True)
+            ],
+        )
+        sorted_probs = mx.softmax(sorted_logits, axis=-1)
+        probs = mx.put_along_axis(
+            mx.zeros_like(sorted_probs), sorted_ids, sorted_probs, axis=-1
+        )
+        if any(greedy_rows):
+            probs = mx.where(mx.array(greedy_rows)[:, None], greedy_probs, probs)
+        return probs
+
+    @classmethod
     def _native_random_tokens(
         cls,
         logits_2d: mx.array,

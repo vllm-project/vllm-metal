@@ -182,7 +182,7 @@ class BlockDraftProposer(ABC):
         self, anchors: mx.array, features: Sequence[mx.array]
     ) -> None: ...
 
-    def propose(self, ctx: ProposeContext) -> DraftTokenIds | None:
+    def propose(self, ctx: ProposeContext) -> tuple[DraftTokenIds | None, None]:
         cache = self.cache
         if cache is None:
             raise RuntimeError(f"{self.name} must bind scheduler KV before proposing")
@@ -290,7 +290,7 @@ class BlockDraftProposer(ABC):
                 limits.append(limit)
         if not rows:
             mx.eval(*cache.storage.buffers)
-            return None
+            return None, None
         # Keep one rectangular draft batch, bounded by its largest remaining
         # budget. Shorter requests return only the prefix they can verify.
         width = max(limits)
@@ -298,9 +298,13 @@ class BlockDraftProposer(ABC):
             self._drafts[width] = self._compile_draft(width)
         tokens = self._drafts[width](mx.array(anchors, dtype=mx.int32), rows)
         mx.eval(tokens, *cache.storage.buffers)
-        return DraftTokenIds(
-            req_ids=req_ids,
-            draft_token_ids=[
-                ids[:limit] for ids, limit in zip(tokens.tolist(), limits, strict=True)
-            ],
+        return (
+            DraftTokenIds(
+                req_ids=req_ids,
+                draft_token_ids=[
+                    ids[:limit]
+                    for ids, limit in zip(tokens.tolist(), limits, strict=True)
+                ],
+            ),
+            None,
         )

@@ -46,17 +46,14 @@ def test_smaller_final_target_limit_logs_once_and_bounds_ingest(prefill, info):
     # Input length 29 + K=3 fits exactly; the next sampled token crosses
     # the final target limit even though the draft checkpoint permits it.
     drafts = proposer.propose(ctx)
-    assert drafts is not None and len(drafts.draft_token_ids[0]) == 3
+    assert drafts[0] is not None and len(drafts[0].draft_token_ids[0]) == 3
     info.assert_not_called()
     assert proposer.get_stats()["num_context_limit_fallback_requests"] == 0
     for token in (9, 10, 11):
         state.token_ids.append(token)
-        assert (
-            proposer.propose(
-                _context("r", state, {"r": state}, num_speculative_tokens=3)
-            )
-            is None
-        )
+        assert proposer.propose(
+            _context("r", state, {"r": state}, num_speculative_tokens=3)
+        ) == (None, None)
     info.assert_called_once()
     assert proposer.get_stats()["num_context_limit_fallback_requests"] == 1
     message = info.call_args.args[0] % info.call_args.args[1:]
@@ -78,23 +75,23 @@ def test_dynamic_width_can_resume_after_temporary_context_skip(deferred, info):
     )
     state = _request_state(scheduler_block_ids=[0, 1, 2], token_ids=list(range(31)))
     ctx = _context("r", state, {"r": state}, num_speculative_tokens=3)
-    assert proposer.propose(ctx) is None
+    assert proposer.propose(ctx) == (None, None)
     info.assert_not_called()
     assert proposer.get_stats()["num_context_limit_fallback_requests"] == 0
 
     state.token_ids.append(9)
     drafts = proposer.propose(replace(ctx, num_speculative_tokens=1))
-    assert drafts is not None and len(drafts.draft_token_ids[0]) == 1
+    assert drafts[0] is not None and len(drafts[0].draft_token_ids[0]) == 1
     info.assert_not_called()
     assert proposer.get_stats()["num_context_limit_fallback_requests"] == 0
 
     state.token_ids.append(10)
-    assert proposer.propose(replace(ctx, num_speculative_tokens=0)) is None
+    assert proposer.propose(replace(ctx, num_speculative_tokens=0)) == (None, None)
     info.assert_not_called()
     assert proposer.get_stats()["num_context_limit_fallback_requests"] == 0
     # Now even K=1 cannot fit. Report it when drafting is requested again.
-    assert proposer.propose(replace(ctx, num_speculative_tokens=1)) is None
-    assert proposer.propose(replace(ctx, num_speculative_tokens=3)) is None
+    assert proposer.propose(replace(ctx, num_speculative_tokens=1)) == (None, None)
+    assert proposer.propose(replace(ctx, num_speculative_tokens=3)) == (None, None)
     info.assert_called_once()
     assert proposer.get_stats()["num_context_limit_fallback_requests"] == 1
 
@@ -112,12 +109,12 @@ def test_initial_prefill_fallback_is_per_request_and_keeps_other_rows_drafting(i
         num_speculative_tokens=3,
     )
     drafts = proposer.propose(ctx)
-    assert drafts is not None and drafts.req_ids == ["fits"]
+    assert drafts[0] is not None and drafts[0].req_ids == ["fits"]
     assert model.input_lens == [9 + 31 + 32, 1, 1]
     assert {call.args[1] for call in info.call_args_list} == {"capped", "beyond"}
     assert info.call_count == 2
     assert proposer.get_stats()["num_context_limit_fallback_requests"] == 2
-    assert proposer.propose(ctx) is None
+    assert proposer.propose(ctx) == (None, None)
     assert info.call_count == 2
     assert proposer.get_stats()["num_context_limit_fallback_requests"] == 2
 
@@ -137,7 +134,7 @@ def test_other_eligibility_gates_do_not_log_context_fallback(mode, info):
             result_mode="intermediate",
             num_speculative_tokens=3,
         )
-    assert proposer.propose(ctx) is None
+    assert proposer.propose(ctx) == (None, None)
     info.assert_not_called()
     assert proposer.get_stats()["num_context_limit_fallback_requests"] == 0
 
@@ -147,10 +144,10 @@ def test_log_survives_recompute_but_not_request_id_reuse(finish, info):
     proposer = _proposer(StubDraftModel(), max_model_len=32, min_speculative_tokens=3)
     state = _request_state(scheduler_block_ids=[0, 1], token_ids=list(range(31)))
     ctx = _context("r", state, {"r": state}, num_speculative_tokens=3)
-    assert proposer.propose(ctx) is None
+    assert proposer.propose(ctx) == (None, None)
     # Preemption/resume invalidates KV, but must not repeat the diagnostic.
     proposer.release_requests({"r"})
-    assert proposer.propose(ctx) is None
+    assert proposer.propose(ctx) == (None, None)
     info.assert_called_once()
     assert proposer.get_stats()["num_context_limit_fallback_requests"] == 1
 
@@ -158,19 +155,16 @@ def test_log_survives_recompute_but_not_request_id_reuse(finish, info):
     if finish == "explicit":
         ctx = replace(ctx, finished_req_ids={"r"})
     else:
-        assert (
-            proposer.propose(
-                replace(
-                    ctx,
-                    request_states={},
-                    decode_reqs=[],
-                    decode_token_ids=[],
-                    num_speculative_tokens=0,
-                )
+        assert proposer.propose(
+            replace(
+                ctx,
+                request_states={},
+                decode_reqs=[],
+                decode_token_ids=[],
+                num_speculative_tokens=0,
             )
-            is None
-        )
-    assert proposer.propose(ctx) is None
+        ) == (None, None)
+    assert proposer.propose(ctx) == (None, None)
     assert info.call_count == 2
     assert proposer.get_stats()["num_context_limit_fallback_requests"] == 2
 
@@ -179,10 +173,9 @@ def test_log_survives_recompute_but_not_request_id_reuse(finish, info):
 def test_request_id_reuse_after_cleanup_without_a_proposal(keep_old_state, info):
     proposer = _proposer(StubDraftModel(), max_model_len=32, min_speculative_tokens=3)
     old = _request_state(scheduler_block_ids=[0, 1], token_ids=list(range(31)))
-    assert (
-        proposer.propose(_context("r", old, {"r": old}, num_speculative_tokens=3))
-        is None
-    )
+    assert proposer.propose(
+        _context("r", old, {"r": old}, num_speculative_tokens=3)
+    ) == (None, None)
     runner = make_stub_runner(_drafter=proposer, _request_states={"r": old})
     # A zero-token cleanup step releases the old request without calling
     # propose(), so its finished ID will not reach the next ProposeContext.
@@ -192,10 +185,9 @@ def test_request_id_reuse_after_cleanup_without_a_proposal(keep_old_state, info)
         del old
         assert old_ref() is None  # Diagnostics must not retain completed tokens.
     new = _request_state(scheduler_block_ids=[0, 1], token_ids=list(range(31)))
-    assert (
-        proposer.propose(_context("r", new, {"r": new}, num_speculative_tokens=3))
-        is None
-    )
+    assert proposer.propose(
+        _context("r", new, {"r": new}, num_speculative_tokens=3)
+    ) == (None, None)
     assert info.call_count == 2
     assert proposer.get_stats()["num_context_limit_fallback_requests"] == 2
 
@@ -220,7 +212,9 @@ def test_build_uses_reachable_scheduler_widths(
     )
     monkeypatch.setattr(dmp, "SDPAPagedAttentionRuntime", Mock())
     config = SimpleNamespace(
+        method="draft_model",
         draft_model_config=SimpleNamespace(model="draft"),
+        draft_sample_method="greedy",
         num_speculative_tokens=3,
         num_speculative_tokens_per_batch_size=schedule,
     )
@@ -248,9 +242,8 @@ def test_build_uses_reachable_scheduler_widths(
     )
     info.reset_mock()  # Ignore the separate model-load message.
     state = _request_state(scheduler_block_ids=[0, 1], token_ids=list(range(31)))
-    assert (
-        proposer.propose(_context("r", state, {"r": state}, num_speculative_tokens=k))
-        is None
-    )
+    assert proposer.propose(
+        _context("r", state, {"r": state}, num_speculative_tokens=k)
+    ) == (None, None)
     assert info.call_count == int(logs)
     assert proposer.get_stats()["num_context_limit_fallback_requests"] == int(logs)

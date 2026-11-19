@@ -226,6 +226,8 @@ def make_stub_runner(
         "_paged_request_seq_lens": {},
         "_intermediate_forward_supported": True,
         "_draft_token_ids": None,
+        "_draft_probs_by_req": {},
+        "_probabilistic_rng_by_req": {},
         "_execute_model_state": None,
         "_sample_failure": None,
         "_diffusion": None,

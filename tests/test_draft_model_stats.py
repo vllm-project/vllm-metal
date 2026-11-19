@@ -51,8 +51,8 @@ def test_counter_is_cumulative_after_cleanup_and_independent_of_log_level(caplog
         state = _request_state(scheduler_block_ids=[0, 1], token_ids=list(range(31)))
         runner._request_states["r"] = state
         ctx = _context("r", state, runner._request_states, num_speculative_tokens=3)
-        assert proposer.propose(ctx) is None
-        assert proposer.propose(ctx) is None
+        assert proposer.propose(ctx) == (None, None)
+        assert proposer.propose(ctx) == (None, None)
         runner._reconcile_request_lifecycle({"r"})
         # Reads after completion preserve the total and do not reset it.
         first = worker.get_draft_model_stats()

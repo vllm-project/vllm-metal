@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
 import mlx.core as mx
+import numpy as np
 from vllm.utils.math_utils import cdiv
 from vllm.v1.outputs import DraftTokenIds
 
@@ -58,6 +59,14 @@ def validate_scheduler_blocks(
         )
 
 
+@dataclass(slots=True)
+class PendingDraftProbs:
+    start_pos: int
+    token_ids: tuple[int, ...]
+    probs: mx.array
+    request_state: RequestState
+
+
 @dataclass(frozen=True, slots=True)
 class ProposeContext:
     """Per-step state a proposer may consume to draft the next tokens.
@@ -84,6 +93,9 @@ class ProposeContext:
     # against absence from request_states (which the new request repopulates
     # under the same id).
     finished_req_ids: set[str]
+    # The runner owns these streams; drafting and next-step verification draw
+    # from the same per-request generator.
+    probabilistic_rng_by_req: Mapping[str, np.random.Generator] | None = None
     target_aux_hidden_states: tuple[mx.array, ...] = ()
     # Per-request cap on draft length for the NEXT step (req_id -> max
     # drafts). Set for hybrid align-mode targets: a verify span must not
@@ -105,8 +117,10 @@ class MetalProposer(Protocol):
         """Whether the runner must collect target hidden states for this drafter."""
         ...
 
-    def propose(self, ctx: ProposeContext) -> DraftTokenIds | None:
-        """Return per-request draft tokens for the next step, or ``None``."""
+    def propose(
+        self, ctx: ProposeContext
+    ) -> tuple[DraftTokenIds | None, dict[str, PendingDraftProbs] | None]:
+        """Return draft IDs, optionally paired with draft distributions."""
         ...
 
     def release_requests(self, req_ids: set[str]) -> None:
@@ -202,9 +216,9 @@ class Gemma4MTPProposer(NoOwnKVProposer):
         # the proposer holds no per-request state of its own.
         del req_ids
 
-    def propose(self, ctx: ProposeContext) -> DraftTokenIds | None:
+    def propose(self, ctx: ProposeContext) -> tuple[DraftTokenIds | None, None]:
         if ctx.num_speculative_tokens <= 0:
-            return None
+            return None, None
 
         runner = self._runner
         assistant = runner._gemma4_mtp_assistant
@@ -213,7 +227,7 @@ class Gemma4MTPProposer(NoOwnKVProposer):
             or not assistant.forward_ready
             or ctx.target_hidden_states is None
         ):
-            return None
+            return None, None
 
         seeds = runner._spec_decode_controller.build_gemma4_mtp_draft_seeds(
             decode_reqs=ctx.decode_reqs,
@@ -227,7 +241,7 @@ class Gemma4MTPProposer(NoOwnKVProposer):
             num_decode_segments=ctx.num_decode_segments,
         )
         if not seeds:
-            return None
+            return None, None
 
         draft_token_ids = assistant.propose_draft_token_ids(
             seeds=seeds,
@@ -239,9 +253,12 @@ class Gemma4MTPProposer(NoOwnKVProposer):
             num_speculative_tokens=ctx.num_speculative_tokens,
         )
         if not draft_token_ids:
-            return None
+            return None, None
 
-        return DraftTokenIds(
-            req_ids=[seed.req_id for seed in seeds],
-            draft_token_ids=draft_token_ids,
+        return (
+            DraftTokenIds(
+                req_ids=[seed.req_id for seed in seeds],
+                draft_token_ids=draft_token_ids,
+            ),
+            None,
         )
