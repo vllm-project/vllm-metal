@@ -6,11 +6,16 @@
 # Kernel launch keywords retain the upstream Triton signatures.
 # Temperature and Gumbel ABIs: https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/worker/gpu/sample/gumbel.py
 # Min-p ABI: https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/worker/gpu/sample/min_p.py
+# Logprob ABIs (v0.33.0): https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/worker/gpu/sample/logprob.py#L61-L108
 # ruff: noqa: N803
 
 from functools import cache
 
 import torch
+
+# Upstream's logprob kernel streams each row. The MPS scorer materializes fp32
+# rows, so it works in chunks of at most this many elements (32 MiB as fp32).
+_MAX_LOGPROB_CHUNK_ELEMENTS = 1 << 23
 
 
 @cache
@@ -35,6 +40,28 @@ def temperature(logits, stride, mapping, values, vocab_size, BLOCK_SIZE):
 def min_p(logits, stride, mapping, values, vocab_size, BLOCK_SIZE):
     threshold = logits.amax(-1, keepdim=True) + values[mapping.long(), None].log()
     logits.masked_fill_(logits < threshold, -float("inf"))
+
+
+def compute_token_logprobs(logits, token_ids):
+    # Replaces the launcher, not _topk_log_softmax_kernel: it sizes its gather
+    # block with triton.next_power_of_2, which the Triton placeholder lacks.
+    token_ids = token_ids.long()
+    scores = logits.new_empty(token_ids.shape, dtype=torch.float32)
+    rows_per_chunk = max(1, _MAX_LOGPROB_CHUNK_ELEMENTS // logits.shape[-1])
+    for row_start in range(0, logits.shape[0], rows_per_chunk):
+        row_end = row_start + rows_per_chunk
+        # Left unnamed, each chunk's fp32 rows are freed before the next.
+        scores[row_start:row_end] = (
+            logits[row_start:row_end]
+            .log_softmax(-1, dtype=torch.float32)
+            .gather(-1, token_ids[row_start:row_end])
+        )
+    return scores
+
+
+def ranks(output, logits, logits_stride, token_ids, vocab_size, BLOCK_SIZE):
+    selected = logits.gather(-1, token_ids.long()[:, None])
+    torch.sum(logits[:, :vocab_size] >= selected, -1, out=output)
 
 
 def gumbel_sample(
