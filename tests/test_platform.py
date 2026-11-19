@@ -2107,7 +2107,7 @@ class TestMetalPlatform:
         ],
         ids=["unset", "low-exported", "high-exported"],
     )
-    def test_mps_worker_reclaims_cached_heaps_at_its_own_budget(
+    def test_mps_worker_sizes_heaps_to_requests_by_default(
         self, tmp_path, monkeypatch, exported
     ) -> None:
         from transformers import Qwen3Config
@@ -2126,14 +2126,11 @@ class TestMetalPlatform:
             dtype="bfloat16",
             skip_tokenizer_init=True,
             max_model_len=128,
-            gpu_memory_utilization=0.5,
         ).create_engine_config()
 
         def watermarks():
             return {k: v for k, v in os.environ.items() if "WATERMARK" in k}
 
-        # Workers inherit the frontend's environment, so a budget exported here
-        # would reach every colocated Omni stage.
         assert watermarks() == exported
 
         monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
@@ -2153,8 +2150,8 @@ class TestMetalPlatform:
                 model_runner_cls=lambda _: None,
             )
         )
-        # An exported watermark always wins.
-        assert watermarks() == (exported or {"PYTORCH_MPS_LOW_WATERMARK_RATIO": "0.5"})
+        # An exported low watermark always wins.
+        assert watermarks() == {"PYTORCH_MPS_LOW_WATERMARK_RATIO": "0.01"} | exported
 
     def test_kept_multimodal_config_normalizes_pixels_on_the_host(
         self, monkeypatch: pytest.MonkeyPatch
