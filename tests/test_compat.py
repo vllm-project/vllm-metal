@@ -1221,7 +1221,48 @@ class TestD3WeightLayoutTransform:
 class TestPrismHadamardQwen35ConfigPatch:
     """Verify prism_hadamard_qwen35 AutoConfig registration and defaults."""
 
-    def test_auto_config_loads_vlm_and_text_only_and_pickles(self, tmp_path) -> None:
+    def test_auto_config_fails_before_patch_and_loads_after(self, tmp_path) -> None:
+        from transformers import CONFIG_MAPPING, AutoConfig
+        from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config
+
+        model_dir = tmp_path / "vlm"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "model_type": "prism_hadamard_qwen35",
+                    "text_config": {"model_type": "qwen3_5_text", "hidden_size": 512},
+                    "vision_config": {"model_type": "qwen3_5", "hidden_size": 128},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        extra = CONFIG_MAPPING._extra_content
+        had_entry = "prism_hadamard_qwen35" in extra
+        previous = extra.pop("prism_hadamard_qwen35", None)
+        try:
+            with pytest.raises(ValueError, match="prism_hadamard_qwen35"):
+                AutoConfig.from_pretrained(str(model_dir))
+
+            compat._patch_transformers_prism_hadamard_qwen35_config()
+            compat._patch_transformers_prism_hadamard_qwen35_config()
+
+            cfg = AutoConfig.from_pretrained(str(model_dir))
+            assert cfg.model_type == "prism_hadamard_qwen35"
+            assert cfg.architectures == ["Qwen3_5ForConditionalGeneration"]
+            assert cfg.text_config.model_type == "qwen3_5_text"
+            assert CONFIG_MAPPING["qwen3_5"] is Qwen3_5Config
+        finally:
+            if had_entry:
+                extra["prism_hadamard_qwen35"] = previous
+            else:
+                extra.pop("prism_hadamard_qwen35", None)
+
+    def test_defaults_preserves_explicit_architectures_and_pickles(
+        self, tmp_path
+    ) -> None:
         import pickle
 
         from transformers import AutoConfig
@@ -1242,10 +1283,6 @@ class TestPrismHadamardQwen35ConfigPatch:
             encoding="utf-8",
         )
         vlm_cfg = AutoConfig.from_pretrained(str(vlm_dir))
-        assert vlm_cfg.model_type == "prism_hadamard_qwen35"
-        assert vlm_cfg.architectures == ["Qwen3_5ForConditionalGeneration"]
-        assert vlm_cfg.text_config.model_type == "qwen3_5_text"
-
         restored = pickle.loads(pickle.dumps(vlm_cfg))
         assert restored.model_type == "prism_hadamard_qwen35"
         assert restored.architectures == ["Qwen3_5ForConditionalGeneration"]
@@ -1264,3 +1301,20 @@ class TestPrismHadamardQwen35ConfigPatch:
         )
         text_cfg = AutoConfig.from_pretrained(str(text_dir))
         assert text_cfg.architectures == ["Qwen3_5ForCausalLM"]
+
+        explicit_dir = tmp_path / "explicit_arch"
+        explicit_dir.mkdir()
+        (explicit_dir / "config.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "model_type": "prism_hadamard_qwen35",
+                    "architectures": ["CustomQwen3_5Arch"],
+                    "text_config": {"model_type": "qwen3_5_text", "hidden_size": 512},
+                    "vision_config": {"model_type": "qwen3_5", "hidden_size": 128},
+                }
+            ),
+            encoding="utf-8",
+        )
+        explicit_cfg = AutoConfig.from_pretrained(str(explicit_dir))
+        assert explicit_cfg.architectures == ["CustomQwen3_5Arch"]

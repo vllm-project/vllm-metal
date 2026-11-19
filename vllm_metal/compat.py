@@ -178,6 +178,9 @@ def _patch_transformers_prism_hadamard_qwen35_config() -> None:
     mlx-vlm and mlx-lm loaders) and omit ``architectures``, so ``AutoConfig``
     fails before vllm-metal can load the model. Map it to a picklable
     ``Qwen3_5Config`` subclass that fills the default Qwen3.5 architecture.
+
+    TODO: remove once the supported transformers release registers
+    ``model_type="prism_hadamard_qwen35"``.
     """
     try:
         from transformers import CONFIG_MAPPING

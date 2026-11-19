@@ -143,6 +143,19 @@ def test_can_wrap_qlora_rejects_custom_quantized_embedding() -> None:
     assert not can_wrap_qlora(_FakeCustomQuantEmbedding())
 
 
+def test_can_wrap_qlora_handles_real_prism_quantized_layers() -> None:
+    """Real mlx-vlm PrismML embeddings are rejected while linears remain wrappable."""
+    hadamard_mod = pytest.importorskip(
+        "mlx_vlm.models.prism_hadamard_qwen35.prism_hadamard_qwen35"
+    )
+    one_bit_mod = pytest.importorskip("mlx_vlm.quantization.one_bit")
+
+    assert not can_wrap_qlora(hadamard_mod.HadamardQuantizedEmbedding(512, 64, 512))
+    assert can_wrap_qlora(hadamard_mod.HadamardQuantizedLinear(512, 64, 512))
+    assert not can_wrap_qlora(one_bit_mod.OneBitEmbedding(64, 128, group_size=128))
+    assert can_wrap_qlora(one_bit_mod.OneBitLinear(128, 64, group_size=128))
+
+
 def test_can_wrap_qlora_requires_scales_on_duck_type() -> None:
     """Do not accept non-linear callables just because they carry AWQ attrs."""
 
