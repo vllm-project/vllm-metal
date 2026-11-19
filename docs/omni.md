@@ -142,3 +142,12 @@ requests speech, and checks the returned 24 kHz WAV:
 PYTORCH_ENABLE_MPS_FALLBACK=0 VLLM_METAL_BACKEND=mps \
   python -m pytest -q tests/e2e/test_mps_omni_serving.py -k lfm3
 ```
+
+To test just the codec on a smaller Mac, the same variable can point to a
+local directory with the checkpoint's Python files and `audio_tokenizer/`.
+This check compares a streamed waveform with a single decode of the same codes:
+
+```bash
+PYTORCH_ENABLE_MPS_FALLBACK=0 VLLM_METAL_BACKEND=mps \
+  python -m pytest -q tests/test_mps_backend.py -k lfm3_streaming_codec
+```
