@@ -1,35 +1,39 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Optional real HTTP regression using a local Qwen3-TTS CustomVoice checkpoint."""
+"""Optional real HTTP speech tests using local Omni checkpoints."""
 
 import asyncio
 import base64
 import importlib.util
+import io
 import json
 import os
 import socket
 import subprocess
 import sys
 import time
+import wave
 from pathlib import Path
 
 import httpx
 import pytest
 import torch
 
-MODEL = os.environ.get("QWEN3_TTS_TEST_MODEL")
 pytestmark = [
     pytest.mark.slow,
     pytest.mark.skipif(
-        not MODEL
-        or not torch.backends.mps.is_available()
+        not torch.backends.mps.is_available()
         or importlib.util.find_spec("vllm_omni") is None,
-        reason="Requires MPS, the Omni extra, and QWEN3_TTS_TEST_MODEL (CustomVoice)",
+        reason="Requires MPS and the Omni extra",
     ),
 ]
 
 
 @pytest.fixture(scope="module")
-def speech_server(tmp_path_factory):
+def speech_server(tmp_path_factory, request):
+    model_env, profile = request.param
+    model = os.environ.get(model_env)
+    if not model:
+        pytest.skip(f"Set {model_env} to the local checkpoint directory")
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
@@ -50,12 +54,13 @@ def speech_server(tmp_path_factory):
                 "-m",
                 "vllm_omni.entrypoints.cli.main",
                 "serve",
-                MODEL,
+                model,
                 "--omni",
                 "--deploy-config",
                 str(
                     Path(__file__).resolve().parents[2]
-                    / "vllm_metal/pytorch_backend/deploy/qwen3_tts_mps.yaml"
+                    / "vllm_metal/pytorch_backend/deploy"
+                    / profile
                 ),
                 "--host",
                 "127.0.0.1",
@@ -104,6 +109,9 @@ def speech_request(index):
     }
 
 
+@pytest.mark.parametrize(
+    "speech_server", [("QWEN3_TTS_TEST_MODEL", "qwen3_tts_mps.yaml")], indirect=True
+)
 @pytest.mark.parametrize("concurrency,temperature", [(1, 0), (4, 0), (8, 0), (1, 0.9)])
 async def test_speech_streams_complete_for_concurrent_requests(
     speech_server, concurrency, temperature
@@ -133,3 +141,28 @@ async def test_speech_streams_complete_for_concurrent_requests(
             assert events[-1] == "speech.audio.done"
 
         await asyncio.gather(*(generate(index) for index in range(concurrency)))
+
+
+@pytest.mark.parametrize(
+    "speech_server", [("LFM3_OMNI_TEST_MODEL", "lfm3_omni_mps.yaml")], indirect=True
+)
+def test_lfm3_speech_returns_nonempty_waveform(speech_server):
+    response = httpx.post(
+        f"{speech_server}/v1/audio/speech",
+        json={
+            "input": "Hello from the Mac.",
+            "response_format": "wav",
+            "seed": 42,
+            "max_new_tokens": 96,
+            "extra_params": {"audio_temperature": 0.0},
+        },
+        timeout=240,
+    )
+    response.raise_for_status()
+    with wave.open(io.BytesIO(response.content)) as wav:
+        assert wav.getframerate() == 24000
+        assert wav.getnchannels() == 1
+        assert wav.getsampwidth() == 2
+        samples = wav.readframes(wav.getnframes())
+        assert len(samples) >= 1920 * 2  # One LiquidCodec frame.
+        assert any(samples)

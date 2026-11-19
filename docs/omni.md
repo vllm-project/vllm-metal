@@ -124,3 +124,21 @@ asyncio.run(main())
 The model's bundled voice is used unless the client supplies reference audio.
 For continuous input, video, and playback acknowledgements, see
 [Omni's DuplexClient guide](https://github.com/vllm-project/vllm-omni/blob/main/docs/serving/realtime_duplex_api.md#using-duplexclient).
+
+## LFM3-Omni-2B development profile
+
+This single-request profile connects the upstream LFM3 temporal model and
+LiquidCodec on one Apple GPU. It targets turn-based speech. The pinned Omni
+model still expects Model Runner V1 request metadata. End-to-end serving
+requires the [upstream V2 port](https://github.com/vllm-project/vllm-omni/pull/10675).
+Duplex input streaming needs separate upstream model support.
+
+To exercise the speech endpoint once the V2 port is available, set
+`LFM3_OMNI_TEST_MODEL` to a local copy of `LiquidAI/LFM3-Omni-2B`, including
+the `audio_tokenizer/` subdirectory. The following test starts the server,
+requests speech, and checks the returned 24 kHz WAV:
+
+```bash
+PYTORCH_ENABLE_MPS_FALLBACK=0 VLLM_METAL_BACKEND=mps \
+  python -m pytest -q tests/e2e/test_mps_omni_serving.py -k lfm3
+```
