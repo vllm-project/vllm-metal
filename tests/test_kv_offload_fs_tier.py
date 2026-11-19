@@ -289,7 +289,7 @@ def test_empty_jobs_complete_and_leave_no_bookkeeping(tmp_path: Path) -> None:
         assert done.wait(timeout=10), "drain_jobs() hung on a keyless job"
         assert len(list(tier.get_finished_jobs())) == 4
         assert tier._store_job_paths == {} and tier._load_job_paths == {}
-        assert tier._store_job_keys == {} and tier._load_job_keys == {}
+        assert tier._load_job_keys == {}
     finally:
         tier.shutdown()
 

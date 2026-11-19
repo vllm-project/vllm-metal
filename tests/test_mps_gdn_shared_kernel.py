@@ -145,6 +145,7 @@ def test_qwen_core_carries_state_in_one_launch(monkeypatch, dtype):
         dt_bias=torch.randn(hv, device="mps"),
         get_state_shape=lambda: (conv_shape, state_shape),
         get_state_dtype=lambda: (dtype, torch.float32),
+        state_alignment=MambaBase.state_alignment,
     )
     # Exercise the real cache-spec view and layer binding, with a page gap.
     spec = MambaSpec(

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import io
 import logging
-import os
 import re
 from collections.abc import Iterator
 
@@ -60,25 +59,17 @@ def test_register_merges_metal_env_vars_into_vllm() -> None:
     assert not missing, f"metal env vars not registered with vllm: {missing}"
 
 
-def test_register_defaults_to_v2_model_runner_when_metal_is_selected(
-    monkeypatch,
-) -> None:
+def test_register_selects_metal_platform_when_available(monkeypatch) -> None:
     monkeypatch.delenv("VLLM_METAL_BACKEND", raising=False)
-    monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
     monkeypatch.setattr(MetalPlatform, "is_available", classmethod(lambda cls: True))
 
     assert vm._register() == "vllm_metal.platform.MetalPlatform"
-    assert os.environ["VLLM_USE_V2_MODEL_RUNNER"] == "1"
 
 
-def test_register_leaves_model_runner_alone_when_metal_is_unavailable(
-    monkeypatch,
-) -> None:
-    monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
+def test_register_declines_when_metal_is_unavailable(monkeypatch) -> None:
     monkeypatch.setattr(MetalPlatform, "is_available", classmethod(lambda cls: False))
 
     assert vm._register() is None
-    assert "VLLM_USE_V2_MODEL_RUNNER" not in os.environ
 
 
 def test_vllm_logging_config_reaches_metal_loggers(

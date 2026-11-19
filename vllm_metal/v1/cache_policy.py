@@ -957,7 +957,7 @@ class WorkerCachePlanner:
         fraction = (
             self._memory_fraction()
             if explicit is None
-            else self._worker.vllm_config.cache_config.gpu_memory_utilization
+            else self._worker.vllm_config.cache_config.resolved_gpu_memory_utilization
         )
         metal_limit = self._metal_limit_bytes()
         model_memory = self.get_model_memory_usage()
@@ -1263,7 +1263,7 @@ class WorkerCachePlanner:
 
     def _memory_fraction(self) -> float:
         """Resolve the paged KV memory fraction from ``--gpu-memory-utilization``."""
-        fraction = self._worker.vllm_config.cache_config.gpu_memory_utilization
+        fraction = self._worker.vllm_config.cache_config.resolved_gpu_memory_utilization
         logger.info(
             "Paged attention: using --gpu-memory-utilization=%.2f",
             fraction,

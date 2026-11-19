@@ -1,13 +1,5 @@
 # Configuration
 
-## Model Runner
-
-Both the MLX and experimental PyTorch MPS backends require Model Runner V2.
-MLX uses `MetalModelRunner` with vLLM's V2 configuration and scheduler contract.
-Leave `VLLM_USE_V2_MODEL_RUNNER` unset (Metal defaults it to `1`) or set it to `1`.
-MLX Model Runner V1 has been removed: `VLLM_USE_V2_MODEL_RUNNER=0` fails at
-configuration time.
-
 ## Environment Variables
 
 vllm-metal validates these variables when the engine configuration is created and reports every invalid value together, so a typo fails the startup. Boolean switches treat `1` as on and any other value as off.
@@ -110,6 +102,9 @@ Sleep levels mean something different on unified memory than on a GPU:
   wake or with the first request after wake.
 - With [KV offloading](kv_offloading.md), sleep also frees the host pool. It
   comes back empty at wake. Prompts already on the disk tier still restore.
+  Keep `reset_connector=True` (the default) for `sleep` and
+  `release_kv_cache_memory` with KV offloading: with `False`, vLLM keeps its
+  index of the freed pool, so prompts restored from it after wake can be wrong.
 
 Sleep mode supports dense, hybrid and MLA models on the MLX backend.
 Supported speculative decoding methods are `ngram`, `draft_model`, `dflash` and

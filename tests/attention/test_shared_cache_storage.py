@@ -23,7 +23,7 @@ from vllm_metal.attention.impls.linear import GDNPagedAttentionWrapper, _GDNForw
 from vllm_metal.metal import get_ops
 
 
-def make_storage(num_blocks=4):
+def make_storage(num_blocks=4, *, with_state=True):
     attention = FullAttentionSpec(
         block_size=16, num_kv_heads=1, head_size=32, dtype=torch.float16
     )
@@ -35,10 +35,9 @@ def make_storage(num_blocks=4):
         mamba_cache_mode="align",
     )
     page = attention.page_size_bytes
-    groups = [
-        KVCacheGroupSpec(layer_names=["a0", "a1"], kv_cache_spec=attention),
-        KVCacheGroupSpec(layer_names=["s0", "s1"], kv_cache_spec=state),
-    ]
+    groups = [KVCacheGroupSpec(layer_names=["a0", "a1"], kv_cache_spec=attention)]
+    if with_state:
+        groups.append(KVCacheGroupSpec(layer_names=["s0", "s1"], kv_cache_spec=state))
     config = KVCacheConfig(
         num_blocks=num_blocks,
         kv_cache_groups=groups,
@@ -245,22 +244,32 @@ def test_budget_above_buffer_limit_uses_shared_regions(monkeypatch):
     assert storage.state_views(["s0", "s1"])[0][0].shape[0] == planned.num_blocks
 
 
-def test_release_frees_backing_and_reallocate_rebinds_existing_views():
-    storage = make_storage(num_blocks=64)
-    views = storage.views([storage.tensors["a0"]])
+def test_release_frees_the_backing_and_existing_views_see_reallocated_memory():
+    storage = make_storage(num_blocks=64, with_state=False)
+    tensor = storage.tensors["a0"]
+    views = storage.views([tensor])
     offsets = storage.region_offsets
-    before = mx.get_active_memory()
 
     storage.release()
-
-    assert storage.released
-    assert before - mx.get_active_memory() >= storage.nbytes
-
+    asleep = (storage.released, tensor.untyped_storage().nbytes())
     storage.reallocate()
-    storage.tensors["a0"].fill_(3)
+    tensor.fill_(3)
 
+    assert asleep == (True, 0)
     assert storage.region_offsets == offsets
     np.testing.assert_array_equal(np.array(views[0]), 3)
+
+
+def test_reallocate_zeroes_pages_when_vllm_needs_kv_cache_zeroing():
+    storage = make_storage(num_blocks=64)
+    tensor = storage.tensors["a0"]
+    views = storage.views([tensor])
+    tensor.fill_(7)
+
+    storage.release()
+    storage.reallocate()
+
+    np.testing.assert_array_equal(np.array(views[0]), 0)
 
 
 def test_unbound_runtime_refuses_sleep_release():

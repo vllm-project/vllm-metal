@@ -10,7 +10,6 @@ import mlx.core as mx
 import numpy as np
 import pytest
 import torch
-from vllm.config import VllmConfig
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import (
@@ -20,6 +19,7 @@ from vllm.v1.core.sched.output import (
     SchedulerOutput,
 )
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
+from vllm.v1.token_buffer import TokenBuffer
 
 import vllm_metal.attention.impls.mm_prefix as mm_prefix_module
 import vllm_metal.envs as metal_envs
@@ -510,7 +510,6 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
             total_num_scheduled_tokens=sum(num_scheduled_tokens.values()),
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             scheduled_encoder_inputs={},
-            num_common_prefix_blocks=[],
             finished_req_ids=set(),
             free_encoder_mm_hashes=[],
             num_invalid_spec_tokens=num_invalid_spec_tokens,
@@ -1728,9 +1727,7 @@ class TestV1MetalModelRunnerExecuteModel:
             scheduled_new_reqs=scheduled_new_reqs or [],
             scheduled_cached_reqs=CachedRequestData(
                 req_ids=req_ids,
-                resumed_req_ids=set(),
                 new_token_ids=[],
-                all_token_ids={},
                 new_block_ids=[None] * len(req_ids),
                 num_computed_tokens=[0] * len(req_ids),
                 num_output_tokens=[0] * len(req_ids),
@@ -1740,7 +1737,6 @@ class TestV1MetalModelRunnerExecuteModel:
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens or {},
             num_invalid_spec_tokens=num_invalid_spec_tokens,
             scheduled_encoder_inputs={},
-            num_common_prefix_blocks=[],
             finished_req_ids=finished_req_ids or set(),
             free_encoder_mm_hashes=[],
             preempted_req_ids=set(),
@@ -1754,6 +1750,7 @@ class TestV1MetalModelRunnerExecuteModel:
         return NewRequestData(
             req_id=req_id,
             prompt_token_ids=[1],
+            prefill_token_ids=[1],
             mm_features=[],
             sampling_params=SamplingParams(),
             pooling_params=None,
@@ -1769,7 +1766,6 @@ class TestV1MetalModelRunnerExecuteModel:
 
         assert out is not None
         assert out.req_ids == []
-        assert out.req_id_to_index == {}
         assert out.sampled_token_ids == []
         assert runner._execute_model_state is None
 
@@ -2218,7 +2214,6 @@ class TestV1MetalModelRunnerGDNLifecycle:
             scheduled_spec_decode_tokens={},
             num_invalid_spec_tokens=None,
             scheduled_encoder_inputs=scheduled_encoder_inputs or {},
-            num_common_prefix_blocks=[],
             finished_req_ids=set(),
             free_encoder_mm_hashes=[],
             preempted_req_ids=preempted_req_ids or set(),
@@ -2568,7 +2563,6 @@ class TestStartPagedForwardSelectiveLogits:
             total_num_scheduled_tokens=sum(num_scheduled_tokens.values()),
             scheduled_spec_decode_tokens=spec_tokens or {},
             scheduled_encoder_inputs={},
-            num_common_prefix_blocks=[],
             finished_req_ids=set(),
             free_encoder_mm_hashes=[],
             num_invalid_spec_tokens=None,
@@ -3384,7 +3378,6 @@ class TestPipelineGateSpecDecodeDerivation:
             total_num_scheduled_tokens=0,
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             scheduled_encoder_inputs={},
-            num_common_prefix_blocks=[],
             finished_req_ids=set(),
             free_encoder_mm_hashes=[],
             num_invalid_spec_tokens=None,
@@ -3394,9 +3387,7 @@ class TestPipelineGateSpecDecodeDerivation:
     def _cached_decode_output(self, req_id: str) -> SchedulerOutput:
         cached = CachedRequestData(
             req_ids=[req_id],
-            resumed_req_ids=set(),
             new_token_ids=[[7]],
-            all_token_ids={},
             new_block_ids=[None],
             num_computed_tokens=[1],
             num_output_tokens=[1],
@@ -3408,7 +3399,6 @@ class TestPipelineGateSpecDecodeDerivation:
             total_num_scheduled_tokens=1,
             scheduled_spec_decode_tokens={},
             scheduled_encoder_inputs={},
-            num_common_prefix_blocks=[],
             finished_req_ids=set(),
             free_encoder_mm_hashes=[],
             num_invalid_spec_tokens=None,
@@ -3653,7 +3643,6 @@ class TestDeferredDecodeSampleThreading:
             total_num_scheduled_tokens=len(decode_reqs),
             scheduled_spec_decode_tokens={},
             scheduled_encoder_inputs={},
-            num_common_prefix_blocks=[],
             finished_req_ids=set(),
             free_encoder_mm_hashes=[],
             num_invalid_spec_tokens=None,
@@ -4088,9 +4077,7 @@ class TestDeferredDecodeSampleThreading:
         runner._submit_deferred_decode_sample()
         cached = CachedRequestData(
             req_ids=["r0", "r1"],
-            resumed_req_ids=set(),
             new_token_ids=[[7], [7]],
-            all_token_ids={},
             new_block_ids=[None, None],
             num_computed_tokens=[2, 2],
             num_output_tokens=[2, 2],
@@ -4102,7 +4089,6 @@ class TestDeferredDecodeSampleThreading:
             total_num_scheduled_tokens=2,
             scheduled_spec_decode_tokens={},
             scheduled_encoder_inputs={},
-            num_common_prefix_blocks=[],
             finished_req_ids=set(),
             free_encoder_mm_hashes=[],
             num_invalid_spec_tokens=None,
@@ -4362,7 +4348,6 @@ class TestIntermediateBodyOnlyForward:
             total_num_scheduled_tokens=sum(scheduled.values()),
             scheduled_spec_decode_tokens={},
             scheduled_encoder_inputs={},
-            num_common_prefix_blocks=[],
             finished_req_ids=set(),
             free_encoder_mm_hashes=[],
             num_invalid_spec_tokens=None,
@@ -4877,9 +4862,7 @@ class TestStateBlockIdLifecycle:
         runner._update_cached_request_blocks(
             CachedRequestData(
                 req_ids=["r"],
-                resumed_req_ids=set(),
                 new_token_ids=[],
-                all_token_ids={},
                 new_block_ids=[([12], [22], [32], [42])],
                 num_computed_tokens=[1],
                 num_output_tokens=[0],
@@ -4951,7 +4934,6 @@ class TestRequestAdmission:
             total_num_scheduled_tokens=num_scheduled_tokens,
             scheduled_spec_decode_tokens={},
             scheduled_encoder_inputs={},
-            num_common_prefix_blocks=[],
             finished_req_ids=set(),
             free_encoder_mm_hashes=[],
             preempted_req_ids=preempted_req_ids or set(),
@@ -4963,8 +4945,6 @@ class TestRequestAdmission:
     ) -> CachedRequestData:
         return CachedRequestData(
             req_ids=["r"],
-            resumed_req_ids=set(),
-            all_token_ids={},
             new_block_ids=[None],
             num_computed_tokens=[num_computed_tokens],
             num_output_tokens=[len(token_ids) - 4],
@@ -5012,11 +4992,8 @@ class TestRequestAdmission:
     def test_readmission_continues_from_prefill_tokens(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
         generator = torch.Generator().manual_seed(0)
         runner = self._preempted_runner(generator)
-        runner.vllm_config = VllmConfig()
-        assert runner.vllm_config.use_v2_model_runner
         runner._paged_attention_runtime = Mock(spec=SDPAPagedAttentionRuntime)
         runner._paged_scheduler_group_indices = (0,)
         runner._request_states["r"].block_ids = [[0, 1]]
@@ -5044,15 +5021,6 @@ class TestRequestAdmission:
         assert state.mrope_position_delta == -2
         assert "r" not in runner._paged_request_seq_lens
         assert "r" not in runner._awaiting_readmission
-
-    def test_readmission_rejects_missing_full_history(self) -> None:
-        runner = self._preempted_runner()
-        new_req = self._new_req([1, 2, 3, 4, 5, 6], num_computed_tokens=0)
-        new_req.prefill_token_ids = None
-        runner._reconcile_request_lifecycle(set(), preempted_req_ids={"r"})
-
-        with pytest.raises(RuntimeError, match="missing prefill_token_ids"):
-            self._admit(runner, new_req, 4)
 
     def _seeded_chunked_prefill(
         self, monkeypatch: pytest.MonkeyPatch, *, deferred: bool
@@ -5274,9 +5242,7 @@ class TestRequestAdmission:
         continuation = self._scheduler_output(None, 2)
         continuation.scheduled_cached_reqs = CachedRequestData(
             req_ids=["r"],
-            resumed_req_ids=set(),
             new_token_ids=[],
-            all_token_ids={},
             new_block_ids=[None],
             num_computed_tokens=[4],
             num_output_tokens=[2],
@@ -5291,6 +5257,49 @@ class TestRequestAdmission:
         assert state.generated_tokens == 3
         assert state.prompt_len == 4
         assert new_req.prefill_token_ids == [1, 2, 3, 4, 5, 6]
+
+    def test_sampled_token_does_not_extend_the_scheduler_token_buffer(
+        self, monkeypatch
+    ) -> None:
+        """The scheduler passes its own TokenBuffer as prompt and prefill ids."""
+        runner = make_stub_runner(
+            model_args={"vocab_size": 8},
+            _paged_attention_runtime=ForwardOutputRuntimeStub([]),
+            _paged_block_size=16,
+            _sampler=Sampler(),
+            num_layers=0,
+        )
+        seen_inputs = []
+
+        def forward(input_ids, **kwargs):
+            seen_inputs.append(input_ids.tolist()[0])
+            return mr.TargetModelForwardOutput(
+                logits=mx.broadcast_to(mx.arange(8), (*input_ids.shape, 8)).astype(
+                    mx.float32
+                )
+            )
+
+        monkeypatch.setattr(runner, "_target_forward", forward)
+        prompt = TokenBuffer([1, 2, 3, 4])
+        new_req = NewRequestData(
+            req_id="r",
+            prompt_token_ids=prompt,
+            prefill_token_ids=prompt,
+            mm_features=[],
+            sampling_params=SamplingParams(temperature=0),
+            pooling_params=None,
+            block_ids=([10, 11],),
+            num_computed_tokens=0,
+            lora_request=None,
+        )
+
+        runner.execute_model(self._scheduler_output(new_req, 4))
+        output = runner.sample_tokens(None)
+
+        assert seen_inputs == [[1, 2, 3, 4]]
+        assert output.sampled_token_ids == [[7]]
+        assert runner._request_states["r"].token_ids == [1, 2, 3, 4, 7]
+        assert prompt == [1, 2, 3, 4]
 
     def test_non_last_pp_stage_keeps_the_prefill_tokens(self, monkeypatch) -> None:
         runner = make_stub_runner(
@@ -5313,9 +5322,7 @@ class TestRequestAdmission:
         cached = self._scheduler_output(None, 1)
         cached.scheduled_cached_reqs = CachedRequestData(
             req_ids=["r"],
-            resumed_req_ids=set(),
             new_token_ids=[[7]],
-            all_token_ids={},
             new_block_ids=[None],
             num_computed_tokens=[6],
             num_output_tokens=[3],

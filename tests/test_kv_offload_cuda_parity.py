@@ -12,7 +12,7 @@ from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 from vllm.v1.kv_offload.cpu.gpu_worker import compute_sub_block_ptrs
 
 from tests.kv_offload_helpers import (
-    gpu_spec,
+    device_ptrs,
     make_storage,
     make_turboquant_storage,
     make_worker,
@@ -66,10 +66,9 @@ def test_store_placement_matches_cuda(
     )
     randomize(storage)
     original = snapshot_blocks(storage, gpu_blocks)
+    ptrs = device_ptrs(worker, gpu_blocks, block_index)
 
-    assert worker.submit_store(
-        1, gpu_spec(gpu_blocks, block_index), CPULoadStoreSpec(cpu_blocks)
-    )
+    assert worker.submit_store(1, ptrs, CPULoadStoreSpec(cpu_blocks))
     assert [r.job_id for r in worker.get_finished()] == [1]
 
     skip = block_index % factor
@@ -92,9 +91,7 @@ def test_store_placement_matches_cuda(
 
     # Load back from the CUDA-verified layout, pinning both directions.
     zero_blocks(storage, gpu_blocks)
-    assert worker.submit_load(
-        2, CPULoadStoreSpec(cpu_blocks), gpu_spec(gpu_blocks, block_index)
-    )
+    assert worker.submit_load(2, CPULoadStoreSpec(cpu_blocks), ptrs)
     assert [r.job_id for r in worker.get_finished()] == [2]
     for a, b in zip(original, snapshot_blocks(storage, gpu_blocks), strict=True):
         np.testing.assert_array_equal(a, b)
@@ -111,7 +108,7 @@ def test_scheduler_side_is_upstream_code() -> None:
     overridden = {
         name for name in vars(MetalOffloadingConnector) if not name.startswith("_")
     }
-    # The host pool methods are worker-side sleep hooks, not overrides.
+    # Worker-side registration and sleep/wake hooks only.
     assert overridden == {
         "register_kv_caches",
         "release_host_pool",

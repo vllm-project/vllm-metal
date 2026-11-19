@@ -36,24 +36,29 @@ def prepare_prefill_inputs(
 
 def prepare_decode_inputs(
     tokens,
+    tokens_stride,
     target_lens,
     rejected,
-    buffers,
+    input_ids,
+    positions,
     sample_positions,
+    query_start_loc,
+    seq_lens,
     max_model_len,
     max_num_reqs,
-    advance_draft_positions=True,
+    BLOCK_SIZE,  # noqa: N803 - upstream kernel launch keyword
+    ADVANCE_DRAFT_POSITIONS,  # noqa: N803 - upstream kernel launch keyword
 ):
     n = tokens.numel()
-    buffers.input_ids[:n].copy_(tokens)
+    input_ids[:n].copy_(tokens)
     sample_positions[:n].add_(1)
     lengths = target_lens[:n] - rejected
-    if advance_draft_positions:
-        buffers.positions[:n].add_(1).clamp_max_(max_model_len - 1)
+    if ADVANCE_DRAFT_POSITIONS:
+        positions[:n].add_(1).clamp_max_(max_model_len - 1)
         lengths = (lengths + 1).clamp_max(max_model_len)
-    buffers.seq_lens[:n].copy_(lengths)
-    buffers.seq_lens[n:].zero_()
-    buffers.query_start_loc.copy_(
+    seq_lens[:n].copy_(lengths)
+    seq_lens[n:].zero_()
+    query_start_loc.copy_(
         torch.arange(
             max_num_reqs + 1, device=tokens.device, dtype=torch.int32
         ).clamp_max(n)

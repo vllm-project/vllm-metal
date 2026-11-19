@@ -354,6 +354,11 @@ class MetalPlatform(Platform):
                 "prompt_logprob_token_ids is not supported on Metal.",
                 parameter="prompt_logprob_token_ids",
             )
+        if params.prompt_logprob_start and envs.VLLM_METAL_BACKEND == "mlx":
+            raise VLLMValidationError(
+                "prompt_logprob_start is not supported on the MLX backend.",
+                parameter="prompt_logprob_start",
+            )
 
         unsupported_controls = [
             name
@@ -541,14 +546,7 @@ class MetalPlatform(Platform):
         """
         envs.validate_environment()
 
-        import vllm.envs as vllm_envs
-
         backend = envs.VLLM_METAL_BACKEND
-        if backend == "mlx" and vllm_envs.VLLM_USE_V2_MODEL_RUNNER is False:
-            raise ValueError(
-                "MLX Model Runner V1 has been removed. Unset "
-                "VLLM_USE_V2_MODEL_RUNNER or set VLLM_USE_V2_MODEL_RUNNER=1."
-            )
 
         from vllm_metal.compat import ensure_vllm_bytelevel_tokenizer_patch
 
@@ -566,6 +564,25 @@ class MetalPlatform(Platform):
         config = get_config()
         parallel_config = vllm_config.parallel_config
         model_config = vllm_config.model_config
+
+        # vLLM fills an unset block size with its own default before this hook;
+        # Metal's drafters and the MPS backend read it before
+        # update_block_size_for_backend runs, so set Metal's size now. The engine
+        # reruns this hook after sizing the KV cache, and that size must stay.
+        cache_config = vllm_config.cache_config
+        if (
+            not cache_config.user_specified_block_size
+            and cache_config.num_gpu_blocks is None
+        ):
+            from vllm_metal.attention.synthetic_backend import MetalBackend
+
+            # With prefix caching on, vLLM fills an unset mamba_block_size with it too.
+            if (
+                cache_config.enable_prefix_caching
+                and cache_config.mamba_block_size == cache_config.block_size
+            ):
+                cache_config.mamba_block_size = MetalBackend.PREFERRED_BLOCK_SIZE
+            cache_config.block_size = MetalBackend.PREFERRED_BLOCK_SIZE
 
         if parallel_config.prefill_context_parallel_size > 1:
             raise NotImplementedError(
@@ -615,6 +632,21 @@ class MetalPlatform(Platform):
         config.apply_moe_expert_offload(add)
 
         logger.debug("Metal config: %s", config)
+
+        speculative_config = vllm_config.speculative_config
+        # vLLM moves a plugin's method name to custom_method and sets method to
+        # its base, if any (vllm#63205).
+        if (
+            backend == "mlx"
+            and speculative_config is not None
+            and speculative_config.custom_method is not None
+        ):
+            raise NotImplementedError(
+                "vllm-metal does not support custom speculative method "
+                f"{speculative_config.custom_method!r}: the MLX backend runs only "
+                "its own drafters, never a plugin's speculator. Use a built-in "
+                "method such as ngram or draft_model."
+            )
 
         if model_config is not None and model_config.enable_sleep_mode:
             cls._check_sleep_mode_config(vllm_config, backend)
@@ -719,20 +751,6 @@ class MetalPlatform(Platform):
                     f"{dense_dtype_hint}, or enable TurboQuant with "
                     "--additional-config '{\"turboquant\": true}'."
                 )
-
-        speculative_config = vllm_config.speculative_config
-        # Upstream skips verify_equal_vocab_size_if_draft_model() when this is set,
-        # so a draft model with a different vocabulary reaches the proposer, which
-        # verifies draft ids against the target vocabulary with no mapping.
-        if (
-            speculative_config is not None
-            and speculative_config.use_heterogeneous_vocab
-        ):
-            raise NotImplementedError(
-                "vllm-metal does not support speculative decoding with a "
-                "heterogeneous draft vocabulary (use_heterogeneous_vocab). Use a "
-                "draft model that shares the target vocabulary."
-            )
 
         # Upstream's scheduler pads a newly admitted decode request to the uniform
         # speculative width, then still clips it to long_prefill_token_threshold,
@@ -957,11 +975,11 @@ class MetalPlatform(Platform):
             parallel_config.pipeline_parallel_size > 1
             and scheduler_config.async_scheduling
         ):
-            # V2 auto-enables async before this hook; an explicit True is
+            # vLLM auto-enables async before this hook; an explicit True is
             # indistinguishable by now, so both must be overridden.
             logger.warning(
                 "Pipeline parallelism on Metal requires synchronous scheduling; "
-                "disabling async scheduling for Model Runner V2."
+                "disabled async_scheduling."
             )
             scheduler_config.async_scheduling = False
 
@@ -1343,7 +1361,7 @@ class MetalPlatform(Platform):
             return
         desired = _pick_mb_buffer_default(
             total_memory_bytes=psutil.virtual_memory().total,
-            memory_fraction=vllm_config.cache_config.gpu_memory_utilization,
+            memory_fraction=vllm_config.cache_config.resolved_gpu_memory_utilization,
             max_num_batched_tokens=(
                 vllm_config.scheduler_config.max_num_batched_tokens
             ),
@@ -1411,12 +1429,11 @@ class MetalPlatform(Platform):
             )
 
         # Delegate the rest to upstream. With our ``_find_non_ssm_backends``
-        # returning ``[MetalBackend]`` (which advertises ``MultipleOf(16)``),
-        # vLLM's Phase 1 picks a kernel-aligned default of 16 for non-hybrid
-        # models (matching the kernel sweet spot), and Phase 2
-        # (``_align_hybrid_block_size``) handles hybrid alignment. The kernel
-        # layer (``pick_kernel_block_size``) validates the final
-        # ``block_size`` at request time.
+        # returning ``[MetalBackend]`` (which advertises ``MultipleOf(16)`` and
+        # prefers 16), vLLM's Phase 1 picks 16 for non-hybrid models (the kernel
+        # sweet spot), and Phase 2 (``_align_hybrid_block_size``) handles hybrid
+        # alignment. The kernel layer (``pick_kernel_block_size``) validates the
+        # final ``block_size`` at request time.
         cache_config = vllm_config.cache_config
         user_block_size = (
             cache_config.block_size if cache_config.user_specified_block_size else None

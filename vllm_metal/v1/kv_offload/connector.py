@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """OffloadingConnector that registers Metal's ``KVCacheStorage``.
 
-Upstream's worker copies through a CUDA-only engine, so only worker
-registration changes; the scheduler side is inherited. No mlx import here:
-the scheduler process loads this module.
+Upstream's worker copies through a CUDA-only engine, so the Metal spec
+supplies the worker that upstream's registration builds; the scheduler side
+is inherited. No mlx import here: the scheduler process loads this module.
 """
 
 from __future__ import annotations
@@ -77,14 +77,16 @@ class MetalOffloadingConnector(OffloadingConnector):
                 "MetalOffloadingConnector requires MetalTieringOffloadingSpec "
                 f"(got {type(spec).__name__}); check kv_connector_extra_config"
             )
-        # Upstream's _init_worker only sets self.worker.
-        self.connector_worker.worker = spec.get_metal_worker(kv_caches)
+        spec.bind_storage(kv_caches)
+        self.connector_worker.register_kv_caches(kv_caches.tensors)
 
     def release_host_pool(self) -> None:
         """Free the host pool for sleep mode.
 
-        vLLM resets the connector before it discards the KV cache. That
-        empties the pool's index, so nothing reads the pool until wake.
+        With ``reset_connector=True`` (the default), vLLM resets the connector
+        before it discards the KV cache. That empties the pool's index, so
+        nothing reads the pool until wake. With ``False`` the index survives
+        and can point at the freed pages.
         """
         if (worker := self._metal_worker()) is not None:
             worker.release_host_pool()

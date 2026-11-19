@@ -21,14 +21,7 @@ _MPS_WATERMARK_ENVS = (
 
 
 def configure_mps(config, *, omni=False):
-    from vllm import envs as vllm_envs
     from vllm.config.compilation import CompilationMode, CUDAGraphMode
-
-    from vllm_metal import envs
-
-    if envs.VLLM_METAL_BACKEND == "mps":
-        if vllm_envs.VLLM_USE_V2_MODEL_RUNNER is not True:
-            raise ValueError("Experimental MPS requires VLLM_USE_V2_MODEL_RUNNER=1")
 
     if omni:
         from vllm.config import DeviceConfig
@@ -76,13 +69,10 @@ def configure_mps(config, *, omni=False):
         or spec.draft_sample_method != "greedy"
         or spec.rejection_sample_method != "standard"
         or spec.enable_adaptive_verification
-        or spec.parallel_drafting
         or model.has_inner_state
         or config.watermark_config is not None
     ):
         raise NotImplementedError("MPS speculation currently supports greedy EAGLE3")
-    if config.cache_config.block_size is None:
-        config.cache_config.block_size = 16
     block_size = config.cache_config.block_size
     # The engine core resets a hybrid model's block size to its smallest
     # group's, which is max_model_len for mamba groups.
@@ -117,7 +107,7 @@ class MPSWorker(MetalWorker):
         # so colocated Omni stages would all get the last stage's budget.
         if not any(env in os.environ for env in _MPS_WATERMARK_ENVS):
             os.environ[_MPS_WATERMARK_ENVS[0]] = str(
-                self.cache_config.gpu_memory_utilization
+                self.cache_config.resolved_gpu_memory_utilization
             )
         self.device = torch.device("mps:0")
         init_worker_distributed_environment(
@@ -168,7 +158,7 @@ class MPSWorker(MetalWorker):
         # Like the MLX backend, budget against the GPU working set, not RAM.
         budget = int(
             torch.mps.recommended_max_memory()
-            * self.cache_config.gpu_memory_utilization
+            * self.cache_config.resolved_gpu_memory_utilization
         )
         available = budget - torch.mps.driver_allocated_memory() - reserve
         if available <= 0:

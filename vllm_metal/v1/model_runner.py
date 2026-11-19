@@ -278,7 +278,6 @@ class _ExecutionBatch:
         """Build ``ModelRunnerOutput`` from this completed batch."""
         return ModelRunnerOutput(
             req_ids=self.req_ids,
-            req_id_to_index=self.req_id_to_index,
             sampled_token_ids=self.sampled_tokens,
             logprobs=self.merged_logprobs(),
             prompt_logprobs_dict=dict(self.prompt_logprobs_dict),
@@ -2791,10 +2790,6 @@ class MetalModelRunner:
 
         mrope_position_delta = None
         if req_id in self._awaiting_readmission:
-            if new_req.prefill_token_ids is None:
-                raise RuntimeError(
-                    f"Readmitted request {req_id!r} is missing prefill_token_ids."
-                )
             # Preemption retains the old state for in-flight sampling. Only
             # readmission replaces its history with the scheduler's snapshot.
             preempted = self._request_states[req_id]
@@ -2806,11 +2801,8 @@ class MetalModelRunner:
         else:
             generator = create_request_generator(sampling_params)
 
-        token_ids = new_req.prefill_token_ids
-        if token_ids is None:
-            token_ids = new_req.prompt_token_ids or []
         state = RequestState(
-            token_ids=list(token_ids),
+            token_ids=list(new_req.prefill_token_ids),
             prompt_len=new_req.prompt_len,
             sampling_params=sampling_params,
             pooling_params=new_req.pooling_params,

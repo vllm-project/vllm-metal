@@ -1204,6 +1204,7 @@ def test_handle_new_request_registers_lora_before_paged_prefill() -> None:
         req_id="req-lora",
         pooling_params=None,
         prompt_token_ids=[1, 2, 3],
+        prefill_token_ids=[1, 2, 3],
         mm_features=[],
         sampling_params=SamplingParams(temperature=0, max_tokens=1),
         block_ids=([4],),

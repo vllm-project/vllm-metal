@@ -29,12 +29,13 @@ _EXAONE4_LAYER_TYPE = {"L": "sliding_attention", "G": "full_attention"}
 
 
 def register_model_compat() -> None:
-    """Register missing model metadata for the Metal MLX runner.
+    """Register Metal's LFM3-VL and LFM3-Audio classes for the MLX runner.
 
     MLX executes the model, while vLLM still queries registered model classes
-    for hybrid capabilities and state-cache metadata. The general-plugin hook
-    runs before ModelConfig inspection, after vllm.config is importable;
-    registering in apply_compat_patches would create an import cycle.
+    for hybrid capabilities, state-cache metadata and multimodal processing.
+    The general-plugin hook runs before ModelConfig inspection, after
+    vllm.config is importable; registering in apply_compat_patches would
+    create an import cycle.
     """
     if os.environ.get("VLLM_METAL_BACKEND", "mlx") != "mlx":
         return
@@ -47,18 +48,17 @@ def register_model_compat() -> None:
 
     from vllm.model_executor.models import ModelRegistry
 
-    supported = ModelRegistry.get_supported_archs()
-    for arch in ("Lfm3ForCausalLM", "Lfm3VlForConditionalGeneration"):
-        if arch not in supported:
-            ModelRegistry.register_model(
-                arch, f"vllm_metal.patches.lfm3_registry:{arch}"
-            )
-
-    if "Lfm3AudioForConditionalGeneration" not in supported:
-        ModelRegistry.register_model(
-            "Lfm3AudioForConditionalGeneration",
-            "vllm_metal.patches.lfm3_audio_registry:Lfm3AudioForConditionalGeneration",
-        )
+    # SCAFFOLDING: remove when the MLX LFM3 adapters accept the placeholders and
+    # processor outputs of vLLM's native LFM3-VL and LFM3-Audio classes; until
+    # then these replace vLLM's registrations. LFM3 text runs on vLLM's own.
+    ModelRegistry.register_model(
+        "Lfm3VlForConditionalGeneration",
+        "vllm_metal.patches.lfm3_registry:Lfm3VlForConditionalGeneration",
+    )
+    ModelRegistry.register_model(
+        "Lfm3AudioForConditionalGeneration",
+        "vllm_metal.patches.lfm3_audio_registry:Lfm3AudioForConditionalGeneration",
+    )
 
 
 def apply_compat_patches() -> None:

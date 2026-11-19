@@ -22,7 +22,12 @@ from vllm.distributed.kv_transfer import (
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorHandshakeMetadata,
 )
-from vllm.distributed.parallel_state import get_pp_group, get_tp_group
+from vllm.distributed.parallel_state import (
+    checkpoint_prepare_distributed_state,
+    checkpoint_restore_distributed_state,
+    get_pp_group,
+    get_tp_group,
+)
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.tasks import SupportedTask
@@ -404,6 +409,12 @@ class MetalWorker(WorkerBase):
         if self._kv_cache_released and (tags is None or "kv_cache" in tags):
             self.model_runner.restore_kv_cache_memory()
             self._kv_cache_released = False
+
+    def checkpoint_prepare(self) -> None:
+        checkpoint_prepare_distributed_state()
+
+    def checkpoint_restore(self) -> None:
+        checkpoint_restore_distributed_state()
 
     def discard(self, tags: tuple[str, ...]) -> None:
         if set(tags) != {"kv_cache"}:
