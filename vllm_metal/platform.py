@@ -622,7 +622,8 @@ class MetalPlatform(Platform):
             cls._check_moe_expert_offload_config(vllm_config, backend)
 
         # Set worker class for Metal
-        if backend == "mps":
+        # vLLM-Omni builds diffusion-stage configs before attaching a model.
+        if backend == "mps" and model_config is not None:
             from vllm_metal.pytorch_backend.worker import configure_mps
 
             cls._serves_omni = getattr(model_config, "model_stage", None) is not None

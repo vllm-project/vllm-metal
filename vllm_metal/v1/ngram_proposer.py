@@ -5,13 +5,13 @@ An :class:`NgramProposer` drafts by matching the longest suffix n-gram of each
 request's committed token history against an earlier occurrence and copying the
 tokens that followed it (vLLM ``method="ngram"``). Unlike
 :class:`vllm_metal.v1.draft_model_proposer.DraftModelProposer` it loads no model
-and keeps no KV cache: the matching is the pure-Python + Numba KMP kernel that
-vLLM ships in :mod:`vllm.v1.spec_decode.ngram_proposer`, which this class wraps.
+and keeps no KV cache: the matching is the pure-Python + Numba KMP kernel in
+:mod:`vllm_metal.v1.ngram_matcher`, which this class wraps.
 
 The wrapper's only job is to translate the per-step :class:`ProposeContext` into
-the runtime draft count and array arguments that upstream's stateless
-``propose`` expects (``num_speculative_tokens``, ``sampled_token_ids``,
-``num_tokens_no_spec``, ``token_ids_cpu``) and hand the result back as
+the runtime draft count and array arguments that the matcher's stateless
+``propose`` expects (``num_speculative_tokens``, ``num_tokens_no_spec``,
+``token_ids_cpu``) and hand the result back as
 :class:`DraftTokenIds`. The committed history lives in
 ``state.token_ids`` (already updated with this step's accepted/sampled tokens by
 the time the runner builds the context).
@@ -39,8 +39,8 @@ from typing import TYPE_CHECKING
 import numpy as np
 from vllm.logger import init_logger
 from vllm.v1.outputs import DraftTokenIds
-from vllm.v1.spec_decode.ngram_proposer import NgramProposer as VllmNgramProposer
 
+from vllm_metal.v1.ngram_matcher import NgramMatcher
 from vllm_metal.v1.proposer import NoOwnKVProposer
 
 if TYPE_CHECKING:
@@ -70,7 +70,7 @@ _COOLDOWN_STEPS = 8
 
 
 class NgramProposer(NoOwnKVProposer):
-    """:class:`vllm_metal.v1.proposer.MetalProposer` backed by vLLM's n-gram kernel."""
+    """:class:`vllm_metal.v1.proposer.MetalProposer` backed by :class:`NgramMatcher`."""
 
     def __init__(
         self,
@@ -93,10 +93,9 @@ class NgramProposer(NoOwnKVProposer):
         # history in _resolve_pending, before this step's proposal is
         # scored as a hit or a miss.
         self._pending: dict[str, tuple[int, tuple[int, ...]]] = {}
-        # Upstream reads only scalar config (prompt_lookup_min/max,
-        # num_speculative_tokens, max_model_len, max_num_seqs) and runs a one-time
-        # Numba JIT warmup in its constructor — keep that off the hot path.
-        self._ngram = VllmNgramProposer(vllm_config)
+        # The matcher compiles its Numba kernel in the constructor, off the
+        # hot path.
+        self._ngram = NgramMatcher(vllm_config)
         spec = vllm_config.speculative_config
         assert spec is not None
         # Below this many committed tokens, the kernel structurally cannot
@@ -107,7 +106,7 @@ class NgramProposer(NoOwnKVProposer):
         assert spec.prompt_lookup_min is not None
         self._prompt_lookup_min = spec.prompt_lookup_min
 
-        # Pre-allocate the int32 token-id buffer once. Upstream only reads
+        # Pre-allocate the int32 token-id buffer once. The matcher only reads
         # ``token_ids_cpu[i, :num_tokens_no_spec[i]]`` per row, so the buffer
         # just needs to be large enough to hold the longest any request's
         # committed history can ever be, across every simultaneously-scheduled
@@ -188,10 +187,9 @@ class NgramProposer(NoOwnKVProposer):
         if not drafting:
             return None
 
-        # Upstream marks a row "active" by a non-empty sampled-ids entry; the
-        # match itself reads only token_ids_cpu[i, :num_tokens_no_spec[i]]. We
-        # forward exactly the requests we have decided may draft, so every row is
-        # active and num_tokens_no_spec is the committed history length.
+        # The match reads only token_ids_cpu[i, :num_tokens_no_spec[i]]. We
+        # forward exactly the requests we have decided may draft, so
+        # num_tokens_no_spec is the committed history length.
         num_requests = len(drafting)
         num_tokens_no_spec = np.array(
             [len(state.token_ids) for _, state in drafting], dtype=np.int32
@@ -200,11 +198,9 @@ class NgramProposer(NoOwnKVProposer):
         token_ids_cpu[:, :] = 0
         for i, (_, state) in enumerate(drafting):
             token_ids_cpu[i, : len(state.token_ids)] = state.token_ids
-        sampled_token_ids: list[list[int]] = [[0]] * num_requests
 
         drafts = self._ngram.propose(
             ctx.num_speculative_tokens,
-            sampled_token_ids,
             num_tokens_no_spec,
             token_ids_cpu,
         )
@@ -235,8 +231,7 @@ class NgramProposer(NoOwnKVProposer):
             # accepted.
             self._pending[req_id] = (len(state.token_ids), tuple(draft))
             req_ids.append(req_id)
-            # Upstream already yields Python ints via ndarray.tolist() — the
-            # old ``[int(t) for t in draft]`` was redundant.
+            # The matcher already yields Python ints via ndarray.tolist().
             draft_token_ids.append(list(draft))
 
         if not req_ids:

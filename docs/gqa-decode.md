@@ -1,23 +1,21 @@
 # GQA decode routing
 
-The default paged attention path selects between 256- and 512-token GQA
-partitions for ordinary single- and multi-request decode in the geometries below.
-Each partition has FP16/BF16 specializations for head dimensions 128/256
-with kernel block16, plus head256 with kernel block32. These form 12 active
-shader specializations.
+The default paged attention path runs ordinary single- and multi-request
+decode on a GQA producer for the geometries below. The producer splits each
+request's KV into 256-token partitions. It has FP16/BF16 specializations for
+head dimensions 128/256 with kernel block16, plus head256 with kernel block32:
+6 active shader specializations.
 
-This is a Metal-backend split-KV occupancy heuristic over precompiled
-partitions. It uses a fixed work budget, counts only complete partitions,
-and tries 512, then 256. A measured M3 preference below chooses P256 for
-some long-context batches that also qualify for P512. This is the same class
-of backend-internal scheduling choice
-as [FA3 split selection](https://github.com/Dao-AILab/flash-attention/blob/main/hopper/heuristics.h),
-[FlashInfer planning](https://github.com/flashinfer-ai/flashinfer/blob/main/include/flashinfer/attention/scheduler.cuh),
-and [ROCm partition choices](https://github.com/vllm-project/vllm/blob/main/csrc/rocm/attention.cu),
-not an equivalent cost model. FA3 also favors fewer splits near its estimated
-best efficiency; this implementation does not adopt its wave-efficiency model.
+The partition size is fixed. A query head walks its partition serially, so
+partitions are the producer's only parallelism over context length, and a
+finer partition fills the GPU sooner. Routing decides only whether to use the
+producer, from a fixed work budget over complete partitions; the detected core
+count is its only device input. This is a backend-internal split-KV choice
+like [FA3 split selection](https://github.com/Dao-AILab/flash-attention/blob/main/hopper/heuristics.h)
+and [FlashInfer planning](https://github.com/flashinfer-ai/flashinfer/blob/main/include/flashinfer/attention/scheduler.cuh),
+not an equivalent cost model.
 
-## Automatic eligibility and partition selection
+## Automatic eligibility
 
 The supported `(query heads, KV heads, head dimension)` geometries are
 `(32,8,128)`, `(24,8,128)`, `(24,4,256)`, `(16,2,128)`, and `(16,2,256)`.
@@ -25,83 +23,51 @@ Kernel block16 is supported for each; block32 is additionally supported for
 `(24,4,256)` and `(16,2,256)`. The existing scope is not inferred from a model-name
 list.
 Geometry and kernel-page admission are checked at the native dispatch gate
-before occupancy planning, including when a private test forces a partition.
+before occupancy planning, including when a private test forces the producer.
 One C++ table owns this domain. Numerical and routing tests read that table
 through `_gqa_decode_config_for_test()` instead of maintaining another list;
 golden threshold values and unsupported-input expectations remain independent.
 
 Let `C` be the detected GPU core count, `Q` the query-head count, and `L_i`
-each request's KV length including its current decode token. Both partitions
-use the same empirical budget of 33 SIMD groups per core. First select the largest
-`P` satisfying `Q * sum(floor(L_i / P)) >= 33 * C`; otherwise use the
-established path. Flooring each length separately avoids counting partial
-tails as complete work or treating short requests as copies of the longest.
+each request's KV length including its current decode token. The producer is
+used when `Q * sum(floor(L_i / 256)) >= 33 * C`, an empirical budget of 33 SIMD
+groups per core; otherwise the established path runs. Flooring each length
+separately avoids counting partial tails as complete work or treating short
+requests as copies of the longest.
 
-The measured 10-core M3 (`applegpu_g15g`) uses an additional short-context
-admission guard. A six-request `32/8/128` batch stays on the established path while
-all KV lengths are below 704; adjacent batch sizes keep the common rule.
-This guard conservatively excludes the measured short-context regression;
-other admitted head128 batches retain their existing partition selection.
+The same budget applies across batch sizes. The GQA planner does not reject a
+batch solely because its unsplit query-head grid exceeds a core-count
+threshold. The established per-token fallback retains its own split-KV policy.
 
-On that M3, multi-request head256 batches that qualify for P512 prefer P256
-when the longest actual KV length reaches
-4,096 tokens with kernel block16, or 8,192 with block32. This preference
-keeps the work gate: it does not admit an otherwise ineligible batch. It
-also requires P256's dynamic statistics plus its 64-byte static workspace to
-fit 32 KiB, using the allocation upper bound as well as the actual lengths;
-an oversized bound retains P512. Dispatch additionally checks the compiled
-pipeline's actual static allocation. These are
-device and layout calibration limits, independent of model names. Outside
-the short guard, shorter contexts and head128 keep the common rule.
-Single requests and other devices are unchanged.
-The preference removes measured M3 P512 regressions without disabling
-the positive long-context GQA cases. These are empirical policy limits, not a claim of the fastest route for every
-prompt or a cross-device speedup claim.
+A single request starts at `256 * ceil(33 * C / Q)` tokens. On a 40-core GPU:
 
-The same complete-partition budget applies across batch sizes. The GQA
-planner does not reject a batch solely because its unsplit query-head grid
-exceeds a core-count threshold. The established per-token fallback retains
-its own split-KV policy.
-
-The single-request decision is unchanged: each partition starts at
-`P * ceil(33 * C / Q)`. Admission and promotion share one rule, with no
-head-ratio correction or per-model budget. This is an empirical policy, not a
-hardware identity or a prediction of the fastest partition at every position.
-
-For one request on a 40-core GPU this gives:
-
-| Q/KV/head dimension | Start P256 | Start P512 |
-|---|---:|---:|
-| 32/8/128 | 10,752 | 21,504 |
-| 24/8/128 or 24/4/256 | 14,080 | 28,160 |
-| 16/2/128 or 256 | 21,248 | 42,496 |
+| Q/KV/head dimension | Start |
+|---|---:|
+| 32/8/128 | 10,752 |
+| 24/8/128 or 24/4/256 | 14,080 |
+| 16/2/128 or 256 | 21,248 |
 
 These values scale with the detected core count; they are not per-device or
-per-model context tables in the implementation. Core-count scaling does not
-establish cross-device performance or guarantee a speedup at every boundary.
-The budget is shared by both partitions; it has no per-model exceptions.
+per-model context tables in the implementation, and the budget has no
+per-model exceptions. Core-count scaling does not establish cross-device
+performance or guarantee a speedup at every boundary. Two `32/8/128` requests
+on that GPU start at 5,376 tokens each. Lengths `[1, 10752]` are admitted too:
+the long request supplies enough complete partitions and the short one none.
 
-For example, two `32/8/128` requests on that GPU start P256 at 5,376 tokens
-each and P512 at 10,752 each. Lengths `[1, 10752]` instead select P256:
-the short request supplies no complete partition. Ten `32/8/128` requests
-start P256 at 1,280 tokens each and P512 at 2,560 each on that GPU.
-
-Only complete partitions count toward selection. The producer, temporary
-buffers and reducer still use `ceil(KV_length / P)` so the final partial
+Only complete partitions count toward admission. The producer, temporary
+buffers and reducer still use `ceil(KV_length / 256)` so the final partial
 partition is processed. The first ordinary decode layer builds an immutable
 CPU length plan once per forward, shared across layers and KV groups. A single
-pass records the request count, maximum length and complete-partition totals
-for P256/P512. Each native layer copies this fixed-size value and applies its
+pass records the request count, maximum length and complete-partition total.
+Each native layer copies this fixed-size value and applies its
 geometry's policy without re-copying or re-scanning the request list. A new
 forward gets a new plan; deferred execution retains the original value.
 Single- and multi-request selection use the same planner. There is no GPU
 readback, startup benchmark or per-request performance probe.
-`gqa_decode_partition_size` exposes the default decision for tests;
-`gqa_decode_shape_eligible` is true when it selects a nonzero partition.
-`gqa_decode_batch_partition_size` takes a list of per-request lengths and
-applies the M3 preference using the executing GPU's architecture by default.
-Its optional `gpu_arch` is a read-only simulation input; it cannot change
-actual dispatch. `max_seq_len` optionally supplies an allocation upper bound.
+`gqa_decode_partition_size` exposes the default decision for tests, 256 or
+zero; `gqa_decode_shape_eligible` is true when it is nonzero.
+`gqa_decode_batch_partition_size` takes a list of per-request lengths;
+`max_seq_len` optionally supplies an allocation upper bound.
 These queries check geometry, work and the scratch budget, not all dispatch
 conditions. Direct primitive callers can pass `gqa_length_plan` from
 `gqa_decode_length_plan(context_lens)`; it must agree with GPU `seq_lens`.
@@ -136,8 +102,7 @@ Every eligible call additionally requires:
 - A verification window of at most 1.
 - Matching FP16/BF16 query, key-cache and value-cache types, or an FP16/BF16
   query over a TurboQuant cache (int8/uint8 K, packed uint8 V). TurboQuant
-  takes the same work budget but only P256: its producer measured faster at
-  P256 than P512 below 64K tokens on M5 and M1 Max. A TurboQuant decode batch
+  takes the same work budget. A TurboQuant decode batch
   reaches this path only as a whole batch; the compressed fallback rows of a
   bounded TurboQuant prefill keep the established kernels.
 - At most **512 MiB total GQA scratch per attention call**. With multi-request
@@ -150,6 +115,8 @@ Every eligible call additionally requires:
   serving windows; it is not a reservation or a bound on total process memory.
 - A kernel page size allowed above and sufficient reducer shared memory:
   aligned dynamic statistics plus the compiled pipeline's static allocation.
+  Apple GPUs' 32 KiB threadgroup limit fits 4,088 partitions, so `max_seq_len`
+  can be at most 1,046,528 tokens.
   This is checked before allocating GQA scratch or encoding the producer;
   an oversized `max_seq_len` allocation bound falls back even when the actual
   KV lengths pass the work budget. The reducer reuses the checked pipeline.
@@ -185,19 +152,18 @@ without it keep their existing batch routing.
 
 Kernel dtype, page layout, query-row shape, feature and resource checks determine
 whether an operation can run. Default admission is a separate measured policy:
-ordinary decode, the listed geometries, the two-tier work budget and the
-scoped M3 partition preference.
+ordinary decode, the listed geometries and the work budget.
 The C++ boundary enforces both, including for direct primitive callers.
 
 The native planner consumes post-append KV lengths, query/KV head geometry
-and detected core count; its result is fallback or P256/P512. For a whole
+and detected core count; its result is fallback or the GQA producer. For a whole
 ordinary decode batch, SDPA forwards the scheduler's existing CPU lengths.
 The primitive captures its own copy and includes it in lazy-node equivalence.
 Direct callers must supply lengths consistent with `seq_lens`; shape and
 positive-length bounds are checked eagerly, without reading GPU array data.
 
-All requests use the same chosen partition. The CPU length plan also captures
-per-request partition offsets for P256/P512, shared immutably across layers.
+The CPU length plan also captures per-request partition offsets, shared
+immutably across layers.
 When rows would need padding, the producer and reducer address tightly packed
 per-request partials using these offsets. Rows that all fill the dispatch stride
 retain their existing layout without an offset buffer. The producer grid and
@@ -228,7 +194,6 @@ rows or whose maximum exceeds `max_decode_context_len`.
 `tests/test_gqa_decode_routing.py` evaluates the public primitive and checks
 `last_paged_dispatch()` alongside the numerical reference. Positive cases
 must actually report `gqa_decode`; partition tests additionally check
-the executed 256/512 specialization through
 `last_gqa_partition_size()`. Boundary, multi-request, verification, feature,
 and disabled cases must report the appropriate established family, including
 upstream mixed prefill/decode.
@@ -250,15 +215,12 @@ Remainder tests cover block16/block32 pages and final page lengths that
 exercise both the 4-token loop and the scalar tail. Long-context page
 tables use a bounded permutation to avoid inflating the physical cache.
 Resource-limit tests reject oversized forced partitions before Metal
-encoding, then check that a larger partition computes the same history.
+encoding.
 `tests/test_attention_sdpa.py` checks that the environment switch and scheduler
 decode count reach the primitive.
 `tests/test_gqa_batched_decode.py` covers independent batch-planning boundaries,
 ragged lengths, every shipped specialization and dtype, shared prefix pages,
 translated scheduler pages, lazy writes, metadata lifetime and excluded routes.
-`tests/test_gqa_m3_policy.py` checks fixed device/page boundaries, unchanged
-single-request and other-device decisions, the reducer allocation limit and
-executed numerical results while lazy batches change membership and partition.
 The Python tests keep expanded verification metadata out of batch planning
 and pass only the decode prefix of a mixed batch, regenerating the plan when
 a later forward changes decode membership, order or lengths. Mixed-prefix
@@ -329,11 +291,11 @@ interchangeable with serving results.
 ## Follow-up work (separate PRs)
 
 These are directions for evaluation after this scoped change, not additional
-enablement or performance claims of this two-tier routing policy:
+enablement or performance claims of this routing policy:
 
 1. **GQA without split-KV:** evaluate a grouped kernel that writes its final
    output directly, independently of context partitioning. Measure its
-   tradeoff against P256/P512 at larger batch sizes.
+   tradeoff against the split producer at larger batch sizes.
 2. **Mixed prefill/decode:** the decode prefix split by
    [#851](https://github.com/vllm-project/vllm-metal/pull/851) (and its NAX
    counterpart) now uses GQA through a decode-prefix length plan (see the
@@ -350,7 +312,7 @@ enablement or performance claims of this two-tier routing policy:
    no per-step materialization of the history. Its partials stay in the
    rotated V domain, and the TurboQuant reduce applies the single inverse FWHT,
    as the split-KV TurboQuant path does. Default routing admits it under the
-   P256 work budget (see the eligibility list above). On M1 Max the budget
+   same work budget (see the eligibility list above). On M1 Max the budget
    leaves some short-context head256 shapes on the established kernels even
    though the producer is faster there; a TurboQuant-specific budget could
    admit them. `tools/benchmark/tq_gqa_decode_benchmark.py` times the kernels.

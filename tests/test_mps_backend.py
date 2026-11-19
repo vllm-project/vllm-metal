@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """MPS request mapping, cache sizing and normalization parity."""
 
+import mmap
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -1041,3 +1042,36 @@ def _check_mrv2_sampling_filters():
     assert processed[2, 1:3].tolist() == [8.0, 8.0]
     assert processed[2].isfinite().tolist() == [False, True, True, False, False]
     assert torch.equal(sample(10)[0], first)
+
+
+def test_omni_platform_peak_memory_resets_per_interval():
+    pytest.importorskip("vllm_omni")
+    from vllm_metal.pytorch_backend.omni_platform import MPSOmniPlatform
+
+    size = 256 << 20
+    MPSOmniPlatform.reset_peak_memory_stats()
+    start = MPSOmniPlatform.max_memory_reserved()
+    with mmap.mmap(-1, size) as buf:
+        for offset in range(0, size, 1 << 20):
+            buf[offset : offset + (1 << 20)] = b"\x01" * (1 << 20)
+    peak = MPSOmniPlatform.max_memory_reserved()
+    assert peak - start >= size * 0.9
+    assert MPSOmniPlatform.max_memory_allocated() >= peak
+
+    MPSOmniPlatform.reset_peak_memory_stats()
+    assert MPSOmniPlatform.max_memory_reserved() < peak - size // 2
+
+
+def test_omni_platform_diffusion_defaults():
+    pytest.importorskip("vllm_omni")
+    from vllm_omni.diffusion.attention.backends.registry import (
+        DiffusionAttentionBackendEnum,
+    )
+
+    from vllm_metal.pytorch_backend.omni_platform import MPSOmniPlatform
+
+    assert MPSOmniPlatform.is_initialized()
+    assert (
+        MPSOmniPlatform.get_diffusion_attn_backend_cls(None, 64)
+        == DiffusionAttentionBackendEnum.TORCH_SDPA.get_path()
+    )

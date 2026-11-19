@@ -135,9 +135,7 @@ _QMV_EPILOGUE = """
     }
 """
 
-_Q2K_QMV_SOURCE = (
-    _QMV_PROLOGUE
-    + """
+_Q2K_QMV_BODY = """
         device const uint8_t* b =
             blocks + ((size_t)row * blocks_per_row + blk) * 84;
         uint scm = b[grp];
@@ -166,12 +164,8 @@ _Q2K_QMV_SOURCE = (
             acc[batch] += s * part - m * xsum;
         }
 """
-    + _QMV_EPILOGUE
-)
 
-_Q3K_QMV_SOURCE = (
-    _QMV_PROLOGUE
-    + """
+_Q3K_QMV_BODY = """
         device const uint8_t* b =
             blocks + ((size_t)row * blocks_per_row + blk) * 110;
         float d = float(as_type<half>(((device const uint16_t*)(b + 108))[0]));
@@ -199,12 +193,8 @@ _Q3K_QMV_SOURCE = (
             acc[batch] += part;
         }
 """
-    + _QMV_EPILOGUE
-)
 
-_Q6K_QMV_SOURCE = (
-    _QMV_PROLOGUE
-    + """
+_Q6K_QMV_BODY = """
         device const uint8_t* b =
             blocks + ((size_t)row * blocks_per_row + blk) * 210;
         uint half_idx = grp / 8;
@@ -234,8 +224,6 @@ _Q6K_QMV_SOURCE = (
             acc[batch] += s * part;
         }
 """
-    + _QMV_EPILOGUE
-)
 
 # mlx types metal_kernel's return as a plain object; the callable contract
 # lives in its docs, so the constants carry Any.
@@ -244,10 +232,10 @@ _DEQUANT_SOURCES: dict[GGMLQuantizationType, str] = {
     GGMLQuantizationType.Q3_K: _Q3K_DEQUANT_SOURCE,
     GGMLQuantizationType.Q6_K: _Q6K_DEQUANT_SOURCE,
 }
-_QMV_SOURCES: dict[GGMLQuantizationType, str] = {
-    GGMLQuantizationType.Q2_K: _Q2K_QMV_SOURCE,
-    GGMLQuantizationType.Q3_K: _Q3K_QMV_SOURCE,
-    GGMLQuantizationType.Q6_K: _Q6K_QMV_SOURCE,
+_QMV_BODIES: dict[GGMLQuantizationType, str] = {
+    GGMLQuantizationType.Q2_K: _Q2K_QMV_BODY,
+    GGMLQuantizationType.Q3_K: _Q3K_QMV_BODY,
+    GGMLQuantizationType.Q6_K: _Q6K_QMV_BODY,
 }
 
 # Kernel names stay unique per qtype so Metal caches them separately.
@@ -265,14 +253,59 @@ _QMV_KERNELS: dict[GGMLQuantizationType, Any] = {
         name=f"gguf_{qtype.name.lower()}_qmv",
         input_names=["blocks", "x", "dims"],
         output_names=["y"],
-        source=source,
+        source=_QMV_PROLOGUE + body + _QMV_EPILOGUE,
     )
-    for qtype, source in _QMV_SOURCES.items()
+    for qtype, body in _QMV_BODIES.items()
 }
 
 # Must match the literal 256 stride in _QMV_PROLOGUE and the 8-simdgroup
 # reduction in _QMV_EPILOGUE.
 _KERNEL_THREADGROUP = 256
+
+# Gather QMV for stacked experts. Each token in the input batch fetches, dequantizes,
+# and performs vector-vector product with each row of each of its corresponding experts
+_GATHER_QMV_PROLOGUE = """
+    uint local_row = threadgroup_position_in_grid.x;
+    uint assignment = threadgroup_position_in_grid.y;
+    uint t = thread_position_in_threadgroup.x;
+    uint blocks_per_row = dims[0];
+    uint expert_rows = dims[1];
+    uint row = idx[assignment] * expert_rows + local_row;
+    const device float* x = xs + (size_t)assignment * blocks_per_row * 256;
+    uint total_groups = blocks_per_row * 16;
+    float acc[NB];
+    for (uint batch = 0; batch < NB; ++batch) acc[batch] = 0.0f;
+    for (uint g = t; g < total_groups; g += 256) {
+        uint blk = g / 16;
+        uint grp = g % 16;
+"""
+
+_GATHER_QMV_EPILOGUE = """
+    }
+    threadgroup float shared[8];
+    float ssum = simd_sum(acc[0]);
+    if ((t & 31) == 0) shared[t / 32] = ssum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (t == 0) {
+        float total = 0.0f;
+        for (uint i = 0; i < 8; ++i) total += shared[i];
+        y[(size_t)assignment * expert_rows + local_row] = total;
+    }
+"""
+
+_GATHER_QMV_KERNELS: dict[GGMLQuantizationType, Any] = {
+    qtype: mx.fast.metal_kernel(
+        name=f"gguf_{qtype.name.lower()}_gather_qmv",
+        input_names=["blocks", "xs", "idx", "dims"],
+        output_names=["y"],
+        source=_GATHER_QMV_PROLOGUE + body + _GATHER_QMV_EPILOGUE,
+    )
+    for qtype, body in _QMV_BODIES.items()
+}
+
+# Threshold for when it's likely faster to make a transient dequantized copy
+# of the expert tensor in memory first (measured; results in PR)
+_GATHER_QMV_MAX_ASSIGNMENTS_PER_EXPERT = 2
 
 
 @dataclass(frozen=True, eq=False)
@@ -497,3 +530,76 @@ class GGUFRawBlockTensor:
             threadgroup=(_KERNEL_THREADGROUP, 1, 1),
         )
         return out.reshape(n_rows, self.in_features)
+
+    def gather_matmul(
+        self,
+        x: mx.array,
+        indices: mx.array,
+        *,
+        num_experts: int,
+        sorted_indices: bool = False,
+    ) -> mx.array:
+        """Compute x @ dequantize(W_e).T for each expert e that indices selects.
+        Treats this tensor as a stack of experts.
+
+        ``sorted_indices`` may allow for a faster implementation if passed indices
+        are sorted.
+
+        Batches with few assignments per expert use the fused gather_qmv kernel
+        which dequantizes one row of this tensor at a time, otherwise an ephemeral
+        dequantized copy of this tensor is made for use with a batched matrix
+        multiply call.
+
+        See ``GGUFTensor.gather_matmul`` for what input and output shapes are used in
+        a MoE forward pass.
+        """
+        *batch_dims, m, in_features = x.shape
+        rows_per_expert = self.out_features // num_experts
+        if in_features != self.in_features:
+            raise ValueError(
+                f"{self.qweight_type.name} gather_matmul expects last dim "
+                f"{self.in_features}, got {in_features}"
+            )
+        assignment_shape = mx.broadcast_shapes(tuple(batch_dims), indices.shape)
+        idx = mx.broadcast_to(indices, assignment_shape).flatten()
+        max_assignments = _GATHER_QMV_MAX_ASSIGNMENTS_PER_EXPERT * num_experts
+        if m == 1 and 0 < idx.size <= max_assignments:
+            # This arm runs when it's likely more efficient to dequantize each
+            # row as it's needed within a custom kernel
+            xs = mx.broadcast_to(x, (*assignment_shape, 1, self.in_features))
+            out = self._gather_qmv(
+                xs.reshape(-1, self.in_features).astype(mx.float32),
+                idx.astype(mx.uint32),
+                rows_per_expert,
+            )
+            return out.reshape(*assignment_shape, 1, rows_per_expert).astype(x.dtype)
+        else:
+            # This arm runs when it's likely more efficient to dequantize the
+            # whole tensor first
+            dense = self._dequantize_rows(self.qweight, x.dtype)
+            experts = dense.reshape(num_experts, rows_per_expert, self.in_features)
+            out = mx.gather_mm(
+                x,
+                experts.swapaxes(-1, -2),
+                rhs_indices=indices,
+                sorted_indices=sorted_indices,
+            )
+            # Ensures that the large dequantized expert tensor doesn't stay in
+            # memory longer than necessary
+            mx.eval(out)
+            return out
+
+    def _gather_qmv(
+        self, xs_f32: mx.array, idx: mx.array, rows_per_expert: int
+    ) -> mx.array:
+        assignments = xs_f32.shape[0]
+        dims = mx.array([self.in_features // 256, rows_per_expert], dtype=mx.uint32)
+        (y,) = _GATHER_QMV_KERNELS[self.qweight_type](
+            inputs=[self.qweight, xs_f32, idx, dims],
+            template=[("NB", 1)],
+            output_shapes=[(assignments, rows_per_expert)],
+            output_dtypes=[mx.float32],
+            grid=(rows_per_expert * _KERNEL_THREADGROUP, assignments, 1),
+            threadgroup=(_KERNEL_THREADGROUP, 1, 1),
+        )
+        return y

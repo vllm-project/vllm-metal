@@ -14,8 +14,7 @@ from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
-from tests.stub_runner import make_stub_runner
-from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
+from tests.stub_runner import make_kv_cache, make_stub_runner
 from vllm_metal.attention.caches.turboquant import (
     BLOCK_SIZE,
     FWHT_SUPPORTED_HEAD_DIMS,
@@ -47,35 +46,11 @@ def mean_cosine_similarity(a: mx.array, b: mx.array) -> float:
     return mx.mean(dot / (a_norm * b_norm + 1e-8)).item()
 
 
-def _fill_cache(
-    cache: MetalPagedKVCache,
-    k_packed: mx.array,
-    v_packed: mx.array,
-    k_scale: mx.array,
-    v_scale: mx.array,
-    k_zero: mx.array,
-    slot: mx.array,
-) -> None:
-    """Scatter packed values into one layer of the paged cache."""
-    num_kv_heads = k_packed.shape[1]
-    scale_group_count = k_scale.shape[-1]
-
-    flat_k = cache.key_caches[0].reshape(-1, num_kv_heads, cache.k_packed_dim)
-    flat_k[slot] = k_packed
-    cache.key_caches[0] = flat_k.reshape(cache.key_caches[0].shape)
-
-    flat_v = cache.value_caches[0].reshape(-1, num_kv_heads, cache.v_packed_dim)
-    flat_v[slot] = v_packed
-    cache.value_caches[0] = flat_v.reshape(cache.value_caches[0].shape)
-
-    for arrays, data in (
-        (cache.key_scale_caches, k_scale),
-        (cache.value_scale_caches, v_scale),
-        (cache.key_zero_caches, k_zero),
-    ):
-        flat = arrays[0].reshape(-1, num_kv_heads, scale_group_count)
-        flat[slot] = data
-        arrays[0] = flat.reshape(arrays[0].shape)
+def _paged(rows: mx.array, num_blocks: int, block_size: int) -> mx.array:
+    """Place token rows in the leading slots of a zeroed paged layout."""
+    pages = mx.zeros((num_blocks * block_size, *rows.shape[1:]), dtype=rows.dtype)
+    pages[: rows.shape[0]] = rows
+    return pages.reshape(num_blocks, block_size, *rows.shape[1:])
 
 
 def _python_attention_reference(
@@ -227,7 +202,7 @@ def test_turboquant_cache_accepts_head_dim_512() -> None:
     key_bits = QUANT_PARAMS[k_quant]["bits"]
     value_bits = V_QUANT_PARAMS[v_quant]["bits"]
     scale_group_count = head_dim // BLOCK_SIZE
-    cache = MetalPagedKVCache(
+    cache = make_kv_cache(
         num_layers=num_layers,
         num_blocks=num_blocks,
         block_size=block_size,
@@ -279,7 +254,7 @@ def test_turboquant_cache_accepts_head_dim_512() -> None:
 )
 def test_paged_attention_rejects_missing_turboquant_arrays(missing: str | None) -> None:
     """Missing TurboQuant arrays must raise instead of dereferencing null pointers."""
-    cache = MetalPagedKVCache(
+    cache = make_kv_cache(
         num_layers=1,
         num_blocks=1,
         block_size=16,
@@ -330,17 +305,7 @@ def test_turboquant_512_head_dim_matches_python_reference() -> None:
     num_kv_heads = 2
     num_query_heads = 4
     head_dim = 512
-    cache = MetalPagedKVCache(
-        num_layers=1,
-        num_blocks=num_blocks,
-        block_size=block_size,
-        num_kv_heads=num_kv_heads,
-        head_dim=head_dim,
-        dtype=mx.float16,
-        turboquant=True,
-        k_quant="q8_0",
-        v_quant="q3_0",
-    )
+    v_bits = V_QUANT_PARAMS["q3_0"]["bits"]
     k = mx.random.normal(
         shape=(num_tokens, num_kv_heads, head_dim), key=mx.random.key(11)
     ).astype(mx.float16)
@@ -363,16 +328,11 @@ def test_turboquant_512_head_dim_matches_python_reference() -> None:
     )
     mx.eval(k_ref, v_ref)
 
-    slot = mx.arange(num_tokens, dtype=mx.int64)
-    mx.eval(slot)
-    _fill_cache(cache, k_packed, v_packed, k_scale, v_scale, k_zero, slot)
-    mx.eval(
-        cache.key_caches[0],
-        cache.value_caches[0],
-        cache.key_scale_caches[0],
-        cache.value_scale_caches[0],
-        cache.key_zero_caches[0],
+    key_cache, value_cache, key_scale_cache, value_scale_cache, key_zero_cache = (
+        _paged(rows, num_blocks, block_size)
+        for rows in (k_packed, v_packed, k_scale, v_scale, k_zero)
     )
+    mx.eval(key_cache, value_cache, key_scale_cache, value_scale_cache, key_zero_cache)
 
     block_tables = mx.array([[0]], dtype=mx.int32)
     seq_lens = mx.array([num_tokens], dtype=mx.int32)
@@ -381,12 +341,12 @@ def test_turboquant_512_head_dim_matches_python_reference() -> None:
     mx.eval(block_tables, seq_lens, cu_seqlens_q, out_metal)
 
     attn_scale = 1.0 / math.sqrt(head_dim)
-    v_centroids = get_v_centroids(cache.v_bits)
+    v_centroids = get_v_centroids(v_bits)
     ops = get_ops()
     out_metal = ops.paged_attention_primitive(
         q,
-        cache.key_caches[0],
-        cache.value_caches[0],
+        key_cache,
+        value_cache,
         num_kv_heads,
         attn_scale,
         0.0,
@@ -396,13 +356,13 @@ def test_turboquant_512_head_dim_matches_python_reference() -> None:
         block_size,
         num_tokens,
         -1,
-        key_scale_cache=cache.key_scale_caches[0],
-        value_scale_cache=cache.value_scale_caches[0],
-        key_zero_cache=cache.key_zero_caches[0],
+        key_scale_cache=key_scale_cache,
+        value_scale_cache=value_scale_cache,
+        key_zero_cache=key_zero_cache,
         v_centroids=v_centroids,
         use_turboquant=True,
         quant_type="q8_0",
-        v_bits=cache.v_bits,
+        v_bits=v_bits,
     )
     mx.eval(out_metal)
 
@@ -426,9 +386,9 @@ def test_tq_encode_kernel_supports_head_dim_512() -> None:
     runtime guard — breaking Gemma-style models with full-attn head_dim=512
     on the first forward pass after the Python encode fallback was removed.
 
-    This test goes through ``ops.tq_encode`` directly (not the Python
-    ``_fill_cache`` path used by ``test_turboquant_512_head_dim_matches_
-    python_reference``) and verifies its outputs match the Python encode.
+    This test goes through ``ops.tq_encode`` directly (not the Python encode
+    used by ``test_turboquant_512_head_dim_matches_python_reference``) and
+    verifies its outputs match the Python encode.
     """
     head_dim = 512
     num_tokens = 16
@@ -440,7 +400,7 @@ def test_tq_encode_kernel_supports_head_dim_512() -> None:
     v_bits = V_QUANT_PARAMS[v_quant]["bits"]
     k_signed = bool(QUANT_PARAMS[k_quant]["signed"])
 
-    cache = MetalPagedKVCache(
+    cache = make_kv_cache(
         num_layers=1,
         num_blocks=num_blocks,
         block_size=block_size,
@@ -773,7 +733,7 @@ def test_metal_encode_python_decode_roundtrip(
     # which takes v_bits directly, so the cache's v_quant is just for shape.
     v_quant = {3: "q3_0", 4: "q4_0", 8: "uint8"}.get(v_bits, "q3_0")
 
-    cache = MetalPagedKVCache(
+    cache = make_kv_cache(
         num_layers=1,
         num_blocks=num_blocks,
         block_size=block_size,

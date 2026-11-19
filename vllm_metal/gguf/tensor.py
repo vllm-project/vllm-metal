@@ -41,6 +41,34 @@ class GGUFTensor(Protocol):
         """``x @ W.T`` without dequantizing; preserves leading dims, returns x.dtype."""
         ...
 
+    def gather_matmul(
+        self,
+        x: mx.array,
+        indices: mx.array,
+        *,
+        num_experts: int,
+        sorted_indices: bool = False,
+    ) -> mx.array:
+        """Compute x @ dequantize(W_e).T for each expert e that indices selects.
+        Treats this tensor as a stack of experts.
+
+        ``sorted_indices`` may allow for a faster implementation if passed indices
+        are sorted.
+
+        The following shapes are a guideline for use in a MoE forward pass:
+
+        When ``sorted_indices`` is False:
+        - gate/up: ``x`` (B, S, 1, 1, D), ``indices`` (B, S, k) -> (B, S, k, 1, N)
+        - down: ``x`` (B, S, k, 1, D), ``indices`` (B, S, k) -> (B, S, k, 1, N)
+
+        When ``sorted_indices`` is True:
+        - gate/up/down: ``x`` (B*S*k, 1, D), ``indices`` (B*S*k,) -> (B*S*k, 1, N)
+
+        B = batch, S = sequence length, k = experts per token, D = ``in_features``,
+        N = ``out_features // num_experts``.
+        """
+        ...
+
     def embedding(self, ids: mx.array, output_dtype: mx.Dtype) -> mx.array:
         """Gather and dequantize the rows selected by ``ids``; returns output_dtype."""
         ...
