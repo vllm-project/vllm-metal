@@ -1,6 +1,6 @@
 # Installation
 
-Requires Apple Silicon and macOS 15 or later. Both methods install Python 3.12,
+Requires Apple Silicon and macOS 15 or later. Both methods default to Python 3.12,
 vLLM core, and prebuilt vllm-metal wheels. No compiler is needed.
 For an editable checkout, see [Contributing](CONTRIBUTING.md#development-setup).
 
@@ -28,6 +28,15 @@ source ~/.venv-vllm-metal/bin/activate
 The script installs `uv` if needed and uses `~/.venv-vllm-metal` for the Python
 environment. Activate it in each new shell before running `vllm`.
 For a stable release, replace `bash` with `bash -s -- --stable` in the command above.
+
+To use Python 3.13, select a release that includes a `cp313` wheel and use a
+separate environment:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/vllm-project/vllm-metal/main/install.sh | \
+  VLLM_METAL_PYTHON=3.13 VLLM_METAL_VENV="$HOME/.venv-vllm-metal313" bash
+source ~/.venv-vllm-metal313/bin/activate
+```
 
 To remove the installation:
 
