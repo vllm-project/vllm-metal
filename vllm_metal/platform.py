@@ -359,6 +359,12 @@ class MetalPlatform(Platform):
                 "prompt_logprob_start is not supported on the MLX backend.",
                 parameter="prompt_logprob_start",
             )
+        # vLLM admits logprobs=-1 when --max-logprobs is -1 or >= the vocab size.
+        if params.logprobs == -1 and envs.VLLM_METAL_BACKEND == "mlx":
+            raise VLLMValidationError(
+                "logprobs=-1 is not supported on the MLX backend.",
+                parameter="logprobs",
+            )
 
         unsupported_controls = [
             name
