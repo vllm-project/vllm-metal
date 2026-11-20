@@ -74,7 +74,7 @@ Open a pull request against `main` in `vllm-project/vllm-metal`.
 
 To avoid agent spam, vLLM Metal uses GitHub's
 [pull request limit](https://github.blog/open-source/maintainers/how-pull-request-limits-are-cutting-down-the-noise/)
-for contributors without write access. The current cap is 5 open pull requests, including drafts.
+for contributors without write access. The current cap is 2 open pull requests, including drafts.
 If this blocks well-intentioned critical work, contact a committer to request exemption-list access.
 
 Every pull request must answer the **Contributor intent** questions in the PR
