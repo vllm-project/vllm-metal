@@ -946,12 +946,11 @@ class TestPlatformDiffusionConfig:
     @pytest.mark.parametrize(
         ("params", "parameter"),
         [
-            ({"logprobs": -1}, "logprobs"),
             ({"prompt_logprobs": 1}, "prompt_logprobs"),
             ({"prompt_logprob_token_ids": [1]}, "prompt_logprob_token_ids"),
         ],
     )
-    def test_rejects_prompt_and_full_vocab_logprobs_while_serving_diffusion(
+    def test_rejects_prompt_logprobs_while_serving_diffusion(
         self, monkeypatch, params, parameter
     ) -> None:
         from vllm.exceptions import VLLMValidationError
