@@ -354,8 +354,8 @@ def test_pool_under_one_request_warns(
 
 
 def test_reset_empties_the_host_pool_index() -> None:
-    """Sleep frees the pool's pages. That is only safe because the reset
-    vLLM runs first leaves no hit that would read them."""
+    """Sleep frees the pool's pages. That is only safe because the connector's
+    reset runs first and leaves no hit that would read them."""
     manager = MetalTieringOffloadingSpec(_offloading_config()).get_manager()
     try:
         ctx = ReqContext(req_id="r-sleep")
