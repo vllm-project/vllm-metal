@@ -492,6 +492,48 @@ def _nax_plan_config(
         ({"value_dim": 512}, (64, 1, 128)),
         ({"token_stride": 1023}, (64, 1, 128)),
         ({"kv_tokens": 15}, (64, 1, 128)),
+        # GQA6 cold-prefill chunks at the 27B cache geometry (784-token pages).
+        # Calibration points from fixed-width timings against a common h1
+        # reference: h6 is 5.46%/4.92% faster than h3 at q=1568/p=15680 in
+        # both run orders, h3 wins at q=992; q=2592 directions disagree. The
+        # 64K case pins selector replay of the last full chunk (no fixed-width
+        # timing exists at that shape).
+        (
+            {
+                "heads": 24,
+                "kv": 4,
+                "page": 16,
+                "physical": 784,
+                "split": 1,
+                "q": 992,
+                "prefix": 12544,
+            },
+            (16, 3, 96),
+        ),
+        (
+            {
+                "heads": 24,
+                "kv": 4,
+                "page": 16,
+                "physical": 784,
+                "split": 1,
+                "q": 1568,
+                "prefix": 15680,
+            },
+            (16, 6, 192),
+        ),
+        (
+            {
+                "heads": 24,
+                "kv": 4,
+                "page": 16,
+                "physical": 784,
+                "split": 1,
+                "q": 1568,
+                "prefix": 62720,
+            },
+            (16, 6, 192),
+        ),
         ({"page": 8}, (64, 1, 128)),
         ({"heads": 17}, (64, 1, 128)),
         ({"kv": 0}, (64, 1, 128)),

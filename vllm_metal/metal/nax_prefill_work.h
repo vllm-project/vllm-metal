@@ -75,7 +75,10 @@ inline NaxPrefillWork nax_sequence_work(
 }
 
 // Relative costs from paired fixed-width D256 measurements on 10, 20 and 40
-// GPU cores (PR #1300). All widths use the same coefficients and work units.
+// GPU cores (PR #1300); the wide-tile state rate was re-fit against the 40-core
+// paired archive after measured 32K cold prefill preferred h6 over h3 where the
+// first fit ranked them 1% apart. All widths use the same coefficients and
+// work units.
 inline double nax_prefill_cost(
     NaxSequence sequence, const NaxGeometry& geometry, NaxLayout layout,
     bool split, int cores) {
@@ -84,7 +87,7 @@ inline double nax_prefill_cost(
   constexpr double kTilesPerCore = 8.;
   constexpr double kKvReadCost = 1. / 3.;
   constexpr double kGroupsPerCore = 5.;
-  constexpr double kWideTileCost = 0.5;
+  constexpr double kWideTileCost = 0.4;
   constexpr double kWideScanCost = 0.1;
 
   // A wider group shares KV reads across heads but holds more live Q rows.
