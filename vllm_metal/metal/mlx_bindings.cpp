@@ -114,8 +114,42 @@ static nb::dict take_nax_prefill_dispatch_trace_python() {
   return result;
 }
 
+// A uint8 [rows, cols] array over memory the caller owns, without a copy.
+// mx.from_dlpack does the same through MLX's allocator, which also adds the
+// buffer to MLX's residency set: with a wired limit set, Metal then wires all
+// of it (#1198). This buffer stays out of every residency set, so its pages
+// are committed only when the GPU uses it. The caller keeps the memory alive
+// and unchanged in size while any array over it may still be used.
+static array wrap_host_memory(uintptr_t ptr, int rows, int cols) {
+  if (ptr == 0 || rows <= 0 || cols <= 0) {
+    throw std::invalid_argument(
+        "wrap_host_memory: needs a non-null pointer and a positive shape");
+  }
+  const size_t nbytes = static_cast<size_t>(rows) * static_cast<size_t>(cols);
+  // The same options MLX gives its own buffers.
+  MTL::Buffer* buffer = metal::device(Device::gpu).mtl_device()->newBuffer(
+      reinterpret_cast<void*>(ptr), nbytes,
+      MTL::ResourceStorageModeShared | MTL::ResourceHazardTrackingModeUntracked,
+      nullptr);
+  if (buffer == nullptr) {
+    throw std::runtime_error("wrap_host_memory: Metal could not wrap " +
+                             std::to_string(nbytes) + " bytes");
+  }
+  array out({rows, cols}, uint8, nullptr, {});
+  out.set_data(
+      allocator::Data(allocator::Buffer(buffer),
+                      [buffer](allocator::Buffer) { buffer->release(); }),
+      nbytes, {static_cast<int64_t>(cols), 1}, array::Flags{true, true, false});
+  out.set_status(array::Status::available);
+  return out;
+}
+
 NB_MODULE(_paged_ops, m) {
   register_mlx_patch(m);
+  m.def("wrap_host_memory", &wrap_host_memory, nb::arg("ptr"), nb::arg("rows"),
+        nb::arg("cols"),
+        "A uint8 [rows, cols] array over caller-owned memory that MLX never "
+        "wires. The caller keeps the memory alive while the array is used.");
   m.attr("PARTITION_SIZE") = nb::int_(kPartitionSize);
   m.def("detected_gpu_core_count", &detected_gpu_core_count,
         "Detected GPU core count, or zero when detection is unavailable.");

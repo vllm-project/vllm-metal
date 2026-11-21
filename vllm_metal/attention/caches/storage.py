@@ -19,10 +19,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.worker.utils import allocate_kv_cache
 
-from vllm_metal.tensor_bridge import (
-    TORCH_TO_MLX_DTYPE,
-    torch_to_mlx,
-)
+from vllm_metal.tensor_bridge import TORCH_TO_MLX_DTYPE
 
 _INT32_MAX = 2**31 - 1
 
@@ -194,10 +191,19 @@ class KVCacheStorage:
         self.pages = CacheViews(self, list(regions.values()))
 
     def _wrap_buffers(self) -> None:
+        from vllm_metal.metal import get_ops
+
+        # Not torch_to_mlx: MLX wires the buffers it adopts while a wired limit
+        # is set, which made the whole pool resident at startup (#1198). The
+        # pages stay owned by self._backing.
         ends = [*self.region_offsets[1:], self.nbytes]
-        self.buffers = [
-            torch_to_mlx(self._raw[start:end].view(self.config.num_blocks, -1))
+        regions = [
+            self._raw[start:end].view(self.config.num_blocks, -1)
             for start, end in zip(self.region_offsets, ends, strict=True)
+        ]
+        self.buffers = [
+            get_ops().wrap_host_memory(region.data_ptr(), *region.shape)
+            for region in regions
         ]
 
     @property
