@@ -3,11 +3,14 @@
 
 from __future__ import annotations
 
+import ctypes
+import resource
 from bisect import bisect_right
 from collections.abc import Sequence
 from types import SimpleNamespace
 
 import mlx.core as mx
+import numpy as np
 import torch
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.v1.kv_cache_interface import (
@@ -17,6 +20,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.worker.utils import allocate_kv_cache
 
+from vllm_metal import envs
 from vllm_metal.tensor_bridge import TORCH_TO_MLX_DTYPE
 
 _INT32_MAX = 2**31 - 1
@@ -79,6 +83,41 @@ def allocate_kv_cache_lazily(
     )
 
 
+_PROT_READ_WRITE = 0x3
+_MAP_PRIVATE_FIXED_ANON = 0x2 | 0x10 | 0x1000
+
+
+def _replace_pages(ptr: int, nbytes: int) -> int:
+    """Map fresh zero pages over the whole pages inside [ptr, ptr + nbytes).
+
+    The range keeps its address, so tensors over it stay valid, and its old
+    pages go back to the OS at once; madvise(MADV_FREE_REUSABLE) only marks
+    them reclaimable. Partial pages at either end are left alone, since they
+    may belong to a neighbour. Returns the bytes replaced.
+    """
+    page = resource.getpagesize()
+    first = -(-ptr // page) * page
+    last = (ptr + nbytes) // page * page
+    if last <= first:
+        return 0
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.mmap.restype = ctypes.c_void_p
+    libc.mmap.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_long,
+    ]
+    got = libc.mmap(
+        first, last - first, _PROT_READ_WRITE, _MAP_PRIVATE_FIXED_ANON, -1, 0
+    )
+    if got != first:
+        raise OSError(ctypes.get_errno(), "could not replace KV chunk pages")
+    return last - first
+
+
 class CacheViews(Sequence[mx.array]):
     """Layer views following the latest native write to their shared backing."""
 
@@ -105,6 +144,11 @@ class CacheViews(Sequence[mx.array]):
         from vllm_metal.metal import get_ops
 
         region, shape, strides, offset, dtype = self.descriptors[index]
+        if getattr(self.storage, "chunk_shift", None) is not None:
+            # Chunk mode: the region's address table, offset to this view's K or V.
+            return self.storage.buffers[region] + mx.array(
+                offset * dtype.size, dtype=mx.uint64
+            )
         return get_ops().as_strided(
             self.storage.buffers[region].view(dtype), shape, strides, offset
         )
@@ -135,6 +179,14 @@ class KVCacheStorage:
             for group in config.kv_cache_groups
             for name in group.layer_names
         }
+        # Read once, so a sleep and wake cycle rebuilds the same layout.
+        self.chunk_mib = envs.VLLM_METAL_KV_CHUNK_MIB
+        self.chunk_shift: int | None = None
+        if self.chunk_mib:
+            if config.needs_kv_cache_zeroing:
+                raise NotImplementedError("kv chunk mode: zero-filled pools")
+            if any(hasattr(spec, "k_quant") for spec in self.specs.values()):
+                raise NotImplementedError("kv chunk mode: TurboQuant caches")
         self._bind()
 
     def _bind(self) -> None:
@@ -171,10 +223,17 @@ class KVCacheStorage:
                     (tensor.block_stride, 1),
                     offset,
                 )
-        self.pages = CacheViews(self, list(regions.values()))
+        # Chunked layers are address tables; nothing can view their bytes.
+        self.pages = (
+            CacheViews(self, list(regions.values())) if not self.chunk_mib else []
+        )
 
     def _wrap_buffers(self) -> None:
         from vllm_metal.metal import get_ops
+
+        if self.chunk_mib:
+            self._wrap_chunks()
+            return
 
         # Not torch_to_mlx: MLX wires the buffers it adopts while a wired limit
         # is set, which made the whole pool resident at startup (#1198). The
@@ -188,6 +247,206 @@ class KVCacheStorage:
             get_ops().wrap_host_memory(region.data_ptr(), *region.shape)
             for region in regions
         ]
+
+    def _wrap_chunks(self) -> None:
+        """Wrap each region as chunks of whole blocks; buffers[r] is r's address table.
+
+        A dispatch commits every buffer it reaches, so one buffer per layer makes
+        the whole pool resident on the first forward pass. Chunks are separate
+        buffers the kernels reach through their GPU addresses, made resident only
+        once a write lands in them (``wire_slots``).
+        """
+        from vllm_metal.metal import get_ops
+
+        ops = get_ops()
+        ends = [*self.region_offsets[1:], self.nbytes]
+        num_blocks = self.config.num_blocks
+        block_bytes = (ends[0] - self.region_offsets[0]) // num_blocks
+        blocks_per_chunk = max(1, (self.chunk_mib << 20) // block_bytes)
+        blocks_per_chunk = 1 << (blocks_per_chunk.bit_length() - 1)
+        self.chunk_shift = blocks_per_chunk.bit_length() - 1
+        self._blocks_per_chunk = blocks_per_chunk
+        self._block_bytes = block_bytes
+        self._region_starts = list(self.region_offsets)
+        self._chunk_blocks = [
+            [
+                min(blocks_per_chunk, num_blocks - first)
+                for first in range(0, num_blocks, blocks_per_chunk)
+            ]
+            for _ in self.region_offsets
+        ]
+        self._chunks: list[list[mx.array | None]] = [
+            [self._new_chunk(r, c) for c in range(len(blocks))]
+            for r, blocks in enumerate(self._chunk_blocks)
+        ]
+        self._addrs = [
+            np.array([ops._buffer_gpu_address(c) for c in chunks], dtype=np.uint64)
+            for chunks in self._chunks
+        ]
+        self.buffers = [mx.array(addrs) for addrs in self._addrs]
+        self._wired_chunks: set[int] = set()
+        self._idle_steps: dict[int, int] = {}
+        self._wired_slots_id: int | None = None
+        # Strides the kernels use, in elements of the cache dtype. Kernels see a
+        # layer as [block, token, head, C]; the upstream view is
+        # [block, head, token, C], so read them off the transposed view.
+        first = next(iter(self.tensors.values())).transpose(1, 2)
+        strides = first.stride()
+        self.chunk_dtype = TORCH_TO_MLX_DTYPE[first.dtype]
+        self.chunk_layout = [
+            strides[0],
+            strides[1],
+            strides[2],
+            0,
+            first.shape[-1] // 2,
+        ]
+
+    def _chunk_span(self, region: int, chunk: int) -> tuple[int, int]:
+        """Address and length of a chunk inside the backing."""
+        start = self._raw.data_ptr() + self._region_starts[region]
+        start += chunk * self._blocks_per_chunk * self._block_bytes
+        return start, self._chunk_blocks[region][chunk] * self._block_bytes
+
+    def _new_chunk(self, region: int, chunk: int) -> mx.array:
+        from vllm_metal.metal import get_ops
+
+        ptr, _ = self._chunk_span(region, chunk)
+        rows = self._chunk_blocks[region][chunk]
+        return get_ops().wrap_host_memory(ptr, rows, self._block_bytes)
+
+    def require_plain_pool(self, feature: str) -> None:
+        """Refuse a consumer that reads or writes the pool bytes directly.
+
+        In chunk mode a layer's cache array is an address table, so treating
+        it as the KV data itself would corrupt the table.
+        """
+        if self.chunk_shift is not None:
+            raise NotImplementedError(f"kv chunk mode: {feature}")
+
+    def chunk_kwargs(self) -> dict:
+        """Arguments telling paged_attention_primitive its K/V arrays are chunk
+        address tables. Empty for a plain pool."""
+        if self.chunk_shift is None:
+            return {}
+        return {
+            "kv_chunk_shift": self.chunk_shift,
+            "kv_chunk_dtype": self.chunk_dtype,
+            "kv_chunk_strides": self.chunk_layout[:3],
+        }
+
+    def write_chunked(
+        self,
+        key: mx.array,
+        value: mx.array,
+        slot_mapping: mx.array,
+        key_table: mx.array,
+        block_size: int,
+    ) -> tuple[mx.array, mx.array]:
+        """Scatter K/V rows into the chunks behind ``key_table``.
+
+        Wires the chunks the slots fall in first. Returns the K and V tables the
+        attention read must depend on; V is K shifted to the value half of a row.
+        """
+        from vllm_metal.metal import get_ops
+
+        if self.chunk_shift is None:
+            raise RuntimeError("write_chunked needs a chunked pool")
+        self.wire_slots(slot_mapping, block_size)
+        key_table = get_ops()._reshape_and_cache_chunked(
+            key,
+            value,
+            slot_mapping,
+            key_table,
+            self.chunk_shift,
+            block_size,
+            self.chunk_layout,
+            self.chunk_dtype,
+        )
+        value_offset = self.chunk_layout[4] * self.chunk_dtype.size
+        return key_table, key_table + mx.array(value_offset, dtype=mx.uint64)
+
+    def wire_slots(self, slot_mapping: mx.array, block_size: int) -> None:
+        """Make the chunks ``slot_mapping`` writes into GPU-resident.
+
+        Called once per forward step; every layer shares the block ids, so the
+        chunk at an index is wired in every region together.
+        """
+        if id(slot_mapping) == self._wired_slots_id:
+            return
+        self._wired_slots_id = id(slot_mapping)
+        slots = np.asarray(slot_mapping)
+        chunk_ids = np.unique((slots[slots >= 0] // block_size) >> self.chunk_shift)
+        self._wire_chunk_ids({int(c) for c in chunk_ids})
+
+    def _wire_chunk_ids(self, chunk_ids: set[int]) -> None:
+        from vllm_metal.metal import get_ops
+
+        ops = get_ops()
+        for c in sorted(chunk_ids - self._wired_chunks):
+            for r, chunks in enumerate(self._chunks):
+                if chunks[c] is None:
+                    # Reclaimed earlier: a fresh wrapper, and the table learns it.
+                    chunks[c] = self._new_chunk(r, c)
+                    self._addrs[r][c] = ops._buffer_gpu_address(chunks[c])
+                    self.buffers[r] = mx.depends(
+                        mx.array(self._addrs[r]), [self.buffers[r]]
+                    )
+                ops._wire_buffer(chunks[c])
+            self._wired_chunks.add(c)
+            self._idle_steps.pop(c, None)
+
+    def _chunk_block_ops(self, ids: np.ndarray, *, copy: bool) -> None:
+        """Copy (ids [n, 2]) or zero (ids [n]) whole blocks in every region."""
+        from vllm_metal.metal import get_ops
+
+        ops = get_ops()
+        self._wire_chunk_ids({int(c) for c in np.unique(ids >> self.chunk_shift)})
+        ids_mx = mx.array(ids)
+        for r in range(len(self.buffers)):
+            self.buffers[r] = ops._chunk_block_ops(
+                self.buffers[r], ids_mx, copy, self.chunk_shift, self._block_bytes
+            )
+
+    def reclaim_idle_chunks(
+        self, live_chunk_ids: set[int], min_idle_steps: int = 4
+    ) -> int:
+        """Give back wired chunks no request's blocks have used for a while.
+
+        Their contents are discarded, so the caller must not use this while freed
+        blocks may still be read again (prefix caching). Returns bytes given back.
+        """
+        idle = []
+        for c in sorted(self._wired_chunks):
+            if c in live_chunk_ids:
+                self._idle_steps.pop(c, None)
+                continue
+            self._idle_steps[c] = self._idle_steps.get(c, 0) + 1
+            if self._idle_steps[c] >= min_idle_steps:
+                idle.append(c)
+        if not idle:
+            return 0
+        # The GPU must be done with a chunk before its pages are replaced.
+        mx.synchronize()
+        freed = 0
+        for c in idle:
+            for r in range(len(self._chunks)):
+                freed += self._drop_chunk(r, c)
+            self._wired_chunks.discard(c)
+            self._idle_steps.pop(c, None)
+        return freed
+
+    def _drop_chunk(self, region: int, chunk: int) -> int:
+        """Unwire a chunk, release its wrapper and return its pages to the OS."""
+        from vllm_metal.metal import get_ops
+
+        wrapper = self._chunks[region][chunk]
+        if wrapper is None:
+            return 0
+        get_ops()._wire_buffer(wrapper, False)
+        self._chunks[region][chunk] = None
+        del wrapper
+        ptr, nbytes = self._chunk_span(region, chunk)
+        return _replace_pages(ptr, nbytes)
 
     @property
     def released(self) -> bool:
@@ -203,6 +462,14 @@ class KVCacheStorage:
         """
         self.buffers = []
         mx.synchronize()
+        if self.chunk_shift is not None:
+            from vllm_metal.metal import get_ops
+
+            for chunks in self._chunks:
+                for wrapper in chunks:
+                    if wrapper is not None:
+                        get_ops()._wire_buffer(wrapper, False)
+            self._chunks, self._wired_chunks = [], set()
         self._backing.resize_(0)
 
     def reallocate(self) -> None:
@@ -235,6 +502,11 @@ class KVCacheStorage:
     def copy_blocks(self, pairs: Sequence[tuple[int, int]]) -> None:
         if not pairs:
             return
+        if self.chunk_shift is not None:
+            self._chunk_block_ops(
+                np.array(pairs, dtype=np.int32).reshape(-1, 2), copy=True
+            )
+            return
         from vllm_metal.metal import get_ops
 
         src, dst = zip(*pairs, strict=True)
@@ -247,6 +519,11 @@ class KVCacheStorage:
 
     def zero_blocks(self, ids: Sequence[int]) -> None:
         if not ids:
+            return
+        if self.chunk_shift is not None:
+            self._chunk_block_ops(
+                np.array(sorted(set(ids)), dtype=np.int32), copy=False
+            )
             return
         from vllm_metal.metal import get_ops
 
@@ -263,6 +540,7 @@ class KVCacheStorage:
         backing buffer, so the write goes through the native scatter like
         ``copy_blocks`` does.
         """
+        self.require_plain_pool("row scatters")
         if len(rows) != len(self.pages):
             raise ValueError(
                 f"scatter_rows takes one row array per page: got {len(rows)} "
