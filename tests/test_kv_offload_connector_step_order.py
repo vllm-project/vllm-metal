@@ -296,13 +296,26 @@ def _mla_runtime():
     return MLAPagedAttentionRuntime()
 
 
-@pytest.mark.parametrize("runtime_factory", [_sdpa_runtime, _mla_runtime])
+def _hybrid_runtime():
+    from vllm_metal.attention.runtime.hybrid import HybridPagedAttentionRuntime
+
+    return HybridPagedAttentionRuntime.__new__(HybridPagedAttentionRuntime)
+
+
+@pytest.mark.parametrize(
+    ("runtime_factory", "storage_attribute"),
+    [
+        (_sdpa_runtime, "_storage"),
+        (_mla_runtime, "_storage"),
+        (_hybrid_runtime, "storage"),
+    ],
+)
 def test_register_hands_the_runtime_storage_to_the_connector(
-    spy_group, runtime_factory
+    spy_group, runtime_factory, storage_attribute
 ):
     runtime = runtime_factory()
     storage = object()
-    runtime._storage = storage
+    setattr(runtime, storage_attribute, storage)
     runner = make_stub_runner(model=SimpleNamespace())
     runner._paged_attention_runtime = runtime
 
@@ -320,6 +333,7 @@ def test_register_hands_the_runtime_storage_to_the_connector(
         # Count-initialized (draft-model) caches never bind storage.
         pytest.param(_sdpa_runtime, id="sdpa-without-storage"),
         pytest.param(_mla_runtime, id="mla-without-storage"),
+        pytest.param(_hybrid_runtime, id="hybrid-without-storage"),
     ],
 )
 def test_register_rejects_runtimes_without_storage(monkeypatch, runtime_factory):

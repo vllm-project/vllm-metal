@@ -8,6 +8,7 @@ is inherited. No mlx import here: the scheduler process loads this module.
 
 from __future__ import annotations
 
+from hashlib import sha256
 from typing import TYPE_CHECKING
 
 from vllm.config import VllmConfig
@@ -15,9 +16,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorRole
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
     OffloadingConnector,
 )
+from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
+    MambaSpec,
     MLAAttentionSpec,
 )
 
@@ -29,24 +32,46 @@ if TYPE_CHECKING:
 
 def validate_metal_support(kv_cache_config: KVCacheConfig) -> None:
     groups = kv_cache_config.kv_cache_groups
-    if len(groups) != 1:
-        got = f"{len(groups)} groups"
-    elif any(name.startswith("draft_layers.") for name in groups[0].layer_names):
+    specs = [group.kv_cache_spec for group in groups]
+    if any(
+        name.startswith("draft_layers.")
+        for group in groups
+        for name in group.layer_names
+    ):
         # Draft-model spec decode registers its KV in the same group.
         got = "a draft model's KV; drop --speculative-config"
-    elif isinstance(groups[0].kv_cache_spec, MLAAttentionSpec) and (
-        type(groups[0].kv_cache_spec) is not MLAAttentionSpec
+    elif (
+        len(specs) == 1
+        and isinstance(specs[0], FullAttentionSpec)
+        and (
+            not isinstance(specs[0], MLAAttentionSpec)
+            or type(specs[0]) is MLAAttentionSpec
+        )
     ):
-        # Subclasses such as HiddenStateCacheSpec do not hold attention KV.
-        got = type(groups[0].kv_cache_spec).__name__
-    elif isinstance(groups[0].kv_cache_spec, FullAttentionSpec):
-        # MLAAttentionSpec is a FullAttentionSpec: one latent row per token.
+        return
+    elif (
+        len(specs) > 1
+        and any(type(spec) is FullAttentionSpec for spec in specs)
+        and any(isinstance(spec, MambaSpec) for spec in specs)
+        and len(kv_cache_config.prefix_cacheable_group_ids) == len(groups)
+        and all(
+            type(spec) is FullAttentionSpec
+            or (
+                isinstance(spec, MambaSpec)
+                and spec.mamba_type == MambaAttentionBackendEnum.GDN_ATTN
+                and spec.mamba_cache_mode == "align"
+            )
+            for spec in specs
+        )
+    ):
         return
     else:
-        got = type(groups[0].kv_cache_spec).__name__
+        got = ", ".join(type(spec).__name__ for spec in specs)
+        if len(specs) != 1:
+            got = f"{len(specs)} groups ({got})"
     raise NotImplementedError(
-        "KV offloading on Metal supports a single full-attention KV cache "
-        f"group; got {got}"
+        "KV offloading on Metal supports a single full-attention KV cache group "
+        f"or full attention with aligned GDN state; got {got}"
     )
 
 
@@ -60,6 +85,22 @@ class MetalOffloadingConnector(OffloadingConnector):
         # The worker builds the connector before it allocates the KV cache.
         if role == KVConnectorRole.WORKER:
             validate_metal_support(kv_cache_config)
+        else:
+            recurrent = tuple(
+                group.kv_cache_spec
+                for group in kv_cache_config.kv_cache_groups
+                if isinstance(group.kv_cache_spec, MambaSpec)
+            )
+            if recurrent:
+                # FileMapper knows the attention dtype, but not the state dtypes
+                # or the padded layout of the recurrent group's pages.
+                layout = sha256(
+                    repr((kv_cache_config.kv_cache_layout, recurrent)).encode()
+                ).hexdigest()[:16]
+                assert vllm_config.kv_transfer_config is not None
+                extra = vllm_config.kv_transfer_config.kv_connector_extra_config
+                for tier in extra.get("secondary_tiers") or ():
+                    tier["hybrid_layout"] = f"gdn-{layout}"
         super().__init__(vllm_config, role, kv_cache_config)
 
     def register_kv_caches(self, kv_caches) -> None:

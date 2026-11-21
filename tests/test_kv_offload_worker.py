@@ -16,7 +16,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     TransferJob,
 )
 from vllm.engine.arg_utils import EngineArgs
+from vllm.v1.kv_offload.base import GPULoadStoreSpec
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
+from vllm.v1.kv_offload.pointer_utils import resolve_device_pointers
 
 from tests.kv_offload_helpers import (
     device_ptrs,
@@ -319,8 +321,28 @@ def test_multi_group_device_pointers_raise() -> None:
     worker = make_worker(make_storage())
     ptrs = device_ptrs(worker, [1, 2])
     two_groups = replace(ptrs, group_block_counts=(2, 0), block_indices=(0, 0))
-    with pytest.raises(ValueError, match="single KV cache group"):
+    with pytest.raises(ValueError, match="cache group counts"):
         worker.submit_store(1, two_groups, CPULoadStoreSpec([0, 1]))
+
+
+def test_shared_pool_roundtrip_for_different_group_rows() -> None:
+    storage = make_storage()
+    worker = make_worker(storage, blocks_per_chunk=2)
+    first, second = worker.kv_caches.group_data_refs[0]
+    worker.kv_caches.group_data_refs = [[first, second], [second]]
+    randomize(storage)
+    block_ids = [5, 3, 6]
+    expected = snapshot_blocks(storage, block_ids)
+    gpu = GPULoadStoreSpec(block_ids, group_sizes=(1, 2), block_indices=(1, 0))
+    pointers = resolve_device_pointers(gpu, worker.kv_caches)
+    cpu = CPULoadStoreSpec([2, 1])
+
+    assert worker.submit_store(1, pointers, cpu)
+    zero_blocks(storage, block_ids)
+    assert worker.submit_load(2, cpu, pointers)
+
+    for actual, want in zip(snapshot_blocks(storage, block_ids), expected, strict=True):
+        np.testing.assert_array_equal(actual, want)
 
 
 def test_duplicate_load_destinations_raise() -> None:

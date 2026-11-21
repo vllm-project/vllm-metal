@@ -353,6 +353,18 @@ def test_pool_under_one_request_warns(
     assert ("GiB or more, or use a shorter" in caplog.text) == (not auto_pool)
 
 
+def test_pool_warning_counts_the_recurrent_checkpoint(caplog) -> None:
+    config = _offloading_config(max_model_len=16 * 4096)
+    (attention,) = config.groups
+    state = replace(
+        attention, group_id=1, layer_names=("state",), sliding_window_size_in_chunks=1
+    )
+    spec = MetalTieringOffloadingSpec(replace(config, groups=(attention, state)))
+    with caplog.at_level("WARNING", logger=_SPEC_LOGGER):
+        spec._warn_if_pool_under_one_request()
+    assert "one --max-model-len request needs 4097." in caplog.text
+
+
 def test_reset_empties_the_host_pool_index() -> None:
     """Sleep frees the pool's pages. That is only safe because the reset
     vLLM runs first leaves no hit that would read them."""

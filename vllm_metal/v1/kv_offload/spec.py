@@ -127,8 +127,13 @@ class MetalTieringOffloadingSpec(TieringOffloadingSpec):
         """
         if self.num_chunks <= 0:
             return
-        tokens_per_chunk = self.tokens_per_block[0] * self.blocks_per_chunk
-        request_chunks = self.config.model.max_model_len // tokens_per_chunk
+        request_chunks = 0
+        for group in self.config.groups:
+            tokens_per_chunk = group.tokens_per_block * self.blocks_per_chunk
+            chunks = self.config.model.max_model_len // tokens_per_chunk
+            if group.sliding_window_size_in_chunks is not None:
+                chunks = min(chunks, group.sliding_window_size_in_chunks)
+            request_chunks += chunks
         if self.num_chunks >= request_chunks:
             return
         # Hundredths of a GiB, rounded up.
