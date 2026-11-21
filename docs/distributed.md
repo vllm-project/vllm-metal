@@ -103,7 +103,7 @@ RAY_ADDRESS=auto VLLM_HOST_IP=10.0.0.1 \
     --no-async-scheduling
 ```
 
-PP needs synchronous scheduling — the first stage has no sampler and rebuilds the token stream from the scheduler, which async scheduling would leave empty. vLLM turns async scheduling off for PP when neither scheduling flag is passed, and an explicit `--async-scheduling` fails loud.
+PP needs synchronous scheduling — the first stage has no sampler and rebuilds the token stream from the scheduler, which async scheduling would leave empty. vLLM turns async scheduling off for PP when neither scheduling flag is passed, and an explicit `--async-scheduling` is overridden with a warning.
 
 On a healthy boot each worker logs its stage — `Pipeline stage 0/2 (is_first=True, is_last=False)` and `Pipeline stage 1/2 (is_first=False, is_last=True)` — and the MLX ring bootstrap lists both Macs' Thunderbolt IPs.
 
@@ -160,7 +160,7 @@ mlx.launch -n 2 --backend ring tools/pp_parity_check.py Qwen/Qwen3-0.6B
 
 - **Checkpoint loading.** PP lazily slices MLX-LM safetensors; AWQ and GGUF are rejected because their loaders materialize the full model before slicing.
 - **Co-located stages oversubscribe the KV budget.** Each stage applies `--gpu-memory-utilization` to the whole device independently; neither knows the other exists, so two stages on one Mac claim roughly twice the fraction. Lower it when stacking. Separate Macs are unaffected.
-- **Synchronous scheduling required.** vLLM disables async scheduling for PP by default; an explicit `--async-scheduling` fails loud.
+- **Synchronous scheduling required.** vLLM disables async scheduling for PP by default; an explicit `--async-scheduling` is overridden with a warning.
 - **TP=1 only.** PP+TP is rejected; tensor parallelism (`--tensor-parallel-size > 1`) is not implemented.
 - **Model support.** YOCO / hybrid / MLA / pooling / VLM / speculative decoding / LoRA are rejected; other shapes (sliding-window, MoE) are untested.
 
