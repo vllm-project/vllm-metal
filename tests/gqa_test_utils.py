@@ -272,6 +272,7 @@ def _run_primitive(
             block_size,
             max_kv_len,
             test_partition,
+            sliding_window=sliding_window,
             **quant_kwargs,
         )
     else:

@@ -331,9 +331,13 @@ NB_MODULE(_paged_ops, m) {
         [](const array& q, const array& k, const array& v,
            float scale, const array& tables, const array& lengths,
            int block_size, int max_seq_len, int partition_size,
-           const std::optional<GqaDecodeLengthPlan>& gqa_length_plan) {
+           const std::optional<GqaDecodeLengthPlan>& gqa_length_plan,
+           int sliding_window) {
           if (partition_size != kGqaPartitionSize) {
             throw std::invalid_argument("GQA test partition must be 256");
+          }
+          if (sliding_window == 0 || sliding_window < -1) {
+            throw std::invalid_argument("GQA test sliding_window must be -1 or positive");
           }
           if (q.ndim() != 3 || q.shape(0) < 1 || k.ndim() != 4 ||
               k.shape() != v.shape() || k.strides() != v.strides() ||
@@ -350,9 +354,10 @@ NB_MODULE(_paged_ops, m) {
               max_seq_len > static_cast<int64_t>(tables.shape(1)) * block_size) {
             throw std::invalid_argument("GQA test entry requires supported one-token decode rows");
           }
+          const int64_t visible_len = sliding_window > 0
+              ? std::min(max_seq_len, sliding_window) : max_seq_len;
           const int64_t num_partitions =
-              (static_cast<int64_t>(max_seq_len) + partition_size - 1) /
-              partition_size;
+              (visible_len + partition_size - 1) / partition_size;
           if (kernels::paged_reduce_threadgroup_bytes(num_partitions) >
               metal::device(Device::gpu).mtl_device()->maxThreadgroupMemoryLength()) {
             throw std::invalid_argument(
@@ -361,16 +366,18 @@ NB_MODULE(_paged_ops, m) {
           auto cu = arange(q.shape(0) + 1, int32);
           return paged_attention_primitive_fn(
               q, k, v, k.shape(2), scale, 0.f, tables, lengths, cu,
-              block_size, max_seq_len, -1, false, "", nullptr, nullptr,
+              block_size, max_seq_len, sliding_window, false, "", nullptr, nullptr,
               nullptr, nullptr, 3, 1, nullptr, nullptr, q.shape(0), q.shape(0),
               max_seq_len, false,
               partition_size, gqa_length_plan);
         }, nb::arg("query"), nb::arg("key_cache"), nb::arg("value_cache"),
         nb::arg("scale"), nb::arg("block_tables"), nb::arg("seq_lens"),
         nb::arg("block_size"), nb::arg("max_seq_len"), nb::arg("partition_size"),
-        nb::arg("gqa_length_plan") = nb::none(),
+        nb::arg("gqa_length_plan") = nb::none(), nb::arg("sliding_window") = -1,
         "Private test-only one-token-per-request GQA dispatch with an explicit partition. "
         "Page IDs and sequence lengths must describe valid cache contents. "
+        "A positive sliding_window runs the windowed producer, which default "
+        "routing does not select yet. "
         "Does not change the default selector or require GPU core detection.");
 
   // TurboQuant counterpart of the entry above. Default routing never sends
