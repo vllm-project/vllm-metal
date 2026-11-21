@@ -359,6 +359,12 @@ class MetalPlatform(Platform):
                 "prompt_logprob_start is not supported on the MLX backend.",
                 parameter="prompt_logprob_start",
             )
+        # vLLM admits logprobs=-1 when --max-logprobs is -1 or >= the vocab size.
+        if params.logprobs == -1 and envs.VLLM_METAL_BACKEND == "mlx":
+            raise VLLMValidationError(
+                "logprobs=-1 is not supported on the MLX backend.",
+                parameter="logprobs",
+            )
 
         unsupported_controls = [
             name
@@ -405,11 +411,6 @@ class MetalPlatform(Platform):
         # Upstream's diffusion sampler applies top_k/top_p to the canvas; the
         # Metal one does not, so refuse them rather than ignore them.
         if cls._serves_diffusion:
-            if params.logprobs == -1:
-                raise VLLMValidationError(
-                    "logprobs=-1 is not supported for diffusion models on Metal.",
-                    parameter="logprobs",
-                )
             for name, enabled in (
                 ("prompt_logprobs", params.prompt_logprobs is not None),
                 ("top_k", params.top_k > 0),
