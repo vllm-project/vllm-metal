@@ -49,6 +49,28 @@ that this setting is off. Offline measurements remain useful when labeled with
 their actual topology, but their absolute rates or A/B ratios should not be
 substituted for serving results.
 
+## Measure short requests during a long prefill
+
+Measure each request alone first. Then send the same short request at a fixed
+offset after dispatching a long prompt that spans several prefill chunks. Choose
+an offset before the long prompt's first generated token and verify the requests
+overlapped. Repeat with a burst of short requests when that reflects your
+workload. Report each class's first-token latency and the long request's TTFT
+in isolation.
+
+Compare `--long-prefill-token-threshold` values with
+`--max-num-batched-tokens` fixed. The threshold caps a long prefill chunk when
+another request is eligible. A lone request can still use the full batch budget.
+Test a smaller `--max-num-batched-tokens` separately if a short request
+waits on a long chunk already in flight. Check both the short-request
+latency and the cost to solo long prompts and similarly sized peers.
+
+Keep sampling and async scheduling fixed across arms. Use cold prefixes for
+the timed mix and record the cached-token count when measuring a warm repeat.
+For a separate diagnostic run, `--enable-logging-iteration-details` reports
+planned context and generation work for each iteration. Use a scoped Metal
+trace when attributing that time to GPU execution.
+
 ## Control warmup and machine state
 
 - Warm every comparison arm with the real workload. Exclude model loading,
