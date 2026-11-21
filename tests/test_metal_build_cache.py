@@ -26,6 +26,7 @@ class _Paths:
     internal: Path
     patch: Path
     kernels: Path
+    nax_work: Path
     device: Path
     device_src: Path
     bld: Path
@@ -46,6 +47,7 @@ def patched(tmp_path, monkeypatch) -> _Paths:
     internal = tmp_path / "ops_internal.h"
     patch = tmp_path / "mlx_patch.cpp"
     kernels = tmp_path / "paged_attention_kernels.h"
+    nax_work = tmp_path / "nax_prefill_work.h"
     device = tmp_path / "metal_device.h"
     device_src = tmp_path / "metal_device.cpp"
     bld = tmp_path / "build.py"
@@ -57,6 +59,7 @@ def patched(tmp_path, monkeypatch) -> _Paths:
     src.write_bytes(b"// source v1")
     patch.write_bytes(b"// patch v1")
     kernels.write_bytes(b"// kernel descriptions v1")
+    nax_work.write_bytes(b"// NAX work v1")
     device.write_bytes(b"// hardware detection v1")
     device_src.write_bytes(b"// hardware detection source v1")
     bld.write_bytes(b"# build v1")
@@ -75,6 +78,7 @@ def patched(tmp_path, monkeypatch) -> _Paths:
         monkeypatch.setattr(build, attr, path)
     monkeypatch.setattr(build, "_MLX_PATCH", patch)
     monkeypatch.setattr(build, "_KERNELS", kernels)
+    monkeypatch.setattr(build, "_NAX_WORK", nax_work)
     monkeypatch.setattr(build, "_DEVICE", device)
     monkeypatch.setattr(build, "_DEVICE_SRC", device_src)
     monkeypatch.setattr(build, "_BUILD", bld)
@@ -95,6 +99,7 @@ def patched(tmp_path, monkeypatch) -> _Paths:
         internal,
         patch,
         kernels,
+        nax_work,
         device,
         device_src,
         bld,
@@ -159,6 +164,7 @@ def test_old_content_with_newer_so_mtime_still_rebuilds(patched):
         "src",
         "patch",
         "kernels",
+        "nax_work",
         "device",
         "paged_attention",
         "gdn",
@@ -176,7 +182,7 @@ def test_hash_changes_with_source_bytes(patched, source_name):
 
 @pytest.mark.parametrize(
     "source_name",
-    ["mps_src", "kernels", "device", "device_src", "bld", "consts"],
+    ["mps_src", "kernels", "nax_work", "device", "device_src", "bld", "consts"],
 )
 def test_mps_hash_changes_with_source_bytes(
     patched, tmp_path, monkeypatch, source_name

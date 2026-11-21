@@ -9,7 +9,7 @@ silently skips itself is worse than no check. Run it on an M5 before touching
     python tools/nax_prefill_parity.py
     VLLM_METAL_NAX_GQA_PREFILL=0 python tools/nax_prefill_parity.py
 
-The default run includes GQA6 head groups and tails. Run the second command
+The default run includes GQA6/GQA8 head groups and tails. Run the second command
 in a fresh process for the upstream control; the feature flag is read at load.
 
 Covers every compiled specialization -- {float16, bfloat16} x head_size
@@ -111,6 +111,7 @@ class Case:
     kv_heads: int = KV_HEADS
     cache_page: int = 0
     expected_widths: tuple[int, int] | None = None
+    planning_cores: int = 40
 
     def __str__(self) -> str:
         return (
@@ -194,7 +195,7 @@ def _boundary_cases() -> list[Case]:
 
 
 def _grouped_cases() -> list[Case]:
-    """GQA6 group widths, tails, translated pages and feature fallbacks."""
+    """Grouped widths, tails, translated pages and feature fallbacks."""
     cases = [
         Case(
             mx.bfloat16,
@@ -225,13 +226,70 @@ def _grouped_cases() -> list[Case]:
             mx.bfloat16,
             256,
             16,
-            "grouped-required-h3-h6",
+            "grouped-required-h6",
             seqs=((1328, 31360),),
             poison_padding=True,
             q_heads=24,
             kv_heads=4,
             cache_page=784,
-            expected_widths=(3, 6),
+            expected_widths=(6, 6),
+            planning_cores=10,
+        )
+    )
+    cases.extend(
+        Case(
+            mx.bfloat16,
+            256,
+            32,
+            f"gqa8-geometry-q{q}-p{prefix}",
+            seqs=((q, prefix),),
+            poison_padding=True,
+            q_heads=h,
+            kv_heads=k,
+        )
+        for h, k, q, prefix in [
+            (16, 2, 63, 31680),
+            (16, 2, 65, 31680),
+            (16, 2, 128, 31681),
+            (16, 2, 144, 31680),
+            (32, 4, 144, 31680),
+            (72, 9, 128, 8193),
+        ]
+    )
+    cases.append(
+        Case(
+            mx.bfloat16,
+            256,
+            32,
+            "grouped-required-h4",
+            seqs=((128, 31681),),
+            poison_padding=True,
+            q_heads=16,
+            kv_heads=2,
+            cache_page=544,
+            expected_widths=(4, 4),
+            planning_cores=10,
+        )
+    )
+    cases.extend(
+        Case(
+            mx.bfloat16,
+            256,
+            page,
+            f"grouped-required-gqa{heads // kv_heads}-h{width}",
+            seqs=((q, prefix),),
+            poison_padding=True,
+            q_heads=heads,
+            kv_heads=kv_heads,
+            cache_page=physical,
+            expected_widths=expected,
+            planning_cores=cores,
+        )
+        for heads, kv_heads, page, physical, q, prefix, cores, width, expected in (
+            (24, 4, 16, 784, 64, 31360, 20, 2, (2, 1)),
+            (16, 2, 32, 1056, 16, 31680, 40, 2, (2, 2)),
+            (64, 8, 32, 1056, 2048, 17, 10, 8, (8, 8)),
+            (24, 4, 16, 784, 144, 31360, 20, 3, (3, 3)),
         )
     )
     for dtype, d, page, window, softcap, sinks in [
@@ -256,6 +314,24 @@ def _grouped_cases() -> list[Case]:
                 True,
                 24,
                 4,
+            )
+        )
+    for dtype, page, window in [
+        (mx.float16, 32, -1),
+        (mx.bfloat16, 16, -1),
+        (mx.bfloat16, 32, 31),
+    ]:
+        cases.append(
+            Case(
+                dtype,
+                256,
+                page,
+                "grouped-fallback",
+                sliding_window=window,
+                seqs=((128, 31681),),
+                poison_padding=True,
+                q_heads=16,
+                kv_heads=2,
             )
         )
     return cases
@@ -293,7 +369,7 @@ def _build_case(case: Case):
         padding = mx.array(float("nan"), dtype=case.dtype)
         key_cache = mx.where(valid, key_cache, padding)
         value_cache = mx.where(valid, value_cache, padding)
-    if case.q_heads // case.kv_heads == 6:
+    if case.q_heads // case.kv_heads in (6, 8):
         kv = mx.stack((key_cache, value_cache), axis=3)
         key_cache, value_cache = kv[:, :, :, 0, :], kv[:, :, :, 1, :]
     max_blocks = max(blocks_per)
@@ -365,7 +441,7 @@ def _compare(case: Case, nax: mx.array, tiled: mx.array) -> tuple[bool, str]:
 
 def _forced_hints(case: Case) -> bool:
     return (
-        case.regime.startswith(("boundary", "grouped", "gqa6"))
+        case.regime.startswith(("boundary", "grouped", "gqa"))
         or case.head_size == 512
         or (case.block_size == 16 and case.head_size >= 128)
     )
@@ -374,7 +450,7 @@ def _forced_hints(case: Case) -> bool:
 def _check(ops, case: Case) -> tuple[bool, str]:
     # This is route correctness under fixed host planning, not GPU timing.
     if case.expected_widths is not None:
-        ops._override_detected_gpu_core_count_for_test(40)
+        ops._override_detected_gpu_core_count_for_test(case.planning_cores)
     try:
         return _check_case(ops, case)
     finally:
@@ -392,7 +468,7 @@ def _check_case(ops, case: Case) -> tuple[bool, str]:
         nax, nax_dispatch, pipeline = _run(
             ops, case, built, enabled=True, split_hint=hint
         )
-        grouped = nax_dispatch == "nax_gqa6_prefill"
+        grouped = nax_dispatch in ("nax_gqa6_prefill", "nax_gqa8_prefill")
         if grouped and os.environ.get("VLLM_METAL_NAX_GQA_PREFILL", "1") != "1":
             return False, "Grouped route ran with the feature disabled"
         width = ops.last_nax_heads_per_threadgroup()
@@ -406,7 +482,7 @@ def _check_case(ops, case: Case) -> tuple[bool, str]:
             if width != expected:
                 return False, f"hint={hint}: executed h{width}, expected h{expected}"
         can_group = (
-            case.regime.startswith(("grouped-", "gqa6-"))
+            case.regime.startswith(("grouped-", "gqa"))
             and case.regime != "grouped-fallback"
         )
         if nax_dispatch != "nax_prefill" and not (can_group and grouped):

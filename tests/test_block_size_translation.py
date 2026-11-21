@@ -304,36 +304,46 @@ def nax_policy_binary(tmp_path_factory):
         pytest.skip("The header-policy test requires a C++17 compiler")
     directory = tmp_path_factory.mktemp("nax-config")
     source = directory / "check.cpp"
-    source.write_text(
-        '#include "paged_attention_kernels.h"\n'
-        "#include <cstdlib>\n#include <iostream>\n#include <iomanip>\n"
-        "int main(int argc, char** argv) {\n"
-        "  using namespace vllm_metal::kernels;\n"
-        '  if (argc == 2 && std::string(argv[1]) == "work") {\n'
-        "    int q, prefix, heads, kv, bq, split;\n"
-        "    std::cout << std::setprecision(17);\n"
-        "    while (std::cin >> q >> prefix >> heads >> kv >> bq >> split) {\n"
-        "      auto w = nax_prefill_work(q, prefix, heads, kv, bq, split);\n"
-        "      std::cout << w.issued << ' ' << w.active << ' ' << w.guarded\n"
-        "        << ' ' << w.guarded_q << ' ' << w.kv_edge << ' ' << w.fast\n"
-        "        << ' ' << w.stream << ' ' << w.tail_stream << ' ' << w.groups\n"
-        "        << ' ' << w.full_blocks << '\\n';\n"
-        "    }\n"
-        "    return 0;\n"
-        "  }\n"
-        "  if (argc != 15) return 2;\n"
-        "  auto cfg = select_nax_config(\n"
-        "      std::atoi(argv[1]), std::atoi(argv[2]), std::atoi(argv[3]),\n"
-        "      std::atoi(argv[4]), std::atoi(argv[5]), std::atoi(argv[6]),\n"
-        "      std::atoi(argv[7]), std::atoi(argv[8]), std::atoi(argv[9]),\n"
-        "      std::atoi(argv[10]), std::atoi(argv[11]), std::atoi(argv[12]), std::atoi(argv[14]));\n"
-        "  cfg = nax_config_for_pipeline(cfg, std::strtoul(argv[13], nullptr, 10));\n"
-        "  std::cout << cfg.BQ << ' ' << cfg.HEADS_PER_TG << ' '\n"
-        "      << cfg.NUM_THREADS << ' '\n"
-        '      << nax_name(std::atoi(argv[10]) ? "bfloat16_t" : "half",\n'
-        "          std::atoi(argv[3]), std::atoi(argv[4]), cfg);\n"
-        "}\n"
-    )
+    source.write_text(r"""
+#include "paged_attention_kernels.h"
+#include <iomanip>
+#include <iostream>
+int main(int argc, char** argv) {
+  using namespace vllm_metal::kernels;
+  if (argc > 1 && std::string(argv[1]) == "work") {
+    int q, prefix, heads, groups, bq, split;
+    std::cout << std::setprecision(17);
+    while (std::cin >> q >> prefix >> heads >> groups >> bq >> split) {
+      const auto w = nax_sequence_work({q, q + prefix}, heads, {bq, 32, groups}, split);
+      std::cout << w.visits << ' ' << w.guarded_visits << ' ' << w.groups << ' '
+                << w.longest_full_scan << ' ' << w.tail_scan << '\n';
+    }
+    return 0;
+  }
+  NaxGeometry g{};
+  NaxSequence s{};
+  int cores, capacity, value_dim, token_stride;
+  bool split;
+  std::cout << std::setprecision(17);
+  while (std::cin >> g.heads >> g.kv_heads >> g.qk_dim >> g.kernel_page >> g.physical_page
+                  >> g.key_head_stride >> s.query_tokens >> s.kv_tokens >> cores
+                  >> split >> capacity >> value_dim >> token_stride) {
+    g.value_dim = value_dim ? value_dim : g.qk_dim;
+    g.key_token_stride = token_stride
+        ? token_stride : int64_t(g.kv_heads) * g.key_head_stride;
+    const auto choice = select_nax_config(g, s, split, cores);
+    const auto cfg = nax_config_for_pipeline(choice, capacity);
+    std::cout << cfg.BQ << ' ' << cfg.HEADS_PER_TG << ' ' << cfg.NUM_THREADS;
+    if (argc > 1) {
+      for (int width : {1, 2, g.heads / g.kv_heads / 2, g.heads / g.kv_heads}) {
+        const NaxLayout layout{width == 1 ? 64 : 16, 32, width};
+        std::cout << ' ' << nax_prefill_cost(s, g, layout, split || width > 1, cores);
+      }
+    }
+    std::cout << '\n';
+  }
+}
+""")
     binary = directory / "check"
     include = Path(__file__).resolve().parent.parent / "vllm_metal/metal"
     result = subprocess.run(
@@ -345,82 +355,27 @@ def nax_policy_binary(tmp_path_factory):
     return binary
 
 
-@pytest.fixture(scope="module")
-def nax_config_runner(nax_policy_binary):
-    def run(
-        *,
-        heads=24,
-        kv_heads=4,
-        head_dim=256,
-        page=16,
-        q=144,
-        seqs=1,
-        prefix=31360,
-        offset=0,
-        enabled=1,
-        bf16=1,
-        unmasked=1,
-        upstream_split=0,
-        capacity=1024,
-        cores=40,
-    ):
-        args = (
-            heads,
-            kv_heads,
-            head_dim,
-            page,
-            q,
-            seqs,
-            prefix + q,
-            offset,
-            enabled,
-            bf16,
-            unmasked,
-            upstream_split,
-            capacity,
-            cores,
-        )
-        result = subprocess.run(
-            [str(nax_policy_binary), *map(str, args)],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        bq, group, threads, name = result.stdout.split()
-        return (int(bq), int(group), int(threads)), name
-
-    return run
-
-
-def _nax_work_loop(q, prefix, heads, kv_heads, bq, split):
-    """Count causal KV visits per Q block, without the closed-form sums."""
-    visits = active = fast = edges = tail = full = blocks = 0
+def _nax_work_loop(q, prefix, heads, width, bq, split):
+    """Count the visits and longest scans directly from causal block ends."""
+    visits = guarded = blocks = full_scan = tail_scan = 0
     for start in range(0, q, bq):
-        valid_q = min(bq, q - start)
-        tiles = len(range(0, prefix + start + valid_q, 32))
+        valid = min(bq, q - start)
+        end = prefix + start + valid
+        tiles = len(range(0, end, 32))
         visits += tiles
-        active += len(range(0, valid_q, 16)) * tiles
         blocks += 1
-        if valid_q == bq:
-            full += 1
-            edge = int(tiles * 32 > prefix + q)
-            edges += edge
-            if split:
-                fast += tiles - edge
+        guarded += tiles if valid < bq or not split else int(tiles * 32 > prefix + q)
+        if valid == bq:
+            full_scan = tiles
         else:
-            tail = tiles
-    scale = heads * (bq // 16)
+            tail_scan = tiles
+    lanes = heads * (bq // 16)
     return (
-        scale * visits,
-        heads * active,
-        scale * (visits - fast),
-        scale * tail,
-        scale * edges,
-        scale * fast,
-        visits / blocks,
-        tail,
-        (heads if bq == 64 else kv_heads) * blocks,
-        full,
+        lanes * visits,
+        lanes * guarded,
+        (heads // width) * blocks,
+        full_scan,
+        tail_scan,
     )
 
 
@@ -433,10 +388,10 @@ def test_nax_work_counts_match_independent_causal_loop(nax_policy_binary):
         for q in (127, 128, 129, 1327, 1328, 1329, 32767, 32768, 32769)
     ]
     cases = [
-        (q, prefix, heads, kv, bq, split)
+        (q, prefix, heads, width, bq, split)
         for q, prefix in lengths
-        for heads, kv in ((24, 4), (54, 9))
-        for bq in (16, 64)
+        for heads, ratio in ((24, 6), (54, 6), (16, 8))
+        for bq, width in ((64, 1), (16, 2), (16, ratio // 2), (16, ratio))
         for split in (0, 1)
     ]
     result = subprocess.run(
@@ -453,183 +408,186 @@ def test_nax_work_counts_match_independent_causal_loop(nax_policy_binary):
         assert actual == _nax_work_loop(*case), case
 
 
-@pytest.mark.parametrize(
-    "changes",
-    [
-        {"enabled": 0},
-        {"bf16": 0},
-        {"unmasked": 0},
-        {"seqs": 2},
-        {"offset": 1},
-        {"head_dim": 512},
-        {"page": 8},
-        {"page": 32},
-        {"cores": 0},
-        {"q": 0},
-        {"q": 1},
-        {"prefix": -1},
-        {"heads": 0},
-        {"kv_heads": 0},
-        {"heads": 25},
-    ],
-)
-def test_nax_grouped_preserves_unsupported_and_unknown_fallbacks(
-    nax_config_runner, changes
+def _nax_plan_config(
+    binary,
+    *,
+    heads=16,
+    kv=2,
+    dim=256,
+    page=32,
+    physical=1056,
+    stride=512,
+    q=16,
+    prefix=31680,
+    cores=40,
+    split=0,
+    capacity=256,
+    value_dim=0,
+    token_stride=0,
+    kv_tokens=None,
 ):
-    cfg, name = nax_config_runner(**changes)
-    assert cfg == (64, 1, 128)
-    assert "_gqa" not in name
-
-
-@pytest.mark.parametrize(
-    ("changes", "group", "suffix"),
-    [
-        ({"q": 144}, 3, "_gqa6_sub_full"),
-        ({"q": 144, "cores": 10}, 6, "_gqa6_full"),
-        ({"q": 128, "cores": 10}, 6, "_gqa6_full"),
-        ({"q": 2048, "prefix": 0, "cores": 10, "upstream_split": 1}, 6, "_gqa6_full"),
-        (
-            {"q": 2049, "prefix": 30719, "cores": 10, "upstream_split": 1},
-            6,
-            "_gqa6_full",
-        ),
-        (
-            {
-                "heads": 48,
-                "kv_heads": 8,
-                "q": 2048,
-                "prefix": 0,
-                "cores": 20,
-                "upstream_split": 1,
-            },
-            6,
-            "_gqa6_full",
-        ),
-        (
-            {
-                "heads": 96,
-                "kv_heads": 16,
-                "q": 1280,
-                "prefix": 8192,
-                "cores": 40,
-                "upstream_split": 1,
-            },
-            6,
-            "_gqa6_full",
-        ),
-        (
-            {
-                "heads": 96,
-                "kv_heads": 16,
-                "q": 1280,
-                "prefix": 8192,
-                "cores": 80,
-                "upstream_split": 1,
-            },
-            1,
-            "",
-        ),
-        (
-            {"heads": 18, "kv_heads": 3, "q": 208, "prefix": 24577, "cores": 10},
-            3,
-            "_gqa6_sub_full",
-        ),
-        (
-            {"heads": 30, "kv_heads": 5, "q": 144, "prefix": 24577, "cores": 10},
-            3,
-            "_gqa6_sub_full",
-        ),
-        (
-            {"heads": 48, "kv_heads": 8, "q": 144, "prefix": 24577, "cores": 20},
-            3,
-            "_gqa6_sub_full",
-        ),
-        (
-            {"heads": 96, "kv_heads": 16, "q": 144, "prefix": 24577, "cores": 40},
-            3,
-            "_gqa6_sub_full",
-        ),
-        (
-            {"q": 2048, "prefix": 32768, "cores": 10, "upstream_split": 1},
-            6,
-            "_gqa6_full",
-        ),
-        ({"q": 144, "prefix": 31361}, 3, "_gqa6_sub_full"),
-        ({"q": 16}, 3, "_gqa6_sub_full"),
-        ({"q": 144, "prefix": 65536, "cores": 10}, 6, "_gqa6_full"),
-        (
-            {
-                "heads": 48,
-                "kv_heads": 8,
-                "q": 1281,
-                "prefix": 65537,
-                "cores": 20,
-                "upstream_split": 1,
-            },
-            6,
-            "_gqa6_full",
-        ),
-        (
-            {
-                "heads": 96,
-                "kv_heads": 16,
-                "q": 1280,
-                "prefix": 129792,
-                "cores": 40,
-                "upstream_split": 1,
-            },
-            6,
-            "_gqa6_full",
-        ),
-        ({"q": 64, "cores": 10}, 3, "_gqa6_sub_full"),
-        ({"q": 64, "cores": 20}, 1, ""),
-        ({"q": 63}, 1, ""),
-        ({"q": 65}, 1, ""),
-        ({"q": 143}, 1, ""),
-        ({"q": 145}, 1, ""),
-        ({"q": 1568, "prefix": 31199, "upstream_split": 1}, 6, "_gqa6_full"),
-        ({"heads": 12, "kv_heads": 2, "q": 144}, 3, "_gqa6_sub_full"),
-        (
-            {
-                "heads": 90,
-                "kv_heads": 15,
-                "q": 415,
-                "prefix": 32258,
-                "upstream_split": 1,
-            },
-            6,
-            "_gqa6_full",
-        ),
-        ({"heads": 16, "kv_heads": 2, "page": 32, "q": 128}, 1, ""),
-        ({"q": 2048, "prefix": 0, "upstream_split": 1}, 1, ""),
-    ],
-)
-def test_nax_grouped_selects_width_from_capacity_and_real_work(
-    nax_config_runner, changes, group, suffix
-):
-    """Core count, absolute heads and guarded tails can change the route."""
-    cfg, name = nax_config_runner(**changes)
-    assert cfg == ((64, 1, 128) if group == 1 else (16, group, 32 * group))
-    assert name == (
-        f"paged_attention_nax_bfloat16_t_hs256_bs{changes.get('page', 16)}{suffix}"
+    fields = (
+        heads,
+        kv,
+        dim,
+        page,
+        physical,
+        stride,
+        q,
+        prefix + q if kv_tokens is None else kv_tokens,
+        cores,
+        split,
+        capacity,
+        value_dim,
+        token_stride,
     )
+    result = subprocess.run(
+        [str(binary)],
+        input=" ".join(map(str, fields)),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return tuple(map(int, result.stdout.split()))
 
 
 @pytest.mark.parametrize(
-    ("changes", "capacity", "expected"),
+    "changes,expected",
     [
-        ({}, 95, (64, 1, 128)),
-        ({}, 96, (16, 3, 96)),
-        ({"q": 1568, "prefix": 31199, "upstream_split": 1}, 191, (64, 1, 128)),
-        ({"q": 1568, "prefix": 31199, "upstream_split": 1}, 192, (16, 6, 192)),
+        ({}, (16, 2, 64)),
+        ({"cores": 10, "q": 128}, (16, 4, 128)),
+        ({"q": 63}, (64, 1, 128)),
+        ({"q": 64, "split": 1}, (64, 1, 128)),
+        ({"q": 1056, "prefix": 15840, "split": 1}, (16, 4, 128)),
+        ({"heads": 64, "kv": 8, "q": 2048, "prefix": 17, "cores": 10}, (16, 8, 256)),
+        (
+            {"heads": 24, "kv": 4, "page": 16, "q": 144, "prefix": 31360, "cores": 20},
+            (16, 3, 96),
+        ),
+        (
+            {"heads": 24, "kv": 4, "page": 16, "q": 1328, "prefix": 31360, "cores": 10},
+            (16, 6, 192),
+        ),
+        (
+            {
+                "heads": 24,
+                "kv": 4,
+                "page": 16,
+                "q": 65,
+                "prefix": 31360,
+                "cores": 10,
+                "stride": 256,
+            },
+            (16, 3, 96),
+        ),
+        ({"stride": 256}, (16, 2, 64)),
+        ({"stride": 384}, (64, 1, 128)),
+        ({"physical": 33}, (64, 1, 128)),
+        ({"dim": 512}, (64, 1, 128)),
+        # Pin the ten-percent admission margin just below, just above and at
+        # equality: grouped costs of 89.71%, 90.49% and exactly 90% of ordinary NAX.
+        ({"split": 1, "q": 289, "prefix": 2495, "stride": 256}, (16, 2, 64)),
+        ({"split": 1, "q": 289, "prefix": 2496, "stride": 256}, (64, 1, 128)),
+        ({"split": 1, "q": 257, "prefix": 1601, "stride": 256}, (64, 1, 128)),
+        ({"value_dim": 512}, (64, 1, 128)),
+        ({"token_stride": 1023}, (64, 1, 128)),
+        ({"kv_tokens": 15}, (64, 1, 128)),
+        # GQA6 cold-prefill chunks at the 27B cache geometry (784-token pages).
+        # Calibration points from fixed-width timings against a common h1
+        # reference: h6 is 5.46%/4.92% faster than h3 at q=1568/p=15680 in
+        # both run orders, h3 wins at q=992; q=2592 directions disagree. The
+        # 64K case pins selector replay of the last full chunk (no fixed-width
+        # timing exists at that shape).
+        (
+            {
+                "heads": 24,
+                "kv": 4,
+                "page": 16,
+                "physical": 784,
+                "split": 1,
+                "q": 992,
+                "prefix": 12544,
+            },
+            (16, 3, 96),
+        ),
+        (
+            {
+                "heads": 24,
+                "kv": 4,
+                "page": 16,
+                "physical": 784,
+                "split": 1,
+                "q": 1568,
+                "prefix": 15680,
+            },
+            (16, 6, 192),
+        ),
+        (
+            {
+                "heads": 24,
+                "kv": 4,
+                "page": 16,
+                "physical": 784,
+                "split": 1,
+                "q": 1568,
+                "prefix": 62720,
+            },
+            (16, 6, 192),
+        ),
+        ({"page": 8}, (64, 1, 128)),
+        ({"heads": 17}, (64, 1, 128)),
+        ({"kv": 0}, (64, 1, 128)),
+        ({"cores": 0}, (64, 1, 128)),
+        ({"q": 1}, (64, 1, 128)),
+        ({"capacity": 63}, (64, 1, 128)),
+        ({"capacity": 64}, (16, 2, 64)),
+        ({"q": 128, "cores": 10, "capacity": 127}, (64, 1, 128)),
+        ({"q": 128, "cores": 10, "capacity": 128}, (16, 4, 128)),
     ],
 )
-def test_nax_grouped_capacity_falls_back_at_the_pipeline_limit(
-    nax_config_runner, changes, capacity, expected
+def test_nax_plan_selects_supported_width(nax_policy_binary, changes, expected):
+    assert _nax_plan_config(nax_policy_binary, **changes) == expected
+
+
+def test_one_cost_comparison_selects_the_width_for_both_cache_layouts(
+    nax_policy_binary,
 ):
-    cfg, name = nax_config_runner(**changes, capacity=capacity)
-    assert cfg == expected
-    assert ("_gqa" in name) == (expected[1] > 1)
+    """Ordinary NAX is the fixed reference for every eligible ratio and layout."""
+    cases = [
+        (
+            ratio,
+            (
+                4 * ratio,
+                4,
+                256,
+                page,
+                physical,
+                stride,
+                q,
+                q + 31360,
+                cores,
+                split,
+                256,
+            ),
+        )
+        for ratio, page, physical in ((6, 16, 784), (8, 32, 1056))
+        for stride in (256, 512)
+        for q in (16, 63, 64, 65, 128, 144, 1328, 2048)
+        for cores in (10, 20, 40, 80)
+        for split in (0, 1)
+    ]
+    output = subprocess.check_output(
+        [str(nax_policy_binary), "rank"],
+        input="\n".join(" ".join(map(str, row + (0, 0))) for _, row in cases),
+        text=True,
+    )
+    for (ratio, case), line in zip(cases, output.splitlines(), strict=True):
+        _, width, _, ordinary, *grouped = map(float, line.split())
+        best = min(grouped)
+        expected = (
+            (2, ratio // 2, ratio)[grouped.index(best)] if best < 0.9 * ordinary else 1
+        )
+        assert width == expected, case
 
 
 class TestNaxKernelInstantiations:
