@@ -101,8 +101,10 @@ Sleep levels mean something different on unified memory than on a GPU:
 - Either way the whole KV pool is freed. The pool takes that memory again at
   wake or with the first request after wake.
 - With [KV offloading](kv_offloading.md), sleep also frees the host pool. It
-  comes back empty at wake, even with `reset_connector=False`. Prompts already
-  on the disk tier still restore.
+  comes back empty at wake, even with `reset_connector=False`. This differs
+  from vLLM on a GPU, where `False` keeps the offloaded blocks for requests
+  after wake. On a Mac the host pool sits in the unified memory that sleep
+  gives back. Prompts already on the disk tier still restore.
 
 Sleep mode supports dense, hybrid and MLA models on the MLX backend.
 Supported speculative decoding methods are `ngram`, `draft_model`, `dflash` and

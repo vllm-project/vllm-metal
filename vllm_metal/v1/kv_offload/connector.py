@@ -97,6 +97,9 @@ class MetalOffloadingConnector(OffloadingConnector):
 
         vLLM resets the connector first only with ``reset_connector=True``.
         Reset it here either way, so no offload hit outlives the freed pages.
+        This departs from upstream, which keeps the offloaded blocks with
+        ``False``: on unified memory the pool shares the RAM that sleep frees.
+        Disk tiers keep their blocks either way.
         """
         if (worker := self._metal_worker()) is not None:
             self._scheduler_connectors[self._engine_id].reset_cache()
