@@ -85,12 +85,14 @@ class Inkling2Plan:
             ):
                 # Keep the input history, so every cached token is a valid
                 # convolution restart point, including shared prefix blocks.
+                # Inputs arrive in the model dtype and upstream widens them to
+                # FP32 exactly, so a wider history dtype would only add bytes.
                 specs[self.conv_name(visit, stream)] = SlidingWindowSpec(
                     block_size=block_size,
                     num_kv_heads=1,
                     head_size=width,
                     head_size_v=0,
-                    dtype=torch.float32,
+                    dtype=dtype,
                     sliding_window=self.conv_kernel_size,
                 )
         return specs
@@ -258,7 +260,7 @@ class _Convolution(nn.Module):
             history = runtime.slots(name, request, max(0, offset - tail), offset)
             state = gather_cache_rows(
                 views[index], history, views.descriptors[index][2][0]
-            )
+            ).astype(mx.float32)
             if offset < tail:
                 state = mx.concatenate(
                     [mx.zeros((tail - offset, x.shape[-1]), mx.float32), state]
@@ -268,7 +270,7 @@ class _Convolution(nn.Module):
             inputs = x[:, lo:hi]
             slots = runtime.slots(name, request, offset, offset + hi - lo)
             views[index] = get_ops().gdn_state_scatter(
-                views[index], inputs[0].astype(mx.float32), slots, paged=True
+                views[index], inputs[0].astype(views[index].dtype), slots, paged=True
             )
             outputs.append(
                 self.inner(

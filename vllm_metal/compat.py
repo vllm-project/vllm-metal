@@ -52,7 +52,7 @@ def register_model_compat() -> None:
     from transformers.models.auto.configuration_auto import CONFIG_MAPPING
     from vllm.model_executor.models import ModelRegistry
 
-    from vllm_metal.patches.inkling2_registry import Inkling2LoopConfig
+    from vllm_metal.patches.inkling2_config import Inkling2LoopConfig
 
     if "inkling2_loop" not in CONFIG_MAPPING:
         AutoConfig.register("inkling2_loop", Inkling2LoopConfig)
