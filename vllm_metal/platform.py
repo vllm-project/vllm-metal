@@ -371,30 +371,17 @@ class MetalPlatform(Platform):
             if enabled
         ]
         if envs.VLLM_METAL_BACKEND == "mps":
-            unsupported_controls += [
-                name
-                for name, enabled in (
-                    ("temperature", params.temperature != 0 and cls._mps_speculative),
-                    ("presence_penalty", params.presence_penalty != 0),
-                    ("frequency_penalty", params.frequency_penalty != 0),
-                    (
-                        "repetition_penalty",
-                        params.repetition_penalty != 1 and not cls._serves_omni,
-                    ),
-                    ("allowed_token_ids", bool(params.allowed_token_ids)),
-                    ("bad_words", bool(params.bad_words)),
-                    # Both controls need an MPS override for MRv2's logit-bias kernel.
-                    # https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/worker/gpu/sample/logit_bias.py#L225-L246
-                    ("logit_bias", bool(params.logit_bias)),
-                    ("min_tokens", params.min_tokens > 0),
-                )
-                if enabled
-            ]
-            unsupported_controls += [
-                name
-                for name in ("logprob_token_ids", "structured_outputs")
-                if getattr(params, name, None) is not None
-            ]
+            # MPS routes sampling through upstream MRv2 kernels; the shared
+            # policy lists the logits-processor-backed controls that still
+            # need Metal-side overrides (e.g. MRv2's logit-bias kernel,
+            # https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/worker/gpu/sample/logit_bias.py#L225-L246).
+            from vllm_metal.v1.sampling_policy import unsupported_request_controls
+
+            unsupported_controls += unsupported_request_controls(
+                params,
+                speculative=cls._mps_speculative,
+                allow_repetition_penalty=cls._serves_omni,
+            )
         if unsupported_controls:
             controls = ", ".join(unsupported_controls)
             raise VLLMValidationError(

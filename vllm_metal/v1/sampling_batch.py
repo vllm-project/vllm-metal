@@ -28,8 +28,13 @@ from vllm_metal.v1.sampling.builtin_logits_processors import (
     MinTokensLogitsProcessor,
 )
 from vllm_metal.v1.sampling.torch_utils import make_tensor_with_pad
+from vllm_metal.v1.sampling_policy import (
+    GREEDY_TEMPERATURE_EPS,
+    any_min_tokens_pending,
+    params_allow_native_greedy,
+    params_allow_native_random,
+)
 
-GREEDY_TEMPERATURE_EPS = 1e-5
 _EMPTY_LOGITSPROCS = LogitsProcessors()
 
 
@@ -193,7 +198,7 @@ class SamplingBatch:
 
     def can_use_native_greedy(self) -> bool:
         """Return whether MLX argmax matches the requested sampling behavior."""
-        return self.params_allow_native_greedy(
+        return params_allow_native_greedy(
             self.sampling_params_list, self.output_lengths
         )
 
@@ -202,29 +207,15 @@ class SamplingBatch:
         sampling_params_list: Sequence[SamplingParams],
         output_lengths: Sequence[int] | None = None,
     ) -> bool:
-        """Whether MLX argmax matches *sampling_params_list* exactly.
+        """Compatibility alias for the shared policy gate.
 
-        Single source of truth for the native-greedy decision so callers that
-        gate before constructing a :class:`SamplingBatch` (e.g. the decode
-        pipeline) cannot drift from the sampling-time check.
-        ``output_lengths`` is each row's generated-token count; see
-        :meth:`_min_tokens_pending`.
+        See
+        :func:`vllm_metal.v1.sampling_policy.params_allow_native_greedy`;
+        kept so callers that gate before constructing a
+        :class:`SamplingBatch` (e.g. the decode pipeline) and the
+        sampling-time check cannot drift apart.
         """
-        return not SamplingBatch._min_tokens_pending(
-            sampling_params_list, output_lengths
-        ) and all(
-            sampling_params.temperature < GREEDY_TEMPERATURE_EPS
-            and sampling_params.top_k <= 0
-            and sampling_params.top_p == 1.0
-            and sampling_params.frequency_penalty == 0.0
-            and sampling_params.presence_penalty == 0.0
-            and sampling_params.repetition_penalty == 1.0
-            and sampling_params.num_logprobs is None
-            and not sampling_params.allowed_token_ids
-            and not sampling_params.bad_words_token_ids
-            and not sampling_params.logit_bias
-            for sampling_params in sampling_params_list
-        )
+        return params_allow_native_greedy(sampling_params_list, output_lengths)
 
     @staticmethod
     def params_allow_native_random(
@@ -233,51 +224,16 @@ class SamplingBatch:
         *,
         allow_seed: bool = False,
     ) -> bool:
-        """Whether the native MLX sampler supports *sampling_params_list*.
+        """Compatibility alias for the shared policy gate.
 
-        Requests must use plain temperature/top-k/top-p/min-p sampling; the
-        mask is built per row, so rows may mix greedy (temperature 0) with
-        random sampling and differ in top-k/top-p/min-p. Requests with sample
-        logprobs, structured outputs, or ``logit_bias`` stay on the torch path.
-        ``output_lengths`` is as in :meth:`params_allow_native_greedy`.
-        Sync and deferred seeded keys use the row's output length before
-        sampling (see :func:`native_sampling_key`).
+        See
+        :func:`vllm_metal.v1.sampling_policy.params_allow_native_random`;
+        ``output_lengths`` and ``allow_seed`` keep their meanings there
+        (min-tokens pending-ness and seeded-row admission for the
+        native-random path).
         """
-        if not sampling_params_list:
-            return False
-        return not SamplingBatch._min_tokens_pending(
-            sampling_params_list, output_lengths
-        ) and all(
-            (allow_seed or sp.seed is None)
-            and sp.frequency_penalty == 0.0
-            and sp.presence_penalty == 0.0
-            and sp.repetition_penalty == 1.0
-            and sp.num_logprobs is None
-            and sp.structured_outputs is None
-            and not sp.allowed_token_ids
-            and not sp.bad_words_token_ids
-            and not sp.logit_bias
-            for sp in sampling_params_list
-        )
-
-    @staticmethod
-    def _min_tokens_pending(
-        sampling_params_list: Sequence[SamplingParams],
-        output_lengths: Sequence[int] | None,
-    ) -> bool:
-        """Whether any row still needs vLLM's min-tokens processor.
-
-        The processor masks stop tokens only while a row has generated fewer
-        than ``min_tokens``, so rows past the minimum can sample natively
-        again. ``None`` counts every row as having generated nothing.
-        """
-        if output_lengths is None:
-            output_lengths = [0] * len(sampling_params_list)
-        return any(
-            output_length < sampling_params.min_tokens
-            for sampling_params, output_length in zip(
-                sampling_params_list, output_lengths, strict=True
-            )
+        return params_allow_native_random(
+            sampling_params_list, output_lengths, allow_seed=allow_seed
         )
 
     @classmethod
@@ -306,9 +262,9 @@ class SamplingBatch:
         Raises on batches neither native path admits — the caller must not
         let those reach here.
         """
-        if cls.params_allow_native_greedy(sampling_params_list, output_lengths):
+        if params_allow_native_greedy(sampling_params_list, output_lengths):
             return mlx_greedy_tokens(logits_2d)
-        random_eligible = cls.params_allow_native_random(
+        random_eligible = params_allow_native_random(
             sampling_params_list, output_lengths, allow_seed=allow_seed
         )
         if next_native_rng_key is not None and random_eligible:
@@ -677,7 +633,7 @@ class SamplingBatch:
                 ),
                 (
                     MinTokensLogitsProcessor,
-                    self._min_tokens_pending(
+                    any_min_tokens_pending(
                         self.sampling_params_list, self.output_lengths
                     ),
                 ),
@@ -816,7 +772,7 @@ def sample_from_logits(
         next_native_rng_key is not None
         and not batch.needs_logprobs
         and batch.generators_are_seeded()
-        and SamplingBatch.params_allow_native_random(
+        and params_allow_native_random(
             batch.sampling_params_list, batch.output_lengths, allow_seed=True
         )
     ):
