@@ -135,6 +135,9 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
     device const int32_t *mm_prefix_ranges
     [[buffer(22), function_constant(use_mm_prefix)]],
     const constant int &q_block_offset [[buffer(30)]],
+    device const uint64_t *k_table [[buffer(28), function_constant(kv_chunked)]],
+    device const uint64_t *v_table [[buffer(29), function_constant(kv_chunked)]],
+    const constant int &kv_chunk_shift [[buffer(27), function_constant(kv_chunked)]],
     threadgroup char *shared_mem [[threadgroup(0)]],
     uint3 tgp [[threadgroup_position_in_grid]],
     uint3 tgpg [[threadgroups_per_grid]],
@@ -340,11 +343,12 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
       int kv_pos = tile_start + t;
       if (kv_pos < seq_len) {
         int64_t pb = int64_t(block_table[kv_pos / BLOCK_SIZE]);
-        const int64_t off = pb * kv_block_stride
-            + (kv_pos % BLOCK_SIZE) * kv_token_stride
+        const int64_t off = (kv_pos % BLOCK_SIZE) * kv_token_stride
             + kv_head_idx * kv_head_stride;
-        const device T *k_ptr = k_cache + off;
-        const device T *v_ptr = v_cache + off;
+        const device T *k_ptr =
+            kv_block_base(k_cache, k_table, pb, kv_block_stride, kv_chunk_shift) + off;
+        const device T *v_ptr =
+            kv_block_base(v_cache, v_table, pb, kv_block_stride, kv_chunk_shift) + off;
         #pragma unroll
         for (int d = lane * VEC; d < HEAD_SIZE; d += NUM_SIMD_LANES * VEC) {
           *((threadgroup vecLoadT *)&K_smem[t * LD + d]) =
@@ -613,6 +617,12 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
       device const int32_t *mm_prefix_ranges                                   \
       [[buffer(22), function_constant(use_mm_prefix)]],                        \
       const constant int &q_block_offset [[buffer(30)]],                       \
+      device const uint64_t *k_table                                           \
+      [[buffer(28), function_constant(kv_chunked)]],                           \
+      device const uint64_t *v_table                                           \
+      [[buffer(29), function_constant(kv_chunked)]],                           \
+      const constant int &kv_chunk_shift                                       \
+      [[buffer(27), function_constant(kv_chunked)]],                           \
       threadgroup char *shared_mem [[threadgroup(0)]],                         \
       uint3 tgp [[threadgroup_position_in_grid]],                              \
       uint3 tgpg [[threadgroups_per_grid]],                                    \

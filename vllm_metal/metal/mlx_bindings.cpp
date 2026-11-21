@@ -61,6 +61,44 @@ static bool nax_hardware_supported() {
       device->supportsFamily(static_cast<MTL::GPUFamily>(hardware::kApple10)));
 }
 
+// Metal residency set for KV chunk buffers (#1198).
+// A chunk added here is committed and reachable by any kernel through its GPU
+// address, with no buffer-slot binding. `use_kv_residency` attaches the set to
+// the command buffer MLX is currently encoding into.
+static MTL::ResidencySet* kv_residency_set() {
+  static MTL::ResidencySet* set = []() {
+    auto* device = metal::device(Device::gpu).mtl_device();
+    auto* desc = MTL::ResidencySetDescriptor::alloc()->init();
+    desc->setInitialCapacity(1024);
+    NS::Error* err = nullptr;
+    auto* s = device->newResidencySet(desc, &err);
+    desc->release();
+    if (s == nullptr) throw std::runtime_error("newResidencySet failed");
+    return s;
+  }();
+  return set;
+}
+
+static void wire_buffer(const array& a, bool wire) {
+  auto* buf = static_cast<MTL::Buffer*>(const_cast<void*>(a.buffer().ptr()));
+  auto* set = kv_residency_set();
+  if (wire) set->addAllocation(buf); else set->removeAllocation(buf);
+  set->commit();
+  set->requestResidency();
+}
+
+void use_kv_residency_on(metal::CommandEncoder& enc) {
+  enc.get_command_buffer()->useResidencySet(kv_residency_set());
+}
+
+static void use_kv_residency() {
+  use_kv_residency_on(metal::get_command_encoder(default_stream(Device::gpu)));
+}
+
+static uint64_t buffer_gpu_address(const array& a) {
+  return static_cast<const MTL::Buffer*>(a.buffer().ptr())->gpuAddress() + a.offset() * a.itemsize();
+}
+
 // ---------------------------------------------------------------------------
 // nanobind module
 // ---------------------------------------------------------------------------
@@ -330,6 +368,22 @@ NB_MODULE(_paged_ops, m) {
         "q4_0/int4/uint4/int2/uint2 at k_bits in {2,3,4,5,8}). V supports "
         "any v_bits in [1, 8] via the v_centroids buffer.");
 
+  m.def("_wire_buffer", &wire_buffer, nb::arg("array"), nb::arg("wire") = true,
+        "Add (or remove) a buffer to the KV chunk residency set.");
+  m.def("_use_kv_residency", &use_kv_residency,
+        "Attach the KV chunk residency set to the current command buffer.");
+  m.def("_buffer_gpu_address", &buffer_gpu_address, nb::arg("array"),
+        "The GPU address of an array's data.");
+  m.def("_chunk_block_ops", &chunk_block_ops_fn, nb::arg("table"), nb::arg("ids"),
+        nb::arg("copy"), nb::arg("chunk_shift"), nb::arg("block_bytes"),
+        "Copy (ids = [n, 2] src/dst) or zero (ids = [n]) whole blocks "
+        "of a chunked layer through its address table.");
+  m.def("_reshape_and_cache_chunked", &reshape_and_cache_chunked_fn,
+        nb::arg("key"), nb::arg("value"), nb::arg("slot_mapping"),
+        nb::arg("table"), nb::arg("chunk_shift"), nb::arg("block_size"),
+        nb::arg("layout"), nb::arg("cache_dtype"),
+        "reshape_and_cache into a layer split into "
+        "chunk buffers; only the chunks passed are bound and written.");
   m.def("reshape_and_cache", &reshape_and_cache_primitive_fn,
         nb::arg("key"), nb::arg("value"),
         nb::arg("key_cache"), nb::arg("value_cache"),
@@ -490,7 +544,9 @@ NB_MODULE(_paged_ops, m) {
            int num_decode_tokens,
            int max_decode_context_len, bool gqa_disabled,
            const std::optional<GqaDecodeLengthPlan>& gqa_length_plan,
-           int nax_split_hint, int nax_prefill_split_hint) {
+           int nax_split_hint, int nax_prefill_split_hint,
+           int kv_chunk_shift, std::optional<Dtype> kv_chunk_dtype,
+           const std::vector<int64_t>& kv_chunk_strides) {
           return paged_attention_primitive_fn(
               query, key_cache, value_cache,
               num_kv_heads, scale, softcap,
@@ -501,7 +557,8 @@ NB_MODULE(_paged_ops, m) {
               window_seqlen_q, sinks, mm_prefix_ranges, num_decode_requests,
               num_decode_tokens, max_decode_context_len, gqa_disabled,
               0, gqa_length_plan, nax_split_hint,
-              nax_prefill_split_hint);
+              nax_prefill_split_hint, kv_chunk_shift, kv_chunk_dtype,
+              kv_chunk_strides);
         },
         nb::arg("query"),
         nb::arg("key_cache"), nb::arg("value_cache"),
@@ -527,6 +584,9 @@ NB_MODULE(_paged_ops, m) {
         nb::arg("gqa_length_plan") = nb::none(),
         nb::arg("nax_split_hint") = -1,
         nb::arg("nax_prefill_split_hint") = -1,
+        nb::arg("kv_chunk_shift") = -1,
+        nb::arg("kv_chunk_dtype").none() = nb::none(),
+        nb::arg("kv_chunk_strides") = std::vector<int64_t>{},
         // Window validation may evaluate metadata with a Python-backed reader.
         nb::call_guard<nb::gil_scoped_release>(),
         "Return a lazy paged attention array (read-only). Cache writes are handled "
