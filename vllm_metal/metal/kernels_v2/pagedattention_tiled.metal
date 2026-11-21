@@ -111,8 +111,15 @@ template <int NBYTES> struct LoadUnit;
 template <> struct LoadUnit<8>  { using type = uint2; };
 template <> struct LoadUnit<16> { using type = uint4; };
 
+// D_SPLIT: simdgroups per 8-row group.  With D_SPLIT > 1 the simdgroups of
+// one row group all compute the same S = Q K^T (redundantly) and each owns
+// HEAD_SIZE / D_SPLIT columns of O.  Q is then read from threadgroup memory
+// per tile instead of being register-resident, so per-thread state shrinks to
+// TD / D_SPLIT O fragments: the way HEAD_SIZE=512 fits registers and the
+// 32 KB threadgroup budget with more than one simdgroup per threadgroup.
 template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
-          int BQ = 32, int TILE_KV = 32, int NUM_THREADS = 128>
+          int BQ = 32, int TILE_KV = 32, int NUM_THREADS = 128,
+          int D_SPLIT = 1>
 [[kernel]] void paged_attention_tiled(
     device T *out [[buffer(2)]],
     device const T *q [[buffer(3)]],
@@ -146,15 +153,24 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
   constexpr int NUM_SG = NUM_THREADS / NUM_SIMD_LANES;
   constexpr int TD = HEAD_SIZE / 8;        // # of 8-wide D fragments
   constexpr int TK = TILE_KV / 8;          // # of 8-wide K fragments
-  constexpr int ROWS_PER_SG = BQ / NUM_SG; // 8 rows per simdgroup
+  constexpr int ROW_SGS = NUM_SG / D_SPLIT;  // simdgroup row groups
+  constexpr int ROWS_PER_SG = BQ / ROW_SGS;   // 8 rows per row group
+  constexpr int TD_O = TD / D_SPLIT;         // O fragments per simdgroup
 
   static_assert(HEAD_SIZE % 8 == 0, "HEAD_SIZE must be a multiple of 8");
   static_assert(TILE_KV % 8 == 0, "TILE_KV must be a multiple of 8");
   static_assert(BQ % NUM_SG == 0, "BQ must be divisible by NUM_SG");
   static_assert(ROWS_PER_SG == 8, "ROWS_PER_SG must equal 8 (frag rows)");
+  static_assert(NUM_SG % D_SPLIT == 0, "D_SPLIT must divide NUM_SG");
+  static_assert(TD % D_SPLIT == 0, "D_SPLIT must divide the fragment count");
+  static_assert(TILE_KV % NUM_SG == 0, "K/V rows split evenly across simdgroups");
 
   const int thread_idx = tpt.x;
   const int head_idx = tgp.x;
+  // Row group and O column part of this simdgroup (D_SPLIT == 1: identity).
+  const int row_sg = int(sg_idx) / D_SPLIT;
+  const int d_part = int(sg_idx) % D_SPLIT;
+  const int d_base = d_part * TD_O;  // first O fragment this simdgroup owns
   const int q_block_global_idx = int(tgp.y) + q_block_offset;
   const int num_heads = tgpg.x;
   const int num_queries_per_kv = num_heads / num_kv_heads;
@@ -199,6 +215,12 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
   threadgroup T *Q_smem = reinterpret_cast<threadgroup T *>(shared_mem);
   threadgroup T *K_smem = Q_smem + Q_ELEMS;
   threadgroup T *V_smem = K_smem + KV_ELEMS;
+  // D_SPLIT > 1: each simdgroup computes S over its own HEAD_SIZE / D_SPLIT
+  // columns of Q and K; the partial 8×8 S fragments are exchanged here and
+  // summed by every simdgroup of the row group.  [ROW_SGS][D_SPLIT][TK] frags
+  // of 64 floats.  Unused (zero-sized on the host side) when D_SPLIT == 1.
+  threadgroup float *S_xchg =
+      reinterpret_cast<threadgroup float *>(V_smem + KV_ELEMS);
 
   const float scale_log2 = scale * M_LOG2E_F;
 
@@ -225,12 +247,18 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
   // per-thread registers, not in some implicit threadgroup memory.
   using vec2T = vec<T, 2>;
   using vec2F = vec<float, 2>;
-  vec2T Qreg[TD];
-  #pragma unroll
-  for (int d = 0; d < TD; d++) {
-    simdgroup_matrix<T, 8, 8> tmp;
-    simdgroup_load(tmp, Q_smem + sg_idx * 8 * LD + d * 8, LD);
-    Qreg[d] = reinterpret_cast<thread vec2T &>(tmp.thread_elements());
+  // With D_SPLIT > 1 the Q fragments are re-read from Q_smem on every tile
+  // (Q_smem stays intact until the output staging after the loop); the
+  // register array is then unused and elided.
+  constexpr int QREG_N = (D_SPLIT == 1) ? TD : 1;
+  vec2T Qreg[QREG_N];
+  if (D_SPLIT == 1) {
+    #pragma unroll
+    for (int d = 0; d < TD; d++) {
+      simdgroup_matrix<T, 8, 8> tmp;
+      simdgroup_load(tmp, Q_smem + row_sg * 8 * LD + d * 8, LD);
+      Qreg[d] = reinterpret_cast<thread vec2T &>(tmp.thread_elements());
+    }
   }
 
   // ─ Initialize per-simdgroup-row online softmax state ──────────────────
@@ -246,9 +274,9 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
 
   // O accumulator: TD fragments of (8 × 8) per simdgroup, register-resident.
   // Each lane holds vec<float,2> per fragment.
-  vec2F Oreg[TD];
+  vec2F Oreg[TD_O];
   #pragma unroll
-  for (int d = 0; d < TD; d++) {
+  for (int d = 0; d < TD_O; d++) {
     Oreg[d] = vec2F(0.0f);
   }
 
@@ -258,7 +286,7 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
 
   // Row ownership is fixed for the whole tile loop: rows >= valid_q are
   // padding, never read the range buffer and stay masked.
-  const bool row_masked = (sg_idx * 8 + fm) >= valid_q;
+  const bool row_masked = (row_sg * 8 + fm) >= valid_q;
 
   // ─ mm_prefix (Gemma 4 vision) ─────────────────────────────────────────
   // [r_start, r_end]: inclusive absolute key positions of this row's image
@@ -274,7 +302,7 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
   if (use_mm_prefix) {
     const int q_row_base = q_seq_start + q_pos_start;
     if (!row_masked) {
-      const int q_row = q_row_base + sg_idx * 8 + fm;
+      const int q_row = q_row_base + row_sg * 8 + fm;
       r_start = mm_prefix_ranges[2 * q_row];
       r_end = mm_prefix_ranges[2 * q_row + 1];
     }
@@ -374,11 +402,20 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
       Sreg[k] = vec2F(0.0f);
     }
 
+    // Each simdgroup covers only its own column part of the head dimension
+    // (all of it when D_SPLIT == 1); the parts are summed below.
     #pragma unroll
-    for (int d = 0; d < TD; d++) {
-      // Materialize Q fragment from register vec → simdgroup_matrix
+    for (int dd = 0; dd < TD_O; dd++) {
+      const int d = d_base + dd;
+      // Materialize Q fragment: from registers (D_SPLIT == 1) or from
+      // threadgroup memory (D_SPLIT > 1, one 8×8 load per fragment).
       simdgroup_matrix<T, 8, 8> q_frag;
-      reinterpret_cast<thread vec2T &>(q_frag.thread_elements()) = Qreg[d];
+      if (D_SPLIT == 1) {
+        reinterpret_cast<thread vec2T &>(q_frag.thread_elements()) =
+            Qreg[(D_SPLIT == 1) ? d : 0];
+      } else {
+        simdgroup_load(q_frag, Q_smem + row_sg * 8 * LD + d * 8, LD);
+      }
 
       #pragma unroll
       for (int k = 0; k < TK; k++) {
@@ -398,6 +435,34 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
       }
     }
 
+    // ─ D_SPLIT > 1: sum the partial S fragments across the row group ──
+    if (D_SPLIT > 1) {
+      #pragma unroll
+      for (int k = 0; k < TK; k++) {
+        simdgroup_matrix<float, 8, 8> part;
+        reinterpret_cast<thread vec2F &>(part.thread_elements()) = Sreg[k];
+        simdgroup_store(part,
+                        S_xchg + ((row_sg * D_SPLIT + d_part) * TK + k) * 64,
+                        8);
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      #pragma unroll
+      for (int k = 0; k < TK; k++) {
+        vec2F acc = vec2F(0.0f);
+        #pragma unroll
+        for (int p = 0; p < D_SPLIT; p++) {
+          simdgroup_matrix<float, 8, 8> part;
+          simdgroup_load(part,
+                         S_xchg + ((row_sg * D_SPLIT + p) * TK + k) * 64,
+                         8);
+          acc += reinterpret_cast<thread vec2F &>(part.thread_elements());
+        }
+        Sreg[k] = acc;
+      }
+      // The next tile's partial-S stores happen after this iteration's
+      // closing barrier, so no further barrier is needed here.
+    }
+
     // ─ Scale + apply mask + softcap (all in registers) ─────────────────
     // Fast path: when the entire tile is "before" the causal frontier of
     // every Q row in this threadgroup, no causal/padding mask is needed.
@@ -407,7 +472,7 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
     // With a sliding window the tile is also unmasked when it lies inside
     // the window of the *last* row of the threadgroup (the tightest one):
     // then every row's window covers the whole tile.
-    const int q_abs_pos = tg_min_q_abs_pos + sg_idx * 8 + fm;
+    const int q_abs_pos = tg_min_q_abs_pos + row_sg * 8 + fm;
     const int min_q_abs_pos = tg_min_q_abs_pos;
     const bool tile_no_mask = (tile_start + TILE_KV - 1) < min_q_abs_pos
                               && (tile_start + TILE_KV) <= seq_len
@@ -491,7 +556,7 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
 
     // ─ Rescale O in registers ───────────────────────────────────────────
     #pragma unroll
-    for (int d = 0; d < TD; d++) {
+    for (int d = 0; d < TD_O; d++) {
       Oreg[d] *= factor;
     }
 
@@ -511,10 +576,10 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
       reinterpret_cast<thread vec2F &>(p_frag.thread_elements()) = Sreg[k];
 
       #pragma unroll
-      for (int d = 0; d < TD; d++) {
+      for (int d = 0; d < TD_O; d++) {
         simdgroup_matrix<T, 8, 8> v_frag;
         simdgroup_load(v_frag,
-                       V_smem + k * 8 * LD + d * 8,
+                       V_smem + k * 8 * LD + (d_base + d) * 8,
                        LD);
 
         // Materialize O accumulator fragment from register vec.
@@ -536,7 +601,7 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
   // Fold the attention sink into each valid row's online-softmax state once.
   // It contributes one learned logit to the denominator and no value row, so
   // O is only rescaled by the max correction.
-  if (use_sinks && (sg_idx * 8 + fm) < valid_q) {
+  if (use_sinks && (row_sg * 8 + fm) < valid_q) {
     const float sink_score = sinks[head_idx] * M_LOG2E_F;
     const float new_max = max(max_score, sink_score);
     const float old_corr =
@@ -545,7 +610,7 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
     sum_score = sum_score * old_corr + sink_exp;
     max_score = new_max;
     #pragma unroll
-    for (int d = 0; d < TD; d++) {
+    for (int d = 0; d < TD_O; d++) {
       Oreg[d] *= old_corr;
     }
   }
@@ -554,19 +619,22 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
   // sum_score is broadcast-replicated across lanes with same fm.
   float inv_sum = 1.0f / (sum_score + 1e-6f);
   #pragma unroll
-  for (int d = 0; d < TD; d++) {
+  for (int d = 0; d < TD_O; d++) {
     Oreg[d] *= inv_sum;
   }
 
   // Reuse Q_smem as the output staging buffer (it's no longer needed).
   // Each simdgroup stores its 8 rows × HEAD_SIZE into Q_smem (as float).
+  // With D_SPLIT > 1 the row group's simdgroups each store their own
+  // column part; every simdgroup passed the loop's final barrier, so no
+  // Q_smem read is still in flight.
   threadgroup float *O_smem = reinterpret_cast<threadgroup float *>(Q_smem);
   #pragma unroll
-  for (int d = 0; d < TD; d++) {
+  for (int d = 0; d < TD_O; d++) {
     simdgroup_matrix<float, 8, 8> o_frag;
     reinterpret_cast<thread vec2F &>(o_frag.thread_elements()) = Oreg[d];
     simdgroup_store(o_frag,
-                    O_smem + sg_idx * 8 * LD + d * 8,
+                    O_smem + row_sg * 8 * LD + (d_base + d) * 8,
                     LD);
   }
 
@@ -586,12 +654,12 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
 // ─── Template instantiation ──────────────────────────────────────────────
 
 #define instantiate_paged_attention_tiled_inner(type, head_size, block_size,   \
-                                                bq, tkv, nt)                   \
+                                                bq, tkv, nt, ds)               \
   template [[host_name("paged_attention_tiled_" #type                          \
                        "_hs" #head_size "_bs" #block_size                      \
-                       "_bq" #bq "_tk" #tkv "_nt" #nt)]]                       \
+                       "_bq" #bq "_tk" #tkv "_nt" #nt "_ds" #ds)]]             \
   [[kernel]] void paged_attention_tiled<type, head_size, block_size,           \
-                                        bq, tkv, nt>(                          \
+                                        bq, tkv, nt, ds>(                      \
       device type *out [[buffer(2)]],                                          \
       device const type *q [[buffer(3)]],                                      \
       device const type *k_cache [[buffer(4)]],                                \
@@ -623,11 +691,11 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
 // Each entry must match a (head_size -> TileConfig) row in select_tile_config
 // in vllm_metal/metal/paged_attention_kernels.h.
 #define instantiate_paged_attention_tiled_heads(type, block_size)              \
-  instantiate_paged_attention_tiled_inner(type, 64,  block_size, 32, 32, 128); \
-  instantiate_paged_attention_tiled_inner(type, 96,  block_size, 32, 32, 128); \
-  instantiate_paged_attention_tiled_inner(type, 128, block_size, 32, 32, 128); \
-  instantiate_paged_attention_tiled_inner(type, 256, block_size, 16, 16,  64); \
-  instantiate_paged_attention_tiled_inner(type, 512, block_size,  8,  8,  32);
+  instantiate_paged_attention_tiled_inner(type, 64,  block_size, 32, 32, 128, 1); \
+  instantiate_paged_attention_tiled_inner(type, 96,  block_size, 32, 32, 128, 1); \
+  instantiate_paged_attention_tiled_inner(type, 128, block_size, 32, 32, 128, 1); \
+  instantiate_paged_attention_tiled_inner(type, 256, block_size, 16, 16,  64, 1); \
+  instantiate_paged_attention_tiled_inner(type, 512, block_size,  8,  8, 128, 4);
 
 #define instantiate_paged_attention_tiled_all(type)                            \
   instantiate_paged_attention_tiled_heads(type, 8);                            \
