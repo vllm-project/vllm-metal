@@ -172,9 +172,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # MLX-native random sampling (default on); greedy behavior is unchanged.
     # Seeded requests use per-request MLX keys in sync and deferred sampling.
     # Penalties, sample logprobs,
-    # allowed-token IDs, bad words, structured outputs, or any speculative
-    # decoding config keep random sampling on torch. Set to "0" as the kill
-    # switch to sample every non-greedy step with the torch sampler.
+    # allowed-token IDs, bad words, and structured outputs keep random
+    # sampling on torch. Speculative drafts still use greedy verification.
+    # Set to "0" to sample every non-greedy step with the torch sampler.
     "VLLM_METAL_NATIVE_SAMPLING": _bool("VLLM_METAL_NATIVE_SAMPLING", True),
     # Experimental MLA Metal decode kernel (RFC #360). Off by default —
     # the MLA wrapper uses the MLX SDPA per-request slow path unless
