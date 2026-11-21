@@ -24,6 +24,11 @@ def can_wrap_qlora(module: Any) -> bool:
         module, quantized_embedding_cls
     ):
         return False
+    # Custom quantized embeddings (e.g. HadamardQuantizedEmbedding,
+    # OneBitEmbedding) do not inherit from nn.QuantizedEmbedding but expose
+    # as_linear() for tied-head projection.
+    if callable(getattr(module, "as_linear", None)):
+        return False
 
     weight = getattr(module, "weight", None)
     scales = getattr(module, "scales", None)

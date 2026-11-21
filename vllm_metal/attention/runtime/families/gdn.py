@@ -99,7 +99,14 @@ class GDNHybridConfig:
 # mlx-lm names the text-only loads by the outer config; mlx-vlm flattens the
 # nested text config, so the same family also arrives as the ``_text`` types.
 GDN_MODEL_TYPES = frozenset(
-    {"qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text", "qwen3_next"}
+    {
+        "prism_hadamard_qwen35",
+        "qwen3_5",
+        "qwen3_5_text",
+        "qwen3_5_moe",
+        "qwen3_5_moe_text",
+        "qwen3_next",
+    }
 )
 
 GDN_FAMILY = StateFamilySpec(

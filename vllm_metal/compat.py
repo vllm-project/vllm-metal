@@ -74,6 +74,7 @@ def apply_compat_patches() -> None:
     _patch_mlx_lm_d3_weight_layout()
     _patch_mlx_lm_minicpm4_model_type()
     _patch_transformers_exaone4_config()
+    _patch_transformers_prism_hadamard_qwen35_config()
 
 
 def _patch_torch_mps_empty_host_cache() -> None:
@@ -167,6 +168,36 @@ def _patch_transformers_exaone4_config() -> None:
     config_cls.__post_init__ = _patched_post_init
     config_cls._vllm_metal_exaone4_patched = True
     logger.debug("Installed Exaone4 config compatibility patch")
+
+
+def _patch_transformers_prism_hadamard_qwen35_config() -> None:
+    """Register ``prism_hadamard_qwen35`` with Transformers ``CONFIG_MAPPING``.
+
+    PrismML's Ternary-Bonsai-2 MLX checkpoints declare
+    ``model_type: "prism_hadamard_qwen35"`` (supported natively by the pinned
+    mlx-vlm and mlx-lm loaders) and omit ``architectures``, so ``AutoConfig``
+    fails before vllm-metal can load the model. Map it to a picklable
+    ``Qwen3_5Config`` subclass that fills the default Qwen3.5 architecture.
+
+    TODO: remove once the supported transformers release registers
+    ``model_type="prism_hadamard_qwen35"``.
+    """
+    try:
+        from transformers import CONFIG_MAPPING
+
+        from vllm_metal.patches.prism_hadamard_config import PrismHadamardQwen35Config
+    except ImportError as exc:
+        logger.debug(
+            "Skipping prism_hadamard_qwen35 config compatibility patch: %s", exc
+        )
+        return
+
+    if PrismHadamardQwen35Config.model_type in CONFIG_MAPPING:
+        return
+    CONFIG_MAPPING.register(
+        PrismHadamardQwen35Config.model_type, PrismHadamardQwen35Config
+    )
+    logger.debug("Registered prism_hadamard_qwen35 config compatibility alias")
 
 
 def _metal_ray_local_gpu_ids(

@@ -53,9 +53,11 @@ def mlx_generate(
     from vllm_metal.compat import (
         _patch_mlx_lm_minicpm4_model_type,
         _patch_transformers_exaone4_config,
+        _patch_transformers_prism_hadamard_qwen35_config,
     )
 
     _patch_transformers_exaone4_config()
+    _patch_transformers_prism_hadamard_qwen35_config()
     _patch_mlx_lm_minicpm4_model_type()
     # Mirror the server, which passes the setting to the tokenizer only.
     if reference_backend == "mlx-vlm":

@@ -209,7 +209,14 @@ class TestGdnPlanRejection:
 class TestStateFamilyFactory:
     @pytest.mark.parametrize(
         "model_type",
-        ["qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text", "qwen3_next"],
+        [
+            "prism_hadamard_qwen35",
+            "qwen3_5",
+            "qwen3_5_text",
+            "qwen3_5_moe",
+            "qwen3_5_moe_text",
+            "qwen3_next",
+        ],
     )
     def test_routes_gdn_model_types_to_the_gdn_family(self, model_type: str) -> None:
         plan = build_hybrid_runtime_plan(

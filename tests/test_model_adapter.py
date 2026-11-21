@@ -210,13 +210,20 @@ class TestShouldForceTextBackbone:
         result = adapter.should_force_text_backbone(hf_config)
         assert result is False
 
+    @pytest.mark.parametrize(
+        ("model_type", "bits"),
+        [
+            ("qwen3_5", 4),
+            ("prism_hadamard_qwen35", 2),
+        ],
+    )
     def test_mlx_quant_qwen35_wrapper_keeps_native_path_with_vision_config(
-        self,
+        self, model_type: str, bits: int
     ) -> None:
         hf_config = SimpleNamespace(
-            model_type="qwen3_5",
+            model_type=model_type,
             architectures=["Qwen3_5ForConditionalGeneration"],
-            quantization={"group_size": 64, "bits": 4, "mode": "affine"},
+            quantization={"group_size": 64, "bits": bits, "mode": "affine"},
             vision_config=SimpleNamespace(spatial_merge_size=2),
             text_config=SimpleNamespace(model_type="qwen3_5_text"),
         )
@@ -1063,7 +1070,9 @@ _QWEN3_VL_FRAME_TOKEN_IDS = {
 
 
 class TestBuildMultimodalAdapter:
-    @pytest.mark.parametrize("model_type", ["qwen3_5", "qwen3_5_moe"])
+    @pytest.mark.parametrize(
+        "model_type", ["prism_hadamard_qwen35", "qwen3_5", "qwen3_5_moe"]
+    )
     def test_builds_qwen35_adapter_from_loaded_vlm(self, model_type: str) -> None:
         vision_tower = object()
         language_model = _Qwen35LanguageModelStub()
