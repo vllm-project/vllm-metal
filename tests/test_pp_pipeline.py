@@ -282,6 +282,32 @@ class TestPipelinedModel:
         assert out == "logits"
         assert stub.input_embeddings is None
 
+    @pytest.mark.parametrize("recv_first", [True, False])
+    def test_later_stage_waits_for_the_receive_alone_on_the_host(
+        self, monkeypatch: pytest.MonkeyPatch, recv_first: bool
+    ) -> None:
+        # The ring backend receives on the CPU, so a GPU command buffer that read
+        # the wire would wait through the whole upstream step, which the Metal
+        # watchdog counts. A forward that may submit GPU work itself receives
+        # before it is built; otherwise the caller's wait evaluates the receive,
+        # and nothing else, once.
+        stub = _StageStubModel()
+        wrapper = PipelinedModel(stub, _pp(1, 3))
+        wire = mx.ones((4, 32), dtype=wrapper._wire_dtype)
+        evaluated: list[tuple[mx.array, ...]] = []
+        monkeypatch.setattr(mx.distributed, "recv", lambda *args, **kwargs: wire)
+        monkeypatch.setattr(mx, "eval", lambda *arrays: evaluated.append(arrays))
+
+        wrapper(mx.zeros((1, 4), dtype=mx.int32), recv_first=recv_first)
+
+        assert len(evaluated) == int(recv_first)
+        assert stub.calls["backbone"].shape == (1, 4, 32)
+        wrapper.wait_for_recv()
+        wrapper.wait_for_recv()
+        assert len(evaluated) == 1
+        assert len(evaluated[0]) == 1
+        assert evaluated[0][0] is wire
+
     def test_wire_descriptor_skips_packed_quant_weight(self) -> None:
         # hidden from config; dtype from the first FLOATING param of the first owned
         # layer, NOT by probing embed_tokens (a streaming non-first stage does not
