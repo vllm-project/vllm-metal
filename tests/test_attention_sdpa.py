@@ -802,13 +802,15 @@ class TestSDPAForward:
         [
             (512, 65_536, True, "prefill", True),
             (511, 65_536, True, "prefill", False),
-            (512, 65_535, True, "prefill", False),
+            (1568, 64_288, True, "prefill", True),
+            (272, 262_144, True, "prefill", True),
             (512, 65_536, False, "prefill", False),
             (1, 65_536, True, "decode", False),
-            (513, 65_536, True, "mixed", False),
+            (513, 65_536, True, "mixed", True),
+            (513, 32_768, True, "mixed", False),
         ],
     )
-    def test_long_aligned_prefill_submits_attention_before_projection(
+    def test_heavy_aligned_prefill_completes_attention_before_projection(
         self, query_rows, context_length, aligned_hybrid, mode, submit
     ) -> None:
         inner = _make_inner(dtype=mx.bfloat16)
@@ -833,11 +835,11 @@ class TestSDPAForward:
         x = mx.ones((_BATCH, query_rows, _HIDDEN), dtype=mx.bfloat16)
         with (
             patch.object(sdpa_mod, "get_ops", return_value=_PagedRoutingOpsSpy()),
-            patch.object(mx, "async_eval") as async_eval,
+            patch.object(mx, "synchronize") as synchronize,
         ):
 
             def o_proj(out: mx.array) -> mx.array:
-                assert async_eval.call_count == int(submit)
+                assert synchronize.call_count == int(submit)
                 return out
 
             inner.o_proj = o_proj

@@ -70,6 +70,11 @@ from vllm_metal.metal import get_ops, paged_attention_capabilities
 
 logger = init_logger(__name__)
 
+# Conservative work floor for the aligned hybrid full-attention path. Use
+# both query rows and visible keys so short suffixes and wide scheduler
+# chunks can hit the same guard at different context lengths.
+_PREFILL_WAIT_QK_PAIRS = 32 * 1024 * 1024
+
 
 def _has_packed_qkv_sdpa_contract(module: nn.Module) -> bool:
     """Return True when *module* exposes the packed Phi-style SDPA contract."""
@@ -1167,18 +1172,29 @@ def sdpa_forward(
         )
         if (
             ctx.state_group_slot_mappings is not None
-            and num_decode == 0
-            and len(ctx.context_lens) == 1
+            and num_decode < len(ctx.context_lens)
+            and num_decode == ctx.num_decode_tokens
             and layer_sliding_window < 0
-            and q_3d.shape[0] >= 512
-            and max_seq_len >= 65_536
-        ):
-            # Long aligned hybrid prefills can hit the Metal interactivity limit
-            # when several full-attention layers share a command buffer.
-            logger.info_once(
-                "Metal: submitting long paged prefill attention per layer."
+            and not ctx.segment_bidi_ranges
+            and ctx.cu_seqlens is not None
+            and sum(
+                (end - start) * length
+                for start, end, length in zip(
+                    ctx.cu_seqlens[:-1],
+                    ctx.cu_seqlens[1:],
+                    ctx.context_lens,
+                    strict=True,
+                )
             )
-            mx.async_eval(out)
+            >= _PREFILL_WAIT_QK_PAIRS
+        ):
+            # Finish a heavy layer before encoding more work on this stream.
+            # Submitting it asynchronously alone can leave several layers queued.
+            logger.info_once(
+                "Metal: completing heavy aligned hybrid prefill attention per layer."
+            )
+            mx.eval(out)
+            mx.synchronize()
 
     if recompute_after_kernel:
         assert ctx.cu_seqlens is not None
