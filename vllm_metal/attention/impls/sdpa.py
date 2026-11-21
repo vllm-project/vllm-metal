@@ -1165,6 +1165,20 @@ def sdpa_forward(
             sinks=sinks,
             **paged_kwargs,
         )
+        if (
+            ctx.state_group_slot_mappings is not None
+            and num_decode == 0
+            and len(ctx.context_lens) == 1
+            and layer_sliding_window < 0
+            and q_3d.shape[0] >= 512
+            and max_seq_len >= 65_536
+        ):
+            # Long aligned hybrid prefills can hit the Metal interactivity limit
+            # when several full-attention layers share a command buffer.
+            logger.info_once(
+                "Metal: submitting long paged prefill attention per layer."
+            )
+            mx.async_eval(out)
 
     if recompute_after_kernel:
         assert ctx.cu_seqlens is not None

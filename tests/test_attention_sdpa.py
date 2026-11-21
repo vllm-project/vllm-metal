@@ -797,6 +797,54 @@ class _PreMmPrefixOps(_PagedOpsCapsOff):
 class TestSDPAForward:
     """Tests for ``sdpa_forward`` runtime argument propagation."""
 
+    @pytest.mark.parametrize(
+        ("query_rows", "context_length", "aligned_hybrid", "mode", "submit"),
+        [
+            (512, 65_536, True, "prefill", True),
+            (511, 65_536, True, "prefill", False),
+            (512, 65_535, True, "prefill", False),
+            (512, 65_536, False, "prefill", False),
+            (1, 65_536, True, "decode", False),
+            (513, 65_536, True, "mixed", False),
+        ],
+    )
+    def test_long_aligned_prefill_submits_attention_before_projection(
+        self, query_rows, context_length, aligned_hybrid, mode, submit
+    ) -> None:
+        inner = _make_inner(dtype=mx.bfloat16)
+        ctx = _make_ctx(query_rows)
+        ctx.context_lens = [context_length]
+        if mode == "mixed":
+            ctx.context_lens.append(context_length)
+            ctx.block_tables.append([0])
+            ctx.cu_seqlens = [0, 1, query_rows]
+        ctx.num_decode_requests = int(mode != "prefill")
+        ctx.num_decode_tokens = ctx.num_decode_requests
+        if aligned_hybrid:
+            ctx.state_group_slot_mappings = ([0] * len(ctx.context_lens),)
+        cache = make_kv_cache(
+            num_layers=1,
+            num_kv_heads=_N_KV_HEADS,
+            head_dim=_HEAD_DIM,
+            num_blocks=1,
+            block_size=8,
+            dtype=mx.bfloat16,
+        )
+        x = mx.ones((_BATCH, query_rows, _HIDDEN), dtype=mx.bfloat16)
+        with (
+            patch.object(sdpa_mod, "get_ops", return_value=_PagedRoutingOpsSpy()),
+            patch.object(mx, "async_eval") as async_eval,
+        ):
+
+            def o_proj(out: mx.array) -> mx.array:
+                assert async_eval.call_count == int(submit)
+                return out
+
+            inner.o_proj = o_proj
+            output, _ = sdpa_forward(inner, x, ctx, cache, layer_idx=0)
+
+        assert output.shape == (_BATCH, query_rows, _HIDDEN)
+
     @pytest.mark.parametrize("cache_dtype", [mx.bfloat16, mx.float16])
     def test_output_projection_receives_the_query_dtype(
         self, cache_dtype: mx.Dtype
