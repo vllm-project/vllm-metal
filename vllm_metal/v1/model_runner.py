@@ -14,6 +14,7 @@ Key contracts:
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from importlib.metadata import entry_points
+from itertools import chain
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypeAlias, cast
 
 import mlx.core as mx
@@ -122,6 +123,7 @@ from vllm_metal.v1.prompt_logprobs import (
 from vllm_metal.v1.proposer import (
     Gemma4MTPProposer,
     MetalProposer,
+    PendingDraftProbs,
     ProposeContext,
 )
 from vllm_metal.v1.sampling import Sampler
@@ -442,6 +444,9 @@ class MetalModelRunner:
         self._sampler = Sampler(logprobs_mode=self.model_config.logprobs_mode)
 
         self._draft_token_ids: DraftTokenIds | None = None
+        # Draft token probabilities pending scheduler handoff and verification.
+        self._draft_probs_by_req: dict[str, PendingDraftProbs] = {}
+        self._probabilistic_rng_by_req: dict[str, np.random.Generator] = {}
         # KV connector driver, built by register_kv_connector_caches.
         self._kv_connector_driver: KVConnector | None = None
         # KV connector step, open across the execute_model / sample_tokens
@@ -2012,11 +2017,22 @@ class MetalModelRunner:
                 if segment.draft_token_ids
             ]
             if spec_items:
-                spec_token_ids = self._spec_decode_controller.verify_greedy(
-                    logits,
-                    [req for _, req, _ in spec_items],
-                    [segment for _, _, segment in spec_items],
-                )
+                spec_reqs = [req for _, req, _ in spec_items]
+                spec_segments = [segment for _, _, segment in spec_items]
+                spec_config = self.vllm_config.speculative_config
+                if SpeculativeDecodeController.use_probabilistic_sampling(spec_config):
+                    spec_token_ids = self._spec_decode_controller.verify_probabilistic(
+                        logits,
+                        spec_reqs,
+                        spec_segments,
+                        self._draft_probs_by_req,
+                        vocab_size=vocab_size,
+                        rng_by_req=self._probabilistic_rng_by_req,
+                    )
+                else:
+                    spec_token_ids = self._spec_decode_controller.verify_greedy(
+                        logits, spec_reqs, spec_segments
+                    )
                 for (decode_index, _, _), sampled_ids in zip(
                     spec_items,
                     spec_token_ids,
@@ -2164,6 +2180,15 @@ class MetalModelRunner:
             batch.add_output(req_id, decode_token_ids[i], logprobs)
 
         num_speculative_tokens = scheduler_output.num_spec_tokens_to_schedule
+
+        spec_config = self.vllm_config.speculative_config
+
+        probabilistic_draft = SpeculativeDecodeController.use_probabilistic_sampling(
+            spec_config
+        )
+        if probabilistic_draft and num_speculative_tokens > 0:
+            self._initialize_probabilistic_rngs(decode_reqs, prefill_reqs)
+
         draft_ctx = ProposeContext(
             target_hidden_states=target_hidden_states,
             target_aux_hidden_states=paged_state.target_aux_hidden_states,
@@ -2180,15 +2205,42 @@ class MetalModelRunner:
             num_decode_segments=num_decode_segments,
             num_speculative_tokens=num_speculative_tokens,
             finished_req_ids=scheduler_output.finished_req_ids,
+            probabilistic_rng_by_req=(
+                self._probabilistic_rng_by_req if probabilistic_draft else None
+            ),
             draft_caps=self._hybrid_draft_caps(
                 decode_segments, decode_token_ids, prefill_reqs
             ),
         )
-        self._draft_token_ids = (
-            self._drafter.propose(draft_ctx) if self._drafter is not None else None
+
+        self._draft_token_ids, draft_probs = (
+            self._drafter.propose(draft_ctx)
+            if self._drafter is not None
+            else (None, None)
         )
+        if draft_probs is not None:
+            self._draft_probs_by_req.update(draft_probs)
 
         return batch, scheduler_output
+
+    def _initialize_probabilistic_rngs(
+        self,
+        decode_reqs: Sequence[tuple[str, RequestState]],
+        prefill_reqs: Sequence[PrefillRequest],
+    ) -> None:
+        """Initialize missing request RNGs before probabilistic drafting."""
+        for req_id, state in chain(
+            decode_reqs,
+            (
+                (prefill.req_id, self._request_states[prefill.req_id])
+                for prefill in prefill_reqs
+            ),
+        ):
+            if req_id not in self._probabilistic_rng_by_req:
+                seed = state.sampling_params.seed
+                self._probabilistic_rng_by_req[req_id] = np.random.default_rng(
+                    seed if seed is None else seed % (1 << 64)
+                )
 
     def _hybrid_draft_caps(
         self,
@@ -3100,6 +3152,12 @@ class MetalModelRunner:
         invalidated = set(evicted_req_ids)
         if preempted_req_ids:
             invalidated.update(preempted_req_ids)
+
+        # Discard draft probabilities for evicted or preempted requests, so
+        # they don't linger in the cache and get returned to a new request.
+        for req_id in invalidated:
+            self._draft_probs_by_req.pop(req_id, None)
+            self._probabilistic_rng_by_req.pop(req_id, None)
 
         # Discard draft KV validity tracking before eviction or recompute.
         if invalidated and self._drafter is not None:

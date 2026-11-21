@@ -111,7 +111,7 @@ def test_scheduler_reservation_covers_exact_draft_write_span(prompt_len, k, cach
 
     drafts = proposer.propose(_prefill(manager, request, k=k))
 
-    assert (drafts is not None) == (k > 0)
+    assert (drafts[0] is not None) == (k > 0)
     # A final prefill ingests the sampled token only when drafting; producing
     # K tokens then writes K-1 more positions. No K+1 allocation is needed.
     assert [pos for _, pos in model.writes] == list(range(prompt_len + k))
@@ -126,7 +126,7 @@ def test_lookahead_pages_are_not_prefix_hits():
     assert manager.allocate_slots(request, 16, num_lookahead_tokens=17)
     model = _WriteTrackingModel()
     proposer = _proposer(model)
-    assert proposer.propose(_prefill(manager, request, k=17)) is not None
+    assert proposer.propose(_prefill(manager, request, k=17))[0] is not None
     blocks = manager.get_blocks("first").blocks[0]
     assert blocks[0].block_hash is not None
     assert all(block.block_hash is None for block in blocks[1:])
@@ -147,7 +147,7 @@ def test_lookahead_pages_are_not_prefix_hits():
         num_lookahead_tokens=3,
     )
     model.writes.clear()
-    assert proposer.propose(_prefill(manager, resumed, k=3, start=16)) is not None
+    assert proposer.propose(_prefill(manager, resumed, k=3, start=16))[0] is not None
     assert [pos for _, pos in model.writes] == list(range(16, len(prompt) + 3))
 
 
@@ -164,7 +164,7 @@ def test_exhaustion_and_lifecycle_return_lookahead_to_scheduler(event):
 
     model = _WriteTrackingModel()
     proposer = _proposer(model)
-    assert proposer.propose(_prefill(manager, first, k=3)) is not None
+    assert proposer.propose(_prefill(manager, first, k=3))[0] is not None
     assert proposer._spec_kv_writes["first"]
     runner = make_stub_runner(_drafter=proposer)
     runner._reconcile_request_lifecycle(
@@ -178,7 +178,7 @@ def test_exhaustion_and_lifecycle_return_lookahead_to_scheduler(event):
     manager.free(first)
     assert manager.block_pool.get_num_free_blocks() == free_before
     assert manager.allocate_slots(waiting, 31, num_lookahead_tokens=3)
-    assert proposer.propose(_prefill(manager, waiting, k=3)) is not None
+    assert proposer.propose(_prefill(manager, waiting, k=3))[0] is not None
     manager.free(waiting)
     assert manager.block_pool.get_num_free_blocks() == free_before
 
@@ -187,13 +187,19 @@ def test_reused_request_id_reingests_after_runner_cleanup():
     model = _WriteTrackingModel()
     proposer = _proposer(model)
     old = _request_state(scheduler_block_ids=[1, 2, 3], token_ids=list(range(31)))
-    assert proposer.propose(_context("r", old, {"r": old}, num_speculative_tokens=3))
+    assert (
+        proposer.propose(_context("r", old, {"r": old}, num_speculative_tokens=3))[0]
+        is not None
+    )
     runner = make_stub_runner(_drafter=proposer, _request_states={"r": old})
     runner._reconcile_request_lifecycle({"r"})
 
     new = _request_state(scheduler_block_ids=[1], token_ids=[7, 8])
     model.writes.clear()
-    assert proposer.propose(_context("r", new, {"r": new}, num_speculative_tokens=3))
+    assert (
+        proposer.propose(_context("r", new, {"r": new}, num_speculative_tokens=3))[0]
+        is not None
+    )
     assert [pos for _, pos in model.writes] == [0, 1, 2, 3]
 
 
@@ -208,7 +214,7 @@ def test_scheduler_context_limit_caps_draft_writes(prompt_len):
 
     drafts = proposer.propose(_prefill(manager, request, k=3))
 
-    assert (drafts is not None) == (prompt_len == 29)
+    assert (drafts[0] is not None) == (prompt_len == 29)
     assert max(pos for _, pos in model.writes) < 32
     assert len(manager.get_blocks("r").get_block_ids()[0]) == 2
 
@@ -230,7 +236,7 @@ def test_chunked_prefill_uses_reserved_blocks_without_drafting_future_prompt():
             )
         model.writes.clear()
         drafts = proposer.propose(ctx)
-        assert (drafts is not None) == (start == 16)
+        assert (drafts[0] is not None) == (start == 16)
         assert [pos for _, pos in model.writes] == list(
             range(start, 16 if start == 0 else 35)
         )

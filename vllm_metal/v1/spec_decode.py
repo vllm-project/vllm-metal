@@ -3,20 +3,22 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
 import mlx.core as mx
+import numpy as np
 from vllm.v1.core.sched.output import SchedulerOutput
 
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPDraftSeed
-from vllm_metal.v1.sampling_batch import GREEDY_TEMPERATURE_EPS
+from vllm_metal.v1.sampling_batch import GREEDY_TEMPERATURE_EPS, SamplingBatch
 
 if TYPE_CHECKING:
     from vllm.config.speculative import SpeculativeConfig
 
     from vllm_metal.v1.model_runner import RequestState
+    from vllm_metal.v1.proposer import PendingDraftProbs
 
 
 class _PagedDecodeStateLike(Protocol):
@@ -25,6 +27,7 @@ class _PagedDecodeStateLike(Protocol):
 
 
 class _SpecDecodeRequestStateLike(Protocol):
+    token_ids: Sequence[int]
     sampling_params: Any
     generated_tokens: int
 
@@ -75,6 +78,17 @@ class PagedDecodeSegment:
 
 class SpeculativeDecodeController:
     """Owns Metal's current target-side speculative decode contract."""
+
+    @staticmethod
+    def use_probabilistic_sampling(
+        spec_config: SpeculativeConfig | None,
+    ) -> bool:
+        """Whether draft-model probabilistic sampling is configured."""
+        return (
+            spec_config is not None
+            and spec_config.method == "draft_model"
+            and spec_config.draft_sample_method == "probabilistic"
+        )
 
     @staticmethod
     def active_spec_decode_tokens(
@@ -205,7 +219,10 @@ class SpeculativeDecodeController:
                 )
             draft_reqs.append((req_id, request_by_id[req_id]))
 
-        self._validate_greedy_sampling(draft_reqs)
+        if self.use_probabilistic_sampling(speculative_config):
+            self._validate_probabilistic_sampling(draft_reqs)
+        else:
+            self._validate_greedy_sampling(draft_reqs)
 
     def build_decode_segments(
         self,
@@ -306,6 +323,151 @@ class SpeculativeDecodeController:
 
         return sampled_token_ids
 
+    def verify_probabilistic(
+        self,
+        logits: mx.array,
+        decode_reqs: Sequence[tuple[str, _SpecDecodeRequestStateLike]],
+        decode_segments: Sequence[PagedDecodeSegment],
+        draft_probs_by_req: MutableMapping[str, PendingDraftProbs],
+        *,
+        vocab_size: int,
+        rng_by_req: Mapping[str, np.random.Generator],
+    ) -> list[list[int]]:
+        """Process target logits, verify drafts, and consume draft records.
+
+        ``logits`` uses the packed row layout. Only the supplied segments are
+        processed, using each request's sampling controls. The caller owns
+        each request's RNG; draft records are removed after successful verification.
+        """
+        if len(decode_reqs) != len(decode_segments):
+            raise ValueError("decode_reqs and decode_segments must have equal length")
+
+        if not decode_segments:
+            return []
+
+        if logits.ndim != 3 or logits.shape[0] != 1:
+            raise ValueError("logits must have shape [1, rows, vocab]")
+
+        if not 0 < vocab_size <= logits.shape[2]:
+            raise ValueError("vocab_size must fit within the logits vocabulary")
+
+        for (req_id, state), segment in zip(decode_reqs, decode_segments, strict=True):
+            if req_id != segment.req_id:
+                raise ValueError(f"Mismatched verification request: {req_id!r}")
+            if segment.bonus_row >= logits.shape[1]:
+                raise ValueError(f"Missing target verification rows for {req_id!r}")
+            if segment.draft_token_ids:
+                pending = draft_probs_by_req.get(req_id)
+                if (
+                    pending is None
+                    or pending.start_pos != len(state.token_ids)
+                    or pending.token_ids[: len(segment.draft_token_ids)]
+                    != segment.draft_token_ids
+                ):
+                    raise ValueError(
+                        f"Missing or mismatched draft probabilities for {req_id!r}"
+                    )
+
+        self._validate_probabilistic_sampling(decode_reqs)
+
+        target_logits = mx.concatenate(
+            [
+                logits[0, segment.start_row : segment.bonus_row + 1, :vocab_size]
+                for segment in decode_segments
+            ],
+            axis=0,
+        )
+        row_params = [
+            state.sampling_params
+            for (_, state), segment in zip(decode_reqs, decode_segments, strict=True)
+            for _ in range(segment.num_query_tokens)
+        ]
+        target_probs = SamplingBatch.processed_probabilities(target_logits, row_params)
+        mx.eval(target_probs)
+        probs = np.asarray(target_probs.tolist(), dtype=np.float64)
+
+        output: list[list[int]] = []
+        row_start = 0
+        for (req_id, _), segment in zip(decode_reqs, decode_segments, strict=True):
+            target_rows = probs[row_start : row_start + segment.num_query_tokens]
+            row_start += segment.num_query_tokens
+
+            rng = rng_by_req.get(req_id)
+            if rng is None:
+                raise ValueError(f"Missing verification RNG for {req_id!r}")
+
+            # If the scheduler admitted a request with no drafts, the draft
+            # proposer will not have produced any draft probabilities for it, so
+            # we sample the bonus row directly from the target distribution.
+            if not segment.draft_token_ids:
+                output.append([self._sample_probabilities(target_rows[-1], rng)])
+                continue
+
+            pending = draft_probs_by_req[req_id]
+            num_drafts = len(segment.draft_token_ids)
+            if (
+                pending.probs.ndim != 2
+                or pending.probs.shape[0] < num_drafts
+                or pending.probs.shape[1] != vocab_size
+            ):
+                raise ValueError(f"Draft probability shape mismatch for {req_id!r}")
+
+            mx.eval(pending.probs)
+            q = np.asarray(pending.probs.tolist(), dtype=np.float64)
+
+            accepted: list[int] = []
+            for offset, draft_token_id in enumerate(segment.draft_token_ids):
+                if not 0 <= draft_token_id < vocab_size:
+                    raise ValueError(f"Draft token outside vocabulary for {req_id!r}")
+
+                draft_row = q[offset]
+                draft_token_prob = draft_row[draft_token_id]
+                if draft_token_prob <= 0:
+                    raise ValueError(
+                        f"Drafted token has zero probability for {req_id!r}"
+                    )
+
+                target_row = target_rows[offset]
+                target_token_prob = target_row[draft_token_id]
+
+                acceptance = min(1.0, target_token_prob / draft_token_prob)
+
+                # Keep the draft token when it passes the acceptance test.
+                if rng.random() < acceptance:
+                    accepted.append(draft_token_id)
+                    continue
+
+                # On rejection, resample from the positive residual.
+                residual = np.maximum(target_row - draft_row, 0.0)
+                residual_mass = residual.sum()
+                if residual_mass <= 0:
+                    raise RuntimeError(
+                        f"Rejected draft has no residual mass for {req_id!r}"
+                    )
+                accepted.append(
+                    self._sample_probabilities(residual / residual_mass, rng)
+                )
+                break
+            else:
+                accepted.append(self._sample_probabilities(target_rows[-1], rng))
+            output.append(accepted)
+
+        for (req_id, _), segment in zip(decode_reqs, decode_segments, strict=True):
+            if segment.draft_token_ids:
+                draft_probs_by_req.pop(req_id, None)
+
+        return output
+
+    @staticmethod
+    def _sample_probabilities(probs: np.ndarray, rng: np.random.Generator) -> int:
+        cumulative = np.cumsum(probs)
+        index = int(
+            np.searchsorted(cumulative, rng.random() * cumulative[-1], side="right")
+        )
+        if index >= len(probs):
+            raise RuntimeError("Probability distribution did not cover the draw")
+        return index
+
     def build_gemma4_mtp_draft_seeds(
         self,
         *,
@@ -327,7 +489,7 @@ class SpeculativeDecodeController:
             decode_token_ids,
             strict=True,
         ):
-            if not sampled_ids or not self.can_draft_greedy(req_id, state, sampled_ids):
+            if not sampled_ids or not self.can_draft(req_id, state, sampled_ids):
                 continue
             accepted_offset = len(sampled_ids) - 1
             seeds.append(
@@ -346,9 +508,7 @@ class SpeculativeDecodeController:
             if result_mode == "intermediate":
                 continue
             state = request_states.get(prefill.req_id)
-            if state is None or not self.can_draft_greedy(
-                prefill.req_id, state, (token_id,)
-            ):
+            if state is None or not self.can_draft(prefill.req_id, state, (token_id,)):
                 continue
             prefill_end = cu_seqlens[num_decode_segments + i + 1]
             seeds.append(
@@ -363,13 +523,14 @@ class SpeculativeDecodeController:
 
         return tuple(seeds)
 
-    def can_draft_greedy(
+    def can_draft(
         self,
         req_id: str,
         request_state: _SpecDecodeRequestStateLike,
         sampled_ids: Sequence[int],
+        draft_sample_method: str = "greedy",
     ) -> bool:
-        """Whether a request may be drafted under greedy-only spec decode."""
+        """Whether a request may draft under the selected sampling method."""
         # Sampling updates the output count before the scheduler retires a request.
         sampling_params = request_state.sampling_params
         max_tokens = sampling_params.max_tokens
@@ -384,7 +545,14 @@ class SpeculativeDecodeController:
         ):
             return False
         try:
-            self._validate_greedy_sampling([(req_id, request_state)])
+            if draft_sample_method == "probabilistic":
+                self._validate_probabilistic_sampling([(req_id, request_state)])
+            elif draft_sample_method == "greedy":
+                self._validate_greedy_sampling([(req_id, request_state)])
+            else:
+                raise ValueError(
+                    f"Unknown draft sample method: {draft_sample_method!r}"
+                )
         except NotImplementedError:
             return False
         return True
@@ -397,12 +565,14 @@ class SpeculativeDecodeController:
         prefill_token_ids: Sequence[int],
         prefill_result_modes: Sequence[str],
         request_states: Mapping[str, _SpecDecodeRequestStateLike],
+        *,
+        draft_sample_method: str = "greedy",
     ) -> Sequence[tuple[str, RequestState]]:
         """Filter ``ctx`` to requests eligible for drafting this step.
 
         Shared eligibility filter for block-draft, draft-model and n-gram
         proposers: skip decode rows that did not sample this step, skip
-        finished or non-greedy requests via :meth:`can_draft_greedy`, skip
+        finished or unsupported-sampling requests, skip
         intermediate prefill chunks, and de-duplicate prefill rows whose
         ``req_id`` was already admitted through decode.
 
@@ -411,6 +581,10 @@ class SpeculativeDecodeController:
         no newly-committed tokens), but the eligibility decisions live here
         so the proposers cannot drift out of sync.
         """
+        if draft_sample_method not in ("greedy", "probabilistic"):
+            # Match the runner's greedy proposer path for other methods.
+            draft_sample_method = "greedy"
+
         eligible: list[tuple[str, RequestState]] = []
         seen: set[str] = set()
 
@@ -419,7 +593,12 @@ class SpeculativeDecodeController:
         ):
             if not sampled_ids:
                 continue
-            if not self.can_draft_greedy(req_id, state, sampled_ids):
+            if not self.can_draft(
+                req_id,
+                state,
+                sampled_ids,
+                draft_sample_method=draft_sample_method,
+            ):
                 continue
             eligible.append((req_id, state))  # type: ignore[arg-type]
             seen.add(req_id)
@@ -430,8 +609,11 @@ class SpeculativeDecodeController:
             if result_mode == "intermediate" or prefill.req_id in seen:
                 continue
             state = request_states.get(prefill.req_id)
-            if state is None or not self.can_draft_greedy(
-                prefill.req_id, state, (prefill_token_ids[i],)
+            if state is None or not self.can_draft(
+                prefill.req_id,
+                state,
+                (prefill_token_ids[i],),
+                draft_sample_method=draft_sample_method,
             ):
                 continue
             eligible.append((prefill.req_id, state))  # type: ignore[arg-type]
@@ -463,6 +645,30 @@ class SpeculativeDecodeController:
                     "supports greedy sampling only (temperature=0, no "
                     "penalties, constraints, logprobs, or logit_bias, and "
                     "not before a request reaches min_tokens)."
+                )
+
+    def _validate_probabilistic_sampling(
+        self,
+        decode_reqs: Sequence[tuple[str, _SpecDecodeRequestStateLike]],
+    ) -> None:
+        for _, request_state in decode_reqs:
+            sampling_params = request_state.sampling_params
+            unsupported = (
+                sampling_params.frequency_penalty != 0.0
+                or sampling_params.presence_penalty != 0.0
+                or sampling_params.repetition_penalty != 1.0
+                or sampling_params.num_logprobs is not None
+                or bool(sampling_params.allowed_token_ids)
+                or bool(sampling_params.bad_words_token_ids)
+                or bool(sampling_params.logit_bias)
+                or sampling_params.structured_outputs is not None
+                or request_state.generated_tokens < sampling_params.min_tokens
+            )
+            if unsupported:
+                raise NotImplementedError(
+                    "Probabilistic speculative verification on Metal requires "
+                    "no penalties, constraints, logprobs, or logit_bias, "
+                    "and a request past min_tokens."
                 )
 
 

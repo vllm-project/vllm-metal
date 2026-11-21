@@ -122,8 +122,8 @@ def test_chunked_prefill_then_rejection_overwrites_temporary_kv(accepted, propos
         block_ids=[[0], [5, 2, 7, 1]],
     )
     first, second = _features(8), _features(7)
-    assert proposer.propose(_prefill(state, first, 0, False)) is None
-    drafts = proposer.propose(_prefill(state, second, 8, True))
+    assert proposer.propose(_prefill(state, first, 0, False))[0] is None
+    drafts = proposer.propose(_prefill(state, second, 8, True))[0]
     assert drafts is not None
     tokens = drafts.draft_token_ids[0]
     sampled = tokens[:accepted] + [4]
@@ -154,7 +154,7 @@ def test_chunked_prefill_then_rejection_overwrites_temporary_kv(accepted, propos
         num_speculative_tokens=3,
         finished_req_ids=set(),
     )
-    actual = proposer.propose(ctx)
+    actual = proposer.propose(ctx)[0]
     features = [
         mx.concatenate([a, b, c[: accepted + 1]])
         for a, b, c in zip(first, second, feature, strict=True)
@@ -170,7 +170,7 @@ def test_chunked_prefill_then_rejection_overwrites_temporary_kv(accepted, propos
     proposer.release_requests({"r"})
     assert not proposer._valid_ends
     state.token_ids = [1] * 15 + [2]
-    assert proposer.propose(_prefill(state, _features(15), 0, True)) is not None
+    assert proposer.propose(_prefill(state, _features(15), 0, True))[0] is not None
 
 
 def test_compiled_draft_follows_storage_recreated_by_sleep(proposer):
@@ -182,7 +182,7 @@ def test_compiled_draft_follows_storage_recreated_by_sleep(proposer):
         block_ids=[[0], [5, 2, 7, 1]],
     )
     storage = proposer.cache.storage
-    assert proposer.propose(_prefill(state, _features(15), 0, True)) is not None
+    assert proposer.propose(_prefill(state, _features(15), 0, True))[0] is not None
     gc.collect()
     active = mx.get_active_memory()
     storage.release()
@@ -195,7 +195,7 @@ def test_compiled_draft_follows_storage_recreated_by_sleep(proposer):
     # be written to the new backing by the draft compiled before sleep.
     proposer.release_requests({"r"})
     features = _features(15)
-    drafts = proposer.propose(_prefill(state, features, 0, True))
+    drafts = proposer.propose(_prefill(state, features, 0, True))[0]
     expected = _dense_tokens(proposer, mx.array([2]), [f[None] for f in features], 3)
     assert drafts.draft_token_ids == expected.tolist()
     _assert_committed(proposer, state.block_ids[1], features)
@@ -239,7 +239,7 @@ def test_non_drafting_rows_still_commit_features(kind, proposer):
         ctx = replace(ctx, num_speculative_tokens=0)
     if kind == "context_limit":
         proposer.cache.max_model_len = 17
-    assert proposer.propose(ctx) is None
+    assert proposer.propose(ctx)[0] is None
     assert not proposer._drafts
     assert proposer._valid_ends == {"r": 15}
     _assert_committed(proposer, state.block_ids[1], ctx.target_aux_hidden_states)
@@ -258,7 +258,7 @@ def test_exhausted_output_budget_commits_features_without_drafting(
     )
     prefix = _features(15)
     ctx = _prefill(state, prefix, 0, True)
-    result = proposer.propose(ctx)
+    result = proposer.propose(ctx)[0]
     assert (result is not None) == (max_tokens > 2)
     state.token_ids.extend([3] * 3)
     state.generated_tokens = 4
@@ -294,7 +294,7 @@ def test_exhausted_output_budget_commits_features_without_drafting(
 
     monkeypatch.setattr(proposer, "_compile_draft", unexpected_draft)
     monkeypatch.setitem(proposer._drafts, 3, unexpected_draft)
-    assert proposer.propose(ctx) is None
+    assert proposer.propose(ctx)[0] is None
     assert proposer._valid_ends == {"r": len(features[0])}
     _assert_committed(proposer, state.block_ids[1], features)
 
@@ -346,7 +346,7 @@ def test_exhausted_row_does_not_suppress_live_drafts(
         return forward(anchors, rows)
 
     monkeypatch.setitem(proposer._drafts, 3, record_forward)
-    result = proposer.propose(ctx)
+    result = proposer.propose(ctx)[0]
     assert result is not None and result.req_ids == ["live"]
     assert calls == [([2], [(live.block_ids[1], 15)])]
     expected = _dense_tokens(
@@ -380,7 +380,7 @@ def test_remaining_output_budget_bounds_draft_forward(
         return compile_draft(width)
 
     monkeypatch.setattr(proposer, "_compile_draft", record_compile)
-    result = proposer.propose(_prefill(state, features, 0, True))
+    result = proposer.propose(_prefill(state, features, 0, True))[0]
     _assert_committed(proposer, state.block_ids[1], features)
     if not expected_width:
         assert result is None and not widths
@@ -441,7 +441,7 @@ def test_mixed_output_budgets_share_one_bounded_draft_batch(
         return record_forward
 
     monkeypatch.setattr(proposer, "_compile_draft", record_compile)
-    result = proposer.propose(ctx)
+    result = proposer.propose(ctx)[0]
     assert result.req_ids == ["short", "long"]
     assert calls == [(width, [3, 4], [([2, 3], 15), ([4, 5], 15)])]
     expected = _dense_tokens(
@@ -532,7 +532,7 @@ def test_first_prefill_draft_uses_sampled_anchor_at_absolute_position(
     monkeypatch.setattr(proposer, "_compile_draft", record_compile)
     result = proposer.propose(
         _prefill(state, [f[start:] for f in features], start, True)
-    )
+    )[0]
     assert result is not None
     # The final prompt token is 1; the target has already emitted anchor 2 at
     # position 31. A cached suffix must preserve that absolute position and
@@ -592,7 +592,7 @@ def test_build_forwards_prefix_caching(monkeypatch, proposer, prefix_caching):
     built.cache.write_context([f[:16] for f in features], [(state.block_ids[1], 0, 16)])
     ctx = _prefill(state, [f[16:] for f in features], 16, True)
     if prefix_caching:
-        assert built.propose(ctx) is not None
+        assert built.propose(ctx)[0] is not None
         _assert_committed(built, state.block_ids[1], features)
     else:
         with pytest.raises(RuntimeError, match="discontinuous"):
@@ -655,7 +655,7 @@ def test_width_changes_commit_verified_rows_and_reuse_compiled_callables(
 
     monkeypatch.setattr(proposer.cache, "compile_draft", compile_width)
     committed = _features(15)
-    result = proposer.propose(_prefill(state, committed, 0, True))
+    result = proposer.propose(_prefill(state, committed, 0, True))[0]
     # Incoming verification and outgoing proposal widths are independent.
     # Consecutive K=0 steps still grow committed context before K grows again.
     for step, width in enumerate((1, 0, 0, 3, 1, 3)):
@@ -686,7 +686,7 @@ def test_width_changes_commit_verified_rows_and_reuse_compiled_callables(
                 num_decode_segments=1,
                 num_speculative_tokens=width,
             )
-        )
+        )[0]
         committed = tuple(
             mx.concatenate([old, new[: len(sampled)]])
             for old, new in zip(committed, feature, strict=True)
@@ -735,7 +735,7 @@ def test_context_limit_uses_selected_width(width, proposer):
     )
     result = proposer.propose(
         replace(_prefill(state, _features(15), 0, True), num_speculative_tokens=width)
-    )
+    )[0]
     assert proposer._valid_ends == {"r": 15}
     if width == 1:
         assert len(result.draft_token_ids[0]) == 1
@@ -764,7 +764,7 @@ def test_prefix_hit_reuses_committed_kv_without_writing_shared_blocks(
     ctx = _prefill(state, original, 0, True)
     if producer == "zero_k":
         ctx = replace(ctx, num_speculative_tokens=0)
-    result = proposer.propose(ctx)
+    result = proposer.propose(ctx)[0]
     assert (result is not None) == (producer == "greedy")
     shared = [
         np.array(stored[5])
@@ -781,7 +781,7 @@ def test_prefix_hit_reuses_committed_kv_without_writing_shared_blocks(
     state.token_ids = [1] * 16 + [3] * 7 + [4]
     state.prompt_len = 23
     suffix = _features(7)
-    result = proposer.propose(_prefill(state, suffix, 16, True))
+    result = proposer.propose(_prefill(state, suffix, 16, True))[0]
     assert result is not None
     features = [
         mx.concatenate([prefix[:16], tail])
@@ -817,7 +817,7 @@ def test_prefix_hit_does_not_allow_a_later_gap(proposer):
         sampling_params=SamplingParams(temperature=0),
         block_ids=[[0], [5, 2, 7, 1]],
     )
-    assert proposer.propose(_prefill(state, _features(4), 16, False)) is None
+    assert proposer.propose(_prefill(state, _features(4), 16, False))[0] is None
     before = [np.array(buffer) for buffer in proposer.cache.storage.buffers]
     with pytest.raises(RuntimeError, match="discontinuous"):
         proposer.propose(_prefill(state, _features(4), 24, False))
@@ -836,7 +836,7 @@ def test_prefix_hit_beyond_draft_context_stays_target_only(proposer, start):
         block_ids=[[0], [5, 2, 7, 1]],
     )
     before = [np.array(buffer) for buffer in proposer.cache.storage.buffers]
-    assert proposer.propose(_prefill(state, _features(1), start, True)) is None
+    assert proposer.propose(_prefill(state, _features(1), start, True))[0] is None
     assert not proposer._valid_ends
     for actual, expected in zip(proposer.cache.storage.buffers, before, strict=True):
         np.testing.assert_array_equal(np.array(actual), expected)

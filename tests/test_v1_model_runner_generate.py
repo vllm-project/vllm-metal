@@ -192,8 +192,8 @@ class TestDrafterReleaseOnLifecycle:
             def needs_target_hidden_states(self, *args, **kwargs) -> bool:
                 return False
 
-            def propose(self, ctx) -> None:
-                return None
+            def propose(self, ctx) -> tuple[None, None]:
+                return None, None
 
             def release_requests(self, req_ids: set[str]) -> None:
                 released.append(set(req_ids))
@@ -1473,7 +1473,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
             runner.vllm_config.speculative_config = SimpleNamespace(method="ngram")
         elif blocker == "drafter":
             runner._drafter = Mock()
-            runner._drafter.propose.return_value = None
+            runner._drafter.propose.return_value = (None, None)
         elif blocker == "grammar_output":
             grammar_output = self._make_grammar_output(["r0"], 4)
         self._install_paged_state(
@@ -4735,7 +4735,7 @@ def test_intermediate_prefill_keeps_rng_and_drafter_bookkeeping(has_final_prefil
     # An installed drafter excludes the intermediate-only short-circuit.
     # It must still receive every chunk, including those that sample nothing.
     runner._drafter = Mock()
-    runner._drafter.propose.return_value = None
+    runner._drafter.propose.return_value = (None, None)
     params = SamplingParams(temperature=0.8, seed=7, logprobs=2)
     generator = torch.Generator().manual_seed(7)
     before = generator.get_state()

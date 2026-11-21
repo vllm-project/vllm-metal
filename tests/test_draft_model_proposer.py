@@ -343,7 +343,7 @@ def test_blocks_come_from_scheduler_assignment() -> None:
     state = _request_state(scheduler_block_ids=[1, 0])  # order matters
     drafts = proposer.propose(_context("r1", state, {"r1": state}))
 
-    assert drafts is not None
+    assert drafts[0] is not None
     used = model.block_tables[0][0]
     assert used[:2] == [1, 0]
 
@@ -358,7 +358,7 @@ def test_lookahead_uses_only_scheduler_blocks_at_exact_boundary(k) -> None:
     drafts = proposer.propose(
         _context("r1", state, {"r1": state}, num_speculative_tokens=k)
     )
-    assert (drafts is not None) == (k > 0)
+    assert (drafts[0] is not None) == (k > 0)
     assert all(blocks == [7, 2] for call in model.block_tables for blocks in call)
 
 
@@ -390,7 +390,7 @@ def test_context_limit_suppresses_drafts_but_ingests_valid_prefix(
         )
         ctx = _context("r1", state, {"r1": state}, num_speculative_tokens=3)
     drafts = proposer.propose(ctx)
-    assert (drafts is not None) == expected_drafts
+    assert (drafts[0] is not None) == expected_drafts
     # A non-drafting final prefill need not ingest its sampled token yet.
     expected_ingest = min(target_end + (not prefill or expected_drafts), 32)
     assert model.input_lens[0] == expected_ingest
@@ -408,7 +408,7 @@ def test_cache_hit_seeds_draft_seq_len_from_scheduler_boundary() -> None:
     )
     drafts = proposer.propose(_context("r1", state, {"r1": state}))
 
-    assert drafts is not None
+    assert drafts[0] is not None
     assert model.input_lens[0] == 1
 
 
@@ -418,7 +418,7 @@ def test_no_cache_hit_ingests_the_whole_committed_range() -> None:
     state = _request_state(scheduler_block_ids=[0, 1], num_computed_tokens=0)
     drafts = proposer.propose(_context("r1", state, {"r1": state}))
 
-    assert drafts is not None
+    assert drafts[0] is not None
     assert model.input_lens[0] == PROMPT_LEN
 
 
@@ -436,7 +436,7 @@ def test_ineligible_request_ingests_but_never_drafts(temperature, max_tokens) ->
         _context("r1", state, {"r1": state}, num_speculative_tokens=3)
     )
 
-    assert drafts is None  # nothing to draft for
+    assert drafts == (None, None)  # nothing to draft for
     assert len(model.block_tables) == 1  # but ingest still ran
 
 
@@ -473,7 +473,7 @@ def test_intermediate_prefill_chunk_ingests_without_drafting() -> None:
     )
     drafts = proposer.propose(ctx)
 
-    assert drafts is None
+    assert drafts == (None, None)
     assert len(model.block_tables) == 1
 
 
@@ -490,7 +490,7 @@ def test_eager_zero_k_still_ingests() -> None:
         )
     )
 
-    assert drafts is None
+    assert drafts == (None, None)
     assert model.input_lens == [8]
     assert proposer._draft_seq_lens == {"r1": 8}
 
@@ -508,7 +508,7 @@ def test_lazy_zero_to_positive_k_catches_up_before_drafting() -> None:
         )
     )
 
-    assert zero_k_drafts is None
+    assert zero_k_drafts == (None, None)
     assert model.input_lens == []
     assert proposer._draft_seq_lens == {"r1": 0}
 
@@ -520,8 +520,8 @@ def test_lazy_zero_to_positive_k_catches_up_before_drafting() -> None:
         )
     )
 
-    assert drafts is not None
-    assert drafts.draft_token_ids == [[len(prompt) % VOCAB_SIZE]]
+    assert drafts[0] is not None
+    assert drafts[0].draft_token_ids == [[len(prompt) % VOCAB_SIZE]]
     assert model.input_lens == [len(prompt) + 1]
     assert proposer._draft_seq_lens == {"r1": len(prompt) + 1}
 
@@ -552,7 +552,7 @@ def test_lazy_positive_to_zero_k_preserves_boundary() -> None:
         )
     )
 
-    assert zero_k_drafts is None
+    assert zero_k_drafts == (None, None)
     assert model.input_lens == [8]
     assert proposer._draft_seq_lens == {"r1": 8}
 
@@ -602,7 +602,7 @@ def _draft_two_rounds(
                 {"r1": state1},
                 num_speculative_tokens=num_speculative_tokens,
             )
-        )
+        )[0]
         is not None
     )
     round2_ingest_index = len(model.input_lens)
@@ -618,7 +618,7 @@ def _draft_two_rounds(
                 {"r1": state2},
                 num_speculative_tokens=num_speculative_tokens,
             )
-        )
+        )[0]
         is not None
     )
     return round2_ingest_index
@@ -718,7 +718,7 @@ def test_spec_kv_ledger_cleared_on_release() -> None:
     assert (
         proposer.propose(
             _context("r1", state1, {"r1": state1}, num_speculative_tokens=3)
-        )
+        )[0]
         is not None
     )
     proposer.release_requests({"r1"})
@@ -732,7 +732,7 @@ def test_spec_kv_ledger_cleared_on_release() -> None:
     assert (
         proposer.propose(
             _context("r1", state2, {"r1": state2}, num_speculative_tokens=3)
-        )
+        )[0]
         is not None
     )
 
@@ -755,8 +755,8 @@ def test_chunked_ingest_forwards_per_chunk(
     drafts = proposer.propose(_prefills_context([("r1", list(range(20)))]))
 
     assert model.input_lens == [16, 5]
-    assert drafts is not None
-    assert drafts.draft_token_ids == [[20 % VOCAB_SIZE]]
+    assert drafts[0] is not None
+    assert drafts[0].draft_token_ids == [[20 % VOCAB_SIZE]]
 
 
 def test_ingest_chunk_exact_multiple_two_equal_rounds(
@@ -771,8 +771,8 @@ def test_ingest_chunk_exact_multiple_two_equal_rounds(
     drafts = proposer.propose(_prefills_context([("r1", list(range(31)))]))
 
     assert model.input_lens == [16, 16]
-    assert drafts is not None
-    assert drafts.draft_token_ids == [[31 % VOCAB_SIZE]]
+    assert drafts[0] is not None
+    assert drafts[0].draft_token_ids == [[31 % VOCAB_SIZE]]
 
 
 def test_ingest_chunk_larger_than_prompt_single_forward(
@@ -786,8 +786,8 @@ def test_ingest_chunk_larger_than_prompt_single_forward(
     drafts = proposer.propose(_prefills_context([("r1", list(range(20)))]))
 
     assert model.input_lens == [21]
-    assert drafts is not None
-    assert drafts.draft_token_ids == [[20 % VOCAB_SIZE]]
+    assert drafts[0] is not None
+    assert drafts[0].draft_token_ids == [[20 % VOCAB_SIZE]]
 
 
 def test_ingest_chunk_size_zero_single_forward(
@@ -801,8 +801,8 @@ def test_ingest_chunk_size_zero_single_forward(
     drafts = proposer.propose(_prefills_context([("r1", list(range(20)))]))
 
     assert model.input_lens == [21]
-    assert drafts is not None
-    assert drafts.draft_token_ids == [[20 % VOCAB_SIZE]]
+    assert drafts[0] is not None
+    assert drafts[0].draft_token_ids == [[20 % VOCAB_SIZE]]
 
 
 @pytest.mark.parametrize(
@@ -833,8 +833,8 @@ def test_small_ingest_ignores_chunk_knob(monkeypatch: pytest.MonkeyPatch) -> Non
     drafts = proposer.propose(_prefills_context([("r1", list(range(15)))]))
 
     assert model.input_lens == [16]
-    assert drafts is not None
-    assert drafts.draft_token_ids == [[15 % VOCAB_SIZE]]
+    assert drafts[0] is not None
+    assert drafts[0].draft_token_ids == [[15 % VOCAB_SIZE]]
 
 
 def test_mixed_chunk_lengths_share_rounds(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -850,9 +850,9 @@ def test_mixed_chunk_lengths_share_rounds(monkeypatch: pytest.MonkeyPatch) -> No
     )
 
     assert model.input_lens == [32, 15]
-    assert drafts is not None
-    assert drafts.req_ids == ["r1", "r2"]
-    assert drafts.draft_token_ids == [[20 % VOCAB_SIZE], [25 % VOCAB_SIZE]]
+    assert drafts[0] is not None
+    assert drafts[0].req_ids == ["r1", "r2"]
+    assert drafts[0].draft_token_ids == [[20 % VOCAB_SIZE], [25 % VOCAB_SIZE]]
 
 
 def test_packed_ingest_projects_only_each_plans_last_row() -> None:
@@ -865,8 +865,8 @@ def test_packed_ingest_projects_only_each_plans_last_row() -> None:
     )
 
     assert adapter.logits_indices == [[7, 16]]
-    assert drafts is not None
-    assert drafts.draft_token_ids == [[7], [8]]
+    assert drafts[0] is not None
+    assert drafts[0].draft_token_ids == [[7], [8]]
 
 
 def test_tiny_ingest_keeps_combined_model_forward() -> None:
@@ -877,8 +877,8 @@ def test_tiny_ingest_keeps_combined_model_forward() -> None:
     drafts = proposer.propose(_prefills_context([("r1", [0]), ("r2", [0])]))
 
     assert adapter.logits_indices == []
-    assert drafts is not None
-    assert drafts.draft_token_ids == [[1], [1]]
+    assert drafts[0] is not None
+    assert drafts[0].draft_token_ids == [[1], [1]]
 
 
 def test_unsupported_large_ingest_keeps_combined_model_forward() -> None:
@@ -894,8 +894,8 @@ def test_unsupported_large_ingest_keeps_combined_model_forward() -> None:
 
     assert model.input_lens == [21]
     assert adapter.logits_indices == []
-    assert drafts is not None
-    assert drafts.draft_token_ids == [[20 % VOCAB_SIZE]]
+    assert drafts[0] is not None
+    assert drafts[0].draft_token_ids == [[20 % VOCAB_SIZE]]
 
 
 def test_chunked_ingest_selects_only_large_projection_rounds(
@@ -913,8 +913,8 @@ def test_chunked_ingest_selects_only_large_projection_rounds(
     # The 32-row first round selects two rows. The 15-row tail stays on the
     # combined model forward because tiny head projections do not benefit.
     assert adapter.logits_indices == [[15, 31]]
-    assert drafts is not None
-    assert drafts.draft_token_ids == [[20 % VOCAB_SIZE], [25 % VOCAB_SIZE]]
+    assert drafts[0] is not None
+    assert drafts[0].draft_token_ids == [[20 % VOCAB_SIZE], [25 % VOCAB_SIZE]]
 
 
 # -- Sliding-window / hybrid draft rejection ---------------------------------
@@ -992,8 +992,7 @@ def test_scheduler_adoption_uses_target_limit_after_auto_fit() -> None:
     state = _request_state(token_ids=list(range(31)), scheduler_block_ids=[0, 1])
     # The checkpoint's original limit would allow drafting into a third block.
     # The engine's final limit suppresses lookahead while retaining valid ingest.
-    assert (
-        proposer.propose(_context("r", state, {"r": state}, num_speculative_tokens=3))
-        is None
-    )
+    assert proposer.propose(
+        _context("r", state, {"r": state}, num_speculative_tokens=3)
+    ) == (None, None)
     assert model.input_lens == [31]

@@ -141,7 +141,7 @@ def test_scheduler_hits_share_only_committed_prefix(runtime, live, drop):
     first = _request("first", [1] * 47)
     features = _features(47)
     assert _allocate(manager, first) == 0
-    assert proposer.propose(_context(manager, first, features, 0)) is not None
+    assert proposer.propose(_context(manager, first, features, 0))[0] is not None
     if not live:
         manager.free(first)
         proposer.release_requests({"first"})
@@ -164,7 +164,7 @@ def test_scheduler_hits_share_only_committed_prefix(runtime, live, drop):
     ]
     result = proposer.propose(
         _context(manager, second, [f[start:] for f in full], start)
-    )
+    )[0]
     assert (
         result.draft_token_ids
         == _dense_tokens(proposer, mx.array([4]), [f[None] for f in full], 3).tolist()
@@ -208,7 +208,7 @@ def test_missing_group_recomputes_common_suffix(runtime, missing_group):
     assert start == 16
     full = [f[:39] for f in features]
     assert (
-        proposer.propose(_context(manager, second, [f[start:] for f in full], start))
+        proposer.propose(_context(manager, second, [f[start:] for f in full], start))[0]
         is not None
     )
     _assert_committed(
@@ -231,14 +231,14 @@ def test_chunked_cached_prefill_commits_only_suffix(runtime):
     assert (
         proposer.propose(
             _context(manager, second, [f[16:32] for f in features], 16, final=False)
-        )
+        )[0]
         is None
     )
     second.num_computed_tokens = 32
     assert manager.allocate_slots(second, 7, num_lookahead_tokens=4) is not None
     result = proposer.propose(
         _context(manager, second, [f[32:39] for f in features], 32)
-    )
+    )[0]
     _assert_committed(
         proposer,
         manager.get_blocks(second.request_id).get_block_ids()[1],
@@ -258,7 +258,7 @@ def test_lookahead_and_partial_pages_are_not_reusable_prefixes(runtime):
     free = manager.block_pool.get_num_free_blocks()
     first = _request("first", [1] * 47)
     _allocate(manager, first)
-    result = proposer.propose(_context(manager, first, _features(47), 0))
+    result = proposer.propose(_context(manager, first, _features(47), 0))[0]
     # Drafting wrote temporary positions through the next page boundary.
     # A new prompt matching these tokens still only hits the full prompt pages.
     second = _request("second", [1] * 47 + [4] + result.draft_token_ids[0])
@@ -309,7 +309,7 @@ def test_same_step_prefix_consumer_waits_for_all_context_writes(runtime):
         request_states={**b.request_states, **a.request_states},
         cu_seqlens=[0, 23, 70],
     )
-    result = proposer.propose(ctx)
+    result = proposer.propose(ctx)[0]
     assert result.req_ids == ["consumer", "producer"]
     _assert_committed(
         proposer,
@@ -340,7 +340,7 @@ def test_resume_or_id_reuse_adopts_new_scheduler_hit(runtime, reuse_id):
     assert (
         proposer.propose(
             _context(manager, resumed, [f[start:39] for f in features], start)
-        )
+        )[0]
         is not None
     )
     _assert_committed(

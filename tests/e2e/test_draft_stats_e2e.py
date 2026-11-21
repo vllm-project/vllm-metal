@@ -284,7 +284,7 @@ def _run_controlled_recovery(batch_size, path):
                     )
                     req_ids.append(req_id)
                     drafts.append(draft)
-                return DraftTokenIds(req_ids=req_ids, draft_token_ids=drafts)
+                return DraftTokenIds(req_ids=req_ids, draft_token_ids=drafts), None
 
             patch.setattr(runner._drafter, "propose", propose)
             for phase in ("cold", "cached"):

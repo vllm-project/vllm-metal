@@ -116,8 +116,8 @@ def test_draft_kv_matches_native_after_rejection_and_recompute(
         result = proposer.propose(
             _context("r", state, {"r": state}, num_speculative_tokens=3)
         )
-        assert result is not None
-        drafts = result.draft_token_ids[0]
+        assert result[0] is not None
+        drafts = result[0].draft_token_ids[0]
         expected = []
         for _ in range(3):
             logits = native(mx.array([[*history, *expected]]))
@@ -156,10 +156,9 @@ def test_draft_kv_matches_native_after_rejection_and_recompute(
 
     # K=0 defers ingest, then K=3 must catch up before reading old lookahead.
     state = _request_state(scheduler_block_ids=blocks, token_ids=history)
-    assert (
-        proposer.propose(_context("r", state, {"r": state}, num_speculative_tokens=0))
-        is None
-    )
+    assert proposer.propose(
+        _context("r", state, {"r": state}, num_speculative_tokens=0)
+    ) == (None, None)
     history.extend([91, 23])
     check_round()
 

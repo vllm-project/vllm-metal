@@ -44,7 +44,7 @@ def test_dspark_uses_exactly_k_slots_at_context_and_page_limit(
     )
     actual = proposer.propose(
         replace(_prefill(state, features, 0, True), num_speculative_tokens=width)
-    )
+    )[0]
     assert actual is not None and actual.req_ids == ["r"]
     expected = model.draft(
         mx.array([4]),
