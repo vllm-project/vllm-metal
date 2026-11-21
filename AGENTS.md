@@ -21,6 +21,10 @@ gh pr list --repo vllm-project/vllm-metal --state open --search "<issue_number> 
 
 Do not open a duplicate PR. Explain any materially different approach in the PR description.
 
+## Pull requests
+
+- Fill the PR template's contributor-intent questions only from explicit human answers. Never invent, infer, or prefill them; if an answer is missing, stop and ask the human before opening the PR.
+
 ## Coding style
 
 - Match existing code style.
