@@ -20,6 +20,7 @@ from vllm_metal.attention.caches.turboquant import (
     V_QUANT_PARAMS,
     packed_dim,
 )
+from vllm_metal.tensor_bridge import TORCH_TO_MLX_DTYPE
 
 
 class MetalPagedKVCache:
@@ -91,7 +92,7 @@ class MetalPagedKVCache:
             cache.value_scale_caches = storage.views(value_scales)
             cache.key_zero_caches = storage.views(zeros)
         else:
-            cache.dtype = cache.key_caches[0].dtype
+            cache.dtype = TORCH_TO_MLX_DTYPE[storage.tensors[names[0]].dtype]
         cache._storage = storage
         return cache
 

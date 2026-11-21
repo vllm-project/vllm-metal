@@ -809,6 +809,8 @@ def sdpa_forward(
     max_seq_len = meta.max_seq_len
 
     v_centroids: mx.array | None = None
+    storage = getattr(kv_cache, "_storage", None)
+    kv_chunk_kwargs = storage.chunk_kwargs() if storage is not None else {}
     if shared_kv is not None or read_existing_kv:
         # YOCO shared layer / MTP read-existing layer: the authoritative K/V
         # already lives in the paged cache.  Skip writes to avoid redundant
@@ -872,13 +874,24 @@ def sdpa_forward(
         # both K and V into the paged cache by slot_mapping, replacing the two
         # per-layer MLX scatters. The outputs alias the input cache buffers in
         # place and carry graph provenance for the paged_attention read below.
-        new_k_cache, new_v_cache = get_ops().reshape_and_cache(
-            k_3d,
-            v_3d,
-            kv_cache.key_caches[layer_idx],
-            kv_cache.value_caches[layer_idx],
-            slot_mapping,
-        )
+        if storage is not None and kv_chunk_kwargs:
+            # Chunked KV: the caches are address tables, and the write returns
+            # the tables the read below must depend on.
+            new_k_cache, new_v_cache = storage.write_chunked(
+                k_3d,
+                v_3d,
+                slot_mapping,
+                kv_cache.key_caches[layer_idx],
+                cache_block_size,
+            )
+        else:
+            new_k_cache, new_v_cache = get_ops().reshape_and_cache(
+                k_3d,
+                v_3d,
+                kv_cache.key_caches[layer_idx],
+                kv_cache.value_caches[layer_idx],
+                slot_mapping,
+            )
         # Rebind so next layer / decode step uses the updated cache
         kv_cache.replace_layer_cache(layer_idx, new_k_cache, new_v_cache)
 
@@ -1164,6 +1177,7 @@ def sdpa_forward(
             window_seqlen_q=ctx.verify_window_q,
             sinks=sinks,
             **paged_kwargs,
+            **kv_chunk_kwargs,
         )
 
     if recompute_after_kernel:

@@ -25,6 +25,11 @@ import vllm_metal.envs as envs
             "(0 means single-forward ingest), got '-1'",
         ),
         (
+            "VLLM_METAL_KV_CHUNK_MIB",
+            "-16",
+            "VLLM_METAL_KV_CHUNK_MIB must be at least 0, got '-16'",
+        ),
+        (
             "VLLM_METAL_RING_BASE_PORT",
             "port",
             "VLLM_METAL_RING_BASE_PORT must be an integer, got 'port'",
@@ -90,6 +95,8 @@ def test_a_bad_value_names_the_variable_and_the_value(
     [
         ("VLLM_METAL_SPEC_INGEST_CHUNK", "0", 0),
         ("VLLM_METAL_SPEC_INGEST_CHUNK", "16", 16),
+        ("VLLM_METAL_KV_CHUNK_MIB", "0", 0),
+        ("VLLM_METAL_KV_CHUNK_MIB", "16", 16),
         ("VLLM_METAL_RING_BASE_PORT", "40000", 40000),
         ("VLLM_METAL_RING_BASE_PORT", "1024", 1024),
         ("VLLM_METAL_RING_BASE_PORT", "65535", 65535),

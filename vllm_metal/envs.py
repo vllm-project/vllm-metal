@@ -132,6 +132,7 @@ if TYPE_CHECKING:
     VLLM_METAL_VISIBLE_DEVICES: str | None = None
     VLLM_METAL_RING_BASE_PORT: int = 32323
     VLLM_METAL_KV_COMMIT_PROBE: bool = True
+    VLLM_METAL_KV_CHUNK_MIB: int = 0
 
 environment_variables: dict[str, Callable[[], Any]] = {
     # Opt-in PyTorch MPS backend; model capabilities are checked by the worker.
@@ -256,6 +257,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # sample, the pool is sized down to what is free. Set to "0" to skip the
     # touch (no sample, no sizing change).
     "VLLM_METAL_KV_COMMIT_PROBE": _bool("VLLM_METAL_KV_COMMIT_PROBE", True),
+    # Chunked KV pool (issue #1198). A positive value splits every layer
+    # region into Metal buffers of about this many MiB (rounded down to a
+    # power of two blocks) that the kernels reach through GPU address
+    # tables, so only the chunks a request writes are ever made resident.
+    # 0 (the default) keeps one buffer per region. Opt-in: TurboQuant, MLA,
+    # Mamba/hybrid state, KV offloading and block draft proposers refuse to
+    # start with it on.
+    "VLLM_METAL_KV_CHUNK_MIB": _int("VLLM_METAL_KV_CHUNK_MIB", 0, minimum=0),
 }
 
 
