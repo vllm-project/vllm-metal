@@ -651,6 +651,21 @@ constant int v_bits [[function_constant(70)]];  // V quantization bit width (def
 // 80/81/90 in turboquant.metal, 100 in reshape_and_cache.metal, 110 below).
 constant bool use_mm_prefix [[function_constant(120)]];
 constant bool use_compact_scratch [[function_constant(130)]];
+// Chunked KV (#1198): the KV cache is a list of chunk buffers reached
+// through a table of GPU addresses (slots 28/29); block b lives in chunk
+// b >> kv_chunk_shift at local block b & (chunks_per - 1).
+constant bool kv_chunked [[function_constant(140)]];
+
+template <typename T>
+inline const device T *kv_block_base(
+    const device T *cache, const device uint64_t *table, int64_t block,
+    int64_t block_stride, int chunk_shift) {
+  if (kv_chunked) {
+    const int64_t local = block & ((int64_t(1) << chunk_shift) - 1);
+    return (const device T *)(table[block >> chunk_shift]) + local * block_stride;
+  }
+  return cache + block * block_stride;
+}
 // Window mode: 0 = per-token (grid.y is a query token; today's decode path).
 // > 0 = the number of PA_WINDOW_ROWS-row sub-windows per segment: grid.y is
 // a (segment, sub-window) pair and the threadgroup owns up to
@@ -707,7 +722,10 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
     [[buffer(18), function_constant(use_sinks)]], // [num_heads]
     device const int32_t *cu_seqlens_q [[buffer(19)]],  // [num_seqs + 1]
     const constant int &num_seqs [[buffer(20)]],
-    const constant int &sliding_window [[buffer(21)]],  // -1 = disabled
+    const constant int &sliding_window [[buffer(21)]],
+    device const uint64_t *k_table [[buffer(28), function_constant(kv_chunked)]],
+    device const uint64_t *v_table [[buffer(29), function_constant(kv_chunked)]],
+    const constant int &kv_chunk_shift [[buffer(30), function_constant(kv_chunked)]],  // -1 = disabled
     const device half *key_scale_cache
     [[buffer(22), function_constant(use_turboquant)]], // [num_blocks, block_size, num_kv_heads, head_size/32]
     const device half *value_scale_cache
@@ -974,7 +992,7 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
 #pragma unroll
       for (int j = 0; j < NUM_VECS_PER_THREAD; j++) {
         const device K_CACHE_T *k_ptr =
-            k_cache + physical_block_number * kv_block_stride +
+            kv_block_base(k_cache, k_table, physical_block_number, kv_block_stride, kv_chunk_shift) +
             physical_block_offset * kv_token_stride +
             kv_head_idx * kv_head_stride;
         const int vec_idx = thread_group_offset + j * THREAD_GROUP_SIZE;
@@ -1110,7 +1128,7 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
             v_centroids, v_bits);
       } else {
         const device V_CACHE_T *v_ptr =
-            v_cache + physical_block_number * kv_block_stride +
+            kv_block_base(v_cache, v_table, physical_block_number, kv_block_stride, kv_chunk_shift) +
             tok * kv_token_stride +
             kv_head_idx * kv_head_stride;
 #pragma unroll
@@ -1405,7 +1423,7 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
 #pragma unroll
       for (int j = 0; j < NUM_VECS_PER_THREAD; j++) {
         const device K_CACHE_T *k_ptr =
-            k_cache + physical_block_number * kv_block_stride +
+            kv_block_base(k_cache, k_table, physical_block_number, kv_block_stride, kv_chunk_shift) +
             physical_block_offset * kv_token_stride +
             kv_head_idx * kv_head_stride;
         const int vec_idx = thread_group_offset + j * THREAD_GROUP_SIZE;
@@ -1619,7 +1637,7 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
         }
       } else {
         const device V_CACHE_T *v_ptr =
-            v_cache + physical_block_number * kv_block_stride +
+            kv_block_base(v_cache, v_table, physical_block_number, kv_block_stride, kv_chunk_shift) +
             tok * kv_token_stride +
             kv_head_idx * kv_head_stride;
 #pragma unroll
@@ -2573,6 +2591,12 @@ template <typename T, typename K_CACHE_T, int HEAD_SIZE, int BLOCK_SIZE,
       device const int32_t *cu_seqlens_q [[buffer(19)]],                       \
       const constant int &num_seqs [[buffer(20)]],                             \
       const constant int &sliding_window [[buffer(21)]],                       \
+      device const uint64_t *k_table                                           \
+      [[buffer(28), function_constant(kv_chunked)]],                           \
+      device const uint64_t *v_table                                           \
+      [[buffer(29), function_constant(kv_chunked)]],                           \
+      const constant int &kv_chunk_shift                                       \
+      [[buffer(30), function_constant(kv_chunked)]],                           \
       const device half *key_scale_cache                                       \
       [[buffer(22), function_constant(use_turboquant)]],                       \
       const device half *value_scale_cache                                     \

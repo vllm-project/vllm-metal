@@ -24,6 +24,7 @@ vllm-metal validates these variables when the engine configuration is created an
 | `VLLM_METAL_BUILD_FROM_SOURCE` | `0` | Compile the native `_paged_ops` Metal extension from source at runtime instead of loading the prebuilt artifact shipped in the wheel. For kernel developers / source installs; requires the Xcode command-line tools (`clang++`). Off by default — release wheels ship the `.so` prebuilt. See [Contributing](CONTRIBUTING.md). |
 | `VLLM_METAL_SPEC_VERIFY_WINDOW` | `0` | Enable spec-decode verification window mode ([issue #465](https://github.com/vllm-project/vllm-metal/issues/465)): the K+1 verification rows share each KV block load instead of re-reading the context per row. Off by default; non-hybrid verify windows keep the expanded per-token layout. Outputs are bitwise identical either way; the win is chip- and shape-dependent (measured up to +40% e2e at concurrency 16-32 with 8k contexts on M2/M3 Ultra, and regressions single-stream on M4 Pro and at concurrency 32 on M2 Max). Non-hybrid MLA models and head sizes above 256 use the expanded layout. Hybrid GDN targets force window mode when speculative decoding is configured (their state scan needs one segment per request); hybrid speculation with head sizes above 256 or non-GDN state families is rejected. The same opt-in also merges the `draft_model` proposer's small committed-token ingest into one window per request (head sizes above 256 keep the expanded layout there too); single-stream TPOT is within run-to-run noise of the expanded ingest (0.6B pair, 8k prefix, M4 Pro), and generated tokens are identical. With speculative decoding on, the engine logs at startup which layout the verify windows and the draft model's committed-token ingest use, and why. |
 | `VLLM_METAL_SPEC_INGEST_CHUNK` | `1024` | Maximum number of cold draft-model KV-ingest tokens processed per forward ([issue #482](https://github.com/vllm-project/vllm-metal/issues/482)). Chunking bounds each dispatch stall and the peak logits allocation; a multiple of the KV block size is recommended. Set to `0` to restore single-forward ingest; a non-integer or negative value fails the startup. |
+| `VLLM_METAL_KV_CHUNK_MIB` | `0` | Chunked KV pool ([#1198](https://github.com/vllm-project/vllm-metal/issues/1198)). A positive value splits each layer of the pool into buffers of about this many MiB that the attention kernels reach through a table of GPU addresses, so only the chunks requests write are kept in memory. `0` keeps one buffer per layer. See [KV Cache Memory Settings](#kv-cache-memory-settings). |
 | `VLLM_METAL_VISIBLE_DEVICES` | — | Set automatically by the Ray executor per worker (the device-control var); not user-configurable. See [Distributed](distributed.md). |
 | `VLLM_METAL_RING_BASE_PORT` | `32323` | Base TCP port for the MLX ring data plane under pipeline parallelism, in the user-port range `[1024, 65535]`; stage *r* binds `base + r` (so the default is `32323`/`32324` for two stages). Set the **same** value on every node to move the ring off a busy port — e.g. when an `mlx.launch` job, a restart still in `TIME_WAIT`, or another PP job holds the default. See [Distributed](distributed.md#pipeline-parallelism). |
 
@@ -136,6 +137,15 @@ requests use little of it. Expect the whole pool in memory at startup or after
 the first request
 ([#1198](https://github.com/vllm-project/vllm-metal/issues/1198)). The memory
 reported for the process (RSS) can show less than this.
+
+`VLLM_METAL_KV_CHUNK_MIB=16` changes that. Each layer is split into 16 MiB
+chunks, and a chunk is kept in memory only once a request writes into it, so a
+0.6B model with a 5 GiB pool holds about 0.4 GiB after a short request instead
+of 5 GiB. With prefix caching off, chunks no running request uses are given
+back a few steps after their requests finish. It is opt-in for now: TurboQuant,
+MLA, Mamba and other state caches, KV offloading and the DFlash and DSpark
+draft proposers refuse to start with it on, and decode batches that would use
+the GQA kernel use the per-token kernel instead.
 
 With automatic sizing, the pool and the model weights together take about the
 `--gpu-memory-utilization` fraction (default 0.92) of the memory macOS

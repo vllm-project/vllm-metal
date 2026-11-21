@@ -37,6 +37,7 @@ class BlockDraftPagedCache:
     ) -> None:
         self.model = model
         self.storage = storage
+        storage.require_plain_pool("block draft proposers")
         cfg = model.config
         if (
             len(layer_names) != cfg.num_hidden_layers

@@ -24,6 +24,7 @@ class MLAPagedLatentCache:
         """Bind latent views from vLLM's resolved cache layout."""
         if not names:
             raise ValueError("MLA cache requires at least one layer")
+        storage.require_plain_pool("MLA latent caches")
 
         specs = [storage.specs[name] for name in names]
         first = specs[0]

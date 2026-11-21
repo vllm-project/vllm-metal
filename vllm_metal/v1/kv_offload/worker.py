@@ -51,6 +51,7 @@ class MetalKVOffloadWorker(OffloadingWorker):
             raise ValueError(
                 f"region has {region.num_chunks} chunks, expected {num_cpu_chunks}"
             )
+        storage.require_plain_pool("KV offloading")
         self.storage = storage
         # The caches upstream resolves this worker's device pointers against.
         self.kv_caches = kv_caches

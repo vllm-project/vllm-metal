@@ -150,7 +150,9 @@ array paged_attention_primitive_fn(
     int max_decode_context_len = 0, bool gqa_disabled = false,
     int gqa_test_partition = 0,
     const std::optional<GqaDecodeLengthPlan>& gqa_length_plan = std::nullopt,
-    int nax_split_hint = -1, int nax_prefill_split_hint = -1);
+    int nax_split_hint = -1, int nax_prefill_split_hint = -1,
+    int kv_chunk_shift = -1, std::optional<Dtype> kv_chunk_dtype = std::nullopt,
+    const std::vector<int64_t>& kv_chunk_strides = {});
 std::tuple<array, array, array, array, array> tq_encode_primitive_fn(
     const array& key, const array& value,
     const array& key_cache, const array& value_cache,
@@ -158,6 +160,14 @@ std::tuple<array, array, array, array, array> tq_encode_primitive_fn(
     const array& key_zero_cache,
     const array& slot_mapping, const array& v_centroids,
     int v_bits, int k_bits, bool k_signed);
+array reshape_and_cache_chunked_fn(
+    const array& key, const array& value, const array& slot_mapping,
+    const array& table, int chunk_shift, int block_size,
+    std::vector<int64_t> layout, Dtype cache_dtype);
+void use_kv_residency_on(metal::CommandEncoder& enc);
+array chunk_block_ops_fn(const array& table, const array& ids, bool copy,
+                         int chunk_shift, int64_t block_bytes);
+
 std::tuple<array, array> reshape_and_cache_primitive_fn(
     const array& key, const array& value,
     const array& key_cache, const array& value_cache,

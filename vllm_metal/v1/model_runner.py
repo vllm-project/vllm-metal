@@ -1319,6 +1319,28 @@ class MetalModelRunner:
         self._paged_group_block_sizes = backend.kv_group_block_sizes()
         self._paged_state_group_indices = backend.state_scheduler_group_indices()
 
+    def _reclaim_idle_kv_chunks(self, runtime) -> None:
+        """Chunk mode: give back chunks no live request uses.
+
+        Freed blocks may still be read back under prefix caching, so this only
+        runs with prefix caching off.
+        """
+        storage = getattr(runtime, "_storage", None)
+        if storage is None or getattr(storage, "chunk_shift", None) is None:
+            return
+        if self.cache_config.enable_prefix_caching:
+            return
+        shift = storage.chunk_shift
+        live = {
+            b >> shift
+            for state in self._request_states.values()
+            for group in state.block_ids
+            for b in group
+        }
+        freed = storage.reclaim_idle_chunks(live)
+        if freed:
+            logger.debug("KV chunks reclaimed: %.0f MiB", freed / (1 << 20))
+
     def _copy_paged_block_ids(
         self, block_ids: Sequence[Sequence[int]]
     ) -> list[list[int]]:
@@ -1589,6 +1611,7 @@ class MetalModelRunner:
                 # destinations. Populate those physical blocks before the
                 # hybrid state manager reads the rewritten tables.
                 runtime.copy_blocks(scheduler_output.kv_cache_block_copies)
+            self._reclaim_idle_kv_chunks(runtime)
             if ctx is not None and runtime is not None and runtime.needs_step_context():
                 step_req_ids = [req_id for req_id, _ in decode_reqs]
                 step_req_ids.extend(pr.req_id for pr in prefill_reqs)
