@@ -456,13 +456,14 @@ class SpeculativeDecodeController:
                 or bool(sampling_params.bad_words_token_ids)
                 or bool(sampling_params.logit_bias)
                 or request_state.generated_tokens < sampling_params.min_tokens
+                or sampling_params.thinking_token_budget is not None
             )
             if unsupported:
                 raise NotImplementedError(
                     "Speculative decode verification on Metal currently "
                     "supports greedy sampling only (temperature=0, no "
-                    "penalties, constraints, logprobs, or logit_bias, and "
-                    "not before a request reaches min_tokens)."
+                    "penalties, constraints, logprobs, logit_bias, or a thinking "
+                    "budget, and not before a request reaches min_tokens)."
                 )
 
 

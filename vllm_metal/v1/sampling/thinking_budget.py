@@ -5,7 +5,8 @@ The vendored sampler drives the holder through exactly these calls
 (``has_tracked_requests`` gate, ``update_state`` bookkeeping, and the
 ``apply_to_logits`` mask). Upstream's concrete holder lives in a module
 vllm-project/vllm#63373 removes, so a thinking-budget implementation
-only needs to satisfy this protocol; vllm-metal passes ``None`` today.
+only needs to satisfy this protocol. vllm-metal's is
+``vllm_metal.v1.thinking_budget.ForcedEndTokens``.
 """
 
 from __future__ import annotations
