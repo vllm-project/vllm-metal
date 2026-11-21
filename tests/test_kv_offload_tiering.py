@@ -366,8 +366,8 @@ def test_pool_warning_counts_the_recurrent_checkpoint(caplog) -> None:
 
 
 def test_reset_empties_the_host_pool_index() -> None:
-    """Sleep frees the pool's pages. That is only safe because the reset
-    vLLM runs first leaves no hit that would read them."""
+    """Sleep frees the pool's pages. That is only safe because the connector's
+    reset runs first and leaves no hit that would read them."""
     manager = MetalTieringOffloadingSpec(_offloading_config()).get_manager()
     try:
         ctx = ReqContext(req_id="r-sleep")

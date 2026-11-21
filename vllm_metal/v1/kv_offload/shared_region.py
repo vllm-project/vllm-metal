@@ -115,9 +115,8 @@ class MetalSharedOffloadRegion(SharedOffloadRegion):
     def release_pages(self) -> None:
         """Return the pool's pages to the OS. Their contents are lost.
 
-        Only safe once nothing will read the pool. With ``reset_connector=True``
-        (the default), vLLM resets the connector, which empties the pool's
-        index, before it frees the KV cache. The views stay valid. Call
+        Only safe once nothing will read the pool. The connector resets the
+        pool's index before it calls this. The views stay valid. Call
         ``reuse_pages`` before writing again, or the kernel can drop the
         writes. Best effort: a failure keeps the pages, so sleep still
         completes.

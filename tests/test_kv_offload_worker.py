@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the Metal KV offloading worker."""
 
+import hashlib
 import json
 from dataclasses import replace
 from types import SimpleNamespace
@@ -16,7 +17,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     TransferJob,
 )
 from vllm.engine.arg_utils import EngineArgs
-from vllm.v1.kv_offload.base import GPULoadStoreSpec
+from vllm.v1.kv_offload.base import (
+    GPULoadStoreSpec,
+    LookupResult,
+    ReqContext,
+    make_offload_key,
+)
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 from vllm.v1.kv_offload.pointer_utils import resolve_device_pointers
 
@@ -396,28 +402,12 @@ def test_shut_down_worker_raises() -> None:
 
 
 class TestConnectorHostPool:
-    """The connector passes sleep and wake to the offload worker's region."""
+    """Sleep and wake do nothing without a Metal offload worker."""
 
     def _connector(self, worker) -> MetalOffloadingConnector:
         connector = MetalOffloadingConnector.__new__(MetalOffloadingConnector)
         connector.connector_worker = SimpleNamespace(worker=worker)
         return connector
-
-    def test_reaches_the_worker_region(self) -> None:
-        storage = make_storage()
-        worker = make_worker(storage)
-        assert worker.region is not None
-        region = worker.region
-        calls: list[str] = []
-        region.release_pages = lambda: calls.append("release")
-        region.reuse_pages = lambda: calls.append("reuse")
-        try:
-            connector = self._connector(worker)
-            connector.release_host_pool()
-            connector.restore_host_pool()
-            assert calls == ["release", "reuse"]
-        finally:
-            worker.shutdown()
 
     def test_ignores_a_worker_of_another_type(self) -> None:
         connector = self._connector(MagicMock(spec=[]))
@@ -485,17 +475,22 @@ class TestConnectorRegistration:
         )
         vllm_config = _offloading_engine_config(tmp_path)
         storage = make_storage(num_kv_heads=2, head_dim=64, block_size=16)
+        # Both roles share one process, as under the uni executor.
+        scheduler = MetalOffloadingConnector(
+            vllm_config, KVConnectorRole.SCHEDULER, storage.config
+        )
         connector = MetalOffloadingConnector(
             vllm_config, KVConnectorRole.WORKER, storage.config
         )
         connector.register_kv_caches(storage)
-        yield connector, storage
+        yield connector, storage, scheduler
         connector.shutdown()
+        scheduler.shutdown()
 
     def test_store_and_load_round_trip_through_upstreams_worker(
         self, offloading
     ) -> None:
-        connector, storage = offloading
+        connector, storage, _ = offloading
 
         original, restored = _store_then_load(connector, storage, [5, 2, 7], [0, 1, 2])
         finished = connector.get_finished(set())
@@ -510,7 +505,7 @@ class TestConnectorRegistration:
     def test_store_and_load_round_trip_through_upstreams_worker_after_sleep(
         self, offloading
     ) -> None:
-        connector, storage = offloading
+        connector, storage, _ = offloading
         registered = connector.connector_worker.worker.kv_caches.tensors[0].tensor
 
         storage.release()
@@ -526,3 +521,46 @@ class TestConnectorRegistration:
         )
         for a, b in zip(original, restored, strict=True):
             np.testing.assert_array_equal(a, b)
+
+    def test_sleep_and_wake_reach_the_worker_region(
+        self, offloading, monkeypatch
+    ) -> None:
+        connector, _, _ = offloading
+        region = connector.connector_worker.worker.region
+        calls: list[str] = []
+        monkeypatch.setattr(region, "release_pages", lambda: calls.append("release"))
+        monkeypatch.setattr(region, "reuse_pages", lambda: calls.append("reuse"))
+
+        connector.release_host_pool()
+        connector.restore_host_pool()
+
+        assert calls == ["release", "reuse"]
+
+    @pytest.mark.parametrize("reset_connector", [True, False])
+    def test_release_host_pool_leaves_no_offload_hit_when_the_pool_is_freed(
+        self, offloading, monkeypatch, reset_connector
+    ) -> None:
+        """vLLM resets the connector first only with reset_connector=True."""
+        connector, _, scheduler = offloading
+        manager = scheduler.connector_scheduler.manager
+        ctx = ReqContext(req_id="r-sleep")
+        manager.on_new_request(ctx)
+        key = make_offload_key(hashlib.sha256(b"slept").digest(), 0)
+        manager.prepare_store([key], ctx)
+        manager.complete_store([key], ctx)
+        before = manager.lookup(key, ctx)
+        region = connector.connector_worker.worker.region
+        free_pages = region.release_pages
+        at_release = []
+
+        def release_pages() -> None:
+            at_release.append(manager.lookup(key, ctx))
+            free_pages()
+
+        monkeypatch.setattr(region, "release_pages", release_pages)
+
+        if reset_connector:
+            scheduler.reset_cache()
+        connector.release_host_pool()
+
+        assert (before, at_release) == (LookupResult.HIT, [LookupResult.MISS])

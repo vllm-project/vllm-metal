@@ -4,9 +4,8 @@
 from __future__ import annotations
 
 from bisect import bisect_right
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from types import SimpleNamespace
-from typing import Any
 
 import mlx.core as mx
 import torch
@@ -15,7 +14,6 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheLayout,
     UniformTypeKVCacheSpecs,
-    create_kv_cache_views,
 )
 from vllm.v1.worker.utils import allocate_kv_cache
 
@@ -51,7 +49,6 @@ def gather_cache_rows(cache: mx.array, ids: mx.array, block_stride: int) -> mx.a
 def allocate_kv_cache_lazily(
     config: KVCacheConfig,
     layout: KVCacheLayout,
-    specs: Mapping[str, Any],
 ) -> dict[str, torch.Tensor]:
     """Allocate the KV backing store without committing its pages.
 
@@ -68,34 +65,21 @@ def allocate_kv_cache_lazily(
     precision would decode stale bytes as NaN/Inf). Uniform-precision attention
     caches skip per-block zeroing upstream, and their kernels mask every slot
     past the sequence length, so unwritten memory never reaches an output. Keep
-    vLLM's allocation verbatim in that case.
+    vLLM's zero-filled allocation verbatim in that case.
 
-    The layer views are built by vLLM's own :func:`create_kv_cache_views`, so
-    the layout (sizes, strides, offsets, dtype) is identical either way;
-    ``tests/attention/test_lazy_kv_allocation.py`` pins that equality.
+    Otherwise vLLM's ``allocate`` callback replaces the filled backing buffer
+    with an uninitialized one, so the allocation and its layer views stay
+    entirely upstream; ``tests/attention/test_lazy_kv_allocation.py`` pins that
+    layout.
     """
     if config.needs_kv_cache_zeroing:
         return allocate_kv_cache(config, torch.device("cpu"), layout)
-
-    sizes = {tensor.size for tensor in config.kv_cache_tensors}
-    if len(sizes) != 1:
-        raise ValueError("KV cache tensors must share one backing allocation.")
-    backing = torch.empty(sizes.pop(), dtype=torch.int8, device="cpu")
-    caches: dict[str, torch.Tensor] = {}
-    for tensor in config.kv_cache_tensors:
-        spec = specs[tensor.layers[0]]
-        if not spec.has_layer_views:
-            caches.update((name, backing) for name in tensor.layers)
-            continue
-        views = create_kv_cache_views(
-            backing,
-            spec,
-            config.num_blocks_of(tensor),
-            layout,
-            tensor,
-        )
-        caches.update(zip(tensor.layers, views, strict=True))
-    return caches
+    return allocate_kv_cache(
+        config,
+        torch.device("cpu"),
+        layout,
+        allocate=lambda size: torch.empty(size, dtype=torch.int8, device="cpu"),
+    )
 
 
 class CacheViews(Sequence[mx.array]):
@@ -161,7 +145,6 @@ class KVCacheStorage:
         self.tensors = allocate_kv_cache_lazily(
             config,
             KVCacheLayout[config.kv_cache_layout],
-            self.specs,
         )
         first = next(iter(self.tensors.values()))
         self._backing = first.untyped_storage()

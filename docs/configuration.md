@@ -9,7 +9,7 @@ vllm-metal validates these variables when the engine configuration is created an
 | `VLLM_MLX_DEVICE` | `gpu` | MLX device (`gpu` or `cpu`) |
 | `VLLM_METAL_DISABLE_NAX` | `0` | Emergency override for automatic M5 NAX prefill attention. Set to `1` to force the non-NAX fallback. |
 | `VLLM_METAL_NAX_GQA_PREFILL` | `1` | Automatically select three- or six-head grouped NAX prefill on the MLX backend for single-sequence causal attention without sliding windows, softcap or sinks, using BF16, head dimension 256, GQA ratio 6 and 16-token kernel pages. The work-based selector compares query and KV lengths, query/KV heads, detected GPU cores and the actual upstream pipeline. Unsupported features, mixed batches/suffix offsets, unknown capacity or insufficient pipeline limits retain upstream. Extra six-head admission uses complete groups per GPU core and full-tile work coverage for power-of-two KV-head layouts; its guarded-query allowance is calibrated only at 10 cores. Other layouts retain the existing work score; total KV length has no fixed 32K admission cap. Complete tiles omit bounds checks while partial Q/KV tiles remain guarded. Set `0` to retain upstream NAX. Read once at worker startup; restart after changing it. `VLLM_METAL_DISABLE_NAX=1` disables all NAX. |
-| `VLLM_METAL_DISABLE_GQA_DECODE` | `0` | Set to `1` to keep eligible ordinary decode on the established per-token / split-KV kernels. Automatic GQA routing uses the [supported geometries, kernel pages and batch planning rules](gqa-decode.md), requiring 33 SIMD groups of complete 256-token partitions per detected GPU core. This switch only disables the optimization. |
+| `VLLM_METAL_DISABLE_GQA_DECODE` | `0` | The MLX backend automatically uses grouped-query attention (GQA) for eligible one-token decode rows, including the decode prefix of a mixed batch. Eligibility depends on the head layout and the amount of cached context. Set to `1` before starting the server to use the per-token or split-KV kernels for those rows. |
 | `VLLM_METAL_TQ_PREFILL` | `auto` | Materialize eligible TurboQuant prefills when NAX is available. `1` explicitly enables the tiled fallback on other GPUs; `0` keeps compressed attention. Set before worker startup. |
 | `VLLM_METAL_TQ_PREFILL_MAX_MIB` | `auto` | TurboQuant prefill workspace, reserved inside `gpu_memory_utilization` before KV sizing. `auto` caps the device allowance by model and scheduler limits for non-speculative serving, and can fall below 256 MiB. A number sets an explicit MiB limit; `0` disables materialization. See [automatic sizing and memory bounds](turboquant.md#prefill-acceleration). |
 | `VLLM_METAL_MULTIMODAL_MODE` | `auto` | Multimodal serve mode: `auto` uses the compatibility allowlist (Gemma 4 gets the vision sidecar when its checkpoint allows); `multimodal-native` disables overrides; `text-only` forces the text-only path for every multimodal checkpoint |
@@ -101,10 +101,10 @@ Sleep levels mean something different on unified memory than on a GPU:
 - Either way the whole KV pool is freed. The pool takes that memory again at
   wake or with the first request after wake.
 - With [KV offloading](kv_offloading.md), sleep also frees the host pool. It
-  comes back empty at wake. Prompts already on the disk tier still restore.
-  Keep `reset_connector=True` (the default) for `sleep` and
-  `release_kv_cache_memory` with KV offloading: with `False`, vLLM keeps its
-  index of the freed pool, so prompts restored from it after wake can be wrong.
+  comes back empty at wake, even with `reset_connector=False`. This differs
+  from vLLM on a GPU, where `False` keeps the offloaded blocks for requests
+  after wake. On a Mac the host pool sits in the unified memory that sleep
+  gives back. Prompts already on the disk tier still restore.
 
 Sleep mode supports dense, hybrid and MLA models on the MLX backend.
 Supported speculative decoding methods are `ngram`, `draft_model`, `dflash` and

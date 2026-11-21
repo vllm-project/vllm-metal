@@ -92,21 +92,16 @@ length range; requested lengths alone may not describe the executed workload.
 Disable prefix caching for uncached comparisons, as above, or deliberately
 control the cached prefixes in both arms.
 
-For a [GQA decode](gqa-decode.md) comparison, start one server with
-`VLLM_METAL_DISABLE_GQA_DECODE=0` and a separate server with
-`VLLM_METAL_DISABLE_GQA_DECODE=1`, keeping all other settings identical. Run
-them sequentially and stop the previous server and its workers before starting
-the next arm. Zero allows normal selection; it does not force GQA or a specific
-partition, and both arms can legitimately use the same fallback.
+For a GQA decode comparison, run the same workload with the default routing
+and with `VLLM_METAL_DISABLE_GQA_DECODE=1`. Restart the server and its workers
+between runs. Short contexts can take the same path in both runs.
 
-Verify the executed path in the worker that runs attention. For GQA, follow
-the [dispatch diagnostic procedure](gqa-decode.md#validation): opt in while
-evaluation is idle, evaluate the operation, then read the recorded family and
-partition. A selector query is not execution evidence. The getters record the
-last process-wide dispatch, not a per-request or per-layer trace; under
-concurrency, use a separate controlled route check or a suitably scoped trace.
-Keep diagnostics consistent between arms and perform expensive
-[GPU captures](profiling.md) separately from throughput measurements.
+To verify the route in an idle worker, get `ops` from `vllm_metal.metal.get_ops()`
+and save the previous setting returned by `ops._set_paged_dispatch_diagnostics(True)`.
+Evaluate one attention call. For pure decode, `ops.last_paged_dispatch()` reports
+`gqa_decode` when the producer ran. For a mixed batch, `ops.last_gqa_num_requests()`
+counts the decode rows that used GQA. Restore the previous setting after the check.
+Run these diagnostics and [GPU captures](profiling.md) separately from timing.
 
 Numerical attention tests, actual dispatch and serving speed are separate
 evidence. Natural generations can diverge even with greedy sampling; for
