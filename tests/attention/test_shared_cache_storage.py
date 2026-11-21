@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Physical sharing and native writes using vLLM-created cache views."""
 
+import importlib.util
 from types import SimpleNamespace
 
 import mlx.core as mx
@@ -20,7 +21,7 @@ from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
 from vllm_metal.attention.caches.state_cache import PagedStateCache
 from vllm_metal.attention.caches.storage import KVCacheStorage
 from vllm_metal.attention.impls.linear import GDNPagedAttentionWrapper, _GDNForwardState
-from vllm_metal.metal import get_ops
+from vllm_metal.metal import get_ops, state_scatter
 
 
 def make_storage(num_blocks=4, *, with_state=True):
@@ -53,6 +54,97 @@ def make_storage(num_blocks=4, *, with_state=True):
         kv_cache_layout="LBNHC",
     )
     return KVCacheStorage(config)
+
+
+@pytest.fixture(params=["native", "tilelang"])
+def scatter_backend(request, monkeypatch):
+    backend = request.param
+    monkeypatch.setattr(state_scatter, "_implementation", state_scatter._native_scatter)
+    if backend == "tilelang" and (
+        importlib.util.find_spec("tilelang") is None
+        or importlib.util.find_spec("_tilelang_mlx") is None
+    ):
+        pytest.skip("Install the optional dependencies in docs/tilelang-state-cache.md")
+    if backend == "tilelang":
+        from vllm_metal.metal.tilelang_state_scatter import scatter
+
+        monkeypatch.setattr(state_scatter, "_implementation", scatter)
+
+
+@pytest.mark.usefixtures("scatter_backend")
+@pytest.mark.parametrize("dtype", [mx.float16, mx.float32])
+def test_state_scatter_preserves_unaligned_view_boundaries(dtype):
+    """Vector-aligned row lengths do not imply aligned backing offsets."""
+    slots, width, padding, offset = 4, 512, 8, 1
+    stride = width + padding
+    raw = mx.full((offset + slots * stride + 1,), -1, dtype=dtype)
+    pool = get_ops().as_strided(raw, (slots, width), (stride, 1), offset)
+    source = mx.arange(2 * width + 2).astype(dtype)
+    rows = get_ops().as_strided(source, (2, width), (width, 1), offset)
+    ids = mx.array([3, 1], dtype=mx.int32)
+    mx.eval(raw, pool, source, rows, ids)
+
+    pool = state_scatter.scatter(pool, rows, ids, strides=(stride, 1))
+    mx.eval(pool)
+
+    expected = np.full(raw.size, -1, dtype=np.array(rows).dtype)
+    for row, slot in enumerate((3, 1)):
+        expected[offset + slot * stride : offset + slot * stride + width] = np.arange(
+            offset + row * width, offset + (row + 1) * width
+        )
+    np.testing.assert_array_equal(np.array(raw), expected)
+    np.testing.assert_array_equal(np.array(source), np.arange(2 * width + 2))
+
+
+@pytest.mark.usefixtures("scatter_backend")
+@pytest.mark.parametrize("reader", ["storage", "cross_stream"])
+@pytest.mark.parametrize("layer_idx", [0, 1])
+def test_deferred_state_updates_preserve_shared_pages(reader, layer_idx):
+    """Flush, copy and zero must retain page aliases and untouched bytes."""
+    storage = make_storage()
+    mx.eval(*storage.buffers)
+    backing = next(iter(storage.tensors.values())).untyped_storage()
+    raw = torch.empty(0, dtype=torch.uint8).set_(backing)
+    raw.fill_(0x35)
+    expected = raw.clone()
+    cache = PagedStateCache(storage.state_views(["s0", "s1"]))
+    conv = mx.full((2, 2, 4), 7, dtype=mx.float16)
+    recurrent = mx.full((2, 1, 4, 32), 9, dtype=mx.float32)
+    cache.set_pending_conv_state(layer_idx, [3, 1], conv)
+    cache.set_pending_recurrent_state(layer_idx, [3, 1], recurrent)
+    # Copy flushes the pending write; zero follows it without an intermediate eval.
+    cache.copy_slots([3], [2], [layer_idx])
+    cache.zero_slots([1], [layer_idx])
+    state = storage.tensors[f"s{layer_idx}"]
+    pages = expected.as_strided(
+        state.shape, state.stride(), state.storage_offset()
+    ).squeeze(dim=(1, 2))
+    for slot in (2, 3):
+        pages[slot, :16].view(torch.float16).fill_(7)
+        pages[slot, 16:528].view(torch.float32).fill_(9)
+    pages[1, :528].zero_()
+    if reader == "storage":
+        mx.eval(*storage.buffers)
+    else:
+        with mx.stream(mx.new_stream(mx.gpu)):
+            observed = [
+                cache.conv_states[layer_idx] + 0,
+                cache.recurrent_states[layer_idx] + 0,
+            ]
+            mx.eval(*observed)
+        np.testing.assert_array_equal(
+            np.array(observed[0]),
+            pages[:, :16].view(torch.float16).reshape(4, 2, 4).numpy(),
+        )
+        np.testing.assert_array_equal(
+            np.array(observed[1]),
+            pages[:, 16:528].view(torch.float32).reshape(4, 1, 4, 32).numpy(),
+        )
+    # Attention and state views can alias; compare the physical allocation once.
+    # This includes padding and every byte outside the requested state rows.
+    assert torch.equal(raw, expected)
+    np.testing.assert_array_equal(np.array(conv), 7)
+    np.testing.assert_array_equal(np.array(recurrent), 9)
 
 
 def test_strided_state_writes_share_upstream_backing():
