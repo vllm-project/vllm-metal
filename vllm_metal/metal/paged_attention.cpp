@@ -254,6 +254,23 @@ static bool nax_eligible(
 // Helper: dtype → Metal type string
 // ---------------------------------------------------------------------------
 
+// Chunked KV (#1198): the key_cache/value_cache arrays handed to the attention
+// kernels are uint64 tables of chunk GPU addresses, and these fields carry what
+// the kernels used to read off the cache arrays themselves.
+struct KvChunkMode {
+  bool on = false;
+  int shift = 0;
+  Dtype cache_dtype = float16;
+  int64_t block_stride = 0;
+  int64_t token_stride = 0;
+  int64_t head_stride = 0;
+  bool operator==(const KvChunkMode& o) const {
+    return on == o.on && shift == o.shift && cache_dtype == o.cache_dtype &&
+           block_stride == o.block_stride && token_stride == o.token_stride &&
+           head_stride == o.head_stride;
+  }
+};
+
 std::string dtype_to_metal(Dtype dt) {
   switch (dt) {
     case float16:   return "half";
@@ -288,13 +305,19 @@ static int get_bits(const std::string& quant_type) {
 // Both GQA and the established kernels address translated subpages this way.
 static void bind_paged_attn_strides(
     metal::CommandEncoder& enc, const array& query,
-    const array& key_cache, int block_size) {
+    const array& key_cache, int block_size, const KvChunkMode& kv_chunk) {
   int32_t q_stride = static_cast<int32_t>(query.shape(1) * query.shape(2));
-  int32_t kv_block_stride = static_cast<int32_t>(key_cache.strides()[0]);
-  if (static_cast<int>(key_cache.shape(1)) > block_size) {
-    kv_block_stride = static_cast<int32_t>(block_size * key_cache.strides()[1]);
+  int32_t kv_block_stride, kv_head_stride;
+  if (kv_chunk.on) {
+    kv_block_stride = static_cast<int32_t>(kv_chunk.block_stride);
+    kv_head_stride = static_cast<int32_t>(kv_chunk.head_stride);
+  } else {
+    kv_block_stride = static_cast<int32_t>(key_cache.strides()[0]);
+    if (static_cast<int>(key_cache.shape(1)) > block_size) {
+      kv_block_stride = static_cast<int32_t>(block_size * key_cache.strides()[1]);
+    }
+    kv_head_stride = static_cast<int32_t>(key_cache.strides()[2]);
   }
-  int32_t kv_head_stride = static_cast<int32_t>(key_cache.strides()[2]);
   enc.set_bytes(q_stride, 15);
   enc.set_bytes(kv_block_stride, 16);
   enc.set_bytes(kv_head_stride, 17);
@@ -308,7 +331,7 @@ static void bind_paged_attn_buffers(
     int num_kv_heads, float softcap,
     const array& block_tables, const array& seq_lens,
     const array& cu_seqlens_q,
-    int block_size, int sliding_window) {
+    int block_size, int sliding_window, const KvChunkMode& kv_chunk = {}) {
   enc.set_output_array(out, 2);
   enc.set_input_array(query,        3);
   enc.set_input_array(key_cache,    4);
@@ -325,7 +348,7 @@ static void bind_paged_attn_buffers(
   int32_t max_blocks_i = static_cast<int32_t>(block_tables.shape(1));
   enc.set_bytes(max_blocks_i, 13);
 
-  bind_paged_attn_strides(enc, query, key_cache, block_size);
+  bind_paged_attn_strides(enc, query, key_cache, block_size, kv_chunk);
 
   enc.set_input_array(cu_seqlens_q, 19);
   int32_t num_seqs_i = static_cast<int32_t>(cu_seqlens_q.shape(0) - 1);
@@ -487,7 +510,7 @@ static void dispatch_paged_attention_tiled(
     const array& cu_seqlens_q,
     int block_size, int max_seq_len, int sliding_window, int q_block_offset,
     kernels::TileConfig cfg, Stream s, const array* sinks,
-    const array* mm_prefix_ranges) {
+    const array* mm_prefix_ranges, const KvChunkMode& kv_chunk = {}) {
   auto& d = metal::device(s.device);
 
   int total_q_tokens = static_cast<int>(query.shape(0));
@@ -503,9 +526,10 @@ static void dispatch_paged_attention_tiled(
   // unset function constant fails pipeline creation.  MLX caches pipelines
   // by hash_name, so each constant combination needs its own suffix.
   auto* kernel = d.get_kernel(
-      plan.base_kname, lib, plan.hash_name,
+      plan.base_kname, lib, plan.hash_name + (kv_chunk.on ? "_kvc" : ""),
       {{&plan.use_sinks, MTL::DataType::DataTypeBool, NS::UInteger(40)},
-       {&plan.use_mm_prefix, MTL::DataType::DataTypeBool, NS::UInteger(120)}});
+       {&plan.use_mm_prefix, MTL::DataType::DataTypeBool, NS::UInteger(120)},
+       {&kv_chunk.on, MTL::DataType::DataTypeBool, NS::UInteger(140)}});
 
   int num_heads = static_cast<int>(query.shape(1));
   auto& enc = metal::get_command_encoder(s);
@@ -514,9 +538,17 @@ static void dispatch_paged_attention_tiled(
 
   bind_paged_attn_buffers(enc, out, query, key_cache, value_cache,
                           num_kv_heads, softcap, block_tables, seq_lens,
-                          cu_seqlens_q, block_size, sliding_window);
+                          cu_seqlens_q, block_size, sliding_window, kv_chunk);
   enc.set_bytes(scale, 9);
   enc.set_bytes(q_block_offset, 30);
+  if (kv_chunk.on) {
+    // The cache arrays are the chunk address tables.
+    use_kv_residency_on(enc);
+    enc.set_input_array(key_cache, 28);
+    enc.set_input_array(value_cache, 29);
+    int32_t shift = kv_chunk.shift;
+    enc.set_bytes(shift, 27);
+  }
   if (plan.use_sinks) {
     enc.set_input_array(*sinks, 18);
   }
@@ -603,6 +635,7 @@ static void dispatch_paged_attention_v2_reduce(
 }
 
 struct PagedAttentionMetadata {
+  KvChunkMode kv_chunk;
   const GqaDecodeLengthPlan& gqa_length_plan;
   Dtype query_dtype;
   Dtype key_dtype;
@@ -1027,7 +1060,7 @@ static void dispatch_paged_attention_gqa_decode(
   enc.set_input_array(arrays.seq_lens, 12);
   int32_t g_max_blocks = static_cast<int32_t>(arrays.block_tables.shape(1));
   enc.set_bytes(g_max_blocks, 13);
-  bind_paged_attn_strides(enc, arrays.query, arrays.key_cache, metadata.block_size);
+  bind_paged_attn_strides(enc, arrays.query, arrays.key_cache, metadata.block_size, metadata.kv_chunk);
   if (plan.compact) enc.set_input_array(*g_offsets, 18);
   if (tq) bind_turboquant_buffers(enc, arrays);
   // One threadgroup per (partition, kv head, sequence); each simdgroup
@@ -1056,7 +1089,8 @@ static void dispatch_paged_attention_per_token(
       arrays.sinks != nullptr, metadata.use_turboquant,
       metadata.k_bits, metadata.v_bits, plan.window_q);
   auto* kernel = encoding.device->get_kernel(
-      kernel_plan.kernel_name, encoding.library, kernel_plan.hash_name,
+      kernel_plan.kernel_name, encoding.library,
+      kernel_plan.hash_name + (metadata.kv_chunk.on ? "_kvc" : ""),
       {{&kernel_plan.use_partitioning, MTL::DataType::DataTypeBool, NS::UInteger(10)},
        {&kernel_plan.use_alibi,        MTL::DataType::DataTypeBool, NS::UInteger(20)},
        {&kernel_plan.use_fp8,          MTL::DataType::DataTypeBool, NS::UInteger(30)},
@@ -1064,7 +1098,18 @@ static void dispatch_paged_attention_per_token(
        {&kernel_plan.use_tq,           MTL::DataType::DataTypeBool, NS::UInteger(50)},
        {&kernel_plan.k_bits,           MTL::DataType::DataTypeInt,  NS::UInteger(60)},
        {&kernel_plan.v_bits,           MTL::DataType::DataTypeInt,  NS::UInteger(70)},
-       {&kernel_plan.window_q,         MTL::DataType::DataTypeInt,  NS::UInteger(110)}});
+       {&kernel_plan.window_q,         MTL::DataType::DataTypeInt,  NS::UInteger(110)},
+       {&metadata.kv_chunk.on,         MTL::DataType::DataTypeBool, NS::UInteger(140)}});
+
+  // Chunked KV: the cache arrays are the chunk address tables.
+  auto bind_chunk_tables = [&]() {
+    if (!metadata.kv_chunk.on) return;
+    use_kv_residency_on(enc);
+    enc.set_input_array(arrays.key_cache, 28);
+    enc.set_input_array(arrays.value_cache, 29);
+    int32_t shift = metadata.kv_chunk.shift;
+    enc.set_bytes(shift, 30);
+  };
 
   const size_t shmem = kernels::paged_threadgroup_bytes(
       metadata.head_size, metadata.block_size, static_cast<int>(arrays.query.itemsize()),
@@ -1093,10 +1138,11 @@ static void dispatch_paged_attention_per_token(
         enc, arrays.out, arrays.query, arrays.key_cache, arrays.value_cache,
         metadata.num_kv_heads, metadata.softcap, arrays.block_tables,
         arrays.seq_lens, arrays.cu_seqlens_q,
-        metadata.block_size, metadata.sliding_window);
+        metadata.block_size, metadata.sliding_window, metadata.kv_chunk);
     enc.set_bytes(metadata.scale, 9);
     bind_turboquant();
     bind_sinks();
+    bind_chunk_tables();
     enc.dispatch_threadgroups(
         MTL::Size::Make(metadata.num_heads, plan.grid_y, grid_z),
         MTL::Size::Make(num_threads, 1, 1));
@@ -1120,7 +1166,7 @@ static void dispatch_paged_attention_per_token(
       enc, tmp_out, arrays.query, arrays.key_cache, arrays.value_cache,
       metadata.num_kv_heads, metadata.softcap, arrays.block_tables,
       arrays.seq_lens, arrays.cu_seqlens_q,
-      metadata.block_size, metadata.sliding_window);
+      metadata.block_size, metadata.sliding_window, metadata.kv_chunk);
   enc.set_bytes(metadata.scale, 9);
   enc.set_output_array(exp_sums, 0);
   enc.set_output_array(max_logits, 1);
@@ -1129,6 +1175,7 @@ static void dispatch_paged_attention_per_token(
   // it is counted once rather than once per partition), but slot 18 is still a
   // declared argument under function constant 40, so it must be bound here.
   bind_sinks();
+  bind_chunk_tables();
   enc.dispatch_threadgroups(
       MTL::Size::Make(metadata.num_heads, plan.grid_y, grid_z),
       MTL::Size::Make(num_threads, 1, 1));
@@ -1174,10 +1221,12 @@ static void dispatch_paged_attention_v2_online(
     int decode_only_rows = 0, bool gqa_disabled = false,
     bool force_gqa = false,
     const GqaDecodeLengthPlan& gqa_length_plan = {},
-    int nax_split_hint = -1, int nax_prefill_split_hint = -1) {
+    int nax_split_hint = -1, int nax_prefill_split_hint = -1,
+    const KvChunkMode& kv_chunk = {}) {
   int head_size = static_cast<int>(query.shape(2));
-  PagedAttentionMetadata metadata{
-      gqa_length_plan, query.dtype(), key_cache.dtype(), value_cache.dtype()};
+  const Dtype k_dtype = kv_chunk.on ? kv_chunk.cache_dtype : key_cache.dtype();
+  const Dtype v_dtype = kv_chunk.on ? kv_chunk.cache_dtype : value_cache.dtype();
+  PagedAttentionMetadata metadata{kv_chunk, gqa_length_plan, query.dtype(), k_dtype, v_dtype};
   metadata.head_size = head_size;
   metadata.query_tokens = static_cast<int>(query.shape(0));
   metadata.query_sequences = static_cast<int>(cu_seqlens_q.shape(0)) - 1;
@@ -1216,8 +1265,8 @@ static void dispatch_paged_attention_v2_online(
         // Fallback: original per-token kernel
         encoding.device = &metal::device(s.device);
         encoding.dt = dtype_to_metal(query.dtype());
-        encoding.k_cache_dt = dtype_to_metal(key_cache.dtype());
-        encoding.v_cache_dt = dtype_to_metal(value_cache.dtype());
+        encoding.k_cache_dt = dtype_to_metal(k_dtype);
+        encoding.v_cache_dt = dtype_to_metal(v_dtype);
       },
       [&]() {
         encoding.library = encoding.device->get_library("paged_attention_v2_kern");
@@ -1225,6 +1274,37 @@ static void dispatch_paged_attention_v2_online(
       },
       gpu_core_count, detected_gpu_core_count);
 
+  if (kv_chunk.on) {
+    // Only the per-token and tiled kernels read the chunk table.
+    switch (plan.route) {
+      case PagedAttentionRoute::PerToken:
+      case PagedAttentionRoute::SplitKv:
+      case PagedAttentionRoute::Window:
+      case PagedAttentionRoute::WindowSplitKv:
+        break;
+      case PagedAttentionRoute::Tiled:
+      case PagedAttentionRoute::MixedTiled:
+        break;
+      case PagedAttentionRoute::GqaDecode:
+        plan.route = plan.fallback;
+        break;
+      case PagedAttentionRoute::NaxSplit:
+      case PagedAttentionRoute::NaxUnsplit:
+      case PagedAttentionRoute::MixedNaxSplit:
+      case PagedAttentionRoute::MixedNaxUnsplit:
+        // The NAX kernels do not read the chunk table yet (M5 only).
+        if (!plan.tile_config) {
+          throw std::runtime_error(
+              "kv chunk mode: no tiled kernel for this head size and NAX is "
+              "not chunk-aware");
+        }
+        plan.route = plan.route == PagedAttentionRoute::NaxSplit ||
+                             plan.route == PagedAttentionRoute::NaxUnsplit
+                         ? PagedAttentionRoute::Tiled
+                         : PagedAttentionRoute::MixedTiled;
+        break;
+    }
+  }
   MTL::ComputePipelineState* gqa_rkernel = nullptr;
   if (plan.route == PagedAttentionRoute::GqaDecode) {
     // Check the actual reducer pipeline before allocating scratch or encoding
@@ -1264,7 +1344,7 @@ static void dispatch_paged_attention_v2_online(
       dispatch_paged_attention_tiled(
           out, query, key_cache, value_cache, num_kv_heads, scale, softcap,
           block_tables, seq_lens, cu_seqlens_q, block_size, max_seq_len,
-          sliding_window, 0, *plan.tile_config, s, sinks, mm_prefix_ranges);
+          sliding_window, 0, *plan.tile_config, s, sinks, mm_prefix_ranges, kv_chunk);
       return;
     case PagedAttentionRoute::GqaDecode:
       dispatch_paged_attention_gqa_decode(arrays, metadata, plan, encoding, gqa_rkernel);
@@ -1332,7 +1412,8 @@ static void dispatch_paged_attention_mixed(
       metadata.num_kv_heads, metadata.scale, metadata.softcap,
       arrays.block_tables, arrays.seq_lens, arrays.cu_seqlens_q,
       metadata.block_size, metadata.max_seq_len, metadata.sliding_window, q_block_offset,
-      *plan.tile_config, arrays.s, arrays.sinks, arrays.mm_prefix_ranges);
+      *plan.tile_config, arrays.s, arrays.sinks, arrays.mm_prefix_ranges,
+      metadata.kv_chunk);
   record_paged_dispatch(PagedDispatch::MixedPrefillDecode,
                         decode_partition, decode_requests);
   return;
@@ -1357,8 +1438,9 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
       int num_decode_tokens = 0, int max_decode_context_len = 0,
       bool gqa_disabled = false, bool force_gqa = false,
       const GqaDecodeLengthPlan& gqa_length_plan = {},
-      int nax_split_hint = -1, int nax_prefill_split_hint = -1)
-      : UnaryPrimitive(stream),
+      int nax_split_hint = -1, int nax_prefill_split_hint = -1,
+      const KvChunkMode& kv_chunk = {})
+      : UnaryPrimitive(stream), kv_chunk_(kv_chunk),
         num_kv_heads_(num_kv_heads), scale_(scale), softcap_(softcap),
         block_size_(block_size), max_seq_len_(max_seq_len),
         sliding_window_(sliding_window),
@@ -1404,7 +1486,7 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
         ks, vs, kz, vc, use_turboquant_, k_bits_, v_bits_, sk, mp,
         num_decode_requests_, num_decode_tokens_, max_decode_context_len_,
         0, gqa_disabled_, force_gqa_, gqa_length_plan_,
-        nax_split_hint_, nax_prefill_split_hint_);
+        nax_split_hint_, nax_prefill_split_hint_, kv_chunk_);
   }
 
   const char* name() const override { return "PagedAttention"; }
@@ -1429,10 +1511,12 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
         && rhs->force_gqa_ == force_gqa_
         && rhs->gqa_length_plan_ == gqa_length_plan_
         && rhs->nax_split_hint_ == nax_split_hint_
-        && rhs->nax_prefill_split_hint_ == nax_prefill_split_hint_;
+        && rhs->nax_prefill_split_hint_ == nax_prefill_split_hint_
+        && rhs->kv_chunk_ == kv_chunk_;
   }
 
  private:
+  KvChunkMode kv_chunk_;
   int num_kv_heads_;
   float scale_;
   float softcap_;
@@ -1475,7 +1559,18 @@ array paged_attention_primitive_fn(
     int max_decode_context_len, bool gqa_disabled,
     bool force_gqa,
     const std::optional<GqaDecodeLengthPlan>& gqa_length_plan,
-    int nax_split_hint, int nax_prefill_split_hint) {
+    int nax_split_hint, int nax_prefill_split_hint,
+    int kv_chunk_shift, std::optional<Dtype> kv_chunk_dtype,
+    const std::vector<int64_t>& kv_chunk_strides) {
+  KvChunkMode kv_chunk;
+  if (kv_chunk_shift >= 0) {
+    if (!kv_chunk_dtype || kv_chunk_strides.size() != 3) {
+      throw std::invalid_argument(
+          "kv_chunk_shift needs kv_chunk_dtype and three kv_chunk_strides");
+    }
+    kv_chunk = {true, kv_chunk_shift, *kv_chunk_dtype, kv_chunk_strides[0],
+                kv_chunk_strides[1], kv_chunk_strides[2]};
+  }
   if (nax_split_hint < -1 || nax_split_hint > 1)
     throw std::invalid_argument("nax_split_hint must be -1, 0 or 1");
   if (nax_prefill_split_hint < -1 || nax_prefill_split_hint > 1)
@@ -1555,7 +1650,8 @@ array paged_attention_primitive_fn(
     }
     const int num_segments = static_cast<int>(cu_seqlens_q.shape(0)) - 1;
     const int head_size_q = static_cast<int>(query.shape(2));
-    if (query.dtype() == float32 || query.dtype() != key_cache.dtype()
+    const Dtype kv_dtype = kv_chunk.on ? kv_chunk.cache_dtype : key_cache.dtype();
+    if (query.dtype() == float32 || query.dtype() != kv_dtype
         || window_seqlen_q > 1 || total_q <= num_segments
         || !kernels::select_tile_config(head_size_q)) {
       throw std::invalid_argument(
@@ -1639,7 +1735,7 @@ array paged_attention_primitive_fn(
       use_turboquant, k_bits, v_bits, window_seqlen_q, sinks != nullptr,
       mm_prefix_ranges != nullptr, num_decode_requests, num_decode_tokens,
       max_decode_context_len, gqa_disabled, force_gqa, lengths,
-      nax_split_hint, nax_prefill_split_hint);
+      nax_split_hint, nax_prefill_split_hint, kv_chunk);
   std::vector<array> inputs = {query, key_cache, value_cache,
                                block_tables, seq_lens, cu_seqlens_q};
   if (use_turboquant) {
@@ -1975,6 +2071,211 @@ class ReshapeAndCachePrimitive : public Primitive {
     return dynamic_cast<const ReshapeAndCachePrimitive*>(&other) != nullptr;
   }
 };
+
+
+// ---------------------------------------------------------------------------
+// Chunked KV (#1198): reshape_and_cache over a layer split into chunks.
+//
+// The layer is a list of separate Metal buffers. Kernels reach them through a
+// table of GPU addresses (one per chunk); the chunks a batch writes must be in
+// the KV residency set first. The table array doubles as the dependency token:
+// the primitive outputs an alias of it, so later readers of the table are
+// ordered after this write. Kernel source is compiled at first use.
+// ---------------------------------------------------------------------------
+void use_kv_residency_on(metal::CommandEncoder& enc);
+
+namespace {
+
+std::string chunked_rac_source() {
+  return R"(
+#include <metal_stdlib>
+using namespace metal;
+typedef bfloat bfloat16_t;
+template <typename KV_T, typename CACHE_T>
+[[kernel]] void reshape_and_cache_chunked(
+    const device KV_T* key [[buffer(0)]],
+    const device KV_T* value [[buffer(1)]],
+    const device int64_t* slot_mapping [[buffer(2)]],
+    const device uint64_t* table [[buffer(3)]],
+    constant int& chunk_shift [[buffer(4)]],
+    constant int& num_heads [[buffer(5)]],
+    constant int& head_size [[buffer(6)]],
+    constant int& block_size [[buffer(7)]],
+    constant int64_t* layout [[buffer(9)]],    // block, token, head stride, k_off, v_off (elements)
+    uint gid [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tpg [[threads_per_threadgroup]]) {
+  const int64_t slot_idx = slot_mapping[gid];
+  if (slot_idx < 0) return;
+  const int64_t block_idx = slot_idx / block_size;
+  const int64_t block_offset = slot_idx % block_size;
+  const int64_t local_block = block_idx & ((int64_t(1) << chunk_shift) - 1);
+  device CACHE_T* base = (device CACHE_T*)(table[block_idx >> chunk_shift]);
+  const int n = num_heads * head_size;
+  for (int i = tid; i < n; i += tpg) {
+    const int head_idx = i / head_size;
+    const int head_offset = i % head_size;
+    const int64_t tgt = local_block * layout[0] + block_offset * layout[1] +
+                        head_idx * layout[2] + head_offset;
+    base[layout[3] + tgt] = CACHE_T(key[int64_t(gid) * n + i]);
+    base[layout[4] + tgt] = CACHE_T(value[int64_t(gid) * n + i]);
+  }
+}
+#define inst(kv, cache) template [[host_name("rac_chunked_" #kv "_" #cache)]] [[kernel]] void reshape_and_cache_chunked<kv, cache>( \
+    const device kv* key [[buffer(0)]], const device kv* value [[buffer(1)]], const device int64_t* slot_mapping [[buffer(2)]], \
+    const device uint64_t* table [[buffer(3)]], constant int& chunk_shift [[buffer(4)]], constant int& num_heads [[buffer(5)]], \
+    constant int& head_size [[buffer(6)]], constant int& block_size [[buffer(7)]], constant int64_t* layout [[buffer(9)]], \
+    uint gid [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]], uint tpg [[threads_per_threadgroup]]);
+inst(half, half)
+inst(bfloat16_t, bfloat16_t)
+inst(float, float)
+)";
+}
+
+class ReshapeAndCacheChunkedPrimitive : public Primitive {
+ public:
+  ReshapeAndCacheChunkedPrimitive(Stream stream, int chunk_shift, int block_size,
+                                  std::vector<int64_t> layout, Dtype cache_dtype)
+      : Primitive(stream), chunk_shift_(chunk_shift), block_size_(block_size),
+        layout_(std::move(layout)), cache_dtype_(cache_dtype) {}
+
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
+    throw std::runtime_error("ReshapeAndCacheChunkedPrimitive only supports GPU");
+  }
+
+  // inputs: 0=key, 1=value, 2=slot_mapping, 3=table (uint64 per chunk)
+  // outputs: 0=table, aliased, as the dependency token for later readers.
+  void eval_gpu(const std::vector<array>& inputs,
+                std::vector<array>& outputs) override {
+    outputs[0].copy_shared_buffer(inputs[3]);
+    const array& key = inputs[0];
+    const int num_tokens = static_cast<int>(key.shape(0));
+    const int num_heads = static_cast<int>(key.shape(1));
+    const int head_size = static_cast<int>(key.shape(2));
+    auto s = stream();
+    auto& d = metal::device(s.device);
+    auto* lib = d.get_library("rac_chunked_proto", chunked_rac_source);
+    std::string kname = "rac_chunked_" + dtype_to_metal(key.dtype()) + "_" +
+                        dtype_to_metal(cache_dtype_);
+    auto* kernel = d.get_kernel(kname, lib);
+    auto& enc = metal::get_command_encoder(s);
+    use_kv_residency_on(enc);
+    enc.set_compute_pipeline_state(kernel);
+    enc.set_input_array(inputs[0], 0);
+    enc.set_input_array(inputs[1], 1);
+    enc.set_input_array(inputs[2], 2);
+    enc.set_output_array(outputs[0], 3);
+    enc.set_bytes(chunk_shift_, 4);
+    enc.set_bytes(num_heads, 5);
+    enc.set_bytes(head_size, 6);
+    enc.set_bytes(block_size_, 7);
+    enc.set_vector_bytes(layout_, 9);
+    enc.dispatch_threadgroups(MTL::Size::Make(num_tokens, 1, 1),
+                              MTL::Size::Make(std::min(num_heads * head_size, 256), 1, 1));
+  }
+
+  const char* name() const override { return "ReshapeAndCacheChunked"; }
+  bool is_equivalent(const Primitive& other) const override { return false; }
+
+ private:
+  int chunk_shift_;
+  int block_size_;
+  std::vector<int64_t> layout_;
+  Dtype cache_dtype_;
+};
+
+}  // namespace
+
+namespace {
+
+// Block copy / zero over chunked layers: one threadgroup per block, threads
+// stride over 16-byte words. Compiled at first use.
+std::string chunked_blockops_source() {
+  return R"(
+#include <metal_stdlib>
+using namespace metal;
+[[kernel]] void kv_chunk_copy_blocks(
+    const device uint64_t* table [[buffer(0)]],
+    const device int* pairs [[buffer(1)]],      // [n, 2] = (src, dst)
+    constant int& chunk_shift [[buffer(2)]],
+    constant int64_t& block_bytes [[buffer(3)]],
+    uint gid [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tpg [[threads_per_threadgroup]]) {
+  const int64_t src = pairs[2 * gid], dst = pairs[2 * gid + 1];
+  const int64_t mask = (int64_t(1) << chunk_shift) - 1;
+  const device uint4* s = (const device uint4*)(table[src >> chunk_shift] + (src & mask) * block_bytes);
+  device uint4* d = (device uint4*)(table[dst >> chunk_shift] + (dst & mask) * block_bytes);
+  for (int64_t i = tid; i < block_bytes / 16; i += tpg) d[i] = s[i];
+}
+[[kernel]] void kv_chunk_zero_blocks(
+    const device uint64_t* table [[buffer(0)]],
+    const device int* ids [[buffer(1)]],
+    constant int& chunk_shift [[buffer(2)]],
+    constant int64_t& block_bytes [[buffer(3)]],
+    uint gid [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tpg [[threads_per_threadgroup]]) {
+  const int64_t b = ids[gid];
+  const int64_t mask = (int64_t(1) << chunk_shift) - 1;
+  device uint4* d = (device uint4*)(table[b >> chunk_shift] + (b & mask) * block_bytes);
+  for (int64_t i = tid; i < block_bytes / 16; i += tpg) d[i] = uint4(0);
+}
+)";
+}
+
+class ChunkBlockOpsPrimitive : public Primitive {
+ public:
+  ChunkBlockOpsPrimitive(Stream stream, bool copy, int chunk_shift, int64_t block_bytes)
+      : Primitive(stream), copy_(copy), chunk_shift_(chunk_shift), block_bytes_(block_bytes) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
+    throw std::runtime_error("ChunkBlockOpsPrimitive only supports GPU");
+  }
+  // inputs: 0=table, 1=ids (int32 [n] or [n,2]); output 0 = table, aliased.
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) override {
+    outputs[0].copy_shared_buffer(inputs[0]);
+    const int n = static_cast<int>(inputs[1].shape(0));
+    auto s = stream();
+    auto& d = metal::device(s.device);
+    auto* lib = d.get_library("kv_chunk_blockops", chunked_blockops_source);
+    auto* kernel = d.get_kernel(copy_ ? "kv_chunk_copy_blocks" : "kv_chunk_zero_blocks", lib);
+    auto& enc = metal::get_command_encoder(s);
+    use_kv_residency_on(enc);
+    enc.set_compute_pipeline_state(kernel);
+    enc.set_output_array(outputs[0], 0);
+    enc.set_input_array(inputs[1], 1);
+    enc.set_bytes(chunk_shift_, 2);
+    enc.set_bytes(block_bytes_, 3);
+    enc.dispatch_threadgroups(MTL::Size::Make(n, 1, 1), MTL::Size::Make(256, 1, 1));
+  }
+  const char* name() const override { return "ChunkBlockOps"; }
+  bool is_equivalent(const Primitive&) const override { return false; }
+ private:
+  bool copy_;
+  int chunk_shift_;
+  int64_t block_bytes_;
+};
+
+}  // namespace
+
+array chunk_block_ops_fn(const array& table, const array& ids, bool copy,
+                         int chunk_shift, int64_t block_bytes) {
+  if (block_bytes % 16 != 0) {
+    throw std::invalid_argument("chunk block ops: block_bytes must be a multiple of 16");
+  }
+  auto prim = std::make_shared<ChunkBlockOpsPrimitive>(
+      default_stream(Device::gpu), copy, chunk_shift, block_bytes);
+  return array(table.shape(), table.dtype(), prim, {table, ids});
+}
+
+array reshape_and_cache_chunked_fn(
+    const array& key, const array& value, const array& slot_mapping,
+    const array& table, int chunk_shift, int block_size,
+    std::vector<int64_t> layout, Dtype cache_dtype) {
+  auto prim = std::make_shared<ReshapeAndCacheChunkedPrimitive>(
+      default_stream(Device::gpu), chunk_shift, block_size, std::move(layout), cache_dtype);
+  return array(table.shape(), table.dtype(), prim, {key, value, slot_mapping, table});
+}
 
 std::tuple<array, array> reshape_and_cache_primitive_fn(
     const array& key, const array& value,
