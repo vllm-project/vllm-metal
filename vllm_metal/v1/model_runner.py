@@ -1992,11 +1992,11 @@ class MetalModelRunner:
 
         # ---- sample tokens ----
         vocab_size = self._vocab_size
+        # Draft rows use the greedy verifier below. Only plain decode rows
+        # and completed prefills can use the native sampling key.
         next_native_rng_key = (
             self._next_native_sample_key
             if self._native_sampling_enabled
-            and self.vllm_config.speculative_config is None
-            and self._drafter is None
             and grammar_output is None
             and not scheduler_output.has_structured_output_requests
             else None
