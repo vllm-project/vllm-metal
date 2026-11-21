@@ -651,6 +651,15 @@ constant int v_bits [[function_constant(70)]];  // V quantization bit width (def
 // 80/81/90 in turboquant.metal, 100 in reshape_and_cache.metal, 110 below).
 constant bool use_mm_prefix [[function_constant(120)]];
 constant bool use_compact_scratch [[function_constant(130)]];
+// Optional defaults preserve the shared shader ABI for other launchers.
+constant int relative_bias_extent_fc [[function_constant(140)]];
+constant int relative_bias_extent = is_function_constant_defined(relative_bias_extent_fc)
+    ? relative_bias_extent_fc : 0;
+constant bool use_relative_bias = relative_bias_extent > 0;
+constant bool query_sinks_fc [[function_constant(141)]];
+constant bool use_query_sinks = is_function_constant_defined(query_sinks_fc)
+    ? query_sinks_fc : false;
+
 // Window mode: 0 = per-token (grid.y is a query token; today's decode path).
 // > 0 = the number of PA_WINDOW_ROWS-row sub-windows per segment: grid.y is
 // a (segment, sub-window) pair and the threadgroup owns up to
@@ -724,6 +733,8 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
     [[buffer(28), function_constant(use_turboquant)]],
     constant int64_t &scale_head_stride
     [[buffer(29), function_constant(use_turboquant)]],
+    device const T *relative_bias
+    [[buffer(30), function_constant(use_relative_bias)]],
     threadgroup char *shared_mem [[threadgroup(0)]],
     uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],
     uint3 threadgroups_per_grid [[threadgroups_per_grid]],
@@ -1024,6 +1035,12 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
       qk +=
           (alibi_slope != 0) ? alibi_slope * (token_idx - effective_context_len + 1) : 0;
 
+      if (use_relative_bias) {
+        const int distance = effective_context_len - 1 - token_idx;
+        if (distance >= 0 && distance < relative_bias_extent)
+          qk += float(relative_bias[(int64_t(q_token_idx) * num_heads + head_idx)
+                                    * relative_bias_extent + distance]);
+      }
       if (thread_group_offset == 0) {
         // Causal mask: only attend to KV positions < effective_context_len.
         bool mask = token_idx >= effective_context_len;
@@ -1217,7 +1234,7 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
     // into the global max and exp-sum instead, so it is counted once across
     // all partitions rather than once per partition.
     if (!USE_PARTITIONING && use_sinks) {
-      const float sink_val = sinks[head_idx] * M_LOG2E_F;
+      const float sink_val = sinks[(use_query_sinks ? int64_t(q_token_idx) * num_heads : 0) + head_idx] * M_LOG2E_F;
       const float new_m = max(warp_m, sink_val);
       const float old_corr = (warp_m == -FLT_MAX) ? 0.f : exp2(warp_m - new_m);
 #pragma unroll
@@ -1481,6 +1498,12 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
                   ? alibi_slope * (token_idx - row_context_len + 1)
                   : 0;
 
+        if (use_relative_bias) {
+          const int distance = row_context_len - 1 - token_idx;
+          if (distance >= 0 && distance < relative_bias_extent)
+            qk += float(relative_bias[(int64_t(q_token_idx + r) * num_heads + head_idx)
+                                      * relative_bias_extent + distance]);
+        }
         if (thread_group_offset == 0) {
           // Causal mask: only attend to KV positions < row_context_len.
           bool mask = token_idx >= row_context_len;
@@ -1735,7 +1758,7 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
       // See the equivalent block in the per-token kernel for the rationale;
       // partitioned mode defers to paged_attention_v2_reduce.
       if (!USE_PARTITIONING && use_sinks) {
-        const float sink_val = sinks[head_idx] * M_LOG2E_F;
+        const float sink_val = sinks[(use_query_sinks ? int64_t(q_token_idx + r) * num_heads : 0) + head_idx] * M_LOG2E_F;
         const float new_m = max(warp_m[r], sink_val);
         const float old_corr =
             (warp_m[r] == -FLT_MAX) ? 0.f : exp2(warp_m[r] - new_m);
@@ -1983,7 +2006,7 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
   // Include the sink in the global max before rescaling. max_logits are
   // stored in log2 space by paged_attention; lift the raw sink to match.
   if (use_sinks) {
-    max_logit = max(max_logit, sinks[head_idx] * M_LOG2E_F);
+    max_logit = max(max_logit, sinks[(use_query_sinks ? int64_t(q_token_idx) * num_heads : 0) + head_idx] * M_LOG2E_F);
   }
 
   // Load rescaled exp sums to shared memory.
@@ -2004,7 +2027,7 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
 
   // Include the sink in the global exp sum (sinks lifted to log2 space).
   if (use_sinks) {
-    global_exp_sum += exp2(sinks[head_idx] * M_LOG2E_F - max_logit);
+    global_exp_sum += exp2(sinks[(use_query_sinks ? int64_t(q_token_idx) * num_heads : 0) + head_idx] * M_LOG2E_F - max_logit);
   }
 
   const float inv_global_exp_sum =
@@ -2589,6 +2612,8 @@ template <typename T, typename K_CACHE_T, int HEAD_SIZE, int BLOCK_SIZE,
       [[buffer(28), function_constant(use_turboquant)]],                       \
       constant int64_t &scale_head_stride                                     \
       [[buffer(29), function_constant(use_turboquant)]],                       \
+      device const type *relative_bias                                       \
+      [[buffer(30), function_constant(use_relative_bias)]],                    \
       threadgroup char *shared_mem [[threadgroup(0)]],                         \
       uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],     \
       uint3 threadgroups_per_grid [[threadgroups_per_grid]],                   \

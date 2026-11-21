@@ -134,6 +134,8 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
     const constant int &sliding_window [[buffer(21)]],
     device const int32_t *mm_prefix_ranges
     [[buffer(22), function_constant(use_mm_prefix)]],
+    device const T *relative_bias
+    [[buffer(28), function_constant(use_relative_bias)]],
     const constant int &q_block_offset [[buffer(30)]],
     threadgroup char *shared_mem [[threadgroup(0)]],
     uint3 tgp [[threadgroup_position_in_grid]],
@@ -411,7 +413,7 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
     const int min_q_abs_pos = tg_min_q_abs_pos;
     const bool tile_no_mask = (tile_start + TILE_KV - 1) < min_q_abs_pos
                               && (tile_start + TILE_KV) <= seq_len
-                              && softcapping <= 0.0f
+                              && softcapping <= 0.0f && !use_relative_bias
                               && (sliding_window < 0
                                   || tile_start >= tg_max_q_abs_pos + 1 - sliding_window);
 
@@ -432,6 +434,13 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
             s = softcapping * precise::tanh(s_orig / softcapping) * M_LOG2E_F;
           }
           int kv_pos = tile_start + k * 8 + fn + jj;
+          const int distance = q_abs_pos - kv_pos;
+          if (use_relative_bias && !row_masked && distance >= 0
+              && distance < relative_bias_extent) {
+            const int row = q_seq_start + q_pos_start + sg_idx * 8 + fm;
+            s += float(relative_bias[(int64_t(row) * num_heads + head_idx)
+                                      * relative_bias_extent + distance]) * M_LOG2E_F;
+          }
           // (causal OR same image block) AND window: HF Gemma 4 semantics.
           // in_block folds to false when use_mm_prefix is off, and it can
           // never open a key at or beyond seq_len.
@@ -537,7 +546,7 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
   // It contributes one learned logit to the denominator and no value row, so
   // O is only rescaled by the max correction.
   if (use_sinks && (sg_idx * 8 + fm) < valid_q) {
-    const float sink_score = sinks[head_idx] * M_LOG2E_F;
+    const float sink_score = sinks[(use_query_sinks ? int64_t(q_seq_start + q_pos_start + sg_idx * 8 + fm) * num_heads : 0) + head_idx] * M_LOG2E_F;
     const float new_max = max(max_score, sink_score);
     const float old_corr =
         (max_score == -INFINITY) ? 0.0f : fast::exp2(max_score - new_max);
@@ -612,6 +621,8 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
       const constant int &sliding_window [[buffer(21)]],                       \
       device const int32_t *mm_prefix_ranges                                   \
       [[buffer(22), function_constant(use_mm_prefix)]],                        \
+      device const type *relative_bias                                       \
+      [[buffer(28), function_constant(use_relative_bias)]],                    \
       const constant int &q_block_offset [[buffer(30)]],                       \
       threadgroup char *shared_mem [[threadgroup(0)]],                         \
       uint3 tgp [[threadgroup_position_in_grid]],                              \

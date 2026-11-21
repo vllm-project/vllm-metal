@@ -487,7 +487,7 @@ static void dispatch_paged_attention_tiled(
     const array& cu_seqlens_q,
     int block_size, int max_seq_len, int sliding_window, int q_block_offset,
     kernels::TileConfig cfg, Stream s, const array* sinks,
-    const array* mm_prefix_ranges) {
+    const array* mm_prefix_ranges, const array* relative_bias) {
   auto& d = metal::device(s.device);
 
   int total_q_tokens = static_cast<int>(query.shape(0));
@@ -498,14 +498,20 @@ static void dispatch_paged_attention_tiled(
       block_size, q_block_offset, cfg, static_cast<int>(query.itemsize()),
       sinks != nullptr, mm_prefix_ranges != nullptr);
 
+  const int bias_extent = relative_bias ? relative_bias->shape(2) : 0;
+  const bool query_sinks = sinks && sinks->ndim() == 2;
+  plan.hash_name += "_rb" + std::to_string(bias_extent)
+      + "_qs" + (query_sinks ? "1" : "0");
   auto* lib = d.get_library("paged_attention_v2_kern");
-  // Both constants are set on every dispatch: a function that references an
+  // Feature constants are set on every dispatch: a function that references an
   // unset function constant fails pipeline creation.  MLX caches pipelines
   // by hash_name, so each constant combination needs its own suffix.
   auto* kernel = d.get_kernel(
       plan.base_kname, lib, plan.hash_name,
       {{&plan.use_sinks, MTL::DataType::DataTypeBool, NS::UInteger(40)},
-       {&plan.use_mm_prefix, MTL::DataType::DataTypeBool, NS::UInteger(120)}});
+       {&plan.use_mm_prefix, MTL::DataType::DataTypeBool, NS::UInteger(120)},
+       {&bias_extent, MTL::DataType::DataTypeInt, NS::UInteger(140)},
+       {&query_sinks, MTL::DataType::DataTypeBool, NS::UInteger(141)}});
 
   int num_heads = static_cast<int>(query.shape(1));
   auto& enc = metal::get_command_encoder(s);
@@ -520,6 +526,7 @@ static void dispatch_paged_attention_tiled(
   if (plan.use_sinks) {
     enc.set_input_array(*sinks, 18);
   }
+  if (relative_bias) enc.set_input_array(*relative_bias, 28);
   // Slot 22 is bound here, not in bind_paged_attn_buffers: that helper is
   // shared with the per-token kernel, where slot 22 is TurboQuant's k_codes.
   if (plan.use_mm_prefix) {
@@ -538,7 +545,7 @@ static void dispatch_paged_attention_tiled(
 // tmp_out[token, head, partition, :].
 static MTL::ComputePipelineState* paged_attention_v2_reduce_kernel(
     metal::Device& d, const std::string& dt, int head_size,
-    int partition_size, bool use_sinks, bool use_tq_fc, bool compact = false) {
+    int partition_size, bool use_sinks, bool use_tq_fc, bool compact = false, bool query_sinks = false) {
   auto rname = kernels::paged_reduce_kernel_name(dt, head_size, partition_size);
   // The reduce kernel reads sinks (40), TurboQuant (50) and compact scratch
   // (130); other function constants are inert for it. TurboQuant batches take this
@@ -551,13 +558,15 @@ static MTL::ComputePipelineState* paged_attention_v2_reduce_kernel(
   std::string rhash = rname + "_v2reduce"
       + "_tq" + (use_tq_fc ? "1" : "0")
       + "_sk" + (use_sinks ? "1" : "0")
-      + "_compact" + (compact ? "1" : "0");
+      + "_compact" + (compact ? "1" : "0")
+      + "_qs" + (query_sinks ? "1" : "0");
   auto* lib = d.get_library("paged_attention_v2_kern");
   return d.get_kernel(
       rname, lib, rhash,
       {{&use_sinks, MTL::DataType::DataTypeBool, NS::UInteger(40)},
        {&use_tq_fc, MTL::DataType::DataTypeBool, NS::UInteger(50)},
-       {&compact, MTL::DataType::DataTypeBool, NS::UInteger(130)}});
+       {&compact, MTL::DataType::DataTypeBool, NS::UInteger(130)},
+       {&query_sinks, MTL::DataType::DataTypeBool, NS::UInteger(141)}});
 }
 
 static void dispatch_paged_attention_v2_reduce(
@@ -572,7 +581,7 @@ static void dispatch_paged_attention_v2_reduce(
   if (rkernel == nullptr) {
     rkernel = paged_attention_v2_reduce_kernel(
         d, dt, head_size, partition_size, use_sinks, use_tq_fc,
-        partition_offsets != nullptr);
+        partition_offsets != nullptr, sinks && sinks->ndim() == 2);
   }
   const size_t reduce_shmem = kernels::paged_reduce_threadgroup_bytes(max_num_partitions);
   const size_t capacity = d.mtl_device()->maxThreadgroupMemoryLength();
@@ -624,6 +633,8 @@ struct PagedAttentionMetadata {
   int v_bits;
   bool use_mm_prefix;
   bool use_sinks;
+  bool use_relative_bias;
+  bool query_sinks;
   bool nax_ready;
   bool nax_enabled;
   int num_decode_requests;
@@ -657,7 +668,7 @@ static bool gqa_decode_metadata_eligible(
   return !has_prefill && m.window_seqlen_q <= 1 && gqa_decode_rows
       && (m.query_dtype == float16 || m.query_dtype == bfloat16)
       && gqa_cache_dtypes && m.softcap <= 0.f && !m.use_sinks
-      && m.sliding_window < 0;
+      && !m.use_relative_bias && m.sliding_window < 0;
 }
 
 // The single routing point selects execution paths from CPU metadata and lazy providers.
@@ -718,7 +729,7 @@ static PagedAttentionPlan select_paged_attention_route(
       has_prefill && m.window_seqlen_q > 1 && m.head_size <= kWindowMaxHeadSize;
 
   const bool use_nax = has_prefill && !window_batch && !m.use_turboquant
-      && dtype_ok && !m.use_mm_prefix
+      && dtype_ok && !m.use_mm_prefix && !m.use_relative_bias && !m.query_sinks
       && nax_eligible(m.query_dtype, m.head_size, m.block_size, m.nax_ready, m.nax_enabled);
   const auto tile_config = has_prefill && !window_batch && !m.use_turboquant
       && dtype_ok ? kernels::select_tile_config(m.head_size) : std::nullopt;
@@ -917,6 +928,7 @@ struct PagedAttentionArrays {
   const array* v_centroids;
   const array* sinks;
   const array* mm_prefix_ranges;
+  const array* relative_bias;
   Stream s;
 };
 
@@ -1050,11 +1062,15 @@ static void dispatch_paged_attention_per_token(
     const PagedAttentionArrays& arrays, const PagedAttentionMetadata& metadata,
     const PagedAttentionPlan& plan, const PagedAttentionEncoding& encoding) {
   auto& enc = *encoding.encoder;
-  const auto kernel_plan = make_paged_attention_kernel_plan(
+  auto kernel_plan = make_paged_attention_kernel_plan(
       encoding.dt, encoding.k_cache_dt, encoding.v_cache_dt,
       metadata.head_size, metadata.block_size, plan.partition,
       arrays.sinks != nullptr, metadata.use_turboquant,
       metadata.k_bits, metadata.v_bits, plan.window_q);
+  const int bias_extent = arrays.relative_bias ? arrays.relative_bias->shape(2) : 0;
+  const bool query_sinks = arrays.sinks && arrays.sinks->ndim() == 2;
+  kernel_plan.hash_name += "_rb" + std::to_string(bias_extent)
+      + "_qs" + (query_sinks ? "1" : "0");
   auto* kernel = encoding.device->get_kernel(
       kernel_plan.kernel_name, encoding.library, kernel_plan.hash_name,
       {{&kernel_plan.use_partitioning, MTL::DataType::DataTypeBool, NS::UInteger(10)},
@@ -1064,7 +1080,9 @@ static void dispatch_paged_attention_per_token(
        {&kernel_plan.use_tq,           MTL::DataType::DataTypeBool, NS::UInteger(50)},
        {&kernel_plan.k_bits,           MTL::DataType::DataTypeInt,  NS::UInteger(60)},
        {&kernel_plan.v_bits,           MTL::DataType::DataTypeInt,  NS::UInteger(70)},
-       {&kernel_plan.window_q,         MTL::DataType::DataTypeInt,  NS::UInteger(110)}});
+       {&kernel_plan.window_q,         MTL::DataType::DataTypeInt,  NS::UInteger(110)},
+       {&bias_extent, MTL::DataType::DataTypeInt, NS::UInteger(140)},
+       {&query_sinks, MTL::DataType::DataTypeBool, NS::UInteger(141)}});
 
   const size_t shmem = kernels::paged_threadgroup_bytes(
       metadata.head_size, metadata.block_size, static_cast<int>(arrays.query.itemsize()),
@@ -1079,6 +1097,7 @@ static void dispatch_paged_attention_per_token(
   // Sink logits (slot 18); bound only when the kernel was specialized with
   // use_sinks, since the argument is declared under that function constant.
   auto bind_sinks = [&]() {
+    if (arrays.relative_bias) enc.set_input_array(*arrays.relative_bias, 30);
     if (!kernel_plan.use_sinks) return;
     enc.set_input_array(*arrays.sinks, 18);
   };
@@ -1174,7 +1193,8 @@ static void dispatch_paged_attention_v2_online(
     int decode_only_rows = 0, bool gqa_disabled = false,
     bool force_gqa = false,
     const GqaDecodeLengthPlan& gqa_length_plan = {},
-    int nax_split_hint = -1, int nax_prefill_split_hint = -1) {
+    int nax_split_hint = -1, int nax_prefill_split_hint = -1,
+    const array* relative_bias = nullptr) {
   int head_size = static_cast<int>(query.shape(2));
   PagedAttentionMetadata metadata{
       gqa_length_plan, query.dtype(), key_cache.dtype(), value_cache.dtype()};
@@ -1195,6 +1215,8 @@ static void dispatch_paged_attention_v2_online(
   metadata.v_bits = v_bits;
   metadata.use_mm_prefix = mm_prefix_ranges != nullptr;
   metadata.use_sinks = sinks != nullptr;
+  metadata.query_sinks = sinks && sinks->ndim() == 2;
+  metadata.use_relative_bias = relative_bias != nullptr;
   metadata.nax_ready = nax_lib_ready_;
   metadata.nax_enabled = nax_enabled_;
   metadata.num_decode_requests = num_decode_requests;
@@ -1208,7 +1230,7 @@ static void dispatch_paged_attention_v2_online(
   const PagedAttentionArrays arrays{
       out, query, key_cache, value_cache, block_tables, seq_lens, cu_seqlens_q,
       key_scale_cache, value_scale_cache, key_zero_cache, v_centroids,
-      sinks, mm_prefix_ranges, s};
+      sinks, mm_prefix_ranges, relative_bias, s};
   PagedAttentionEncoding encoding;
   auto plan = select_paged_attention_route(
       metadata,
@@ -1264,7 +1286,7 @@ static void dispatch_paged_attention_v2_online(
       dispatch_paged_attention_tiled(
           out, query, key_cache, value_cache, num_kv_heads, scale, softcap,
           block_tables, seq_lens, cu_seqlens_q, block_size, max_seq_len,
-          sliding_window, 0, *plan.tile_config, s, sinks, mm_prefix_ranges);
+          sliding_window, 0, *plan.tile_config, s, sinks, mm_prefix_ranges, relative_bias);
       return;
     case PagedAttentionRoute::GqaDecode:
       dispatch_paged_attention_gqa_decode(arrays, metadata, plan, encoding, gqa_rkernel);
@@ -1305,7 +1327,8 @@ static void dispatch_paged_attention_mixed(
       metadata.num_decode_requests, metadata.num_decode_tokens,
       metadata.max_decode_context_len,
       metadata.num_decode_tokens, metadata.gqa_disabled, /*force_gqa=*/false,
-      prefix_plan ? metadata.gqa_length_plan : GqaDecodeLengthPlan{});
+      prefix_plan ? metadata.gqa_length_plan : GqaDecodeLengthPlan{},
+      -1, -1, arrays.relative_bias);
   // Keep the decode prefix's GQA selection visible in the diagnostics.
   const int decode_partition = g_last_gqa_partition.load(std::memory_order_relaxed);
   const int decode_requests = g_last_gqa_requests.load(std::memory_order_relaxed);
@@ -1332,7 +1355,8 @@ static void dispatch_paged_attention_mixed(
       metadata.num_kv_heads, metadata.scale, metadata.softcap,
       arrays.block_tables, arrays.seq_lens, arrays.cu_seqlens_q,
       metadata.block_size, metadata.max_seq_len, metadata.sliding_window, q_block_offset,
-      *plan.tile_config, arrays.s, arrays.sinks, arrays.mm_prefix_ranges);
+      *plan.tile_config, arrays.s, arrays.sinks, arrays.mm_prefix_ranges,
+      arrays.relative_bias);
   record_paged_dispatch(PagedDispatch::MixedPrefillDecode,
                         decode_partition, decode_requests);
   return;
@@ -1357,7 +1381,8 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
       int num_decode_tokens = 0, int max_decode_context_len = 0,
       bool gqa_disabled = false, bool force_gqa = false,
       const GqaDecodeLengthPlan& gqa_length_plan = {},
-      int nax_split_hint = -1, int nax_prefill_split_hint = -1)
+      int nax_split_hint = -1, int nax_prefill_split_hint = -1,
+      bool use_relative_bias = false)
       : UnaryPrimitive(stream),
         num_kv_heads_(num_kv_heads), scale_(scale), softcap_(softcap),
         block_size_(block_size), max_seq_len_(max_seq_len),
@@ -1370,7 +1395,8 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
         max_decode_context_len_(max_decode_context_len),
         gqa_disabled_(gqa_disabled), force_gqa_(force_gqa),
         gqa_length_plan_(gqa_length_plan), nax_split_hint_(nax_split_hint),
-        nax_prefill_split_hint_(nax_prefill_split_hint) {}
+        nax_prefill_split_hint_(nax_prefill_split_hint),
+        use_relative_bias_(use_relative_bias) {}
 
   void eval_cpu(const std::vector<array>&, array&) override {
     throw std::runtime_error(
@@ -1393,6 +1419,7 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
     const array* vc = use_turboquant_ ? &inputs[9] : nullptr;
     const array* sk = use_sinks_ ? &inputs[6] : nullptr;
     const array* mp = use_mm_prefix_ ? &inputs[use_sinks_ ? 7 : 6] : nullptr;
+    const array* rb = use_relative_bias_ ? &inputs.back() : nullptr;
     dispatch_paged_attention_v2_online(
         out,
         inputs[0],               // query
@@ -1404,7 +1431,7 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
         ks, vs, kz, vc, use_turboquant_, k_bits_, v_bits_, sk, mp,
         num_decode_requests_, num_decode_tokens_, max_decode_context_len_,
         0, gqa_disabled_, force_gqa_, gqa_length_plan_,
-        nax_split_hint_, nax_prefill_split_hint_);
+        nax_split_hint_, nax_prefill_split_hint_, rb);
   }
 
   const char* name() const override { return "PagedAttention"; }
@@ -1429,7 +1456,8 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
         && rhs->force_gqa_ == force_gqa_
         && rhs->gqa_length_plan_ == gqa_length_plan_
         && rhs->nax_split_hint_ == nax_split_hint_
-        && rhs->nax_prefill_split_hint_ == nax_prefill_split_hint_;
+        && rhs->nax_prefill_split_hint_ == nax_prefill_split_hint_
+        && rhs->use_relative_bias_ == use_relative_bias_;
   }
 
  private:
@@ -1453,6 +1481,7 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
   GqaDecodeLengthPlan gqa_length_plan_;
   int nax_split_hint_;
   int nax_prefill_split_hint_;
+  bool use_relative_bias_;
 };
 
 array paged_attention_primitive_fn(
@@ -1475,7 +1504,8 @@ array paged_attention_primitive_fn(
     int max_decode_context_len, bool gqa_disabled,
     bool force_gqa,
     const std::optional<GqaDecodeLengthPlan>& gqa_length_plan,
-    int nax_split_hint, int nax_prefill_split_hint) {
+    int nax_split_hint, int nax_prefill_split_hint,
+    const array* relative_bias) {
   if (nax_split_hint < -1 || nax_split_hint > 1)
     throw std::invalid_argument("nax_split_hint must be -1, 0 or 1");
   if (nax_prefill_split_hint < -1 || nax_prefill_split_hint > 1)
@@ -1515,23 +1545,28 @@ array paged_attention_primitive_fn(
           "attention sinks are not supported with TurboQuant quantized KV; "
           "pass sinks=None or disable TurboQuant for this layer");
     }
-    if (sinks->ndim() != 1) {
+    if (query.ndim() != 3 ||
+        !((sinks->ndim() == 1 && sinks->shape(0) == query.shape(1)) ||
+          (sinks->ndim() == 2 && sinks->shape(0) == query.shape(0) &&
+           sinks->shape(1) == query.shape(1)))) {
       throw std::invalid_argument(
-          "sinks must be 1-D with one entry per query head, got ndim=" +
-          std::to_string(sinks->ndim()));
-    }
-    const int num_q_heads = static_cast<int>(query.shape(1));
-    if (static_cast<int>(sinks->shape(0)) != num_q_heads) {
-      throw std::invalid_argument(
-          "sinks must have one entry per query head (" +
-          std::to_string(num_q_heads) + "), got " +
-          std::to_string(sinks->shape(0)));
+          "sinks must have one entry per query head: [heads] or [query rows, heads]");
     }
     if (sinks->dtype() != float32) {
       throw std::invalid_argument(
           "sinks must be float32; the kernel reads them as device float and "
           "folds them into a float32 softmax accumulator");
     }
+  }
+  if (relative_bias != nullptr) {
+    if (use_turboquant)
+      throw std::invalid_argument("relative_bias is not supported with TurboQuant");
+    if (query.ndim() != 3 || relative_bias->ndim() != 3 ||
+        relative_bias->shape(0) != query.shape(0) ||
+        relative_bias->shape(1) != query.shape(1) || relative_bias->shape(2) <= 0 ||
+        relative_bias->dtype() != query.dtype())
+      throw std::invalid_argument(
+          "relative_bias must have shape [query rows, heads, positive extent] and query dtype");
   }
   if (mm_prefix_ranges != nullptr) {
     // Every routing condition of dispatch_paged_attention_v2_online that
@@ -1639,18 +1674,19 @@ array paged_attention_primitive_fn(
       use_turboquant, k_bits, v_bits, window_seqlen_q, sinks != nullptr,
       mm_prefix_ranges != nullptr, num_decode_requests, num_decode_tokens,
       max_decode_context_len, gqa_disabled, force_gqa, lengths,
-      nax_split_hint, nax_prefill_split_hint);
+      nax_split_hint, nax_prefill_split_hint, relative_bias != nullptr);
   std::vector<array> inputs = {query, key_cache, value_cache,
                                block_tables, seq_lens, cu_seqlens_q};
   if (use_turboquant) {
     inputs.insert(inputs.end(), {*key_scale_cache, *value_scale_cache,
                                  *key_zero_cache, *v_centroids});
   } else if (sinks != nullptr) {
-    inputs.push_back(*sinks);
+    inputs.push_back(contiguous(*sinks));
   }
   if (mm_prefix_ranges != nullptr) {
     inputs.push_back(*mm_prefix_ranges);
   }
+  if (relative_bias != nullptr) inputs.push_back(contiguous(*relative_bias));
   return array(query.shape(), query.dtype(), std::move(prim), std::move(inputs));
 }
 
