@@ -393,6 +393,28 @@ class TestMetalPlatform:
             ),
         )
 
+    def test_validate_request_rejects_full_vocab_logprobs_on_mlx(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The MLX runner raises on logprobs=-1, which would kill the engine."""
+        monkeypatch.setenv("VLLM_METAL_BACKEND", "mlx")
+
+        with pytest.raises(
+            VLLMValidationError,
+            match=re.escape("logprobs=-1 is not supported on the MLX backend."),
+        ) as exc_info:
+            MetalPlatform.validate_request(
+                {}, SamplingParams(temperature=0, logprobs=-1)
+            )
+        assert exc_info.value.parameter == "logprobs"
+
+    def test_validate_request_allows_full_vocab_logprobs_on_mps(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("VLLM_METAL_BACKEND", "mps")
+
+        MetalPlatform.validate_request({}, SamplingParams(temperature=0, logprobs=-1))
+
     @pytest.mark.parametrize(
         ("pooling_params", "parameter", "message"),
         [
