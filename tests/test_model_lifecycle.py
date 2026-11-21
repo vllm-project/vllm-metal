@@ -241,13 +241,21 @@ class TestModelLifecycle:
 
     @pytest.mark.parametrize("revision", [None, "release-tag", "a" * 40])
     @pytest.mark.parametrize(
-        "backend", ["text", "vlm", "lfm3", "awq", "pooling", "offload"]
+        "backend", ["text", "vlm", "lfm3", "inkling2_loop", "awq", "pooling", "offload"]
     )
     def test_generation_loads_only_weights_at_requested_revision(
         self, monkeypatch: pytest.MonkeyPatch, revision: str | None, backend: str
     ) -> None:
         model = object()
-        loader = Mock(return_value=model)
+        if backend == "inkling2_loop":
+            model = nn.Module()
+            model.model = nn.Module()
+            model.model.layers = [nn.Linear(2, 2), nn.Linear(2, 2)]
+        loader = Mock(
+            return_value=SimpleNamespace(language_model=model)
+            if backend == "inkling2_loop"
+            else model
+        )
         weights_loader = Mock(return_value=(model, {}))
         download = Mock(return_value=Path("cached-model"))
         detect_awq = Mock(
@@ -263,8 +271,8 @@ class TestModelLifecycle:
                 model="org/model",
                 revision=revision,
                 is_multimodal_model=backend == "vlm",
-                hf_config=SimpleNamespace(model_type="lfm3")
-                if backend == "lfm3"
+                hf_config=SimpleNamespace(model_type=backend)
+                if backend in {"lfm3", "inkling2_loop"}
                 else None,
             )
         )
@@ -296,16 +304,20 @@ class TestModelLifecycle:
             loader.assert_called_once_with("resolved/model", revision=revision)
         else:
             download.assert_called_once_with("resolved/model", revision=revision)
-            selected_loader = loader if backend in {"vlm", "lfm3"} else weights_loader
+            selected_loader = (
+                loader
+                if backend in {"vlm", "lfm3", "inkling2_loop"}
+                else weights_loader
+            )
             selected_loader.assert_called_once_with(
-                Path("cached-model"), lazy=backend == "offload"
+                Path("cached-model"), lazy=backend in {"offload", "inkling2_loop"}
             )
         if backend == "offload":
             install_experts.assert_called_once_with(
                 model, "resolved/model", revision, 4096
             )
             assert runner._expert_store is install_experts.return_value
-        if backend not in {"vlm", "lfm3"}:
+        if backend not in {"vlm", "lfm3", "inkling2_loop"}:
             detect_awq.assert_called_once_with("resolved/model", revision=revision)
 
     def test_private_mlx_lm_compatible_model_path_adapts_indexed_custom_shards(

@@ -466,7 +466,10 @@ class DefaultModelAdapter(ModelAdapter):
     def generation_model_provider(
         self, hf_config: Any, *, is_multimodal: bool
     ) -> Literal["mlx-lm", "mlx-vlm"]:
-        if is_multimodal or getattr(hf_config, "model_type", None) == "lfm3":
+        if is_multimodal or getattr(hf_config, "model_type", None) in (
+            "lfm3",
+            "inkling2_loop",
+        ):
             return "mlx-vlm"
         return "mlx-lm"
 
@@ -978,6 +981,10 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
         text_model = self.text_model(model)
         if hasattr(text_model, "compute_logits"):
             return text_model.compute_logits(hidden_states)
+
+        if getattr(text_model, "model_type", None) == "inkling2_loop_text":
+            # Keep the upstream FP32 head, vocabulary truncation, and softcap.
+            return text_model._logits_from_norm(hidden_states)
 
         args = getattr(text_model, "args", None)
         tie_word_embeddings = bool(

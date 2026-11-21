@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import mlx.core as mx
 import torch
 from mlx_lm.utils import load_model as mlx_lm_load_model
 from mlx_vlm.utils import get_model_path as mlx_vlm_model_path
@@ -406,7 +407,19 @@ class ModelLifecycle:
         elif use_mlx_vlm:
             load_label = "MLX-VLM model"
             model_path = mlx_vlm_model_path(model_name, revision=revision)
-            model = mlx_vlm_load_model(model_path, lazy=lazy_weights)
+            inkling_text = (
+                not is_vlm
+                and getattr(model_config.hf_config, "model_type", None)
+                == "inkling2_loop"
+            )
+            model = mlx_vlm_load_model(model_path, lazy=lazy_weights or inkling_text)
+            if inkling_text:
+                model = model.language_model
+                if not lazy_weights:
+                    # Bound checkpoint conversion work per Metal command buffer.
+                    for layer in model.model.layers:
+                        mx.eval(layer.parameters())
+                    mx.eval(model.parameters())
             ensure_lfm2_vl_torch_outputs(
                 getattr(model_config.hf_config, "model_type", None)
             )
@@ -506,6 +519,23 @@ class ModelLifecycle:
 
         # Dimension resolution reads model_args immediately after this phase.
         runner.model_args = loaded_model.model_args
+        if runner.model_args.get("model_type") == "inkling2_loop_text":
+            from vllm_metal.attention.runtime.inkling2 import Inkling2Plan
+
+            config = runner.vllm_config
+            if (
+                config.speculative_config is not None
+                or config.lora_config is not None
+                or config.parallel_config.pipeline_parallel_size != 1
+                or config.kv_transfer_config is not None
+                or get_config().turboquant
+            ):
+                raise NotImplementedError(
+                    "Inkling Mini currently requires single-GPU text generation "
+                    "without speculation, LoRA, KV transfer, or TurboQuant."
+                )
+            runner.inkling2_plan = Inkling2Plan.from_config(runner.model.config)
+            runner.model_args["vocab_size"] = runner.model.config.unpadded_vocab_size
         runner._vocab_size = int(loaded_model.model_args["vocab_size"])
         logger.debug("Model args: %s", loaded_model.model_args)
 

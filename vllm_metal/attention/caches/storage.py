@@ -28,18 +28,22 @@ _INT32_MAX = 2**31 - 1
 def gather_cache_rows(cache: mx.array, ids: mx.array, block_stride: int) -> mx.array:
     """Read rows from ``(blocks, rows_per_block, ...)``; stride is in elements."""
     # MLX selects offset width from logical size, which misses wide pool strides
-    # (#1081). Slice before flattening so each gather's offsets fit in 32 bits.
+    # (#1081). Slice before indexing so each gather's offsets fit in 32 bits.
     blocks_per_take = max(_INT32_MAX // block_stride, 1)
     row_shape = cache.shape[2:]
+    rows_per_block = cache.shape[1]
     if cache.shape[0] <= blocks_per_take:
-        return cache.reshape(-1, *row_shape)[ids]
+        # Index both page axes directly: flattening padded pages materializes
+        # the entire pool even when a convolution needs only three rows.
+        return cache[ids // rows_per_block, ids % rows_per_block]
 
     rows = None
     for first in range(0, cache.shape[0], blocks_per_take):
-        part = cache[first : first + blocks_per_take].reshape(-1, *row_shape)
-        local = ids - first * cache.shape[1]
-        inside = (local >= 0) & (local < part.shape[0])
-        taken = mx.take(part, mx.where(inside, local, 0), axis=0)
+        part = cache[first : first + blocks_per_take]
+        local = ids - first * rows_per_block
+        inside = (local >= 0) & (local < part.shape[0] * rows_per_block)
+        safe = mx.where(inside, local, 0)
+        taken = part[safe // rows_per_block, safe % rows_per_block]
         mask = inside.reshape(-1, *([1] * len(row_shape)))
         rows = taken if rows is None else mx.where(mask, taken, rows)
     assert rows is not None

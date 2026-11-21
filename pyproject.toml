@@ -37,8 +37,8 @@ dependencies = [
     "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@4cfc6478473b0668ede3eb0cc93f2a9181a15052 ; platform_system == 'Darwin' and platform_machine == 'arm64'",
     "llguidance>=1.7.0,<1.8.0; platform_machine == 'x86_64' or platform_machine == 'arm64' or platform_machine == 'aarch64' or platform_machine == 'ppc64le'",
     # Includes LFM3 and EmbeddingGemma 2 model definitions; requires MLX >=0.32.4.
-    # Pin the merged LFM3-VL processor fix (mlx-vlm#2640) until its release.
-    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@b7bec926d061b6fd8935b244eb3e76435aa04514 ; platform_system == 'Darwin' and platform_machine == 'arm64'",
+    # Includes Inkling Mini's looped model and native NVFP4/MXFP8 loader (#2778).
+    "mlx-vlm @ git+https://github.com/Neywa-Labs/mlx-vlm@111ac668078e017c9db1eb3936f4d7a6e0a88f89 ; platform_system == 'Darwin' and platform_machine == 'arm64'",
     # Model loading and weights
     # Keep aligned with vLLM 0.34.0's Transformers bounds, in upstream's own form.
     # vLLM caps transformers in requirements/common.txt since vllm#59614 (5.18.0
@@ -109,7 +109,7 @@ metal = "vllm_metal:register"
 # subprocesses; GGUF loading stays lazy for other model formats.
 [project.entry-points."vllm.general_plugins"]
 gguf_metal = "vllm_metal.gguf.vllm_integration:register"
-# Metal's LFM3-VL and LFM3-Audio classes for the MLX runner, in place of vLLM's own.
+# Model metadata and processor compatibility for the MLX runner.
 metal_model_metadata = "vllm_metal.compat:register_model_compat"
 # Keeps the target context for a shorter draft model on the MLX runner.
 metal_draft_context_limit = "vllm_metal.patches.draft_context_limit:register"

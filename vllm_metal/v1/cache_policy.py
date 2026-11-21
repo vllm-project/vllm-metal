@@ -503,6 +503,9 @@ class ModelCachePolicy:
         self._require_supported_per_layer_shapes()
         block_size = self._runner.cache_config.block_size
         torch_dtype = MLX_TO_TORCH_DTYPE[self._require_kv_cache_dtype()]
+        inkling_plan = getattr(self._runner, "inkling2_plan", None)
+        if inkling_plan is not None:
+            return inkling_plan.cache_specs(block_size, torch_dtype)
         config = get_config()
         use_turboquant = self._use_turboquant(config)
 
@@ -685,6 +688,19 @@ class ModelCachePolicy:
 
     def _initialize_upstream_storage(self, kv_cache_config: KVCacheConfig) -> None:
         self.validate_paged_attention_support()
+        inkling_plan = getattr(self._runner, "inkling2_plan", None)
+        if inkling_plan is not None:
+            from vllm_metal.attention.runtime.inkling2 import Inkling2Runtime
+
+            inkling_runtime = Inkling2Runtime(
+                inkling_plan, self._require_kv_cache_dtype()
+            )
+            inkling_runtime.initialize_from_config(kv_cache_config)
+            inkling_runtime.patch_model(self._runner.model)
+            self._runner.install_paged_attention_runtime(
+                inkling_runtime, block_size=inkling_runtime.kv_group_block_sizes()[0]
+            )
+            return
         if self._runner.is_hybrid:
             runtime = self._build_hybrid_backend()
             runtime.initialize_from_config(kv_cache_config)
