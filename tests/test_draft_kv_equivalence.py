@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Compare real paged draft KV with an independent native MLX-LM forward."""
 
-import gc
-
 import mlx.core as mx
 import numpy as np
 import pytest
@@ -170,11 +168,8 @@ def test_draft_kv_matches_native_after_rejection_and_recompute(
 
     # Sleep frees the one backing the draft shares; the engine recomputes the
     # request after wake. Draft reads and writes must follow the new backing.
-    gc.collect()
-    before = mx.get_active_memory()
     storage.release()
-    gc.collect()
-    assert before - mx.get_active_memory() >= storage.nbytes
+    assert next(iter(storage.tensors.values())).untyped_storage().nbytes() == 0
     storage.reallocate()
     for tensor in storage.tensors.values():
         tensor.fill_(torch.nan)
