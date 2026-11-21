@@ -425,14 +425,16 @@ class MetalWorker(WorkerBase):
             raise NotImplementedError(
                 f"Sleep mode is not supported with {type(self.model_runner).__name__}."
             )
-        before = mx.get_active_memory()
         self.model_runner.release_kv_cache_memory()
         self._kv_cache_released = True
+        runtime = self.model_runner.paged_attention_runtime
+        pool_bytes = runtime.storage.nbytes if runtime is not None else 0
         gc.collect()
         mx.clear_cache()
+        # The pool is not MLX memory, so MLX's meter cannot show it going.
         logger.info(
-            "Sleep mode freed %.2f GiB; %.2f GiB of Metal memory is still in use.",
-            (before - mx.get_active_memory()) / (1 << 30),
+            "Sleep mode released the %.2f GiB KV cache; MLX still holds %.2f GiB.",
+            pool_bytes / (1 << 30),
             mx.get_active_memory() / (1 << 30),
         )
 
