@@ -117,8 +117,6 @@ main() {
     (
       export VLLM_METAL_PYTHON="$python_version"
       export VLLM_METAL_VENV="$wheel_build_dir/venv-$python_version"
-      # Use uv-managed Python like CI; the runner's 3.13 lacks the CMake dev module.
-      export UV_PYTHON_PREFERENCE=only-managed
       # Rebuild each launcher's CPython ABI with the installer's framework pins.
       ./install.sh
       ensure_venv "$VLLM_METAL_VENV"
