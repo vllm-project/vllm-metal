@@ -1015,23 +1015,30 @@ class MetalModelRunner:
         """Hand the runtime's KV storage to the KV connector, and build its driver.
 
         Called by the worker after ``initialize_kv_cache`` when a KV connector
-        is configured. Only the SDPA and MLA runtimes' ``KVCacheStorage`` is
-        registered. Hybrid caches have no layout the connector can address.
+        is configured. Paged runtimes register the upstream ``KVCacheStorage``
+        that contains their attention and recurrent pages.
         """
         from vllm_metal.attention.runtime.mla import MLAPagedAttentionRuntime
         from vllm_metal.attention.runtime.sdpa import SDPAPagedAttentionRuntime
 
         runtime = self._paged_attention_runtime
         storage = None
-        if isinstance(runtime, (SDPAPagedAttentionRuntime, MLAPagedAttentionRuntime)):
+        if isinstance(
+            runtime,
+            (
+                SDPAPagedAttentionRuntime,
+                MLAPagedAttentionRuntime,
+                HybridPagedAttentionRuntime,
+            ),
+        ):
             try:
-                storage = runtime.storage
+                storage = getattr(runtime, "storage", None)
             except RuntimeError:
                 storage = None
         if storage is None:
             raise NotImplementedError(
-                "KV offloading on Metal requires the SDPA or MLA paged attention "
-                "runtime with storage bound from the KV cache config; "
+                "KV offloading on Metal requires paged attention with storage "
+                "bound from the KV cache config; "
                 f"{type(runtime).__name__} provides none."
             )
         # MRv2's driver registers the caches it is given. The Metal connector

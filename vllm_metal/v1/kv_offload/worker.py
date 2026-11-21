@@ -24,6 +24,7 @@ from vllm.v1.kv_offload.base import (
     TransferResult,
 )
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
+from vllm.v1.kv_offload.pointer_utils import iter_pointer_groups
 
 from vllm_metal.attention.caches.storage import KVCacheStorage
 from vllm_metal.v1.kv_offload.shared_region import MetalSharedOffloadRegion
@@ -58,7 +59,6 @@ class MetalKVOffloadWorker(OffloadingWorker):
         self.num_cpu_chunks = num_cpu_chunks
         self.region: MetalSharedOffloadRegion | None = region
         self._finished: list[TransferResult] = []
-        self._sub_slots = np.arange(blocks_per_chunk)
         self._num_gpu_blocks = int(storage.config.num_blocks)
 
         # The pool lives in the shared region so the disk tier reads the same
@@ -161,22 +161,56 @@ class MetalKVOffloadWorker(OffloadingWorker):
         if self.region is None:
             raise RuntimeError("KV offloading worker is shut down")
         group_sizes = device_ptrs.group_block_counts
-        if len(group_sizes) != 1:
-            raise ValueError(f"expected a single KV cache group, got {group_sizes!r}")
-        # Upstream asserts this while resolving; asserts vanish under -O.
+        ref_counts = tuple(map(len, self.kv_caches.group_data_refs))
+        if (
+            len(group_sizes) != len(ref_counts)
+            or device_ptrs.group_data_ref_counts != ref_counts
+        ):
+            raise ValueError(
+                "device pointers do not match the registered cache group counts"
+            )
         if len(device_ptrs.block_indices) != len(group_sizes):
             raise ValueError(
                 f"block_indices must have one entry per KV cache group, got "
                 f"{device_ptrs.block_indices!r} for {group_sizes!r}"
             )
-        if device_ptrs.block_indices[0] < 0:
+        if any(index < 0 for index in device_ptrs.block_indices):
+            raise ValueError("block indices must be non-negative")
+        cpu_ids = cpu_spec.block_ids
+        if len(cpu_ids) and (
+            int(cpu_ids.min()) < 0 or int(cpu_ids.max()) >= self.num_cpu_chunks
+        ):
             raise ValueError(
-                f"block index must be non-negative, got {device_ptrs.block_indices[0]}"
+                f"CPU chunk ids out of range [{int(cpu_ids.min())}, "
+                f"{int(cpu_ids.max())}] for {self.num_cpu_chunks} chunks"
             )
-        group_size = group_sizes[0]
-        if group_size == 0:
+
+        # The groups share the allocator's physical block IDs. Map each group's
+        # pointers and chunk span before gathering/scattering them in one pass.
+        all_ids, all_chunks, all_subs = [], [], []
+        cpu_offset = 0
+        factor = self.blocks_per_chunk
+        for group in iter_pointer_groups(device_ptrs, factor):
+            cpu_end = cpu_offset + group.n_chunks
+            if cpu_end > len(cpu_ids):
+                raise ValueError("CPU chunks too few for the cache groups")
+            lo = group.dev_ptr_offset
+            all_ids.append(
+                self._block_ids(
+                    device_ptrs.ptrs[lo : lo + group.group_size], group.group_idx
+                )
+            )
+            chunk_indices, sub_slots = np.divmod(
+                np.arange(group.group_size) + group.skip, factor
+            )
+            all_chunks.append(cpu_ids[cpu_offset + chunk_indices])
+            all_subs.append(sub_slots)
+            cpu_offset = cpu_end
+        if cpu_offset != len(cpu_ids):
+            raise ValueError("extra CPU chunks for the cache groups")
+        if not all_ids:
             return
-        gpu_ids = self._block_ids(device_ptrs.ptrs[:group_size])
+        gpu_ids = np.concatenate(all_ids)
         if int(gpu_ids.min()) < 0 or int(gpu_ids.max()) >= self._num_gpu_blocks:
             raise ValueError(
                 f"GPU block ids out of range [{int(gpu_ids.min())}, "
@@ -185,31 +219,19 @@ class MetalKVOffloadWorker(OffloadingWorker):
         # The scatter writes destinations in parallel; repeats would race.
         if not store and len(np.unique(gpu_ids)) != len(gpu_ids):
             raise ValueError("duplicate GPU block ids in a load")
-        factor = self.blocks_per_chunk
-        skip = device_ptrs.block_indices[0] % factor
-        cpu_ids = cpu_spec.block_ids
-        if int(cpu_ids.min()) < 0 or int(cpu_ids.max()) >= self.num_cpu_chunks:
-            raise ValueError(
-                f"CPU chunk ids out of range [{int(cpu_ids.min())}, "
-                f"{int(cpu_ids.max())}] for {self.num_cpu_chunks} chunks"
-            )
-        if len(cpu_ids) * factor < skip + group_size:
-            raise ValueError(
-                f"CPU chunks too few: {len(cpu_ids)} x {factor} < {skip} + {group_size}"
-            )
-        chunks = np.repeat(cpu_ids, factor)[skip : skip + group_size]
-        subs = np.tile(self._sub_slots, len(cpu_ids))[skip : skip + group_size]
+        chunks = np.concatenate(all_chunks)
+        subs = np.concatenate(all_subs)
         step = self._blocks_per_slice
-        for lo in range(0, group_size, step):
+        for lo in range(0, len(gpu_ids), step):
             yield gpu_ids[lo : lo + step], chunks[lo : lo + step], subs[lo : lo + step]
 
-    def _block_ids(self, ptrs: np.ndarray) -> np.ndarray:
+    def _block_ids(self, ptrs: np.ndarray, group_index: int) -> np.ndarray:
         """Invert ``resolve_device_pointers`` for the group's first data ref.
 
         Every data ref of a group addresses the same blocks, and the copies
         move every page, so one ref is enough.
         """
-        ref = self.kv_caches.group_data_refs[0][0]
+        ref = self.kv_caches.group_data_refs[group_index][0]
         tensor = self.kv_caches.tensors[ref.tensor_idx].tensor
         # A pointer below the base wraps outside the range _slices accepts.
         offsets = ptrs - np.uint64(tensor.data_ptr())

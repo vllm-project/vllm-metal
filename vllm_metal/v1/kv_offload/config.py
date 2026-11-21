@@ -64,9 +64,10 @@ def default_host_pool_bytes(vllm_config: VllmConfig) -> int:
     retried on the next step. Two full-length requests is the smallest pool
     with no retries at concurrency 4 in the #1037 measurements, where every
     size from half a request to four stored the same bytes. Prompts there
-    were shorter than each pool. Offloading serves only uniform
-    full-attention models, whose KV is ``2 * kv_heads * head_size`` elements
-    per token and layer. MLA keeps one latent row of
+    were shorter than each pool. Full-attention KV is
+    ``2 * kv_heads * head_size`` elements per token and layer. For GDN
+    hybrids, this estimates the attention portion before the state layout
+    is resolved. MLA keeps one latent row of
     ``kv_lora_rank + qk_rope_head_dim``. A compressed layout only lets the
     same bytes hold more blocks. The token count rounds up to whole blocks
     once the block size is known.
@@ -164,12 +165,9 @@ def configure_kv_offloading(vllm_config: VllmConfig) -> None:
         raise NotImplementedError(
             "KV offloading on Metal does not support pooling models."
         )
-    # Hybrid models keep recurrent state the connector cannot restore. The
-    # connector refuses their extra cache groups too, but after the weights.
-    if model_config.is_hybrid:
+    if model_config.is_hybrid and not cache_config.enable_prefix_caching:
         raise NotImplementedError(
-            "KV offloading on Metal supports a single full-attention KV cache "
-            "group; hybrid models are not supported."
+            "Hybrid KV offloading on Metal requires --enable-prefix-caching."
         )
     speculative_config = vllm_config.speculative_config
     if speculative_config is not None and speculative_config.method in (

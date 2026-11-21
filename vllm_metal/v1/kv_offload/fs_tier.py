@@ -113,14 +113,14 @@ class MetalFileSystemTierManager(FileSystemTierManager):
         tier_type: str,
         root_dir: str,
         max_size_gib: float | None = None,
+        hybrid_layout: str = "",
         **kwargs,
     ) -> None:
         # The factory passes the class name; report "fs" like the CUDA path.
         tier_type = "fs"
         store_dir = prepare_root_dir(root_dir)
         signature = layout_signature()
-        if signature:
-            store_dir = os.path.join(store_dir, signature)
+        store_dir = os.path.join(store_dir, *filter(None, (signature, hybrid_layout)))
         _make_private_dir(store_dir)
         if store_dir != root_dir:
             logger.info("KV store blocks live under %s (Spotlight-excluded)", store_dir)
