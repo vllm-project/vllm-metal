@@ -177,14 +177,8 @@ class _Attention(nn.Module):
             attn.rel_scale,
         )
         if not attn.is_sliding and cfg.log_scaling_n_floor is not None:
-            positions = mx.concatenate(
-                [
-                    mx.arange(hi - lo) + ctx.offsets[request] + 1
-                    for request, (lo, hi) in enumerate(runtime.segments())
-                ]
-            )
             tau = 1 + cfg.log_scaling_alpha * mx.log(
-                mx.maximum(positions / cfg.log_scaling_n_floor, 1)
+                mx.maximum(runtime.positions() / cfg.log_scaling_n_floor, 1)
             )
             q = (q.astype(mx.float32) * tau[:, None, None]).astype(x.dtype)
             r = (r.astype(mx.float32) * tau[:, None, None]).astype(x.dtype)
@@ -253,10 +247,36 @@ class _Convolution(nn.Module):
         name = runtime.plan.conv_name(cache.visit, stream)
         index = runtime.conv_indices[name]
         views = runtime.conv_views
+        tail = self.inner.kernel_size - 1
         outputs = []
-        for request, (lo, hi) in enumerate(runtime.segments()):
+        count, history_ids, valid, write_ids = runtime.decode_rows(name)
+        if count:
+            # Leading one-token requests run as one batch: one history gather,
+            # one upstream call and one scatter, whatever the batch size.
+            state = gather_cache_rows(
+                views[index], history_ids, views.descriptors[index][2][0]
+            ).astype(mx.float32)
+            state = state.reshape(count, tail, -1)
+            if valid is not None:
+                state = mx.where(valid, state, 0)
+            native_cache = ArraysCache(4)
+            native_cache[stream] = state
+            inputs = x[:, :count]
+            views[index] = get_ops().gdn_state_scatter(
+                views[index],
+                inputs[0].astype(views[index].dtype),
+                write_ids,
+                paged=True,
+            )
+            batched = self.inner(
+                inputs.reshape(count, 1, -1),
+                *(arg[:, :count].reshape(count, 1, -1) for arg in dynamic),
+                cache=native_cache,
+            )
+            outputs.append(batched.reshape(1, count, -1))
+        segments = list(runtime.segments())
+        for request, (lo, hi) in enumerate(segments[count:], start=count):
             offset = runtime.context.offsets[request]
-            tail = self.inner.kernel_size - 1
             history = runtime.slots(name, request, max(0, offset - tail), offset)
             state = gather_cache_rows(
                 views[index], history, views.descriptors[index][2][0]
@@ -313,6 +333,8 @@ class Inkling2Runtime(PagedAttentionRuntimeBase):
 
     def __init__(self, plan: Inkling2Plan, dtype: mx.Dtype):
         self.plan, self.dtype = plan, dtype
+        self._memo_context: Any = None
+        self._memo: dict[Any, Any] = {}
 
     def initialize_from_config(self, config):
         self.storage = KVCacheStorage(config)
@@ -353,6 +375,67 @@ class Inkling2Runtime(PagedAttentionRuntimeBase):
     def segments(self):
         lengths = self.context.cu_seqlens
         return zip(lengths[:-1], lengths[1:], strict=True)
+
+    def _per_forward(self, key, build):
+        """Build a value from this forward's metadata once, for every layer."""
+        ctx = self.context  # A new context per forward, so entries never go stale.
+        if self._memo_context is not ctx:
+            self._memo_context, self._memo = ctx, {}
+        if key not in self._memo:
+            self._memo[key] = build()
+        return self._memo[key]
+
+    def positions(self) -> mx.array:
+        """One-based absolute position of every packed token."""
+        return self._per_forward("positions", self._build_positions)
+
+    def _build_positions(self):
+        offsets = self.context.offsets
+        return mx.array(
+            [
+                offset + 1 + i
+                for offset, (lo, hi) in zip(offsets, self.segments(), strict=True)
+                for i in range(hi - lo)
+            ],
+            dtype=mx.int32,
+        )
+
+    def decode_rows(self, name: str):
+        """Count, history slots, history mask and write slots of the leading
+        one-token requests in ``name``'s KV group."""
+        group = self._groups[name]
+        return self._per_forward(("decode", group), lambda: self._build_rows(group))
+
+    def _build_rows(self, group_index: int):
+        ctx = self.context
+        count = 0
+        for lo, hi in self.segments():
+            if hi - lo != 1:
+                break
+            count += 1
+        if not count:
+            return 0, None, None, None
+        group = ctx.kv_groups[group_index]
+        block_size = group.block_size
+        tail = self.plan.conv_kernel_size - 1
+        history, valid, write = [], [], []
+        for request in range(count):
+            table, offset = group.block_tables[request], ctx.offsets[request]
+            for position in range(offset - tail, offset):
+                valid.append(position >= 0)
+                # Rows before the sequence start read position 0 and are masked.
+                position = max(position, 0)
+                history.append(
+                    table[position // block_size] * block_size + position % block_size
+                )
+            write.append(table[offset // block_size] * block_size + offset % block_size)
+        mask = None if all(valid) else mx.array(valid).reshape(count, tail, 1)
+        return (
+            count,
+            mx.array(history, dtype=mx.int32),
+            mask,
+            mx.array(write, dtype=mx.int32),
+        )
 
     def slots(self, name: str, request: int, start: int, end: int):
         group = self.context.kv_groups[self._groups[name]]
