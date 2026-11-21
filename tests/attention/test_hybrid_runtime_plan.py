@@ -163,6 +163,24 @@ class TestGdnPlanDecision:
             ATTENTION_LAYER,
         )
 
+    def test_topology_follows_an_explicit_layer_types_order(self) -> None:
+        layer_types = [
+            "linear_attention",
+            "full_attention",
+            "full_attention",
+            "linear_attention",
+            "linear_attention",
+            "full_attention",
+            "linear_attention",
+            "linear_attention",
+        ]
+        plan = build_gdn_hybrid_plan(
+            dict(GDN_ARGS, layer_types=layer_types), 8, STATE_DTYPES
+        )
+
+        assert plan.layers.attention_indices == (1, 2, 5)
+        assert plan.layers.state_indices == (0, 3, 4, 6, 7)
+
     def test_geometry_packs_qk_and_v_into_the_conv_stream(self) -> None:
         plan = build_gdn_hybrid_plan(GDN_ARGS, 8, STATE_DTYPES)
 
