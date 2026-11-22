@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import functools
 import json
 from collections import OrderedDict
 from collections.abc import Sequence
@@ -459,27 +458,6 @@ _NATIVE_MM_RULES: dict[
     "lfm3_vl": (frozenset(), _LFM3_VL_ARCHITECTURES),
     "lfm2_vl": (_LFM2_VL_MODEL_TYPES, _LFM2_VL_ARCHITECTURES),
 }
-
-
-@functools.cache
-def _kv_cache_classes() -> tuple[tuple[type, ...], tuple[type, ...]]:
-    """(rotating, full) KV cache classes of mlx-lm and mlx-vlm.
-
-    mlx-vlm defines its own cache classes rather than subclassing mlx-lm's,
-    so a model it loads (Gemma 3, for instance) builds caches of either kind.
-    """
-    from mlx_lm.models import cache as lm
-
-    rotating: list[type] = [lm.RotatingKVCache]
-    full: list[type] = [lm.KVCache]
-    try:
-        from mlx_vlm.models import cache as vlm
-    except ImportError:
-        pass
-    else:
-        rotating.append(vlm.RotatingKVCache)
-        full.append(vlm.KVCache)
-    return tuple(rotating), tuple(full)
 
 
 class DefaultModelAdapter(ModelAdapter):
@@ -1300,16 +1278,23 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
             return None
         # TODO: Contribute a per-layer attention-layout API to mlx-lm, then
         # read that metadata here instead of inferring it from KV cache classes.
-        rotating, full = _kv_cache_classes()
+        from mlx_lm.models import cache as lm_cache
+        from mlx_vlm.models import cache as vlm_cache
+
+        rotating_cache_types = (
+            lm_cache.RotatingKVCache,
+            vlm_cache.RotatingKVCache,
+        )
+        full_cache_types = (lm_cache.KVCache, vlm_cache.KVCache)
 
         caches = make_cache()
         if len(caches) != num_layers:
             return None
         windows: list[int] = []
         for cache in caches:
-            if isinstance(cache, rotating) and cache.keep == 0:
+            if isinstance(cache, rotating_cache_types) and cache.keep == 0:
                 windows.append(int(cache.max_size))
-            elif isinstance(cache, full):
+            elif isinstance(cache, full_cache_types):
                 windows.append(-1)
             else:
                 return None
