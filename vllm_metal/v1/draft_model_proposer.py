@@ -58,7 +58,6 @@ from typing import TYPE_CHECKING, Any
 from weakref import WeakValueDictionary
 
 import mlx.core as mx
-import numpy as np
 from mlx_lm.utils import load_model as mlx_lm_load_model
 from vllm.logger import init_logger
 from vllm.v1.outputs import DraftTokenIds
@@ -80,7 +79,7 @@ from vllm_metal.v1.proposer import (
     PendingDraftProbs,
     validate_scheduler_blocks,
 )
-from vllm_metal.v1.sampling_batch import SamplingBatch
+from vllm_metal.v1.sampling_batch import SamplingBatch, sample_from_probabilities
 from vllm_metal.v1.spec_decode import SpeculativeDecodeController
 
 if TYPE_CHECKING:
@@ -561,18 +560,10 @@ class DraftModelProposer(NoOwnKVProposer):
                 draft_logits = draft_logits[:, :vocab_size]
 
             if probabilistic:
-                probs = SamplingBatch.processed_probabilities(
+                probs = SamplingBatch.native_sampling_probabilities(
                     draft_logits, sampling_params
                 )
-                mx.eval(probs)
-                prob_rows = np.asarray(probs.tolist(), dtype=np.float64)
-                tokens = mx.array(
-                    [
-                        self._controller._sample_probabilities(row, rng)
-                        for row, rng in zip(prob_rows, rngs, strict=True)
-                    ],
-                    dtype=mx.int32,
-                )
+                tokens = sample_from_probabilities(probs, rngs).astype(mx.int32)
                 draft_prob_cols.append(probs)
             else:
                 tokens = mx.argmax(draft_logits, axis=-1)

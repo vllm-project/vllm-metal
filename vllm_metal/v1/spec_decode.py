@@ -5,14 +5,18 @@ from __future__ import annotations
 
 from collections.abc import Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import mlx.core as mx
 import numpy as np
 from vllm.v1.core.sched.output import SchedulerOutput
 
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPDraftSeed
-from vllm_metal.v1.sampling_batch import GREEDY_TEMPERATURE_EPS, SamplingBatch
+from vllm_metal.v1.sampling_batch import (
+    GREEDY_TEMPERATURE_EPS,
+    SamplingBatch,
+    sample_from_probabilities,
+)
 
 if TYPE_CHECKING:
     from vllm.config.speculative import SpeculativeConfig
@@ -404,97 +408,107 @@ class SpeculativeDecodeController:
             for (_, state), segment in zip(decode_reqs, decode_segments, strict=True)
             for _ in range(segment.num_query_tokens)
         ]
-        target_probs = SamplingBatch.processed_probabilities(target_logits, row_params)
-        mx.eval(target_probs)
-        probs = np.asarray(target_probs.tolist(), dtype=np.float64)
+        target_probs = SamplingBatch.native_sampling_probabilities(
+            target_logits, row_params
+        )
+        # Transfer only the probabilities of the drafted IDs for acceptance.
+        # The full rows stay in MLX for the residual and bonus draws.
+        target_scores: dict[str, mx.array] = {}
+        draft_scores: dict[str, mx.array] = {}
+        row_start = 0
+        for segment in decode_segments:
+            req_id = segment.req_id
+            num_drafts = len(segment.draft_token_ids)
+            start = row_start
+            row_start += segment.num_query_tokens
+            if not num_drafts:
+                continue
+
+            if any(not 0 <= token < vocab_size for token in segment.draft_token_ids):
+                raise ValueError(f"Draft token outside vocabulary for {req_id!r}")
+            token_ids = mx.array(segment.draft_token_ids, dtype=mx.int32)[:, None]
+            target_scores[req_id] = mx.take_along_axis(
+                target_probs[start : start + num_drafts], token_ids, axis=-1
+            ).reshape(-1)
+            if draft_sample_method == "probabilistic":
+                q = draft_probs_by_req[req_id].probs
+                if q.ndim != 2 or q.shape[0] < num_drafts or q.shape[1] != vocab_size:
+                    raise ValueError(f"Draft probability shape mismatch for {req_id!r}")
+                draft_scores[req_id] = mx.take_along_axis(
+                    q[:num_drafts], token_ids, axis=-1
+                ).reshape(-1)
+        if target_scores:
+            mx.eval(*target_scores.values(), *draft_scores.values())
 
         output: list[list[int]] = []
+        draw_rows: list[mx.array] = []
+        rngs: list[np.random.Generator] = []
         row_start = 0
-        for (req_id, _), segment in zip(decode_reqs, decode_segments, strict=True):
-            target_rows = probs[row_start : row_start + segment.num_query_tokens]
-            row_start += segment.num_query_tokens
-
+        for segment in decode_segments:
+            req_id = segment.req_id
             rng = rng_by_req.get(req_id)
             if rng is None:
                 raise ValueError(f"Missing verification RNG for {req_id!r}")
+            target_rows = target_probs[row_start : row_start + segment.num_query_tokens]
+            row_start += segment.num_query_tokens
 
-            # If the scheduler admitted a request with no drafts, the draft
-            # proposer will not have produced any draft probabilities for it, so
-            # we sample the bonus row directly from the target distribution.
-            if not segment.draft_token_ids:
-                output.append([self._sample_probabilities(target_rows[-1], rng)])
-                continue
-
-            q: np.ndarray | None = None
-            if draft_sample_method == "probabilistic":
-                pending = draft_probs_by_req[req_id]
-                num_drafts = len(segment.draft_token_ids)
-                if (
-                    pending.probs.ndim != 2
-                    or pending.probs.shape[0] < num_drafts
-                    or pending.probs.shape[1] != vocab_size
-                ):
-                    raise ValueError(f"Draft probability shape mismatch for {req_id!r}")
-
-                mx.eval(pending.probs)
-                q = np.asarray(pending.probs.tolist(), dtype=np.float64)
+            target_values = (
+                cast(list[float], target_scores[req_id].tolist())
+                if segment.draft_token_ids
+                else []
+            )
+            draft_values = (
+                cast(list[float], draft_scores[req_id].tolist())
+                if req_id in draft_scores
+                else [1.0] * len(segment.draft_token_ids)
+            )
 
             accepted: list[int] = []
             for offset, draft_token_id in enumerate(segment.draft_token_ids):
-                if not 0 <= draft_token_id < vocab_size:
-                    raise ValueError(f"Draft token outside vocabulary for {req_id!r}")
-
-                if q is None:
-                    draft_row = np.zeros(vocab_size, dtype=np.float64)
-                    draft_row[draft_token_id] = 1.0
-                else:
-                    draft_row = q[offset]
-                draft_token_prob = draft_row[draft_token_id]
-                if draft_token_prob <= 0:
+                draft_token_prob = draft_values[offset]
+                if not draft_token_prob > 0:
                     raise ValueError(
-                        f"Drafted token has zero probability for {req_id!r}"
+                        f"Drafted token has invalid probability for {req_id!r}"
                     )
-
-                target_row = target_rows[offset]
-                target_token_prob = target_row[draft_token_id]
-
-                acceptance = min(1.0, target_token_prob / draft_token_prob)
+                acceptance = min(1.0, target_values[offset] / draft_token_prob)
 
                 # Keep the draft token when it passes the acceptance test.
                 if rng.random() < acceptance:
                     accepted.append(draft_token_id)
                     continue
 
-                # On rejection, resample from the positive residual.
-                residual = np.maximum(target_row - draft_row, 0.0)
-                residual_mass = residual.sum()
-                if residual_mass <= 0:
-                    raise RuntimeError(
-                        f"Rejected draft has no residual mass for {req_id!r}"
+                target_row = target_rows[offset]
+                if draft_sample_method == "probabilistic":
+                    draw_rows.append(
+                        mx.maximum(
+                            target_row - draft_probs_by_req[req_id].probs[offset], 0.0
+                        )
                     )
-                accepted.append(
-                    self._sample_probabilities(residual / residual_mass, rng)
-                )
+                else:
+                    # Subtracting a one-hot proposal only removes the draft ID.
+                    draw_rows.append(
+                        mx.where(
+                            mx.arange(vocab_size) == draft_token_id, 0.0, target_row
+                        )
+                    )
                 break
             else:
-                accepted.append(self._sample_probabilities(target_rows[-1], rng))
+                draw_rows.append(target_rows[-1])
             output.append(accepted)
+            rngs.append(rng)
+
+        # Gumbel-max accepts unnormalized weights, including the residual.
+        drawn_tokens = cast(
+            list[int], sample_from_probabilities(mx.stack(draw_rows), rngs).tolist()
+        )
+        for accepted, token_id in zip(output, drawn_tokens, strict=True):
+            accepted.append(token_id)
 
         for (req_id, _), segment in zip(decode_reqs, decode_segments, strict=True):
             if segment.draft_token_ids and draft_sample_method == "probabilistic":
                 draft_probs_by_req.pop(req_id, None)
 
         return output
-
-    @staticmethod
-    def _sample_probabilities(probs: np.ndarray, rng: np.random.Generator) -> int:
-        cumulative = np.cumsum(probs)
-        index = int(
-            np.searchsorted(cumulative, rng.random() * cumulative[-1], side="right")
-        )
-        if index >= len(probs):
-            raise RuntimeError("Probability distribution did not cover the draw")
-        return index
 
     def build_gemma4_mtp_draft_seeds(
         self,

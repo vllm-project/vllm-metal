@@ -379,7 +379,7 @@ class SamplingBatch:
         return sorted_desc, sorted_idx
 
     @classmethod
-    def processed_probabilities(
+    def native_sampling_probabilities(
         cls,
         logits_2d: mx.array,
         sampling_params_list: Sequence[SamplingParams],
@@ -836,6 +836,30 @@ def mlx_greedy_tokens(logits_2d: mx.array) -> mx.array:
     pipeline submit the argmax asynchronously and defer the sync one step.
     """
     return mx.argmax(logits_2d, axis=-1)
+
+
+def sample_from_probabilities(
+    probs: mx.array, rngs: Sequence[np.random.Generator]
+) -> mx.array:
+    """Draw one token per row of probability weights with Metal Gumbel-max."""
+    from vllm_metal.metal import get_ops
+
+    if probs.ndim != 2 or probs.shape[0] != len(rngs):
+        raise ValueError("Expected one row of probability weights per RNG")
+    seeds = mx.array(
+        [int(rng.integers(-(1 << 63), 1 << 63)) for rng in rngs], dtype=mx.int64
+    )
+    tokens = get_ops().gumbel_sample(
+        mx.log(probs.astype(mx.float32)),
+        seeds,
+        mx.zeros((len(rngs),), dtype=mx.int64),
+        mx.ones((len(rngs),), dtype=mx.float32),
+        None,
+    )
+    chosen_weights = mx.take_along_axis(probs, tokens[:, None], axis=-1)
+    if not mx.all(chosen_weights > 0).item():
+        raise RuntimeError("Cannot sample a row without positive probability mass")
+    return tokens
 
 
 def sample_from_logits(
