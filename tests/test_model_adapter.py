@@ -1617,6 +1617,41 @@ class TestBuildSlidingWindowPerLayer:
 
         assert result == expected
 
+    def test_mlx_vlm_cache_factory_drives_windows(self) -> None:
+        """mlx-vlm builds its own cache classes, not subclasses of mlx-lm's."""
+        from mlx_vlm.models import cache as vlm_cache
+        from mlx_vlm.models.gemma3 import language
+        from mlx_vlm.models.gemma3.config import TextConfig
+
+        config = TextConfig(
+            model_type="gemma3_text",
+            hidden_size=8,
+            num_hidden_layers=12,
+            intermediate_size=16,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=4,
+            vocab_size=32,
+            sliding_window=512,
+            sliding_window_pattern=6,
+        )
+        # The VLM wrapper's text sub-model owns the cache factory.
+        model = SimpleNamespace(language_model=language.LanguageModel(config))
+        caches = model.language_model.make_cache()
+        assert {type(c) for c in caches} == {
+            vlm_cache.RotatingKVCache,
+            vlm_cache.KVCache,
+        }
+        assert not isinstance(caches[0], RotatingKVCache)
+
+        result = DefaultModelAdapter().build_sliding_window_per_layer(
+            {"sliding_window": 512, "sliding_window_pattern": 6},
+            num_layers=12,
+            model=model,
+        )
+
+        assert result == [512] * 5 + [-1] + [512] * 5 + [-1]
+
     @pytest.mark.parametrize(
         "caches",
         [
