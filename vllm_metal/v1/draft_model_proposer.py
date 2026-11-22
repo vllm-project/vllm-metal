@@ -454,7 +454,7 @@ class DraftModelProposer(NoOwnKVProposer):
         )
         draft_logits = mx.take(first_logits, drafting_indices, axis=0)
 
-        probabilistic = SpeculativeDecodeController.use_probabilistic_sampling(
+        probabilistic = SpeculativeDecodeController.uses_probabilistic_draft_sampling(
             self._speculative_config
         )
         draft_cols, draft_prob_cols = self._generate_draft_columns(
@@ -606,7 +606,7 @@ class DraftModelProposer(NoOwnKVProposer):
         drafting_req_ids: set[str] = set()
         draft_sample_method = (
             "probabilistic"
-            if SpeculativeDecodeController.use_probabilistic_sampling(
+            if SpeculativeDecodeController.uses_probabilistic_draft_sampling(
                 self._speculative_config
             )
             else "greedy"
@@ -619,6 +619,7 @@ class DraftModelProposer(NoOwnKVProposer):
             ctx.prefill_result_modes,
             ctx.request_states,
             draft_sample_method=draft_sample_method,
+            use_rejection_sampling=True,
         ):
             if num_speculative_tokens <= 0:
                 continue

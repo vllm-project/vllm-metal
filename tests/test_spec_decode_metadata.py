@@ -290,7 +290,9 @@ class TestSpecDecodePolicy:
             _scheduler_output(scheduled_spec_decode_tokens={"r0": [1]}),
             [("r0", _request_state())],
             is_hybrid=True,
-            speculative_config=SimpleNamespace(method="ngram"),
+            speculative_config=SimpleNamespace(
+                method="ngram", rejection_sample_method="standard"
+            ),
             hybrid_family="gdn",
         )
 
@@ -302,7 +304,9 @@ class TestSpecDecodePolicy:
                 _scheduler_output(scheduled_spec_decode_tokens={"r0": [1]}),
                 [("r0", _request_state())],
                 is_hybrid=True,
-                speculative_config=SimpleNamespace(method="ngram"),
+                speculative_config=SimpleNamespace(
+                    method="ngram", rejection_sample_method="standard"
+                ),
                 hybrid_family="mamba2",
             )
 
@@ -312,7 +316,11 @@ class TestSpecDecodePolicy:
                 _scheduler_output(scheduled_spec_decode_tokens={"r0": [1]}),
                 [("r0", _request_state())],
                 is_hybrid=True,
-                speculative_config=SimpleNamespace(method="draft_model"),
+                speculative_config=SimpleNamespace(
+                    method="draft_model",
+                    draft_sample_method="greedy",
+                    rejection_sample_method="standard",
+                ),
             )
 
     def test_hybrid_rejects_invalid_draft_token_sentinel(self) -> None:
@@ -321,7 +329,9 @@ class TestSpecDecodePolicy:
                 _scheduler_output(scheduled_spec_decode_tokens={"r0": [7, -1]}),
                 [("r0", _request_state())],
                 is_hybrid=True,
-                speculative_config=SimpleNamespace(method="ngram"),
+                speculative_config=SimpleNamespace(
+                    method="ngram", rejection_sample_method="standard"
+                ),
             )
 
     def test_hybrid_rejects_scheduler_invalid_spec_tokens(self) -> None:
@@ -333,7 +343,9 @@ class TestSpecDecodePolicy:
                 ),
                 [("r0", _request_state())],
                 is_hybrid=True,
-                speculative_config=SimpleNamespace(method="ngram"),
+                speculative_config=SimpleNamespace(
+                    method="ngram", rejection_sample_method="standard"
+                ),
             )
 
     def test_rejects_invalid_draft_token_sentinel(self) -> None:

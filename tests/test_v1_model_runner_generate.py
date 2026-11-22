@@ -1471,7 +1471,9 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         scheduler_output.has_structured_output_requests = blocker == "structured_output"
         grammar_output = None
         if blocker == "speculative_config":
-            runner.vllm_config.speculative_config = SimpleNamespace(method="ngram")
+            runner.vllm_config.speculative_config = SimpleNamespace(
+                method="ngram", rejection_sample_method="standard"
+            )
         elif blocker == "drafter":
             runner._drafter = Mock()
             runner._drafter.propose.return_value = (None, None)

@@ -8,8 +8,8 @@ are interchangeable implementations; the runner holds no per-method knowledge.
 
 The shared *verify* half stays in
 :class:`vllm_metal.v1.spec_decode.SpeculativeDecodeController`
-(``build_decode_segments`` + ``verify_greedy``); only the *propose* half is
-polymorphic here.
+(``build_decode_segments`` + ``verify_greedy`` or
+``verify_rejection_sampling``); only the *propose* half is polymorphic here.
 """
 
 from __future__ import annotations
