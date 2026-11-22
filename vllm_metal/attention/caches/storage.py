@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import ctypes
+import resource
 from bisect import bisect_right
 from collections.abc import Sequence
 from types import SimpleNamespace
@@ -61,22 +63,60 @@ def allocate_kv_cache_lazily(
     is written) and mixed-precision caches (a block reinterpreted under another
     precision would decode stale bytes as NaN/Inf). Uniform-precision attention
     caches skip per-block zeroing upstream, and their kernels mask every slot
-    past the sequence length, so unwritten memory never reaches an output. Keep
-    vLLM's zero-filled allocation verbatim in that case.
+    past the sequence length, so unwritten memory never reaches an output.
+    Where zeros are needed they come from the OS instead (``_zero_lazily``), so
+    those pools are not committed either.
 
-    Otherwise vLLM's ``allocate`` callback replaces the filled backing buffer
-    with an uninitialized one, so the allocation and its layer views stay
-    entirely upstream; ``tests/attention/test_lazy_kv_allocation.py`` pins that
-    layout.
+    vLLM's ``allocate`` callback replaces the filled backing buffer, so the
+    allocation and its layer views stay entirely upstream;
+    ``tests/attention/test_lazy_kv_allocation.py`` pins that layout.
     """
-    if config.needs_kv_cache_zeroing:
-        return allocate_kv_cache(config, torch.device("cpu"), layout)
-    return allocate_kv_cache(
-        config,
-        torch.device("cpu"),
-        layout,
-        allocate=lambda size: torch.empty(size, dtype=torch.int8, device="cpu"),
+
+    def allocate(size: int) -> torch.Tensor:
+        backing = torch.empty(size, dtype=torch.int8, device="cpu")
+        if config.needs_kv_cache_zeroing:
+            _zero_lazily(backing.view(torch.uint8))
+        return backing
+
+    return allocate_kv_cache(config, torch.device("cpu"), layout, allocate=allocate)
+
+
+_PROT_READ_WRITE = 0x3
+_MAP_PRIVATE_FIXED_ANON = 0x2 | 0x10 | 0x1000
+
+
+def _zero_lazily(raw: torch.Tensor) -> None:
+    """Make a CPU byte tensor read as zeros without writing most of it.
+
+    The whole pages inside it are replaced with fresh anonymous pages, which
+    read as zeros and take no memory until something writes them; a fill would
+    write, and so commit, every page. The tensor keeps its address. The
+    partial pages at either end may hold other data and are zeroed in place.
+    """
+    page = resource.getpagesize()
+    start = raw.data_ptr()
+    first = -(-start // page) * page
+    last = (start + raw.numel()) // page * page
+    if last <= first:
+        raw.zero_()
+        return
+    raw[: first - start].zero_()
+    raw[last - start :].zero_()
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.mmap.restype = ctypes.c_void_p
+    libc.mmap.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_long,
+    ]
+    mapped = libc.mmap(
+        first, last - first, _PROT_READ_WRITE, _MAP_PRIVATE_FIXED_ANON, -1, 0
     )
+    if mapped != first:
+        raise OSError(ctypes.get_errno(), "could not map zero pages over the KV pool")
 
 
 class CacheViews(Sequence[mx.array]):
@@ -209,7 +249,7 @@ class KVCacheStorage:
         """Bring the backing memory back with the layout vLLM scheduled against."""
         self._backing.resize_(self.nbytes)
         if self.config.needs_kv_cache_zeroing:
-            self._raw.zero_()
+            _zero_lazily(self._raw)
         self._wrap_buffers()
 
     def depend(self, arrays: Sequence[mx.array]) -> None:

@@ -112,13 +112,13 @@ def test_attention_only_config_is_allocated_uninitialized():
     )
 
 
-def test_uniform_caches_skip_vllms_zero_filling_allocator(monkeypatch):
+def test_no_config_goes_through_vllms_zero_filling_allocator(monkeypatch):
     """A revert of the lazy path must fail here, not merely cost memory.
 
     The layout assertions below hold for both allocations, so they cannot tell
-    the two apart. This pins the contract itself: a uniform-precision cache
-    delegates to vLLM's allocator with an uninitialized ``allocate`` callback,
-    while a Mamba cache keeps vLLM's zero-filling default.
+    the two apart. This pins the contract itself: every cache delegates to
+    vLLM's allocator with its own ``allocate`` callback. A Mamba cache still
+    reads as zeros, but the zeros come from the OS instead of a fill.
     """
     allocators: list[object] = []
     original = storage_module.allocate_kv_cache
@@ -135,7 +135,7 @@ def test_uniform_caches_skip_vllms_zero_filling_allocator(monkeypatch):
 
     KVCacheStorage(_hybrid_config())
     assert len(allocators) == 2
-    assert allocators[1] is None
+    assert allocators[1] is not None
 
 
 def test_uninitialized_backing_matches_upstream_layout():
@@ -203,6 +203,42 @@ def test_pool_is_not_resident_under_the_workers_wired_limit():
         assert _resident_bytes(backing) == 0
     finally:
         mx.set_wired_limit(previous)
+
+
+# A Mamba-bearing pool of 128 MiB. Attention and state layers share one
+# allocation: 2 layers x 2048-byte pages.
+_HYBRID_POOL_BYTES = 128 << 20
+_HYBRID_POOL_BLOCKS = _HYBRID_POOL_BYTES // (2 * 2048)
+
+
+def _partial_pages_bytes() -> int:
+    """Zeroing writes at most the two partial pages at the ends of the pool."""
+    return 2 * resource.getpagesize()
+
+
+def test_zero_filled_pools_read_zero_without_being_resident():
+    """State is read before it is written, so the pool must read as zeros, but
+    a fill would commit all of it before the first request."""
+    storage = KVCacheStorage(_hybrid_config(num_blocks=_HYBRID_POOL_BLOCKS))
+    backing = next(iter(storage.tensors.values()))
+    assert storage.config.needs_kv_cache_zeroing
+    assert storage.nbytes == _HYBRID_POOL_BYTES
+    assert _resident_bytes(backing) <= _partial_pages_bytes()
+    raw = torch.empty(0, dtype=torch.uint8).set_(backing.untyped_storage())
+    assert not raw.any()
+
+
+def test_wake_zeroes_the_pool_without_committing_it():
+    storage = KVCacheStorage(_hybrid_config(num_blocks=_HYBRID_POOL_BLOCKS))
+    backing = next(iter(storage.tensors.values()))
+    raw = torch.empty(0, dtype=torch.uint8).set_(backing.untyped_storage())
+    raw.fill_(7)
+
+    storage.release()
+    storage.reallocate()
+
+    assert _resident_bytes(backing) <= _partial_pages_bytes()
+    assert not raw.any()
 
 
 def _run_decode(ctx: int, tail_is_nan: bool) -> mx.array:
