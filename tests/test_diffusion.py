@@ -926,7 +926,7 @@ class TestPlatformDiffusionConfig:
         monkeypatch.setattr(MetalPlatform, "_serves_diffusion", True)
         monkeypatch.setattr(MetalPlatform, "_diffusion_canvas_length", _CANVAS)
 
-        MetalPlatform.validate_request(None, SamplingParams(**params))
+        MetalPlatform.validate_request({}, SamplingParams(**params))
 
     def test_rejects_a_canvas_smaller_than_the_served_one(self, monkeypatch) -> None:
         from vllm.exceptions import VLLMValidationError
@@ -940,7 +940,7 @@ class TestPlatformDiffusionConfig:
         with pytest.raises(
             VLLMValidationError, match="smaller than the served canvas"
         ) as exc_info:
-            MetalPlatform.validate_request(None, params)
+            MetalPlatform.validate_request({}, params)
         assert exc_info.value.parameter == "diffusion_canvas_length"
 
     @pytest.mark.parametrize(
@@ -958,7 +958,7 @@ class TestPlatformDiffusionConfig:
         monkeypatch.setattr(MetalPlatform, "_serves_diffusion", True)
 
         with pytest.raises(VLLMValidationError, match="not supported") as exc_info:
-            MetalPlatform.validate_request(None, SamplingParams(**params))
+            MetalPlatform.validate_request({}, SamplingParams(**params))
         assert exc_info.value.parameter == parameter
 
     @pytest.mark.parametrize(
@@ -978,9 +978,9 @@ class TestPlatformDiffusionConfig:
         monkeypatch.setattr(MetalPlatform, "_serves_diffusion", True)
 
         # Disabled values (the defaults, or top_k=-1) are accepted.
-        MetalPlatform.validate_request(None, SamplingParams(top_k=-1, top_p=1.0))
+        MetalPlatform.validate_request({}, SamplingParams(top_k=-1, top_p=1.0))
         with pytest.raises(VLLMValidationError, match=parameter) as exc_info:
-            MetalPlatform.validate_request(None, SamplingParams(**params))
+            MetalPlatform.validate_request({}, SamplingParams(**params))
         assert exc_info.value.parameter == parameter
 
     def test_rejects_turboquant(self, monkeypatch) -> None:

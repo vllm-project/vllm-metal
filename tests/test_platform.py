@@ -22,6 +22,8 @@ from vllm.config import (
 from vllm.config.multimodal import MultiModalConfig
 from vllm.engine.arg_utils import EngineArgs
 from vllm.exceptions import VLLMValidationError
+from vllm.inputs.engine import MultiModalInput, embeds_input, mm_input
+from vllm.multimodal.inputs import MultiModalKwargsItems, PlaceholderRange
 from vllm.pooling_params import LateInteractionParams, PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -111,6 +113,19 @@ class _PluginNgramSpeculatorConfig(NgramSpeculatorConfig):
     """A plugin speculator that builds on vLLM's ngram setup."""
 
     speculator_class = "vllm.v1.worker.gpu.spec_decode.speculator.BaseSpeculator"
+
+
+def _media_input(*modalities: str) -> MultiModalInput:
+    """A rendered multimodal prompt with one item per modality."""
+    return mm_input(
+        prompt_token_ids=list(range(len(modalities))),
+        mm_kwargs=MultiModalKwargsItems({name: [None] for name in modalities}),
+        mm_hashes={name: [name] for name in modalities},
+        mm_placeholders={
+            name: [PlaceholderRange(offset=index, length=1)]
+            for index, name in enumerate(modalities)
+        },
+    )
 
 
 class TestMetalPlatform:
@@ -414,6 +429,62 @@ class TestMetalPlatform:
         monkeypatch.setenv("VLLM_METAL_BACKEND", "mps")
 
         MetalPlatform.validate_request({}, SamplingParams(temperature=0, logprobs=-1))
+
+    @pytest.mark.parametrize("backend", ["mlx", "mps"])
+    @pytest.mark.parametrize(
+        "params",
+        [SamplingParams(temperature=0), PoolingParams()],
+        ids=["generate", "pooling"],
+    )
+    def test_validate_request_rejects_prompt_embeds(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        backend: str,
+        params: SamplingParams | PoolingParams,
+    ) -> None:
+        monkeypatch.setenv("VLLM_METAL_BACKEND", backend)
+        prompt = embeds_input(torch.zeros(2, 8))
+
+        with pytest.raises(
+            VLLMValidationError,
+            match=re.escape("prompt_embeds is not supported on Metal."),
+        ) as exc_info:
+            MetalPlatform.validate_request(prompt, params)
+        assert exc_info.value.parameter == "prompt_embeds"
+
+    def test_validate_request_rejects_media_with_prompt_embeds_on_mlx(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("VLLM_METAL_BACKEND", "mlx")
+        prompt = _media_input("image", "prompt_embeds")
+        params = SamplingParams(temperature=0)
+
+        with pytest.raises(
+            VLLMValidationError,
+            match=re.escape(
+                "prompt_embeds with multimodal input is not supported "
+                "on the MLX backend."
+            ),
+        ) as exc_info:
+            MetalPlatform.validate_request(prompt, params)
+        assert exc_info.value.parameter == "prompt_embeds"
+
+    @pytest.mark.parametrize(
+        ("backend", "modalities"),
+        [("mlx", ("image",)), ("mps", ("image", "prompt_embeds"))],
+        ids=["mlx-media-only", "mps-media-with-embeds"],
+    )
+    def test_validate_request_allows_media_without_prompt_embeds_on_mlx_and_any_on_mps(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        backend: str,
+        modalities: tuple[str, ...],
+    ) -> None:
+        monkeypatch.setenv("VLLM_METAL_BACKEND", backend)
+
+        MetalPlatform.validate_request(
+            _media_input(*modalities), SamplingParams(temperature=0)
+        )
 
     @pytest.mark.parametrize(
         ("pooling_params", "parameter", "message"),

@@ -4,6 +4,7 @@
 import logging
 import os
 import platform as py_platform
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import psutil
@@ -325,7 +326,9 @@ class MetalPlatform(Platform):
         mx.random.seed(seed)
 
     @classmethod
-    def validate_request(cls, processed_inputs: object, params: object) -> None:
+    def validate_request(
+        cls, processed_inputs: Mapping[str, Any], params: object
+    ) -> None:
         """Reject request options that Metal cannot apply correctly."""
         # Keep this import out of module scope: platform discovery imports this
         # module before vLLM finishes selecting the active platform.
@@ -334,6 +337,21 @@ class MetalPlatform(Platform):
         from vllm.sampling_params import SamplingParams
 
         from vllm_metal.v1.pooling.options import unsupported_pooling_option
+
+        if processed_inputs.get("type") == "embeds":
+            raise VLLMValidationError(
+                "prompt_embeds is not supported on Metal.",
+                parameter="prompt_embeds",
+            )
+        if (
+            "prompt_embeds" in processed_inputs.get("mm_kwargs", {})
+            and envs.VLLM_METAL_BACKEND == "mlx"
+        ):
+            raise VLLMValidationError(
+                "prompt_embeds with multimodal input is not supported "
+                "on the MLX backend.",
+                parameter="prompt_embeds",
+            )
 
         # The model runner also rejects these, but by then an exception is
         # fatal to the engine; reject them here so the request gets a 400.
