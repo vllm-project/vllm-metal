@@ -1577,7 +1577,11 @@ class MetalModelRunner:
             self._paged_group_block_sizes,
             merge_verify_windows=self.merge_verify_windows,
             tq_prefill_workspace_bytes=self.tq_prefill_workspace_bytes,
-            all_rows_consumed=needs_prompt_logprob_rows,
+            # LoRA routing covers every packed row, so pruning rows (Gemma 4
+            # YOCO) would leave the adapter layers with fewer rows than routes.
+            all_rows_consumed=(
+                needs_prompt_logprob_rows or self._lora.step_uses_adapter
+            ),
         )
         try:
             ctx = get_context()

@@ -2613,6 +2613,25 @@ class TestStartPagedForwardSelectiveLogits:
         assert captured["all_rows_consumed"] is prompt_logprobs
         assert captured["logits_indices"] == logits_indices
 
+    @pytest.mark.parametrize("lora_id", [7, None], ids=["adapter", "base_model"])
+    def test_keeps_every_row_when_the_step_routes_an_adapter(
+        self, monkeypatch, lora_id: int | None
+    ) -> None:
+        """Gemma 4 YOCO prunes prefill rows, but LoRA routes one index per row."""
+        runner = self._make_runner()
+        runner._lora._manager = SimpleNamespace(set_active_adapters=lambda *_: None)
+        runner._lora._requests_by_id[7] = object()
+        runner._lora.prepare_step([(lora_id, 3)])
+
+        captured = self._run(
+            runner,
+            monkeypatch,
+            [self._make_prefill("r0", [1, 2, 3])],
+            num_logits_rows=1,
+        )
+
+        assert captured["all_rows_consumed"] is (lora_id is not None)
+
     def test_does_not_request_selection_when_unsupported(self, monkeypatch) -> None:
         runner = self._make_runner(_selective_logits_supported=False)
         captured = self._run(
