@@ -881,7 +881,8 @@ def sdpa_forward(
                 k_3d,
                 v_3d,
                 slot_mapping,
-                kv_cache.key_caches[layer_idx],
+                kv_cache.key_caches,
+                layer_idx,
                 cache_block_size,
             )
         else:

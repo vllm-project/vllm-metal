@@ -81,12 +81,17 @@ static MTL::ResidencySet* kv_residency_set() {
   return set;
 }
 
-static void wire_buffer(const array& a, bool wire) {
-  auto* buf = static_cast<MTL::Buffer*>(const_cast<void*>(a.buffer().ptr()));
+// One commit for the whole batch: a commit per buffer would cost one per
+// layer and chunk.
+static void wire_buffers(const std::vector<array>& arrays, bool wire) {
+  if (arrays.empty()) return;
   auto* set = kv_residency_set();
-  if (wire) set->addAllocation(buf); else set->removeAllocation(buf);
+  for (const auto& a : arrays) {
+    auto* buf = static_cast<MTL::Buffer*>(const_cast<void*>(a.buffer().ptr()));
+    if (wire) set->addAllocation(buf); else set->removeAllocation(buf);
+  }
   set->commit();
-  set->requestResidency();
+  if (wire) set->requestResidency();
 }
 
 void use_kv_residency_on(metal::CommandEncoder& enc) {
@@ -329,7 +334,7 @@ NB_MODULE(_paged_ops, m) {
         "q4_0/int4/uint4/int2/uint2 at k_bits in {2,3,4,5,8}). V supports "
         "any v_bits in [1, 8] via the v_centroids buffer.");
 
-  m.def("_wire_buffer", &wire_buffer, nb::arg("array"), nb::arg("wire") = true,
+  m.def("_wire_buffers", &wire_buffers, nb::arg("arrays"), nb::arg("wire") = true,
         "Add (or remove) a buffer to the KV chunk residency set.");
   m.def("_use_kv_residency", &use_kv_residency,
         "Attach the KV chunk residency set to the current command buffer.");

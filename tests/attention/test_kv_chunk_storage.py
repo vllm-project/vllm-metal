@@ -103,7 +103,7 @@ def _write(storage, cache, layer, slots, key, value):
         )
     else:
         k, v = storage.write_chunked(
-            key, value, slots, cache.key_caches[layer], BLOCK_SIZE
+            key, value, slots, cache.key_caches, layer, BLOCK_SIZE
         )
     cache.replace_layer_cache(layer, k, v)
 
@@ -225,6 +225,36 @@ def test_block_copies_and_zeroing_match_the_plain_pool(chunked, plain):
         assert not _attend(
             chunked, caches["chunked"], layer, query, [zeroed], BLOCK_SIZE
         ).any()
+
+
+def test_rewired_chunks_receive_every_layers_writes(chunked, plain):
+    """A reclaimed chunk is re-wrapped on its next write and may get a new GPU
+    address; every layer's write, the first one included, must land in it."""
+    block_ids = [1, BLOCKS_PER_CHUNK + 1]
+    query = mx.ones((1, Q_HEADS, HEAD_DIM)).astype(mx.float16)
+    spare = torch.empty(1 << 20, dtype=torch.uint8)
+    decoys: list[list[mx.array]] = []
+    # A re-wrap often keeps the old address, so cycle a few times.
+    for seed in range(4):
+        caches = {
+            name: _fill(storage, block_ids, ctx=2 * BLOCK_SIZE, seed=seed)
+            for name, storage in (("chunked", chunked), ("plain", plain))
+        }
+        for layer in range(len(LAYERS)):
+            np.testing.assert_array_equal(
+                _attend(
+                    chunked, caches["chunked"], layer, query, block_ids, 2 * BLOCK_SIZE
+                ),
+                _attend(
+                    plain, caches["plain"], layer, query, block_ids, 2 * BLOCK_SIZE
+                ),
+            )
+        assert chunked.reclaim_idle_chunks({0}, min_idle_steps=1)
+        # Wrappers made in between take the freed GPU addresses, so the
+        # re-wrapped chunks get new ones, as happens under load.
+        decoys.append(
+            [get_ops().wrap_host_memory(spare.data_ptr(), 64, 16384) for _ in LAYERS]
+        )
 
 
 def test_idle_chunks_are_reclaimed_and_rewired_on_demand(chunked):

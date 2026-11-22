@@ -286,7 +286,7 @@ class KVCacheStorage:
         self.buffers = [mx.array(addrs) for addrs in self._addrs]
         self._wired_chunks: set[int] = set()
         self._idle_steps: dict[int, int] = {}
-        self._wired_slots_id: int | None = None
+        self._wired_slots: mx.array | None = None
         # Strides the kernels use, in elements of the cache dtype. Kernels see a
         # layer as [block, token, head, C]; the upstream view is
         # [block, head, token, C], so read them off the transposed view.
@@ -339,13 +339,16 @@ class KVCacheStorage:
         key: mx.array,
         value: mx.array,
         slot_mapping: mx.array,
-        key_table: mx.array,
+        key_caches: CacheViews,
+        layer: int,
         block_size: int,
     ) -> tuple[mx.array, mx.array]:
-        """Scatter K/V rows into the chunks behind ``key_table``.
+        """Scatter K/V rows into the chunks of ``key_caches[layer]``.
 
-        Wires the chunks the slots fall in first. Returns the K and V tables the
-        attention read must depend on; V is K shifted to the value half of a row.
+        Wires the chunks the slots fall in first, then reads the layer's table,
+        since wiring may re-wrap a reclaimed chunk at a new GPU address. Returns
+        the K and V tables the attention read must depend on; V is K shifted to
+        the value half of a row.
         """
         from vllm_metal.metal import get_ops
 
@@ -356,7 +359,7 @@ class KVCacheStorage:
             key,
             value,
             slot_mapping,
-            key_table,
+            key_caches[layer],
             self.chunk_shift,
             block_size,
             self.chunk_layout,
@@ -371,9 +374,10 @@ class KVCacheStorage:
         Called once per forward step; every layer shares the block ids, so the
         chunk at an index is wired in every region together.
         """
-        if id(slot_mapping) == self._wired_slots_id:
+        if slot_mapping is self._wired_slots:
             return
-        self._wired_slots_id = id(slot_mapping)
+        # Held, not its id(): a freed array's id can come back next step.
+        self._wired_slots = slot_mapping
         slots = np.asarray(slot_mapping)
         chunk_ids = np.unique((slots[slots >= 0] // block_size) >> self.chunk_shift)
         self._wire_chunk_ids({int(c) for c in chunk_ids})
@@ -382,17 +386,24 @@ class KVCacheStorage:
         from vllm_metal.metal import get_ops
 
         ops = get_ops()
-        for c in sorted(chunk_ids - self._wired_chunks):
-            for r, chunks in enumerate(self._chunks):
+        new = sorted(chunk_ids - self._wired_chunks)
+        wrappers = []
+        for r, chunks in enumerate(self._chunks):
+            rewrapped = False
+            for c in new:
                 if chunks[c] is None:
                     # Reclaimed earlier: a fresh wrapper, and the table learns it.
                     chunks[c] = self._new_chunk(r, c)
                     self._addrs[r][c] = ops._buffer_gpu_address(chunks[c])
-                    self.buffers[r] = mx.depends(
-                        mx.array(self._addrs[r]), [self.buffers[r]]
-                    )
-                ops._wire_buffer(chunks[c])
-            self._wired_chunks.add(c)
+                    rewrapped = True
+                wrappers.append(chunks[c])
+            if rewrapped:
+                self.buffers[r] = mx.depends(
+                    mx.array(self._addrs[r]), [self.buffers[r]]
+                )
+        ops._wire_buffers(wrappers)
+        self._wired_chunks.update(new)
+        for c in new:
             self._idle_steps.pop(c, None)
 
     def _chunk_block_ops(self, ids: np.ndarray, *, copy: bool) -> None:
@@ -425,28 +436,28 @@ class KVCacheStorage:
                 idle.append(c)
         if not idle:
             return 0
+        from vllm_metal.metal import get_ops
+
         # The GPU must be done with a chunk before its pages are replaced.
         mx.synchronize()
+        get_ops()._wire_buffers(
+            [
+                chunks[c]
+                for chunks in self._chunks
+                for c in idle
+                if chunks[c] is not None
+            ],
+            False,
+        )
         freed = 0
         for c in idle:
-            for r in range(len(self._chunks)):
-                freed += self._drop_chunk(r, c)
+            for r, chunks in enumerate(self._chunks):
+                if chunks[c] is not None:
+                    chunks[c] = None
+                    freed += _replace_pages(*self._chunk_span(r, c))
             self._wired_chunks.discard(c)
             self._idle_steps.pop(c, None)
         return freed
-
-    def _drop_chunk(self, region: int, chunk: int) -> int:
-        """Unwire a chunk, release its wrapper and return its pages to the OS."""
-        from vllm_metal.metal import get_ops
-
-        wrapper = self._chunks[region][chunk]
-        if wrapper is None:
-            return 0
-        get_ops()._wire_buffer(wrapper, False)
-        self._chunks[region][chunk] = None
-        del wrapper
-        ptr, nbytes = self._chunk_span(region, chunk)
-        return _replace_pages(ptr, nbytes)
 
     @property
     def released(self) -> bool:
@@ -465,11 +476,11 @@ class KVCacheStorage:
         if self.chunk_shift is not None:
             from vllm_metal.metal import get_ops
 
-            for chunks in self._chunks:
-                for wrapper in chunks:
-                    if wrapper is not None:
-                        get_ops()._wire_buffer(wrapper, False)
+            get_ops()._wire_buffers(
+                [w for chunks in self._chunks for w in chunks if w is not None], False
+            )
             self._chunks, self._wired_chunks = [], set()
+            self._wired_slots = None
         self._backing.resize_(0)
 
     def reallocate(self) -> None:
