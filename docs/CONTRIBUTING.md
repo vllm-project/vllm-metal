@@ -72,14 +72,20 @@ Open a pull request against `main` in `vllm-project/vllm-metal`.
 
 ### Pull request limit
 
-To avoid agent spam, vLLM Metal uses GitHub's
-[pull request limit](https://github.blog/open-source/maintainers/how-pull-request-limits-are-cutting-down-the-noise/)
-for contributors without write access. The current cap is 2 open pull requests, including drafts.
-If this blocks well-intentioned critical work, contact a committer to request exemption-list access.
+Contributors without write access may have up to **7 open PRs**, including
+drafts, under [GitHub's pull request limit](https://docs.github.com/en/communities/moderating-comments-and-conversations/limiting-interactions-in-your-repository#limiting-concurrent-open-pull-requests-for-users-without-write-access).
+All authors may have at most **2 PRs ready for review**.
 
-Every pull request must answer the **Contributor intent** questions in the PR
-template. An agent may quote an explicit human answer but must not invent,
-infer, or prefill a missing one; if the human has not answered, stop and ask.
+Drafts remain available for discussion outside the review queue. To reprioritize,
+convert a ready PR to draft before marking another ready.
+Existing PRs stay open. Readiness checks apply when PRs are opened, reopened,
+or marked ready for review.
+
+Before opening a PR as ready or marking it ready, the author must manually check
+both human checklist items. A PR is returned to draft if either confirmation is
+missing or the author already has two other PRs ready for review.
+
+If these limits block important work, contact a maintainer to help prioritize.
 
 ### AI usage policy
 

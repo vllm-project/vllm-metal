@@ -29,7 +29,7 @@ vllm bench serve results. -->
 **BEFORE SUBMITTING:** read [the contributor guide](https://github.com/vllm-project/vllm-metal/blob/main/docs/CONTRIBUTING.md) and run `scripts/lint.sh` plus the relevant tests.
 
 > [!NOTE]
-> To avoid agent spam, vLLM Metal limits contributors without write access to **2 open pull requests**, including drafts. If this blocks well-intentioned critical work, please contact a committer to request exemption-list access.
+> Contributors without write access may have up to **7 open PRs**, including drafts. All authors may have at most **2 PRs ready for review**. See [the contributor guide](https://github.com/vllm-project/vllm-metal/blob/main/docs/CONTRIBUTING.md#pull-request-limit).
 
 ## Checklist
 
