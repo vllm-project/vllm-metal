@@ -36,5 +36,8 @@ vllm bench serve results. -->
 - [ ] I have described the purpose and any compatibility impact.
 - [ ] I have included relevant validation results and noted checks not run.
 - [ ] I have updated documentation where needed.
+
+Before marking this PR ready for review, the author must manually check both human checklist items.
+
 - [ ] I (a human) have written or reviewed the code in this PR to the best of my ability.
 - [ ] I (a human) understand the code changes and can explain their behavior and design choices.
