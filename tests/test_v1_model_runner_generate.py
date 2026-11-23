@@ -41,7 +41,6 @@ from vllm_metal.v1.draft_model_proposer import DraftModelProposer
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPDraftSeed
 from vllm_metal.v1.proposer import Gemma4MTPProposer
 from vllm_metal.v1.sampling import Sampler
-from vllm_metal.v1.sampling_batch import _SamplingResult
 from vllm_metal.v1.spec_decode import PagedDecodeSegment
 from vllm_metal.v1.structured_output import MetalStructuredOutputApplier
 
@@ -1361,12 +1360,20 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         assert draft_state.token_ids == [1, 6, 7, 9]
         assert plain_state.token_ids == [2, 3, 4]
 
+    @pytest.mark.parametrize("native_sampling", [False, True])
     def test_mixed_batch_routes_plain_request_through_sampler(
-        self, monkeypatch
+        self, monkeypatch, native_sampling: bool
     ) -> None:
         runner = self._make_runner()
+        runner._native_sampling_enabled = native_sampling
+        runner.vllm_config.speculative_config = SimpleNamespace(method="ngram")
+        runner._drafter = Mock()
+        runner._drafter.propose.return_value = None
+        runner._sampler = Mock(spec=Sampler)
+        runner._sampler.forward.side_effect = Sampler().forward
         draft_state = self._make_state([1, 6])
         plain_state = self._make_state([2, 3], temperature=0.7)
+        plain_state.sampling_params.top_k = 1
         decode_reqs = [("draft", draft_state), ("plain", plain_state)]
         segments = (
             mr.PagedDecodeSegment(
@@ -1399,23 +1406,25 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
             self._make_logits([7, 9, 4]),
             scheduler_output,
         )
-        sampled_rows = []
+        sample_from_logits = mr.sample_from_logits
 
-        def fake_sample_from_logits(
-            logits_2d, batch, sampler, *, next_native_rng_key=None
-        ):
-            del sampler
-            sampled_rows.append(logits_2d.tolist())
-            assert [sp.temperature for sp in batch.sampling_params_list] == [0.7]
-            return _SamplingResult([4])
+        def sample_plain(logits, batch, sampler, *, next_native_rng_key=None):
+            assert logits.tolist() == [[0.0] * 4 + [10.0] + [0.0] * 11]
+            assert batch.sampling_params_list == [plain_state.sampling_params]
+            return sample_from_logits(
+                logits, batch, sampler, next_native_rng_key=next_native_rng_key
+            )
 
-        monkeypatch.setattr(mr, "sample_from_logits", fake_sample_from_logits)
+        sample = Mock(side_effect=sample_plain)
+        monkeypatch.setattr(mr, "sample_from_logits", sample)
 
         output = runner.sample_tokens(grammar_output=None)
 
         assert output is not None
         assert output.sampled_token_ids == [[7, 9], [4]]
-        assert sampled_rows == [[[0.0] * 4 + [10.0] + [0.0] * 11]]
+        sample.assert_called_once()
+        assert runner._sampler.forward.call_count == int(not native_sampling)
+        assert runner._native_sampling_step == int(native_sampling)
 
     def test_prompt_logprobs_decode_stays_native(self, monkeypatch) -> None:
         monkeypatch.setenv("VLLM_METAL_DECODE_PIPELINE", "1")
@@ -1441,8 +1450,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
             "eligible_mixed",
             "mixed_decode_fallback",
             "mixed_prefill_fallback",
-            "speculative_config",
-            "drafter",
+            "speculative_mixed",
             "grammar_output",
             "structured_output",
         ],
@@ -1469,9 +1477,8 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         )
         scheduler_output.has_structured_output_requests = blocker == "structured_output"
         grammar_output = None
-        if blocker == "speculative_config":
+        if blocker == "speculative_mixed":
             runner.vllm_config.speculative_config = SimpleNamespace(method="ngram")
-        elif blocker == "drafter":
             runner._drafter = Mock()
             runner._drafter.propose.return_value = None
         elif blocker == "grammar_output":
@@ -1485,9 +1492,11 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         )
         mixed = blocker in (
             "eligible_mixed",
+            "speculative_mixed",
             "mixed_decode_fallback",
             "mixed_prefill_fallback",
         )
+        fully_native = blocker in ("eligible", "eligible_mixed", "speculative_mixed")
         if mixed:
             state.sampling_params.top_k = 1
             if blocker == "mixed_decode_fallback":
@@ -1522,14 +1531,14 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
                 cu_seqlens=[0, 1, 2],
                 logits_cu_seqlens=[0, 1, 2],
             )
-            if blocker == "eligible_mixed":
+            if fully_native:
                 expected_steps = 2
 
         batch, _ = runner._sample_paged_batch(grammar_output)
 
         assert len(state.token_ids) == 3
         assert 0 <= state.token_ids[-1] < 16
-        if blocker in ("eligible", "eligible_mixed"):
+        if fully_native:
             runner._sampler.forward.assert_not_called()
         else:
             runner._sampler.forward.assert_called_once()
@@ -1543,7 +1552,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
             assert output.sampled_token_ids == [[7], [4]]
             assert state.token_ids == [1, 6, 4]
             assert runner._request_states["p0"].token_ids == [5, 7]
-            if blocker != "eligible_mixed":
+            if not fully_native:
                 torch_logits = runner._sampler.forward.call_args.args[0]
                 assert torch_logits.argmax(dim=-1).tolist() == [
                     4 if blocker == "mixed_decode_fallback" else 7
@@ -2612,6 +2621,25 @@ class TestStartPagedForwardSelectiveLogits:
 
         assert captured["all_rows_consumed"] is prompt_logprobs
         assert captured["logits_indices"] == logits_indices
+
+    @pytest.mark.parametrize("lora_id", [7, None], ids=["adapter", "base_model"])
+    def test_keeps_every_row_when_the_step_routes_an_adapter(
+        self, monkeypatch, lora_id: int | None
+    ) -> None:
+        """Gemma 4 YOCO prunes prefill rows, but LoRA routes one index per row."""
+        runner = self._make_runner()
+        runner._lora._manager = SimpleNamespace(set_active_adapters=lambda *_: None)
+        runner._lora._requests_by_id[7] = object()
+        runner._lora.prepare_step([(lora_id, 3)])
+
+        captured = self._run(
+            runner,
+            monkeypatch,
+            [self._make_prefill("r0", [1, 2, 3])],
+            num_logits_rows=1,
+        )
+
+        assert captured["all_rows_consumed"] is (lora_id is not None)
 
     def test_does_not_request_selection_when_unsupported(self, monkeypatch) -> None:
         runner = self._make_runner(_selective_logits_supported=False)

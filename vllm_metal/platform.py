@@ -610,7 +610,12 @@ class MetalPlatform(Platform):
             )
         unsupported = [
             name
-            for name in ("enable_trace_replay", "return_sampling_mask")
+            for name in (
+                "enable_trace_replay",
+                "return_sampling_mask",
+                # MLX ignores the embeds; MPS hits MRv2's Triton overlay kernel.
+                "enable_prompt_embeds",
+            )
             if getattr(model_config, name, False)
         ]
         if unsupported:

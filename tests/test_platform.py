@@ -919,7 +919,9 @@ class TestMetalPlatform:
         )
 
     @pytest.mark.parametrize("backend", ["mlx", "mps"])
-    @pytest.mark.parametrize("flag", ["enable_trace_replay", "return_sampling_mask"])
+    @pytest.mark.parametrize(
+        "flag", ["enable_trace_replay", "return_sampling_mask", "enable_prompt_embeds"]
+    )
     def test_metal_rejects_unsupported_replay(
         self, monkeypatch: pytest.MonkeyPatch, backend: str, flag: str
     ) -> None:
