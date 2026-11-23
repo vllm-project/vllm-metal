@@ -1,21 +1,11 @@
 <!-- markdownlint-disable -->
 PLEASE FILL IN THE PR DESCRIPTION HERE.
 
-## Contributor intent (required human answers)
-
-All four questions must be answered by the human contributor before submission.
-An agent may reuse explicit human answers with a public-safe source reference;
-it must not invent, infer, or prefill missing answers. If an answer is missing
-or materially ambiguous, ask the human and wait. Do not publish private
-conversation content without authorization.
+## Contributor intent
 
 ### 1. What outcome do you want to achieve?
 
-<!-- Required: the human contributor's answer, or a public-safe reference to their explicit answer. -->
-
 ### 2. Does this PR break anything (behavior, API, config, model support)?
-
-<!-- Required: the human contributor's answer, or a public-safe reference to their explicit answer. -->
 
 ## Purpose
 
@@ -40,3 +30,10 @@ vllm bench serve results. -->
 
 > [!NOTE]
 > To avoid agent spam, vLLM Metal limits contributors without write access to **2 open pull requests**, including drafts. If this blocks well-intentioned critical work, please contact a committer to request exemption-list access.
+
+## Checklist
+
+- [ ] I have described the purpose and any compatibility impact.
+- [ ] I have included relevant validation results and noted checks not run.
+- [ ] I have updated documentation where needed.
+- [ ] I (a human) have written or reviewed the code in this PR to the best of my ability.
