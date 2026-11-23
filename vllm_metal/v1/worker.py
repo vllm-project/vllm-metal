@@ -237,16 +237,6 @@ class MetalWorker(WorkerBase):
         """
         return self.model_runner.get_kv_cache_spec()
 
-    def initialize_cache(self, num_gpu_blocks: int, num_cpu_blocks: int) -> None:
-        """Initialize the KV cache.
-
-        Args:
-            num_gpu_blocks: Number of GPU cache blocks
-            num_cpu_blocks: Number of CPU cache blocks (unused on Metal)
-        """
-        self.cache_config.num_gpu_blocks = num_gpu_blocks
-        self.cache_config.num_cpu_blocks = num_cpu_blocks
-
     def get_supported_kv_cache_layouts(self) -> list[str]:
         """Report Metal's own page order instead of the CPU backend's LBHNC."""
         return [KV_CACHE_LAYOUT]
