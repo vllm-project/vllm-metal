@@ -23,7 +23,7 @@ Do not open a duplicate PR. Explain any materially different approach in the PR 
 
 ## Pull requests
 
-- Fill the PR template's contributor-intent questions only from explicit human answers. Never invent, infer, or prefill them; if an answer is missing, stop and ask the human before opening the PR.
+- Leave the human checklist items unchecked. The author must check them manually on GitHub.
 
 ## Coding style
 
