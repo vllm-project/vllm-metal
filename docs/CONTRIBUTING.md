@@ -96,10 +96,8 @@ apply to pull requests, issues, discussions, and review comments:
 - **Understand your changes.** Review every generated change and be able to
   explain its behavior, design choices, and interaction with vLLM Metal
   without relying on AI to answer for you.
-- **Validate before submitting.** Run relevant checks and report actual
-  results. For model, kernel, or performance changes, include the Apple Silicon
-  hardware, macOS version, model or checkpoint, configuration, and commands
-  needed to reproduce accuracy or benchmark evidence.
+- **Validate before submitting.** Run relevant checks and report key results.
+  For experiments, put reproduction details in a collapsible section.
 - **Keep communication useful.** Verify technical claims, search for existing
   reports, and edit AI-assisted text for accuracy and brevity. Submit only
   content you have personally reviewed, and take responsibility for responding
