@@ -74,7 +74,11 @@ nav:
   - Features:
     - Structured Decisions: structured_decisions.md
     - GGUF: gguf.md
-    - Speculative Decoding: speculative_decoding.md
+    - Speculative Decoding:
+      - Overview: speculative_decoding.md
+      - DFlash: dflash.md
+      - DSpark: dspark.md
+    - Grouped NAX Prefill: gqa-prefill.md
     - Text Pooling: text_embedding_pooling.md
     - Speech-to-Text: stt.md
     - Omni: omni.md
