@@ -487,7 +487,9 @@ static void dispatch_paged_attention_tiled(
     const array& cu_seqlens_q,
     int block_size, int max_seq_len, int sliding_window, int q_block_offset,
     kernels::TileConfig cfg, Stream s, const array* sinks,
-    const array* mm_prefix_ranges) {
+    const array* mm_prefix_ranges,
+    const array* previous_state = nullptr, bool save_state = false,
+    std::array<int, 2> key_tiles = {}) {
   auto& d = metal::device(s.device);
 
   int total_q_tokens = static_cast<int>(query.shape(0));
@@ -502,10 +504,14 @@ static void dispatch_paged_attention_tiled(
   // Both constants are set on every dispatch: a function that references an
   // unset function constant fails pipeline creation.  MLX caches pipelines
   // by hash_name, so each constant combination needs its own suffix.
+  const bool restore_state = previous_state != nullptr;
   auto* kernel = d.get_kernel(
-      plan.base_kname, lib, plan.hash_name,
+      plan.base_kname, lib, plan.hash_name + (restore_state ? "_r1" : "_r0")
+          + (save_state ? "_s1" : "_s0"),
       {{&plan.use_sinks, MTL::DataType::DataTypeBool, NS::UInteger(40)},
-       {&plan.use_mm_prefix, MTL::DataType::DataTypeBool, NS::UInteger(120)}});
+       {&plan.use_mm_prefix, MTL::DataType::DataTypeBool, NS::UInteger(120)},
+       {&restore_state, MTL::DataType::DataTypeBool, NS::UInteger(121)},
+       {&save_state, MTL::DataType::DataTypeBool, NS::UInteger(122)}});
 
   int num_heads = static_cast<int>(query.shape(1));
   auto& enc = metal::get_command_encoder(s);
@@ -525,10 +531,91 @@ static void dispatch_paged_attention_tiled(
   if (plan.use_mm_prefix) {
     enc.set_input_array(*mm_prefix_ranges, 22);
   }
+  if (restore_state) enc.set_input_array(*previous_state, 23);
+  if (save_state) enc.set_output_array(out, 24);
+  if (restore_state || save_state) enc.set_bytes(key_tiles, 25);
 
   enc.dispatch_threadgroups(
       MTL::Size::Make(num_heads, plan.q_blocks, 1),
       MTL::Size::Make(plan.num_threads, 1, 1));
+}
+
+// Each range consumes the previous range's FP32 online-softmax state.
+// The caller completes it before scheduling another range on the stream.
+class TiledKeyRangePrimitive : public UnaryPrimitive {
+ public:
+  TiledKeyRangePrimitive(Stream stream, int kv_heads, float scale, int block_size,
+                        int key_begin, int key_end, bool final_range)
+      : UnaryPrimitive(stream), kv_heads_(kv_heads), scale_(scale),
+        block_size_(block_size), key_begin_(key_begin), key_end_(key_end),
+        final_range_(final_range) {}
+
+  void eval_cpu(const std::vector<array>&, array&) override {
+    throw std::runtime_error("TiledKeyRangePrimitive only supports GPU");
+  }
+
+  void eval_gpu(const std::vector<array>& in, array& out) override {
+    const auto cfg = *kernels::select_tile_config(in[0].shape(2));
+    out.set_data(allocator::malloc(out.nbytes()));
+    dispatch_paged_attention_tiled(
+        out, in[0], in[1], in[2], kv_heads_, scale_, 0.0f, in[3], in[4],
+        in[5], block_size_, key_end_, -1, 0, cfg, stream(), nullptr, nullptr,
+        in.size() == 7 ? &in[6] : nullptr, !final_range_,
+        {key_begin_ / cfg.TILE_KV, key_end_ / cfg.TILE_KV});
+  }
+
+  const char* name() const override { return "TiledKeyRange"; }
+
+ private:
+  int kv_heads_;
+  float scale_;
+  int block_size_;
+  int key_begin_;
+  int key_end_;
+  bool final_range_;
+};
+
+array tiled_prefill_key_range(
+    const array& q, const array& k, const array& v, const array& table,
+    const array& seq_lens, const array& cu_seqlens_q, float scale,
+    int block_size, int key_begin, int key_end, bool final_range,
+    const array* previous_state) {
+  if (q.ndim() != 3 || k.ndim() != 4 || v.shape() != k.shape() ||
+      q.dtype() != k.dtype() || q.dtype() != v.dtype() ||
+      (q.dtype() != bfloat16 && q.dtype() != float16) ||
+      q.shape(2) != k.shape(3) || k.shape(2) <= 0 ||
+      q.shape(1) % k.shape(2) || table.ndim() != 2 ||
+      seq_lens.ndim() != 1 || cu_seqlens_q.ndim() != 1 ||
+      table.shape(0) != seq_lens.shape(0) ||
+      cu_seqlens_q.shape(0) != seq_lens.shape(0) + 1 ||
+      table.dtype() != int32 || seq_lens.dtype() != int32 ||
+      cu_seqlens_q.dtype() != int32) {
+    throw std::invalid_argument("invalid tiled-attention inputs");
+  }
+  const auto cfg = kernels::select_tile_config(q.shape(2));
+  if (previous_state != nullptr &&
+      (previous_state->dtype() != float32 || previous_state->ndim() != 3 ||
+       previous_state->shape(0) != q.shape(0) ||
+       previous_state->shape(1) != q.shape(1) ||
+       previous_state->shape(2) != q.shape(2) + 2)) {
+    throw std::invalid_argument("invalid tiled-attention FP32 state shape");
+  }
+  if (!cfg || (block_size != 8 && block_size != 16 && block_size != 32) ||
+      k.shape(1) % block_size || key_begin < 0 || key_begin >= key_end ||
+      key_begin % cfg->TILE_KV || key_end % cfg->TILE_KV ||
+      (previous_state == nullptr) != (key_begin == 0) ||
+      (final_range && key_begin == 0)) {
+    throw std::invalid_argument("invalid tiled-attention key range");
+  }
+  auto prim = std::make_shared<TiledKeyRangePrimitive>(
+      default_stream(Device::gpu), k.shape(2), scale, block_size,
+      key_begin, key_end, final_range);
+  std::vector<array> inputs{q, k, v, table, seq_lens, cu_seqlens_q};
+  if (previous_state != nullptr) inputs.push_back(*previous_state);
+  Shape shape = q.shape();
+  if (!final_range) shape[2] += 2;
+  return array(std::move(shape), final_range ? q.dtype() : float32,
+               std::move(prim), std::move(inputs));
 }
 
 // ---------------------------------------------------------------------------
@@ -867,6 +954,46 @@ static PagedAttentionPlan select_paged_attention_route(
       : (partition ? PagedAttentionRoute::SplitKv : PagedAttentionRoute::PerToken);
   plan.route = scratch_fits ? PagedAttentionRoute::GqaDecode : plan.fallback;
   return plan;
+}
+
+std::optional<std::tuple<int, bool>> tiled_prefill_range_plan(
+    const array& query, const array& key, const array& value,
+    int num_seqs, int block_size, int max_seq_len, int num_decode_requests,
+    int num_decode_tokens, int max_decode_context_len,
+    const std::optional<GqaDecodeLengthPlan>& gqa_length_plan) {
+  if (query.ndim() != 3 || key.ndim() != 4 || value.ndim() != 4 ||
+      query.shape(0) <= num_seqs || query.dtype() != key.dtype() ||
+      query.dtype() != value.dtype() ||
+      (block_size != 8 && block_size != 16 && block_size != 32) ||
+      (query.dtype() != bfloat16 && query.dtype() != float16)) {
+    return std::nullopt;
+  }
+  const GqaDecodeLengthPlan empty_plan{};
+  PagedAttentionMetadata metadata{
+      gqa_length_plan ? *gqa_length_plan : empty_plan,
+      query.dtype(), key.dtype(), value.dtype()};
+  metadata.query_tokens = query.shape(0);
+  metadata.query_sequences = num_seqs;
+  metadata.head_size = query.shape(2);
+  metadata.num_heads = query.shape(1);
+  metadata.num_kv_heads = key.shape(2);
+  metadata.block_size = block_size;
+  metadata.max_seq_len = max_seq_len;
+  metadata.sliding_window = -1;
+  metadata.window_seqlen_q = 1;
+  metadata.item_size = query.itemsize();
+  metadata.nax_ready = nax_lib_ready_;
+  metadata.nax_enabled = nax_enabled_;
+  metadata.num_decode_requests = num_decode_requests;
+  metadata.num_decode_tokens = num_decode_tokens;
+  metadata.max_decode_context_len = max_decode_context_len;
+  metadata.nax_split_hint = metadata.nax_prefill_split_hint = -1;
+  const auto plan = select_paged_attention_route(
+      metadata, [] {}, [] {}, gpu_core_count, detected_gpu_core_count);
+  if (plan.route != PagedAttentionRoute::Tiled &&
+      plan.route != PagedAttentionRoute::MixedTiled) return std::nullopt;
+  return std::tuple{plan.tile_config->TILE_KV,
+                    plan.route == PagedAttentionRoute::MixedTiled};
 }
 
 struct PagedAttentionKernelPlan {

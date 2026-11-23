@@ -111,6 +111,10 @@ template <int NBYTES> struct LoadUnit;
 template <> struct LoadUnit<8>  { using type = uint2; };
 template <> struct LoadUnit<16> { using type = uint4; };
 
+constant bool restore_tiled_state [[function_constant(121)]];
+constant bool save_tiled_state [[function_constant(122)]];
+constant bool bound_tiled_keys = restore_tiled_state || save_tiled_state;
+
 template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
           int BQ = 32, int TILE_KV = 32, int NUM_THREADS = 128>
 [[kernel]] void paged_attention_tiled(
@@ -135,6 +139,9 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
     device const int32_t *mm_prefix_ranges
     [[buffer(22), function_constant(use_mm_prefix)]],
     const constant int &q_block_offset [[buffer(30)]],
+    device const float *previous_state [[buffer(23), function_constant(restore_tiled_state)]],
+    device float *next_state [[buffer(24), function_constant(save_tiled_state)]],
+    constant int2 &key_tiles [[buffer(25), function_constant(bound_tiled_keys)]],
     threadgroup char *shared_mem [[threadgroup(0)]],
     uint3 tgp [[threadgroup_position_in_grid]],
     uint3 tgpg [[threadgroups_per_grid]],
@@ -239,6 +246,8 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
   const short2 fc = frag_coord(ushort(lane));
   const short fm = fc.y;   // row within the 8-row tile owned by this SG
   const short fn = fc.x;   // col within the 8-col fragment
+  // Padded rows stay masked and never access online-softmax state.
+  const bool row_masked = int(sg_idx) * 8 + fm >= valid_q;
 
   // Per-thread accumulator state — broadcast across lanes that share fm.
   float max_score = -INFINITY;
@@ -251,14 +260,21 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
   for (int d = 0; d < TD; d++) {
     Oreg[d] = vec2F(0.0f);
   }
+  const int state_row = ((q_seq_start + q_pos_start + sg_idx * 8 + fm) *
+                         num_heads + head_idx) * (HEAD_SIZE + 2);
+  if (restore_tiled_state && !row_masked) {
+    max_score = previous_state[state_row + HEAD_SIZE];
+    sum_score = previous_state[state_row + HEAD_SIZE + 1];
+    #pragma unroll
+    for (int d = 0; d < TD; d++) {
+      Oreg[d] = vec2F(previous_state[state_row + d * 8 + fn],
+                      previous_state[state_row + d * 8 + fn + 1]);
+    }
+  }
 
   const device uint32_t *block_table =
       block_tables + seq_idx * max_num_blocks_per_seq;
   const int num_kv_tiles = DIVIDE_ROUND_UP(seq_len, TILE_KV);
-
-  // Row ownership is fixed for the whole tile loop: rows >= valid_q are
-  // padding, never read the range buffer and stay masked.
-  const bool row_masked = (sg_idx * 8 + fm) >= valid_q;
 
   // ─ mm_prefix (Gemma 4 vision) ─────────────────────────────────────────
   // [r_start, r_end]: inclusive absolute key positions of this row's image
@@ -296,9 +312,14 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
   if (sliding_window >= 0) {
     tile_idx_start = max(0, (tg_min_q_abs_pos + 1 - sliding_window) / TILE_KV);
   }
+  int tile_idx_end = num_kv_tiles;
+  if (bound_tiled_keys) {
+    tile_idx_start = max(tile_idx_start, key_tiles.x);
+    tile_idx_end = min(tile_idx_end, key_tiles.y);
+  }
 
   // ─ MAIN KV TILE LOOP ──────────────────────────────────────────────────
-  for (int tile_idx = tile_idx_start; tile_idx < num_kv_tiles; tile_idx++) {
+  for (int tile_idx = tile_idx_start; tile_idx < tile_idx_end; tile_idx++) {
     const int tile_start = tile_idx * TILE_KV;
 
     // Causal skip: stop once the whole tile lies beyond every key this
@@ -533,6 +554,21 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
     threadgroup_barrier(mem_flags::mem_threadgroup);
   } // end KV tile loop
 
+  if (save_tiled_state) {
+    if (!row_masked) {
+      #pragma unroll
+      for (int d = 0; d < TD; d++) {
+        next_state[state_row + d * 8 + fn] = Oreg[d][0];
+        next_state[state_row + d * 8 + fn + 1] = Oreg[d][1];
+      }
+      if (fn == 0) {
+        next_state[state_row + HEAD_SIZE] = max_score;
+        next_state[state_row + HEAD_SIZE + 1] = sum_score;
+      }
+    }
+    return;
+  }
+
   // Fold the attention sink into each valid row's online-softmax state once.
   // It contributes one learned logit to the denominator and no value row, so
   // O is only rescaled by the max correction.
@@ -613,6 +649,10 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
       device const int32_t *mm_prefix_ranges                                   \
       [[buffer(22), function_constant(use_mm_prefix)]],                        \
       const constant int &q_block_offset [[buffer(30)]],                       \
+      device const float *previous_state                                     \
+      [[buffer(23), function_constant(restore_tiled_state)]],                 \
+      device float *next_state [[buffer(24), function_constant(save_tiled_state)]], \
+      constant int2 &key_tiles [[buffer(25), function_constant(bound_tiled_keys)]], \
       threadgroup char *shared_mem [[threadgroup(0)]],                         \
       uint3 tgp [[threadgroup_position_in_grid]],                              \
       uint3 tgpg [[threadgroups_per_grid]],                                    \
