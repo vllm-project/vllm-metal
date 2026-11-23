@@ -1,6 +1,6 @@
 # Metal Kernel Sources
 
-Native paged-attention and linear-attention Metal shaders for the MLX backend.
+Native Metal shaders for attention, normalization, positional encoding, and sampling.
 
 All shader sources live in `kernels_v2/`.
 
@@ -33,6 +33,9 @@ Source builds require the `build` extra and the Xcode Metal toolchain.
 | **v2 paged attention** | `_build_v2_paged_attention_source` | `#define VLLM_METAL_PARTITION_SIZE` · `#define VLLM_METAL_PA_WINDOW_ROWS` · `float8.metal` · `utils.metal` · `turboquant.metal` · `reshape_and_cache.metal` · `pagedattention.metal` · `pagedattention_tiled.metal` |
 | **GDN state operations** | `_build_gdn_source` | `utils.metal` · `gdn_linear_attention.metal` · `gdn_state_scatter.metal` |
 | **MLA** | `_build_mla_paged_attention_source` | `utils.metal` · `mla.metal` |
+| **RoPE** | `_build_rope_source` | `rope.metal` |
+| **Normalization** | `_build_normalization_source` | `normalization.metal` |
+| **Sampling** | `_build_sampling_source` | `sampling.metal` |
 | **NAX prefill** | `_build_nax_source` | `pagedattention_nax.metal` (optional; macOS 26.2 SDK or newer to build) |
 
 ### 2. `mx.fast.metal_kernel` snippets: `attention/impls/gdn_lazy.py`
@@ -59,6 +62,9 @@ pure decode retains its existing kernel. There is no separate packed user switch
 
 | File | Role |
 |------|------|
+| `rope.metal` | Rotary positional encoding for queries and keys. |
+| `normalization.metal` | Fused residual addition and RMS normalization. |
+| `sampling.metal` | Gumbel-max sampling using the upstream vLLM MRv2 random stream. |
 | `float8.metal` | FP8 E4M3 encode/decode helpers. Concatenated before `utils.metal`. |
 | `utils.metal` | Generic vector types and shared helpers; includes `float8.metal`. Adapted from Apple MLX. |
 | `reshape_and_cache.metal` | Scatter projected K/V into the paged cache through an MLX Primitive. |

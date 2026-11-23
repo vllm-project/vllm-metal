@@ -116,3 +116,24 @@ python tools/diffusion_bench.py --concurrency 1 4 --repeats 3 --json bench.json
 Tokens/s depends on how much of each 32-token canvas the answer uses: a short
 reply still costs a full canvas, so compare the `long` prompt across runs, not
 `short`.
+
+## Manual diagnostics and operator benchmarks
+
+Use these tools for focused checks. For end-to-end performance claims, use
+`vllm bench serve` and follow the [benchmarking guide](../docs/benchmarking-macos.md).
+
+| Tool | Purpose |
+|------|---------|
+| [pp_lazy_rss.py](pp_lazy_rss.py) | Measure per-stage memory for pipeline-parallel loading and profiling. |
+| [avg_gen_length.py](avg_gen_length.py) | Measure average response length on ShareGPT with offline inference. |
+| [repro_block_exhaustion.py](repro_block_exhaustion.py) | Reproduce KV cache block exhaustion. |
+| [compiled_mlp_parity.py](compiled_mlp_parity.py) | Compare generated tokens with compiled MLP dispatch enabled and disabled. |
+| [nemotron_h_parity.py](nemotron_h_parity.py) | Compare Nemotron-H paged serving with mlx-lm, with optional state checks. |
+| [mm_prefix_bench.py](mm_prefix_bench.py) | Compare Gemma 4 image-block attention paths. |
+| [spec_window_bench.py](spec_window_bench.py) | Compare expanded and windowed speculative attention. |
+| [tq_bench.py](tq_bench.py) | Profile TurboQuant encode, decode, and dispatch costs. |
+| [native_sampling_microbench.py](native_sampling_microbench.py) | Compare sampling-step time for Torch and MLX. |
+| [native_sampling_probe.py](native_sampling_probe.py) | Count unexpected CJK characters in repeated sampling responses. |
+| [mla_materialized_prefill_benchmark.py](benchmark/mla_materialized_prefill_benchmark.py) | Compare absorbed and materialized MLA prefill. |
+| [draft_resubmit_benchmark.py](benchmark/draft_resubmit_benchmark.py) | Check draft-cache reuse and greedy token parity after resubmission. |
+| [gguf_gather_qmv_crossover.py](benchmark/gguf_gather_qmv_crossover.py) | Measure the crossover between GGUF expert dequantization and gather QMV. |
