@@ -247,6 +247,7 @@ def _run_primitive(
     native_reference: bool = False,
     force_gqa: bool = False,
     gqa_lengths: list[int] | None = None,
+    plan_window: int = -1,
 ) -> tuple[mx.array, mx.array]:
     mx.random.seed(seed)
     num_seqs = len(kv_lens)
@@ -287,7 +288,7 @@ def _run_primitive(
 
     key_ref, value_ref = key_cache, value_cache
     length_plan = (
-        get_ops().gqa_decode_length_plan(gqa_lengths)
+        get_ops().gqa_decode_length_plan(gqa_lengths, sliding_window=plan_window)
         if gqa_lengths is not None
         else None
     )

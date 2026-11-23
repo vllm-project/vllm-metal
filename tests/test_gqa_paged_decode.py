@@ -34,6 +34,9 @@ GQA_GEOMETRIES = tuple(tuple(row) for row in GQA_CONFIG["geometries"])
 GQA_SIMD_GROUPS_PER_CORE = GQA_CONFIG["simd_groups_per_core"]
 assert GQA_GEOMETRIES
 assert len(GQA_GEOMETRIES) == len(set(GQA_GEOMETRIES))
+# Admitted only on sliding-window layers.
+WINDOWED_GEOMETRIES = tuple(tuple(row) for row in GQA_CONFIG["windowed_geometries"])
+assert WINDOWED_GEOMETRIES and not set(WINDOWED_GEOMETRIES) & set(GQA_GEOMETRIES)
 
 NUM_QUERY_HEADS = 32
 NUM_KV_HEADS = 8
@@ -197,7 +200,7 @@ def test_gqa_partial_page_tails(dtype, n_tok, q, kv, head, block):
         pytest.param(((3, 41), (0, 33), (1, 1), (2, 0)), (1, 23), id="ragged-batch"),
     ],
 )
-@pytest.mark.parametrize("q,kv,head,block", GQA_GEOMETRIES)
+@pytest.mark.parametrize("q,kv,head,block", GQA_GEOMETRIES + WINDOWED_GEOMETRIES)
 def test_windowed_gqa_matches_full_softmax_reference(
     dtype, lengths, window, q, kv, head, block
 ):
@@ -218,6 +221,24 @@ def test_windowed_gqa_matches_full_softmax_reference(
     assert _dispatch_family() == "gqa_decode"
     assert get_ops().last_gqa_partition_size() == GQA_PARTITION_SIZE
     _assert_close(out, ref, dtype)
+
+
+@pytest.mark.parametrize("q,kv,head,block", WINDOWED_GEOMETRIES)
+def test_private_gqa_entry_needs_a_window_for_sliding_only_geometries(
+    q, kv, head, block
+):
+    with pytest.raises(ValueError, match="supported one-token decode rows"):
+        _run_primitive(
+            [65],
+            mx.float16,
+            interleaved=False,
+            seed=0,
+            num_query_heads=q,
+            num_kv_heads=kv,
+            head_size=head,
+            block_size=block,
+            force_gqa=True,
+        )
 
 
 @pytest.mark.parametrize("window", [0, -2])

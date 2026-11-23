@@ -26,6 +26,7 @@ from tests.test_gqa_paged_decode import (
     GQA_GEOMETRIES,
     GQA_SIMD_GROUPS_PER_CORE,
     NUM_QUERY_HEADS,
+    WINDOWED_GEOMETRIES,
 )
 from vllm_metal.metal import get_ops
 
@@ -37,6 +38,7 @@ def test_native_reports_public_routing_capabilities():
         "decode_routing_metadata": True,
         "gqa_length_plan": True,
         "gqa_mixed_decode_plan": True,
+        "gqa_windowed_decode": True,
         "nax_split_hint": True,
         "nax_prefill_split_hint": True,
     }
@@ -431,7 +433,15 @@ def test_spec_window_does_not_switch_kernel_family() -> None:
 
 
 @pytest.mark.parametrize(
-    "feature", [{"softcap": 2.0}, {"sliding_window": 4096}, {"sink_value": 12.0}]
+    "feature",
+    [
+        {"softcap": 2.0},
+        # 32 heads x 4 full P256 partitions of a 1024-token window stay below
+        # the work budget on any GPU with more than three cores.
+        {"sliding_window": 1024},
+        {"sliding_window": 4096, "turboquant": True},
+        {"sink_value": 12.0},
+    ],
 )
 def test_special_attention_features_use_fallback(feature):
     out, ref = _run_primitive(
@@ -620,3 +630,145 @@ def test_default_partition_executes_and_matches_oracle(q, kv, head, block, offse
         _assert_fallback()
     assert ops.last_gqa_partition_size() == expected
     _assert_close(out, ref, mx.bfloat16)
+
+
+def _require_window_work(query_heads: int, window: int, requests: int) -> None:
+    """Positive windowed tests need the budget met over the visible span."""
+    cores = get_ops().detected_gpu_core_count()
+    if cores <= 0:
+        pytest.skip("GPU core count unavailable: GQA conservatively disabled")
+    work = query_heads * requests * (window // GQA_PARTITION_SIZE)
+    if work < GQA_SIMD_GROUPS_PER_CORE * cores:
+        pytest.skip("The visible span is below the GQA work budget on this GPU")
+
+
+def test_sliding_layer_takes_gqa_over_its_window() -> None:
+    """One request: native plans its own window, counting only visible work."""
+    _require_window_work(NUM_QUERY_HEADS, 4096, 1)
+    out, ref = _run_primitive(
+        [32768 + 5],
+        mx.bfloat16,
+        interleaved=True,
+        seed=1272,
+        sliding_window=4096,
+        num_decode_requests=1,
+    )
+    assert _dispatch_family() == "gqa_decode"
+    _assert_close(out, ref, mx.bfloat16)
+
+
+@pytest.mark.parametrize("q,kv,head,block_size", WINDOWED_GEOMETRIES)
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+def test_windowed_geometries_take_gqa_on_sliding_layers(
+    q, kv, head, block_size, dtype
+) -> None:
+    window = 1024
+    lengths = [window - 7, 2 * window + 3, 5000, window, 3 * window + 17, 4097]
+    requests = 16
+    lengths = (lengths * 3)[:requests]
+    visible = sum(min(n, window) // GQA_PARTITION_SIZE for n in lengths)
+    cores = get_ops().detected_gpu_core_count()
+    if cores <= 0 or q * visible < GQA_SIMD_GROUPS_PER_CORE * cores:
+        pytest.skip("The visible span is below the GQA work budget on this GPU")
+    common = {
+        "interleaved": True,
+        "seed": 1273,
+        "num_query_heads": q,
+        "num_kv_heads": kv,
+        "head_size": head,
+        "block_size": block_size,
+        "num_decode_requests": requests,
+        "num_decode_tokens": requests,
+        "max_decode_context_len": max(lengths),
+        "gqa_lengths": lengths,
+    }
+    out, ref = _run_primitive(
+        lengths, dtype, sliding_window=window, plan_window=window, **common
+    )
+    assert _dispatch_family() == "gqa_decode"
+    assert get_ops().last_gqa_num_requests() == requests
+    _assert_close(out, ref, dtype)
+
+    # The same geometry on a full-attention layer keeps the established path.
+    out, ref = _run_primitive(lengths, dtype, **common)
+    _assert_fallback()
+    _assert_close(out, ref, dtype)
+
+
+@pytest.mark.parametrize(
+    "layer_window,plan_window",
+    [(1024, -1), (1024, 512), (-1, 1024)],
+    ids=["unwindowed_plan", "other_window", "full_layer_windowed_plan"],
+)
+def test_plan_must_describe_the_layer_window(layer_window, plan_window) -> None:
+    """A plan for another window never sizes a layer's work or scratch."""
+    lengths = [16384] * 8
+    _require_window_work(NUM_QUERY_HEADS, 1024, len(lengths))
+    out, ref = _run_primitive(
+        lengths,
+        mx.float16,
+        interleaved=True,
+        seed=1274,
+        sliding_window=layer_window,
+        num_decode_requests=len(lengths),
+        num_decode_tokens=len(lengths),
+        max_decode_context_len=max(lengths),
+        gqa_lengths=lengths,
+        plan_window=plan_window,
+    )
+    _assert_fallback()
+    _assert_close(out, ref, mx.float16)
+
+
+def test_windowed_work_counts_only_the_visible_span() -> None:
+    ops = get_ops()
+
+    def partition(requests: int, window: int = 1024) -> int:
+        return ops.gqa_decode_batch_partition_size(
+            16, 8, 256, [100000] * requests, 10, 16, sliding_window=window
+        )
+
+    # 16 heads x 4 full P256 partitions per request against 33 x 10.
+    assert partition(5) == 0
+    assert partition(6) == GQA_PARTITION_SIZE
+    # The same lengths on a full-attention layer: not an admitted geometry.
+    assert ops.gqa_decode_batch_partition_size(16, 8, 256, [100000] * 6, 10, 16) == 0
+    # A sliding layer of a full-attention geometry also counts only its window.
+    assert (
+        ops.gqa_decode_batch_partition_size(
+            32, 8, 128, [100000] * 2, 10, 16, sliding_window=1024
+        )
+        == 0
+    )
+
+
+def test_windowed_length_plan_records_its_window() -> None:
+    ops = get_ops()
+    plan = ops.gqa_decode_length_plan([3000, 10], sliding_window=1024)
+    assert (plan.window, plan.num_requests, plan.max_length) == (1024, 2, 3000)
+    assert ops.gqa_decode_length_plan([3000, 10]).window == 0
+    for invalid in (0, -2):
+        with pytest.raises(ValueError, match="sliding_window"):
+            ops.gqa_decode_length_plan([3000], sliding_window=invalid)
+
+
+def test_mixed_decode_prefix_takes_windowed_gqa(mixed_family) -> None:
+    """A sliding layer's decode prefix takes GQA with its window's plan."""
+    window, lengths = 1024, [3000, 1500, 4100, 1024, 2600, 5000, 999, 3333]
+    inputs = _mixed_inputs(lengths, prefill_kv=40, geometry=(16, 8, 256, 16))
+    inputs["sliding_window"] = window
+    ops = get_ops()
+    plan = ops.gqa_decode_length_plan(lengths, sliding_window=window)
+    with _gpu_cores(8):
+        mixed = _mixed_call(inputs, gqa_length_plan=plan)
+        assert _dispatch_family() == mixed_family
+        assert ops.last_gqa_partition_size() > 0
+        assert ops.last_gqa_num_requests() == len(lengths)
+        # The unwindowed plan keeps the prefix on the windowed per-token kernel.
+        established = _mixed_call(
+            inputs, gqa_length_plan=ops.gqa_decode_length_plan(lengths)
+        )
+        assert ops.last_gqa_partition_size() == 0
+    rows = len(lengths)
+    _assert_close(mixed[:rows], established[:rows], mx.bfloat16)
+    assert mx.array_equal(mixed[rows:], established[rows:]).item()
