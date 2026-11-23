@@ -233,6 +233,7 @@ class PagedAttention {
           buffer(enc, 0, out); buffer(enc, 1, sums); buffer(enc, 2, maxes);
           buffer(enc, 3, tmp); buffer(enc, 4, lens); scalar<int>(enc, 5, parts);
           buffer(enc, 7, cu); scalar<int>(enc, 8, seqs);
+          scalar<int>(enc, 10, -1);  // partitions tile the whole context
           [enc dispatchThreadgroups:MTLSizeMake(heads, tokens, 1)
               threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         }
