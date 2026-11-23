@@ -36,7 +36,7 @@ Do not open a duplicate PR. Explain any materially different approach in the PR 
 
 ## Validation
 
-Run checks relevant to the change. Report the commands, results, and any checks you could not run in the PR description.
+Run relevant checks and report key results. For experiments, put reproduction details in a collapsible section.
 
 Extend related test suites. Test observable behavior rather than locking in implementation details.
 
