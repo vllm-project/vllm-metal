@@ -310,6 +310,63 @@ def test_store_cap_evicts_oldest_before_a_store(tmp_path: Path) -> None:
         tier.shutdown()
 
 
+def test_duplicate_store_does_not_evict_other_block(tmp_path: Path) -> None:
+    tier = _tier(tmp_path, max_size_gib=2.5 * BLOCK / (1 << 30))
+    try:
+        a, b = _key(b"A"), _key(b"B")
+        _store_keys(tier, [a, b])
+        _store_keys(tier, [b], first_job_id=200)
+
+        pa = tier.file_mapper.get_file_name(a)
+        pb = tier.file_mapper.get_file_name(b)
+        assert Path(pa).exists() and Path(pb).exists()
+        assert pa in tier._store_index and pb in tier._store_index
+        assert tier._store_bytes == 2 * BLOCK
+        assert _lookup(tier, a, ReqContext(req_id="duplicate-a")) is LookupResult.HIT
+        assert _lookup(tier, b, ReqContext(req_id="duplicate-b")) is LookupResult.HIT
+    finally:
+        tier.shutdown()
+
+
+def test_concurrent_store_reservations_count_each_new_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Overlapping stores reserve distinct paths together under the cap."""
+    tier = _tier(tmp_path, max_size_gib=2.5 * BLOCK / (1 << 30))
+    started = threading.Event()
+    release = threading.Event()
+    real_store = upstream_io._store_block
+
+    def hold_store(*args, **kwargs):
+        started.set()
+        assert release.wait(timeout=10), "store worker did not get released"
+        real_store(*args, **kwargs)
+
+    try:
+        a, b, c = _key(b"A"), _key(b"B"), _key(b"C")
+        _store_keys(tier, [a])
+
+        monkeypatch.setattr(upstream_io, "_HAS_FSIO_C", False)
+        monkeypatch.setattr(upstream_io, "_store_block", hold_store)
+
+        tier.submit_store(_job(200, [b], 0))
+        assert started.wait(timeout=10), "first store did not start"
+        tier.submit_store(_job(201, [c], 0))
+
+        # B and C together need two blocks. The second submission must make
+        # room for both reservations before either job is accounted.
+        pa = tier.file_mapper.get_file_name(a)
+        assert not Path(pa).exists()
+
+        release.set()
+        assert sorted(_finish(tier)) == [(200, True), (201, True)]
+        assert tier._store_bytes == 2 * BLOCK <= tier._max_store_bytes
+        assert all(Path(tier.file_mapper.get_file_name(key)).exists() for key in (b, c))
+    finally:
+        release.set()
+        tier.shutdown()
+
+
 def _removed_keys(tier) -> list[bytes]:
     return [k for e in tier.take_events() if e.removed for k in e.keys]
 
