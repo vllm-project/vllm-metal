@@ -108,6 +108,8 @@ def test_a_bad_value_names_the_variable_and_the_value(
         ("VLLM_METAL_NAX_GQA_PREFILL", "1", True),
         ("VLLM_METAL_NAX_GQA_PREFILL", "0", False),
         ("VLLM_METAL_NAX_GQA_PREFILL", "yes", False),
+        ("VLLM_METAL_GQA_SPEC_VERIFY", "1", True),
+        ("VLLM_METAL_GQA_SPEC_VERIFY", "0", False),
         ("VLLM_METAL_BUILD_FROM_SOURCE", "yes", False),
     ],
 )
@@ -130,6 +132,7 @@ def test_a_good_value_parses(
         ("VLLM_METAL_DISABLE_NAX", False),
         ("VLLM_METAL_NAX_GQA_PREFILL", True),
         ("VLLM_METAL_SPEC_VERIFY_WINDOW", False),
+        ("VLLM_METAL_GQA_SPEC_VERIFY", False),
         ("VLLM_METAL_BUILD_FROM_SOURCE", False),
     ],
 )
