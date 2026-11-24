@@ -390,7 +390,8 @@ NB_MODULE(_paged_ops, m) {
            int num_decode_tokens,
            int max_decode_context_len, bool gqa_disabled,
            const std::optional<GqaDecodeLengthPlan>& gqa_length_plan,
-           int nax_split_hint, int nax_prefill_split_hint) {
+           int nax_split_hint, int nax_prefill_split_hint,
+           bool gqa_spec_verify) {
           return paged_attention_primitive_fn(
               query, key_cache, value_cache,
               num_kv_heads, scale, softcap,
@@ -401,7 +402,7 @@ NB_MODULE(_paged_ops, m) {
               window_seqlen_q, sinks, mm_prefix_ranges, num_decode_requests,
               num_decode_tokens, max_decode_context_len, gqa_disabled,
               /*force_gqa=*/false, gqa_length_plan, nax_split_hint,
-              nax_prefill_split_hint);
+              nax_prefill_split_hint, gqa_spec_verify);
         },
         nb::arg("query"),
         nb::arg("key_cache"), nb::arg("value_cache"),
@@ -427,6 +428,7 @@ NB_MODULE(_paged_ops, m) {
         nb::arg("gqa_length_plan") = nb::none(),
         nb::arg("nax_split_hint") = -1,
         nb::arg("nax_prefill_split_hint") = -1,
+        nb::arg("gqa_spec_verify") = false,
         // Window validation may evaluate metadata with a Python-backed reader.
         nb::call_guard<nb::gil_scoped_release>(),
         "Return a lazy paged attention array (read-only). Cache writes are handled "
@@ -482,7 +484,7 @@ NB_MODULE(_paged_ops, m) {
         static constexpr const char* names[] = {
             "", "gqa_decode", "per_token_ps0", "per_token_ps512", "window_ps0",
             "window_ps512", "nax_prefill", "tiled_prefill", "mixed_prefill_decode",
-            "mixed_nax_prefill_decode", "nax_gqa6_prefill"};
+            "mixed_nax_prefill_decode", "nax_gqa6_prefill", "gqa_window"};
         static_assert(std::size(names) == static_cast<size_t>(PagedDispatch::Count),
                       "PagedDispatch and its diagnostic names must stay in sync");
         return names[static_cast<size_t>(

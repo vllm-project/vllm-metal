@@ -2275,6 +2275,275 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE, int PARTITION_SIZE>
   }
 }
 
+// One threadgroup per (partition, kv_head, W_ROWS sub-window), one SIMD-group
+// per query head in the GQA group.
+template <typename T, int HEAD_SIZE, int BLOCK_SIZE, int PARTITION_SIZE>
+[[kernel]] void paged_attention_gqa_window(
+    device float *exp_sums [[buffer(0)]], device float *max_logits [[buffer(1)]],
+    device T *tmp_out [[buffer(2)]], device const T *q [[buffer(3)]],
+    device const T *k_cache [[buffer(4)]], device const T *v_cache [[buffer(5)]],
+    const constant int &num_kv_heads [[buffer(8)]],
+    const constant float &scale [[buffer(9)]],
+    device const uint32_t *block_tables [[buffer(11)]],
+    device const uint32_t *context_lens [[buffer(12)]],
+    const constant int &max_num_blocks_per_seq [[buffer(13)]],
+    const constant int &q_stride [[buffer(15)]],
+    const constant int &kv_block_stride [[buffer(16)]],
+    const constant int &kv_head_stride [[buffer(17)]],
+    device const int32_t *cu_seqlens_q [[buffer(19)]],
+    const constant int &sub_windows [[buffer(20)]],
+    const constant int &sliding_window [[buffer(21)]],
+    uint3 tg_pos [[threadgroup_position_in_grid]],
+    uint3 tg_per_grid [[threadgroups_per_grid]],
+    uint3 tptg [[threads_per_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+  static_assert(PARTITION_SIZE % BLOCK_SIZE == 0,
+                "partition start is page-aligned");
+  constexpr int W_ROWS = (HEAD_SIZE <= 128) ? 4 : 2;
+  constexpr int SLICE = DIVIDE_ROUND_UP(HEAD_SIZE, 32);
+  constexpr bool FULL_SLICE = (HEAD_SIZE % 32 == 0);
+
+  const int partition_idx = static_cast<int>(tg_pos.x);
+  const int kv_head_idx = static_cast<int>(tg_pos.y);
+  const int seq_idx = static_cast<int>(tg_pos.z) / sub_windows;
+  const int sub_win = static_cast<int>(tg_pos.z) % sub_windows;
+  const int row_start = sub_win * W_ROWS;
+
+  const int q_seq_start = cu_seqlens_q[seq_idx];
+  const int q_len = cu_seqlens_q[seq_idx + 1] - q_seq_start;
+  const int num_rows = min(q_len - row_start, W_ROWS);
+  if (num_rows <= 0) {
+    return;
+  }
+
+  const int context_len = static_cast<int>(context_lens[seq_idx]);
+  const int base_ctx = context_len - q_len + row_start + 1;
+  const int max_row_ctx = base_ctx + num_rows - 1;
+  const int t0 = partition_idx * PARTITION_SIZE;
+  if (t0 >= max_row_ctx) {
+    return;
+  }
+  const int t_end = min(t0 + PARTITION_SIZE, max_row_ctx);
+
+  const int group = static_cast<int>(tptg.x) / 32;
+  const int head_idx = kv_head_idx * group + static_cast<int>(sg);
+  const int num_heads = num_kv_heads * group;
+  const int max_num_partitions = static_cast<int>(tg_per_grid.x);
+  const int64_t kv_token_stride =
+      static_cast<int64_t>(num_kv_heads) * kv_head_stride;
+
+  float qv[W_ROWS][SLICE];
+#pragma unroll
+  for (int r = 0; r < W_ROWS; r++) {
+    if (r < num_rows) {
+      device const T *q_ptr =
+          q + static_cast<int64_t>(q_seq_start + row_start + r) * q_stride +
+          head_idx * HEAD_SIZE;
+#pragma unroll
+      for (int i = 0; i < SLICE; i++) {
+        const int d = static_cast<int>(lane) + i * 32;
+        qv[r][i] = (FULL_SLICE || d < HEAD_SIZE) ? float(q_ptr[d]) : 0.f;
+      }
+    } else {
+#pragma unroll
+      for (int i = 0; i < SLICE; i++) {
+        qv[r][i] = 0.f;
+      }
+    }
+  }
+
+  float m[W_ROWS];
+  float l[W_ROWS];
+  float acc[W_ROWS][SLICE];
+#pragma unroll
+  for (int r = 0; r < W_ROWS; r++) {
+    m[r] = -FLT_MAX;
+    l[r] = 0.f;
+#pragma unroll
+    for (int i = 0; i < SLICE; i++) {
+      acc[r][i] = 0.f;
+    }
+  }
+
+  const int min_valid_t =
+      (sliding_window >= 0) ? max(0, base_ctx - sliding_window) : 0;
+  const int unmasked_start =
+      (sliding_window >= 0) ? max(0, max_row_ctx - sliding_window) : 0;
+  const float log2e_scale = scale * M_LOG2E_F;
+
+  if (t_end > min_valid_t && (sliding_window < 0 || sliding_window > 0)) {
+    device const uint32_t *bt =
+        block_tables + static_cast<int64_t>(seq_idx) * max_num_blocks_per_seq;
+    const int page0 = max(t0, min_valid_t) / BLOCK_SIZE;
+    const int page_end = (t_end + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    uint32_t page_id = gqa_broadcast_page_id(bt, page0, lane);
+    uint32_t next_page_id = page_id;
+    if (page0 + 1 < page_end) {
+      next_page_id = gqa_broadcast_page_id(bt, page0 + 1, lane);
+    }
+
+    for (int page = page0; page < page_end; page++) {
+      const uint32_t cur_page = page_id;
+      page_id = next_page_id;
+      if (page + 2 < page_end) {
+        next_page_id = gqa_broadcast_page_id(bt, page + 2, lane);
+      }
+      const int tok0 = page * BLOCK_SIZE;
+      const int tok1 = min(tok0 + BLOCK_SIZE, t_end);
+      const int64_t page_kv =
+          static_cast<int64_t>(cur_page) * kv_block_stride +
+          static_cast<int64_t>(kv_head_idx) * kv_head_stride;
+
+      int t = max(tok0, min_valid_t);
+      const int fast_end = min(tok1, base_ctx);
+      if (t >= unmasked_start && t + 4 <= fast_end) {
+        const bool full_sub_win = (num_rows == W_ROWS);
+        for (; t + 4 <= fast_end; t += 4) {
+          float dots[W_ROWS][4] = {{0.f}};
+#pragma unroll
+          for (int u = 0; u < 4; u++) {
+            device const T *ku =
+                k_cache + page_kv + (t - tok0 + u) * kv_token_stride;
+#pragma unroll
+            for (int i = 0; i < SLICE; i++) {
+              const int d = static_cast<int>(lane) + i * 32;
+              const float kval =
+                  (FULL_SLICE || d < HEAD_SIZE) ? float(ku[d]) : 0.f;
+#pragma unroll
+              for (int r = 0; r < W_ROWS; r++) {
+                if (full_sub_win || r < num_rows) {
+                  dots[r][u] = fma(qv[r][i], kval, dots[r][u]);
+                }
+              }
+            }
+          }
+          float p[W_ROWS][4] = {{0.f}};
+#pragma unroll
+          for (int r = 0; r < W_ROWS; r++) {
+            if (full_sub_win || r < num_rows) {
+              const float s0 = simd_sum(dots[r][0]) * log2e_scale;
+              const float s1 = simd_sum(dots[r][1]) * log2e_scale;
+              const float s2 = simd_sum(dots[r][2]) * log2e_scale;
+              const float s3 = simd_sum(dots[r][3]) * log2e_scale;
+              const float m_new = max(m[r], max(max(s0, s1), max(s2, s3)));
+              const float alpha =
+                  (m[r] == -FLT_MAX) ? 0.f : exp2(m[r] - m_new);
+              p[r][0] = exp2(s0 - m_new);
+              p[r][1] = exp2(s1 - m_new);
+              p[r][2] = exp2(s2 - m_new);
+              p[r][3] = exp2(s3 - m_new);
+              l[r] = l[r] * alpha + p[r][0] + p[r][1] + p[r][2] + p[r][3];
+#pragma unroll
+              for (int i = 0; i < SLICE; i++) {
+                acc[r][i] *= alpha;
+              }
+              m[r] = m_new;
+            }
+          }
+#pragma unroll
+          for (int u = 0; u < 4; u++) {
+            device const T *vu =
+                v_cache + page_kv + (t - tok0 + u) * kv_token_stride;
+#pragma unroll
+            for (int i = 0; i < SLICE; i++) {
+              const int d = static_cast<int>(lane) + i * 32;
+              const float vval =
+                  (FULL_SLICE || d < HEAD_SIZE) ? float(vu[d]) : 0.f;
+#pragma unroll
+              for (int r = 0; r < W_ROWS; r++) {
+                if (full_sub_win || r < num_rows) {
+                  acc[r][i] = fma(p[r][u], vval, acc[r][i]);
+                }
+              }
+            }
+          }
+        }
+      }
+
+      for (; t < tok1; t++) {
+        device const T *krow =
+            k_cache + page_kv + (t - tok0) * kv_token_stride;
+        float k_slice[SLICE];
+#pragma unroll
+        for (int i = 0; i < SLICE; i++) {
+          const int d = static_cast<int>(lane) + i * 32;
+          k_slice[i] = (FULL_SLICE || d < HEAD_SIZE) ? float(krow[d]) : 0.f;
+        }
+        float p_row[W_ROWS];
+        bool any_unmasked = false;
+#pragma unroll
+        for (int r = 0; r < W_ROWS; r++) {
+          const int row_ctx = base_ctx + r;
+          const bool valid =
+              (r < num_rows) && (t < row_ctx) &&
+              (sliding_window < 0 || t >= row_ctx - sliding_window);
+          if (valid) {
+            float dot = 0.f;
+#pragma unroll
+            for (int i = 0; i < SLICE; i++) {
+              dot = fma(qv[r][i], k_slice[i], dot);
+            }
+            const float s = simd_sum(dot) * log2e_scale;
+            const float m_new = max(m[r], s);
+            const float alpha =
+                (m[r] == -FLT_MAX) ? 0.f : exp2(m[r] - m_new);
+            const float pr = exp2(s - m_new);
+            l[r] = l[r] * alpha + pr;
+#pragma unroll
+            for (int i = 0; i < SLICE; i++) {
+              acc[r][i] *= alpha;
+            }
+            m[r] = m_new;
+            p_row[r] = pr;
+            any_unmasked = true;
+          } else {
+            p_row[r] = 0.f;
+          }
+        }
+        if (any_unmasked) {
+          device const T *vrow =
+              v_cache + page_kv + (t - tok0) * kv_token_stride;
+#pragma unroll
+          for (int i = 0; i < SLICE; i++) {
+            const int d = static_cast<int>(lane) + i * 32;
+            const float vval =
+                (FULL_SLICE || d < HEAD_SIZE) ? float(vrow[d]) : 0.f;
+#pragma unroll
+            for (int r = 0; r < W_ROWS; r++) {
+              if (p_row[r] > 0.f) {
+                acc[r][i] = fma(p_row[r], vval, acc[r][i]);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+#pragma unroll
+  for (int r = 0; r < W_ROWS; r++) {
+    if (r < num_rows && t0 < base_ctx + r) {
+      const int64_t q_tok = static_cast<int64_t>(q_seq_start + row_start + r);
+      const int64_t pidx =
+          (q_tok * num_heads + head_idx) * max_num_partitions + partition_idx;
+      if (max_num_partitions > 1 && lane == 0) {
+        max_logits[pidx] = m[r];
+        exp_sums[pidx] = l[r];
+      }
+      device T *out_ptr = tmp_out + pidx * HEAD_SIZE;
+      const float inv_l = 1.f / (l[r] + kPagedAttentionSoftmaxEpsilon);
+#pragma unroll
+      for (int i = 0; i < SLICE; i++) {
+        const int d = static_cast<int>(lane) + i * 32;
+        if (FULL_SLICE || d < HEAD_SIZE) {
+          out_ptr[d] = T(acc[r][i] * inv_l);
+        }
+      }
+    }
+  }
+}
+
 // Unpack one lane's SLICE consecutive `bits`-wide indices, starting at element
 // d0 of a packed row. When the slice plus its sub-byte offset fits in 32 bits,
 // the covering bytes are read once into a window and split by shifts instead
@@ -2827,11 +3096,69 @@ instantiate_gqa_decode(half, 256);
 instantiate_gqa_decode_tq(bfloat16_t, 256);
 instantiate_gqa_decode_tq(half, 256);
 
+#define instantiate_gqa_window_inner(type, head_size, block_size,            \
+                                     partition_size)                         \
+  template [[host_name("paged_attention_gqa_window_" #type "_hs" #head_size  \
+                       "_bs" #block_size "_ps" #partition_size)]]            \
+  [[kernel]] void paged_attention_gqa_window<type, head_size, block_size,    \
+                                             partition_size>(                \
+      device float *exp_sums [[buffer(0)]],                                  \
+      device float *max_logits [[buffer(1)]], device type *tmp_out           \
+      [[buffer(2)]],                                                         \
+      device const type *q [[buffer(3)]],                                    \
+      device const type *k_cache [[buffer(4)]],                              \
+      device const type *v_cache [[buffer(5)]],                              \
+      const constant int &num_kv_heads [[buffer(8)]],                        \
+      const constant float &scale [[buffer(9)]],                             \
+      device const uint32_t *block_tables [[buffer(11)]],                    \
+      device const uint32_t *context_lens [[buffer(12)]],                    \
+      const constant int &max_num_blocks_per_seq [[buffer(13)]],             \
+      const constant int &q_stride [[buffer(15)]],                           \
+      const constant int &kv_block_stride [[buffer(16)]],                    \
+      const constant int &kv_head_stride [[buffer(17)]],                     \
+      device const int32_t *cu_seqlens_q [[buffer(19)]],                     \
+      const constant int &sub_windows [[buffer(20)]],                        \
+      const constant int &sliding_window [[buffer(21)]],                     \
+      uint3 tg_pos [[threadgroup_position_in_grid]],                         \
+      uint3 tg_per_grid [[threadgroups_per_grid]],                           \
+      uint3 tptg [[threads_per_threadgroup]],                                \
+      uint sg [[simdgroup_index_in_threadgroup]],                            \
+      uint lane [[thread_index_in_simdgroup]]);
+
+#define instantiate_gqa_window_heads(type, block_size, partition_size)       \
+  instantiate_gqa_window_inner(type, 64, block_size, partition_size);        \
+  instantiate_gqa_window_inner(type, 80, block_size, partition_size);        \
+  instantiate_gqa_window_inner(type, 96, block_size, partition_size);        \
+  instantiate_gqa_window_inner(type, 112, block_size, partition_size);       \
+  instantiate_gqa_window_inner(type, 128, block_size, partition_size);       \
+  instantiate_gqa_window_inner(type, 192, block_size, partition_size);       \
+  instantiate_gqa_window_inner(type, 256, block_size, partition_size);
+
+#define instantiate_gqa_window(type, partition_size)                         \
+  instantiate_gqa_window_heads(type, 8, partition_size);                     \
+  instantiate_gqa_window_heads(type, 16, partition_size);                    \
+  instantiate_gqa_window_heads(type, 32, partition_size);
+
+instantiate_gqa_window(float, 256);
+instantiate_gqa_window(bfloat16_t, 256);
+instantiate_gqa_window(half, 256);
+
 #define instantiate_gqa_small_reduce(type, partition_size)                    \
-  instantiate_paged_attention_v2_reduce_inner(type, 128, 256, 32,            \
-                                              partition_size);              \
-  instantiate_paged_attention_v2_reduce_inner(type, 256, 256, 32,            \
+  instantiate_paged_attention_v2_reduce_inner(type, 64, 256, 32,              \
+                                              partition_size);                \
+  instantiate_paged_attention_v2_reduce_inner(type, 80, 256, 32,              \
+                                              partition_size);                \
+  instantiate_paged_attention_v2_reduce_inner(type, 96, 256, 32,              \
+                                              partition_size);                \
+  instantiate_paged_attention_v2_reduce_inner(type, 112, 256, 32,             \
+                                              partition_size);                \
+  instantiate_paged_attention_v2_reduce_inner(type, 128, 256, 32,             \
+                                              partition_size);                \
+  instantiate_paged_attention_v2_reduce_inner(type, 192, 256, 32,             \
+                                              partition_size);                \
+  instantiate_paged_attention_v2_reduce_inner(type, 256, 256, 32,             \
                                               partition_size);
 
+instantiate_gqa_small_reduce(float, 256);
 instantiate_gqa_small_reduce(bfloat16_t, 256);
 instantiate_gqa_small_reduce(half, 256);

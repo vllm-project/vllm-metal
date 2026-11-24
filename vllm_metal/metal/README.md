@@ -62,7 +62,7 @@ pure decode retains its existing kernel. There is no separate packed user switch
 | `float8.metal` | FP8 E4M3 encode/decode helpers. Concatenated before `utils.metal`. |
 | `utils.metal` | Generic vector types and shared helpers; includes `float8.metal`. Adapted from Apple MLX. |
 | `reshape_and_cache.metal` | Scatter projected K/V into the paged cache through an MLX Primitive. |
-| `pagedattention.metal` | Per-token paged-attention kernel with online softmax and sink support. Adapted from Apple MLX + vLLM. |
+| `pagedattention.metal` | Per-token, GQA decode, and GQA verification-window paged-attention kernels with online softmax and sink support. Adapted from Apple MLX + vLLM. |
 | `pagedattention_tiled.metal` | Tiled Flash-Attention-style kernel using simdgroup 8×8 MMA; shares the paged-attention library. |
 | `pagedattention_nax.metal` | Optional M5 NAX paged-prefill kernel using MPP tensor operations. |
 | `turboquant.metal` | TurboQuant encode/scatter and dequantization helpers: asymmetric uniform K quantization and Lloyd-Max V quantization with FWHT rotation. |
