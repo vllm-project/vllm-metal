@@ -151,6 +151,9 @@ class PagedAttentionContext:
     gqa_disabled: bool = field(
         default_factory=lambda: envs.VLLM_METAL_DISABLE_GQA_DECODE
     )
+    gqa_spec_verify: bool = field(
+        default_factory=lambda: envs.VLLM_METAL_GQA_SPEC_VERIFY
+    )
     # Public native ABI capabilities, queried once for this forward's layers.
     paged_native_capabilities: dict[str, bool] | None = None
     # Immutable native length statistics, shared by all KV groups/layers.

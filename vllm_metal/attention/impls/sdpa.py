@@ -1110,6 +1110,8 @@ def sdpa_forward(
     else:
         paged_kwargs: dict[str, Any] = dict(mm_kwargs)
         paged_kwargs.update(_whole_batch_decode_routing_kwargs(ctx, q_3d.shape[0], ops))
+        if ctx.gqa_spec_verify and not ctx.gqa_disabled and ctx.verify_window_q > 1:
+            paged_kwargs["gqa_spec_verify"] = True
         capabilities = ctx.paged_native_capabilities
         num_decode = ctx.num_decode_requests
         if capabilities["nax_split_hint"] and q_3d.shape[0] > len(ctx.context_lens):
