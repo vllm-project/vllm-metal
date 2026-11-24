@@ -2,7 +2,6 @@
 """Shared constants for Metal paged-attention partitioning."""
 
 PARTITION_SIZE = 512
-PARTITION_THRESHOLD = 4096
 
 # The paged attention Metal kernel is template-instantiated for these block
 # sizes only.  Sorted descending so the kernel block size picker selects the

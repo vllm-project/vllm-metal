@@ -7,6 +7,8 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import mlx.core as mx
+import mlx.nn as nn
 import numpy as np
 import pytest
 import torch
@@ -22,12 +24,6 @@ from vllm_metal.v1.lora import peft_loader as peft_loader_mod
 from vllm_metal.v1.lora import punica_wrapper as punica_mod
 from vllm_metal.v1.lora import runtime as runtime_mod
 from vllm_metal.v1.lora import worker_manager as worker_manager_mod
-
-mx = pytest.importorskip("mlx.core")
-nn = pytest.importorskip("mlx.nn")
-pytest.importorskip("vllm.lora.peft_helper")
-pytest.importorskip("vllm.lora.utils")
-pytest.importorskip("safetensors")
 
 
 # PunicaWrapperMLX.add_lora_linear
@@ -457,7 +453,6 @@ def test_peft_loader_rejects_unsupported_configs(
     err_match: str,
 ) -> None:
     """When called with a LoRAConfig, the loader must surface PEFTHelper's validation."""
-    pytest.importorskip("safetensors.numpy")
     adapter_dir = _write_peft_adapter(tmp_path)
     # Patch the adapter_config.json with the unsupported feature.
     cfg_path = adapter_dir / "adapter_config.json"
@@ -477,8 +472,6 @@ def test_peft_loader_rejects_unsupported_configs(
 def test_peft_loader_rejects_partial_adapter(tmp_path: Path) -> None:
     """Adapter file with only lora_A (or only lora_B) for a module must fail Explicitly."""
     from safetensors.numpy import save_file
-
-    pytest.importorskip("safetensors.numpy")
 
     config = {
         "peft_type": "LORA",
@@ -501,7 +494,6 @@ def test_peft_loader_rejects_partial_adapter(tmp_path: Path) -> None:
 
 def test_peft_loader_without_lora_config_skips_validation(tmp_path: Path) -> None:
     """Backwards-compat: loader without a config still loads even oversized ranks."""
-    pytest.importorskip("safetensors.numpy")
     adapter_dir = _write_peft_adapter(tmp_path)
     cfg_path = adapter_dir / "adapter_config.json"
     cfg = json.loads(cfg_path.read_text())

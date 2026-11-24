@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
+import gguf
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
@@ -22,23 +23,21 @@ from huggingface_hub import constants as hf_constants
 from mlx.utils import tree_flatten
 from mlx_lm import utils as mlx_lm_utils
 
-gguf = pytest.importorskip("gguf")
-
-import vllm_metal.gguf.loader as gguf_loader  # noqa: E402
-from tests.gguf_kquant_fixtures import (  # noqa: E402
+import vllm_metal.gguf.loader as gguf_loader
+from tests.gguf_kquant_fixtures import (
     build_iq3s_blocks,
     build_iq4_blocks,
     build_kquant_blocks,
 )
-from vllm_metal.gguf.adapter import GGUFModelAdapter  # noqa: E402
-from vllm_metal.gguf.loader import GGUFLoadError, GGUFModelLoader  # noqa: E402
-from vllm_metal.gguf.mlx_native import GGUFMLXQuantizedTensor  # noqa: E402
-from vllm_metal.gguf.raw_block import (  # noqa: E402
+from vllm_metal.gguf.adapter import GGUFModelAdapter
+from vllm_metal.gguf.loader import GGUFLoadError, GGUFModelLoader
+from vllm_metal.gguf.mlx_native import GGUFMLXQuantizedTensor
+from vllm_metal.gguf.raw_block import (
     RAW_KERNEL_GGUF_TYPES,
     GGUFRawBlockTensor,
 )
-from vllm_metal.gguf.source import GGUFLoadSource  # noqa: E402
-from vllm_metal.gguf.wrappers import GGUFLinear  # noqa: E402
+from vllm_metal.gguf.source import GGUFLoadSource
+from vllm_metal.gguf.wrappers import GGUFLinear
 
 QT = gguf.GGMLQuantizationType
 

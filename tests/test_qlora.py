@@ -7,6 +7,9 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import mlx.core as mx
+import mlx.nn as nn
+import mlx.utils as mlx_utils
 import numpy as np
 import pytest
 
@@ -20,13 +23,6 @@ from vllm_metal.v1.lora import (
 )
 from vllm_metal.v1.lora import peft_loader as peft_loader_mod
 from vllm_metal.v1.lora.layers import MLXLinearWithLoRA
-
-mx = pytest.importorskip("mlx.core")
-nn = pytest.importorskip("mlx.nn")
-mlx_utils = pytest.importorskip("mlx.utils")
-pytest.importorskip("vllm.lora.peft_helper")
-pytest.importorskip("vllm.lora.utils")
-pytest.importorskip("safetensors")
 
 
 def _make_quantized_linear(
@@ -559,7 +555,6 @@ def _write_peft_adapter(tmp_path: Path) -> Path:
 
 def test_peft_loader_qlora_and_manager_round_trip(tmp_path: Path) -> None:
     """Load a PEFT adapter from disk, activate it on a quantized model."""
-    pytest.importorskip("safetensors.numpy")
     adapter_dir = _write_peft_adapter(tmp_path)
     loaded = peft_loader_mod.load_peft_adapter(adapter_dir, lora_id=1)
 

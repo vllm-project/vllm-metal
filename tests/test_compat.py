@@ -6,7 +6,6 @@ from __future__ import annotations
 import builtins
 import importlib.util
 import json
-import os
 import sys
 from types import ModuleType, SimpleNamespace
 
@@ -488,25 +487,17 @@ class TestQwen35Fp8CompatPatch:
         assert dequantized.shape == (129, 130)
         np.testing.assert_allclose(dequantized, expected)
 
-    def test_dequant_real_mlx_fp8_values_when_enabled(self) -> None:
-        if os.environ.get("VLLM_METAL_RUN_REAL_MLX_FP8_TESTS") != "1":
-            pytest.skip("VLLM_METAL_RUN_REAL_MLX_FP8_TESTS=1 not set")
-
+    def test_dequantizes_real_fp8_values_with_block_scale(self) -> None:
         import mlx.core as mx
 
-        fp8_dtype = getattr(mx, "float8_e4m3fn", None)
-        if fp8_dtype is None:
-            pytest.skip("mlx.core has no float8_e4m3fn dtype")
-
-        weight = mx.array([[1.0, -2.0], [0.5, 4.0]], dtype=mx.float32).astype(fp8_dtype)
-        scale_inv = mx.array([[2.0]], dtype=mx.float32)
+        weight = mx.to_fp8(mx.array([[1.0, -2.0], [0.5, 4.0]]))
+        scale_inv = mx.array([[2.0]])
 
         dequantized = compat._dequantize_qwen35_fp8_weight(weight, scale_inv, mx)
-        mx.eval(dequantized)
 
         np.testing.assert_allclose(
-            np.array(dequantized, dtype=np.float32),
-            np.array([[2.0, -4.0], [1.0, 8.0]], dtype=np.float32),
+            np.array(dequantized.astype(mx.float32)),
+            [[2.0, -4.0], [1.0, 8.0]],
         )
 
     def test_rejects_unexpected_fp8_block_scale_shape(self, monkeypatch) -> None:
