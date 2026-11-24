@@ -382,9 +382,9 @@ class MLXLoRAModelManager:
         )
         if unsupported:
             raise ValueError(
-                f"LoRA adapter {adapter.lora_id} has weights for {unsupported}, "
-                "but Metal does not support LoRA on embed_tokens or lm_head. "
-                "Remove these modules from the adapter's target_modules."
+                f"LoRA adapter {adapter.lora_id} contains weights for "
+                f"{unsupported} that this model cannot apply on Metal. "
+                "Use an adapter trained for supported target modules."
             )
         if loaded == 0:
             raise ValueError(

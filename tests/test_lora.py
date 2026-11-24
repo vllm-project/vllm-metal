@@ -1381,7 +1381,7 @@ def test_add_adapter_rejects_embedding_lora_metal_cannot_apply(extra: str) -> No
         max_num_batched_tokens=2,
         dtype=mx.float32,
     )
-    with pytest.raises(ValueError, match=rf"\['{extra}'\].*embed_tokens or lm_head"):
+    with pytest.raises(ValueError, match=rf"\['{extra}'\].*cannot apply"):
         manager.add_adapter(_adapter_with_extra_module(extra))
     assert manager.list_adapters() == set()
 
