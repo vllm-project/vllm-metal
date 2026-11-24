@@ -370,3 +370,122 @@ def test_gather_matmul_sorted_matches_expert_oracle(qtype, assignments):
     out = qt.gather_matmul(x, indices, num_experts=_NUM_EXPERTS, sorted_indices=True)
 
     _assert_close_to(out, _gather_oracle(x, indices, experts))
+
+
+@pytest.mark.parametrize("fast_flag", ["0", "1"])
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("qtype", _RAW_QTYPES)
+def test_dequantize_fast_and_ref_match_oracle_exact(
+    monkeypatch, fast_flag, dtype, qtype
+):
+    monkeypatch.setenv("VLLM_METAL_GGUF_FAST_QMV", fast_flag)
+    qt, oracle = _make_raw_tensor(rows=7, cols=3 * 256, qtype=qtype)
+
+    out = qt._dequantize_rows(qt.qweight, dtype)
+    expected = mx.array(oracle).astype(dtype)
+    mx.eval(out, expected)
+
+    assert out.dtype == dtype
+    assert out.shape == (7, 3 * 256)
+    assert mx.array_equal(out, expected).item()
+
+
+@pytest.mark.parametrize("qtype", _RAW_QTYPES)
+@pytest.mark.parametrize(
+    ("dtype", "atol", "rtol"),
+    [
+        (mx.float16, 1e-3, 2e-3),
+        (mx.bfloat16, 1e-2, 1e-2),
+        (mx.float32, 1e-4, 1e-4),
+    ],
+)
+@pytest.mark.parametrize("rows", [1, 3, 5, 7, 13])
+@pytest.mark.parametrize("cols", [256, 3 * 256, 5 * 256])
+@pytest.mark.parametrize("batch", [1, 2, 4, 5, 8])
+def test_simd_qmv_matches_reference_path_and_oracle_edge_shapes(
+    monkeypatch, qtype, dtype, atol, rtol, rows, cols, batch
+):
+    qt, oracle = _make_raw_tensor(rows=rows, cols=cols, qtype=qtype)
+    mx.random.seed(17 + rows + batch)
+    x = mx.random.normal((batch, cols)).astype(dtype)
+
+    monkeypatch.setenv("VLLM_METAL_GGUF_FAST_QMV", "1")
+    fast_out = qt.matmul(x)
+    monkeypatch.setenv("VLLM_METAL_GGUF_FAST_QMV", "0")
+    ref_out = qt.matmul(x)
+    oracle_out = mx.matmul(x.astype(mx.float32), mx.array(oracle).T, stream=mx.cpu)
+    mx.eval(fast_out, ref_out, oracle_out)
+
+    assert fast_out.dtype == dtype
+    assert fast_out.shape == (batch, rows)
+    np.testing.assert_allclose(
+        np.array(fast_out.astype(mx.float32)),
+        np.array(ref_out.astype(mx.float32)),
+        atol=atol,
+        rtol=rtol,
+    )
+    ref_max = max(float(mx.max(mx.abs(oracle_out))), 1.0)
+    oracle_rel = {mx.float32: 4e-5, mx.float16: 4e-3, mx.bfloat16: 8e-3}[dtype]
+    np.testing.assert_allclose(
+        np.array(fast_out.astype(mx.float32)),
+        np.array(oracle_out),
+        rtol=0,
+        atol=ref_max * oracle_rel,
+    )
+
+
+@pytest.mark.parametrize("qtype", _RAW_QTYPES)
+@pytest.mark.parametrize(
+    ("dtype", "atol", "rtol"),
+    [
+        (mx.float16, 1e-3, 2e-3),
+        (mx.bfloat16, 1e-2, 1e-2),
+        (mx.float32, 1e-4, 1e-4),
+    ],
+)
+@pytest.mark.parametrize("rows_per_expert", [5, 7])
+def test_simd_gather_qmv_edge_expert_rows_and_broadcasts(
+    monkeypatch, qtype, dtype, atol, rtol, rows_per_expert
+):
+    """Exercise partial expert row tails and both shared-x and general broadcast shapes."""
+    num_experts = 4
+    cols = 3 * 256
+    qt, oracle = _make_raw_tensor(
+        rows=num_experts * rows_per_expert, cols=cols, qtype=qtype
+    )
+    experts = oracle.reshape(num_experts, rows_per_expert, cols)
+    mx.random.seed(91 + rows_per_expert)
+
+    # Case 1: SwitchGLU shared-token broadcast (1, 3, 1, 1, D) x (1, 3, 2) -> x_repeat=2
+    # Case 2: Multi-axis broadcast (2, 1, 1, D) x (1, 2, 2) -> fallback broadcast path
+    shapes = [
+        ((1, 3, 1, 1, cols), (1, 3, 2)),
+        ((2, 1, 1, cols), (1, 2, 2)),
+    ]
+    for x_shape, idx_shape in shapes:
+        x = mx.random.normal(x_shape).astype(dtype)
+        indices = mx.random.randint(0, num_experts, idx_shape)
+
+        monkeypatch.setenv("VLLM_METAL_GGUF_FAST_QMV", "1")
+        fast_out = qt.gather_matmul(x, indices, num_experts=num_experts)
+        monkeypatch.setenv("VLLM_METAL_GGUF_FAST_QMV", "0")
+        ref_out = qt.gather_matmul(x, indices, num_experts=num_experts)
+        oracle_out = _gather_oracle(x.astype(mx.float32), indices, experts)
+        mx.eval(fast_out, ref_out, oracle_out)
+
+        assert fast_out.dtype == dtype
+        assert fast_out.shape == ref_out.shape
+        np.testing.assert_allclose(
+            np.array(fast_out.astype(mx.float32)),
+            np.array(ref_out.astype(mx.float32)),
+            atol=atol,
+            rtol=rtol,
+        )
+        ref_max = max(float(mx.max(mx.abs(oracle_out))), 1.0)
+        oracle_rel = {mx.float32: 4e-5, mx.float16: 4e-3, mx.bfloat16: 8e-3}[dtype]
+        np.testing.assert_allclose(
+            np.array(fast_out.astype(mx.float32)),
+            np.array(oracle_out),
+            rtol=0,
+            atol=ref_max * oracle_rel,
+        )
