@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -1347,6 +1348,58 @@ def test_add_adapter_rejects_zero_module_match_before_cache_mutation() -> None:
         manager.add_adapter(bogus)
     assert manager.list_adapters() == set()
     assert all(sid is None for sid in manager.lora_index_to_id)
+
+
+def _adapter_with_extra_module(extra: str) -> peft_loader_mod.LoadedLoRA:
+    adapter = _make_adapter(
+        lora_id=1,
+        fc1_a=np.zeros((1, 2), dtype=np.float32),
+        fc1_b=np.zeros((2, 1), dtype=np.float32),
+    )
+    adapter.weights[extra] = dataclasses.replace(
+        adapter.weights["fc1"], module_name=extra
+    )
+    return adapter
+
+
+@pytest.mark.parametrize("extra", ["lm_head", "model.embed_tokens"])
+def test_add_adapter_rejects_embedding_lora_metal_cannot_apply(extra: str) -> None:
+    """Serving the adapter without its lm_head / embed_tokens deltas would
+    return wrong outputs with no error, so the load must fail instead."""
+    manager = model_manager_mod.MLXLoRAModelManager(
+        model=_TwoLinearModel(),
+        lora_config=_lora_config_stub(max_loras=1, max_lora_rank=1),
+        max_num_seqs=1,
+        max_num_batched_tokens=2,
+        dtype=mx.float32,
+    )
+    with pytest.raises(ValueError, match=rf"\['{extra}'\].*cannot apply"):
+        manager.add_adapter(_adapter_with_extra_module(extra))
+    assert manager.list_adapters() == set()
+
+
+@pytest.mark.parametrize(
+    "target_modules",
+    [
+        None,  # an untied head is a wrapped linear, so its LoRA applies
+        ["fc1"],  # head excluded at deployment; upstream drops it too
+    ],
+)
+def test_add_adapter_accepts_lm_head_lora_it_places_or_is_told_to_skip(
+    target_modules: list[str] | None,
+) -> None:
+    model = _TwoLinearModel()
+    model.lm_head = nn.Linear(2, 2, bias=False)
+    manager = model_manager_mod.MLXLoRAModelManager(
+        model=model,
+        lora_config=_lora_config_stub(
+            max_loras=1, max_lora_rank=1, target_modules=target_modules
+        ),
+        max_num_seqs=1,
+        max_num_batched_tokens=2,
+        dtype=mx.float32,
+    )
+    assert manager.add_adapter(_adapter_with_extra_module("lm_head"))
 
 
 def test_add_adapter_rejects_ambiguous_suffix_match_before_cache_mutation() -> None:

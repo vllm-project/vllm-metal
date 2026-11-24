@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 _WrappedModule = MLXLinearWithLoRA | MLXQuantizedLinearWithLoRA
 _PreparedLoRAWeights = tuple[mx.array, mx.array, int]
 _PreparedModuleUpdate = tuple[_WrappedModule, _PreparedLoRAWeights | None]
+_EMBEDDING_MODULES = frozenset({"embed_tokens", "lm_head"})
 
 
 class _PreparedAdapterUpdate(NamedTuple):
@@ -351,12 +352,14 @@ class MLXLoRAModelManager:
     ) -> _PreparedAdapterUpdate:
         updates: list[_PreparedModuleUpdate] = []
         loaded = 0
+        consumed: set[str] = set()
         for name, module in self.modules.items():
             weights = _lookup_weights_for_module(adapter, name)
             if weights is None:
                 updates.append((module, None))
                 continue
             loaded += 1
+            consumed.add(weights.module_name)
             lora_a, lora_b = module.prepare_lora_weights(
                 slot,
                 weights.lora_a,
@@ -367,6 +370,21 @@ class MLXLoRAModelManager:
                     module,
                     (lora_a, lora_b, int(weights.lora_a.shape[0])),
                 )
+            )
+        # Upstream applies LoRA to these embedding modules; Metal cannot, so
+        # refuse rather than serve the adapter without them. Modules excluded
+        # by the deployment target_modules are dropped, as upstream does.
+        unsupported = sorted(
+            name
+            for name in adapter.weights.keys() - consumed
+            if name.rsplit(".", 1)[-1] in _EMBEDDING_MODULES
+            and is_in_target_modules(name, self.lora_config.target_modules)
+        )
+        if unsupported:
+            raise ValueError(
+                f"LoRA adapter {adapter.lora_id} contains weights for "
+                f"{unsupported} that this model cannot apply on Metal. "
+                "Use an adapter trained for supported target modules."
             )
         if loaded == 0:
             raise ValueError(
