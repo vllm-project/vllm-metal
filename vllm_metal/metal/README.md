@@ -46,6 +46,7 @@ MLX, via `_read_v2_metal_source`:
 | `gdn_conv1d_silu_prefill.metal` | `gdn_conv1d_silu_prefill_v2` |
 | `gdn_recurrent_decode.metal` | `gdn_recurrent_decode_v2` |
 | `gdn_recurrent_prefill.metal` | `gdn_recurrent_prefill_v2` |
+| `gguf_raw_block.metal` | `gguf_raw_simd_{dequant,qmv,gather_qmv}` |
 
 Recurrent prefill uses one source with a compile-time `Packed` parameter. Within
 the existing lazy prefill eligibility checks, key head dimension 128 and value
@@ -73,6 +74,7 @@ pure decode retains its existing kernel. There is no separate packed user switch
 | `gdn_conv1d_silu_prefill.metal` | Lazy GDN prefill: causal conv1d + SiLU. |
 | `gdn_recurrent_decode.metal` | Lazy GDN decode: recurrent state update. |
 | `gdn_recurrent_prefill.metal` | Lazy GDN prefill: recurrent state updates over packed sequences. |
+| `gguf_raw_block.metal` | SIMD-cooperative GGUF Q2_K/Q3_K/Q6_K dequant, QMV, and MoE gather-QMV kernels. |
 
 ### D512 NAX prefill
 

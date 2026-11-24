@@ -117,6 +117,7 @@ if TYPE_CHECKING:
     VLLM_METAL_MM_PREFIX_PATH: str | None = None
     VLLM_METAL_MODELSCOPE_CACHE: str | None = None
     VLLM_METAL_GDN_LAZY_KERNELS: bool = True
+    VLLM_METAL_GGUF_FAST_QMV: bool = True
     VLLM_METAL_DECODE_PIPELINE: bool = True
     VLLM_METAL_COMPILED_MLP: bool = False
     VLLM_METAL_NATIVE_SAMPLING: bool = True
@@ -159,6 +160,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable lazy GDN kernels by default.
     # Set to "0" to force the eager conv / C++ recurrent fallback path.
     "VLLM_METAL_GDN_LAZY_KERNELS": _bool("VLLM_METAL_GDN_LAZY_KERNELS", True),
+    # SIMD-cooperative Metal kernels for GGUF Q2_K/Q3_K/Q6_K (default on).
+    "VLLM_METAL_GGUF_FAST_QMV": _bool("VLLM_METAL_GGUF_FAST_QMV", True),
     # One-step-ahead decode pipelining (default on). Eligible pure-decode
     # native samples (including seeded requests) defer the sync one step so the
     # next graph build and submit overlap the in-flight GPU forward.
