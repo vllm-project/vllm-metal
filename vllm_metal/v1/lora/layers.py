@@ -37,6 +37,17 @@ def can_wrap_qlora(module: Any) -> bool:
     )
 
 
+def can_wrap_embedding(module: Any) -> bool:
+    return isinstance(module, (nn.Embedding, nn.QuantizedEmbedding))
+
+
+def _embedding_dims(module: nn.Embedding | nn.QuantizedEmbedding) -> tuple[int, int]:
+    if isinstance(module, nn.QuantizedEmbedding):
+        return int(module.num_embeddings), int(module.dims)
+    num_embeddings, dims = module.weight.shape
+    return int(num_embeddings), int(dims)
+
+
 def _infer_qlora_dims(module: Any) -> tuple[int, int]:
     scales = getattr(module, "scales", None)
     if scales is None:
@@ -137,6 +148,28 @@ class _LoRALinearBase(nn.Module):
         self.lora_b_stacked[slot] = mx.zeros_like(self.lora_b_stacked[slot])
         self._lora_ranks[slot] = 0
 
+    def _add_lora_linear(self, x: mx.array, y: mx.array) -> mx.array:
+        """Add this layer's LoRA delta for input ``x`` to the base output ``y``."""
+        if self.punica_wrapper is None or self.punica_wrapper.no_lora:
+            return y
+
+        # Punica expects (n_tokens, dim); collapse leading dims if needed.
+        output_shape = y.shape
+        if x.ndim > 2:
+            x = x.reshape(-1, x.shape[-1])
+            y = y.reshape(-1, y.shape[-1])
+        if x.dtype != self.lora_a_stacked.dtype:
+            x = x.astype(self.lora_a_stacked.dtype)
+        output = self.punica_wrapper.add_lora_linear(
+            y,
+            x,
+            self.lora_a_stacked,
+            self.lora_b_stacked,
+            scale=1.0,
+            lora_ranks=self._lora_ranks,
+        )
+        return output if output.shape == output_shape else output.reshape(output_shape)
+
 
 class MLXLinearWithLoRA(_LoRALinearBase):
     def __init__(
@@ -161,26 +194,7 @@ class MLXLinearWithLoRA(_LoRALinearBase):
         self.base_layer.bias = value
 
     def __call__(self, x: mx.array) -> mx.array:
-        y = self.base_layer(x)
-        if self.punica_wrapper is None or self.punica_wrapper.no_lora:
-            return y
-
-        # Punica expects (n_tokens, dim); collapse leading dims if needed.
-        output_shape = y.shape
-        if x.ndim > 2:
-            x = x.reshape(-1, x.shape[-1])
-            y = y.reshape(-1, y.shape[-1])
-        if x.dtype != self.lora_a_stacked.dtype:
-            x = x.astype(self.lora_a_stacked.dtype)
-        output = self.punica_wrapper.add_lora_linear(
-            y,
-            x,
-            self.lora_a_stacked,
-            self.lora_b_stacked,
-            scale=1.0,
-            lora_ranks=self._lora_ranks,
-        )
-        return output if output.shape == output_shape else output.reshape(output_shape)
+        return self._add_lora_linear(x, self.base_layer(x))
 
 
 class MLXQuantizedLinearWithLoRA(_LoRALinearBase):
@@ -213,22 +227,87 @@ class MLXQuantizedLinearWithLoRA(_LoRALinearBase):
 
     def __call__(self, x: mx.array) -> mx.array:
         # Quantized base forward — runs at the layer's native precision.
+        return self._add_lora_linear(x, self.base_layer(x))
+
+
+class MLXTiedLMHeadWithLoRA(_LoRALinearBase):
+    """LoRA on the output head of a tied embedding, ``embedding.as_linear``.
+
+    The adapter's ``lm_head`` A/B apply here, separately from its
+    ``embed_tokens`` LoRA, as in PEFT and upstream vLLM; the base weight stays
+    shared with the embedding.
+    """
+
+    _lora_name = "LM head LoRA"
+
+    def __init__(
+        self,
+        base_layer: nn.Embedding | nn.QuantizedEmbedding,
+        max_loras: int,
+        max_lora_rank: int,
+        dtype: mx.Dtype,
+    ) -> None:
+        num_embeddings, dims = _embedding_dims(base_layer)
+        super().__init__(
+            base_layer,
+            dims,
+            num_embeddings,
+            max_loras,
+            max_lora_rank,
+            dtype,
+        )
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return self._add_lora_linear(x, self.base_layer.as_linear(x))
+
+
+class MLXEmbeddingWithLoRA(_LoRALinearBase):
+    """LoRA on a token embedding: ``y = E[ids] + A.T[ids] @ B.T``.
+
+    PEFT's ``lora_embedding_A`` is ``(rank, vocab)`` and ``lora_embedding_B``
+    is ``(hidden, rank)``, the linear layout with ``in = vocab``.
+    """
+
+    _lora_name = "Embedding LoRA"
+    # Only the text model's embedding is wrapped; encoders route per call.
+    punica_wrapper: PunicaWrapperMLX | None
+
+    def __init__(
+        self,
+        base_layer: nn.Embedding | nn.QuantizedEmbedding,
+        max_loras: int,
+        max_lora_rank: int,
+        dtype: mx.Dtype,
+    ) -> None:
+        num_embeddings, dims = _embedding_dims(base_layer)
+        super().__init__(
+            base_layer,
+            num_embeddings,
+            dims,
+            max_loras,
+            max_lora_rank,
+            dtype,
+        )
+        # Not a child module, so the shared embedding weight is not listed twice.
+        object.__setattr__(self, "tied_head", None)
+
+    def set_tied_head(self, head: MLXTiedLMHeadWithLoRA) -> None:
+        object.__setattr__(self, "tied_head", head)
+
+    def __call__(self, x: mx.array) -> mx.array:
         y = self.base_layer(x)
         if self.punica_wrapper is None or self.punica_wrapper.no_lora:
             return y
-
-        output_shape = y.shape
-        if x.ndim > 2:
-            x = x.reshape(-1, x.shape[-1])
-            y = y.reshape(-1, y.shape[-1])
-        if x.dtype != self.lora_a_stacked.dtype:
-            x = x.astype(self.lora_a_stacked.dtype)
-        output = self.punica_wrapper.add_lora_linear(
-            y,
-            x,
+        output = self.punica_wrapper.add_lora_embedding(
+            y.reshape(-1, y.shape[-1]),
+            x.reshape(-1),
             self.lora_a_stacked,
             self.lora_b_stacked,
-            scale=1.0,
             lora_ranks=self._lora_ranks,
         )
-        return output if output.shape == output_shape else output.reshape(output_shape)
+        return output.reshape(y.shape)
+
+    def as_linear(self, x: mx.array) -> mx.array:
+        if self.tied_head is None:
+            return self.base_layer.as_linear(x)
+        return self.tied_head(x)
