@@ -92,7 +92,7 @@ Sleep levels mean something different on unified memory than on a GPU:
 | Level | vLLM on a GPU | vllm-metal |
 |---|---|---|
 | 1 | Copies weights to CPU memory, discards the KV cache | Discards the KV cache. Weights stay in place: unified memory has nowhere cheaper to copy them to. |
-| 2 | Discards weights and the KV cache | Not supported yet |
+| 2 | Discards weights and the KV cache | Not supported yet. The call fails after vLLM has paused the engine and, with the default `mode="abort"`, aborted running requests. `wake_up()` resumes the engine. |
 
 - `llm.sleep(level=1)` frees the KV cache. `llm.wake_up()` re-creates it in
   well under a second, and the prefix cache starts empty.

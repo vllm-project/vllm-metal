@@ -317,11 +317,14 @@ class TestSleepMode:
 
         assert calls == ["release"]
 
-    def test_unsupported_level_is_rejected_before_releasing(self) -> None:
+    def test_unsupported_level_is_rejected_and_wake_up_recovers(self) -> None:
+        # vLLM has already paused the scheduler when the worker refuses, so
+        # the error must point at wake_up() and wake_up() must not fail.
         worker, calls = self._worker()
 
-        with pytest.raises(NotImplementedError, match="level 1 only"):
+        with pytest.raises(NotImplementedError, match=r"level 1 only.*wake_up"):
             MetalWorker.sleep(worker, level=2)
+        MetalWorker.wake_up(worker, tags=None)
 
         assert calls == []
 
