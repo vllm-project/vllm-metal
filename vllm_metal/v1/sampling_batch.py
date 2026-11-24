@@ -762,13 +762,13 @@ def create_request_generator(
 
 
 def native_sampling_key(
-    seed: int, step: int, *, domain: Literal["seed", "engine"] = "seed"
+    seed: int, step: int, *, domain: Literal["seed", "engine", "draft"] = "seed"
 ) -> mx.array:
     """Stateless MLX key from a seed and zero-based sampling position.
 
     Seeded rows use the request seed and output length; unseeded rows share
     the engine seed and runner's native sampling counter in the "engine"
-    domain. The default "seed" domain preserves seeded request keys.
+    domain. The "draft" domain separates draft and target draws.
     """
     digest = hashlib.blake2b(
         f"vllm-metal-{domain}:{int(seed)}:{int(step)}".encode(),

@@ -77,9 +77,10 @@ from vllm_metal.v1.proposer import (
     NoOwnKVProposer,
     validate_scheduler_blocks,
 )
+from vllm_metal.v1.sampling_batch import GREEDY_TEMPERATURE_EPS, native_sampling_key
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping
+    from collections.abc import Callable, Mapping, Sequence
 
     from vllm.config import ParallelConfig
     from vllm.config.speculative import SpeculativeConfig
@@ -454,11 +455,23 @@ class DraftModelProposer(NoOwnKVProposer):
             self._spec_config is not None
             and self._spec_config.draft_sample_method == "probabilistic"
         )
+        sampling_requests: list[RequestState] | None
         if use_probabilistic:
-            logits_by_step.append(mx.take(first_logits, drafting_indices, axis=0))
-        draft_cols = [
-            mx.take(mx.argmax(first_logits, axis=-1), drafting_indices, axis=0)
-        ]
+            first_logits = mx.take(first_logits, drafting_indices, axis=0)
+            logits_by_step.append(first_logits)
+            sampling_requests = [
+                ctx.request_states[plan.req_id] for plan in drafting_plans
+            ]
+            first_tokens = self._sample_draft_tokens(
+                first_logits, sampling_requests, draft_index=0
+            )
+        else:
+            sampling_requests = None
+            first_tokens = self._sample_draft_tokens(
+                first_logits, sampling_requests, draft_index=0
+            )
+            first_tokens = mx.take(first_tokens, drafting_indices, axis=0)
+        draft_cols = [first_tokens]
         # Steps 2..K: single-token decode per drafting row.
         for draft_index in range(1, num_speculative_tokens):
             logits = self._draft_step(
@@ -467,7 +480,11 @@ class DraftModelProposer(NoOwnKVProposer):
 
             if use_probabilistic:
                 logits_by_step.append(logits)
-            draft_cols.append(mx.argmax(logits, axis=-1))
+            draft_cols.append(
+                self._sample_draft_tokens(
+                    logits, sampling_requests, draft_index=draft_index
+                )
+            )
 
         drafts = mx.stack(draft_cols, axis=1)  # [num_drafting, K]
         cached_logits = (
@@ -910,6 +927,42 @@ class DraftModelProposer(NoOwnKVProposer):
 
         logits = self._extract_logits(self._model(input_ids, cache=offset_caches))
         return mx.take(logits[0], indices, axis=0)
+
+    @staticmethod
+    def _sample_draft_tokens(
+        logits: mx.array,
+        sampling_requests: Sequence[RequestState] | None,
+        *,
+        draft_index: int,
+    ) -> mx.array:
+        """Select one draft token per row. Only probabilistic mode passes requests."""
+        if sampling_requests is None or all(
+            state.sampling_params.temperature < GREEDY_TEMPERATURE_EPS
+            for state in sampling_requests
+        ):
+            return mx.argmax(logits, axis=-1)
+
+        tokens = []
+        for row, state in zip(logits, sampling_requests, strict=True):
+            params = state.sampling_params
+            if params.temperature < GREEDY_TEMPERATURE_EPS:
+                tokens.append(mx.argmax(row, axis=-1))
+                continue
+            key = (
+                native_sampling_key(
+                    params.seed, state.generated_tokens + draft_index, domain="draft"
+                )
+                if params.seed is not None
+                else None
+            )
+            # Categorical sampling applies softmax to the same scaled logits
+            # used by draft_probs_for() to recover q.
+            tokens.append(
+                mx.random.categorical(
+                    row.astype(mx.float32) / params.temperature, key=key
+                )
+            )
+        return mx.stack(tokens)
 
     def _draft_step(
         self,
