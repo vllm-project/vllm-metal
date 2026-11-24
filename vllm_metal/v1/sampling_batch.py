@@ -14,8 +14,9 @@ import numpy as np
 import torch
 from vllm.sampling_params import SamplingParams
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors, SamplerOutput
+from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 
-from vllm_metal.tensor_bridge import mlx_to_torch
+from vllm_metal.tensor_bridge import mlx_to_torch, torch_to_mlx
 from vllm_metal.v1.logits_processors import (
     BatchMinPLogitsProcessor,
     BatchUpdate,
@@ -404,6 +405,29 @@ class SamplingBatch:
         """
         from vllm_metal.metal import get_ops
 
+        values, temperatures, token_ids = cls._prepare_native_random_logits(
+            logits_2d, sampling_params_list
+        )
+        # Keep request-key ownership above the lazy primitive. Seeded rows use
+        # their own key; unseeded rows retain their position in the batch draw.
+        fallback_key = key if key is not None else mx.zeros((2,), dtype=mx.uint32)
+        row_keys = (
+            row_keys if row_keys is not None else [None] * len(sampling_params_list)
+        )
+        keys = mx.stack([k if k is not None else fallback_key for k in row_keys])
+        seeds = keys.view(mx.int64).reshape(-1)
+        positions = mx.array(
+            [0 if k is not None else i for i, k in enumerate(row_keys)], dtype=mx.int64
+        )
+        return get_ops().gumbel_sample(
+            values, seeds, positions, temperatures, token_ids
+        )
+
+    @classmethod
+    def _prepare_native_random_logits(
+        cls, logits_2d: mx.array, sampling_params_list: Sequence[SamplingParams]
+    ) -> tuple[mx.array, mx.array, mx.array | None]:
+        """Prepare candidate logits, remaining temperatures and optional token IDs."""
         temperatures: list[float] = []
         top_k: list[int] = []
         top_p: list[float] = []
@@ -419,15 +443,6 @@ class SamplingBatch:
                 top_k.append(sp.top_k)
                 top_p.append(sp.top_p)
                 min_p.append(sp.min_p)
-        # Keep request-key ownership above the lazy primitive. Seeded rows use
-        # their own key; unseeded rows retain their position in the batch draw.
-        fallback_key = key if key is not None else mx.zeros((2,), dtype=mx.uint32)
-        row_keys = row_keys if row_keys is not None else [None] * len(temperatures)
-        keys = mx.stack([k if k is not None else fallback_key for k in row_keys])
-        seeds = keys.view(mx.int64).reshape(-1)
-        positions = mx.array(
-            [0 if k is not None else i for i, k in enumerate(row_keys)], dtype=mx.int64
-        )
         values = logits_2d.astype(mx.float32)
         token_ids = None
         if any(
@@ -442,13 +457,7 @@ class SamplingBatch:
                 values / scales[:, None], top_k, top_p, min_p
             )
             temperatures = [1.0 if t != 0 else 0.0 for t in temperatures]
-        return get_ops().gumbel_sample(
-            values,
-            seeds,
-            positions,
-            mx.array(temperatures, dtype=mx.float32),
-            token_ids,
-        )
+        return values, mx.array(temperatures, dtype=mx.float32), token_ids
 
     def _make_temperature(self) -> torch.Tensor | None:
         if self.all_greedy:
@@ -762,13 +771,16 @@ def create_request_generator(
 
 
 def native_sampling_key(
-    seed: int, step: int, *, domain: Literal["seed", "engine", "draft"] = "seed"
+    seed: int,
+    step: int,
+    *,
+    domain: Literal["seed", "engine", "draft", "rejection"] = "seed",
 ) -> mx.array:
     """Stateless MLX key from a seed and zero-based sampling position.
 
     Seeded rows use the request seed and output length; unseeded rows share
     the engine seed and runner's native sampling counter in the "engine"
-    domain. The "draft" domain separates draft and target draws.
+    domain. Draft and rejection sampling use independent domains.
     """
     digest = hashlib.blake2b(
         f"vllm-metal-{domain}:{int(seed)}:{int(step)}".encode(),
@@ -784,6 +796,48 @@ def mlx_greedy_tokens(logits_2d: mx.array) -> mx.array:
     pipeline submit the argmax asynchronously and defer the sync one step.
     """
     return mx.argmax(logits_2d, axis=-1)
+
+
+def compute_random_sampling_probs(
+    logits_2d: mx.array,
+    batch: SamplingBatch,
+    sampler: Sampler,
+    *,
+    use_native_sampling: bool,
+) -> mx.array:
+    """Return the ordinary decode distributions in vocabulary order."""
+    if not batch.all_random:
+        raise ValueError("Expected positive sampling temperatures for all rows.")
+    if (
+        use_native_sampling
+        and not batch.needs_logprobs
+        and batch.generators_are_seeded()
+        and SamplingBatch.params_allow_native_random(
+            batch.sampling_params_list, batch.output_lengths, allow_seed=True
+        )
+    ):
+        values, temperatures, token_ids = batch._prepare_native_random_logits(
+            logits_2d[..., : batch.vocab_size], batch.sampling_params_list
+        )
+        probs = mx.softmax(values / temperatures[:, None], axis=-1)
+        if token_ids is not None:
+            probs = mx.put_along_axis(mx.zeros_like(probs), token_ids, probs, axis=-1)
+        padding = logits_2d.shape[-1] - probs.shape[-1]
+        if padding:
+            probs = mx.pad(probs, ((0, 0), (0, padding)))
+        return probs
+
+    mx.eval(logits_2d)
+    logits = mlx_to_torch(
+        logits_2d.astype(mx.float32), device=batch.SAMPLER_DEVICE
+    ).clone()
+    metadata = batch.make_sampling_metadata()
+    logits = sampler.apply_logits_processors(
+        logits, metadata, predict_bonus_token=False
+    )
+    logits = sampler.apply_random_logits_processors(logits, metadata)
+    logits = apply_top_k_top_p(logits, metadata.top_k, metadata.top_p)
+    return torch_to_mlx(logits.softmax(dim=-1, dtype=torch.float32))
 
 
 def sample_from_logits(

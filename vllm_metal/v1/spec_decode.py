@@ -5,18 +5,26 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import mlx.core as mx
 from vllm.v1.core.sched.output import SchedulerOutput
 
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPDraftSeed
-from vllm_metal.v1.sampling_batch import GREEDY_TEMPERATURE_EPS
+from vllm_metal.v1.sampling_batch import (
+    GREEDY_TEMPERATURE_EPS,
+    SamplingBatch,
+    compute_random_sampling_probs,
+    native_sampling_key,
+)
 
 if TYPE_CHECKING:
+    import torch
     from vllm.config.speculative import SpeculativeConfig
 
+    from vllm_metal.v1.draft_model_proposer import DraftModelProposer
     from vllm_metal.v1.model_runner import RequestState
+    from vllm_metal.v1.sampling import Sampler
 
 
 class _PagedDecodeStateLike(Protocol):
@@ -305,6 +313,150 @@ class SpeculativeDecodeController:
             sampled_token_ids.append(output_ids)
 
         return sampled_token_ids
+
+    def verify_rejection(
+        self,
+        logits: mx.array,
+        decode_reqs: Sequence[tuple[str, RequestState]],
+        decode_segments: Sequence[PagedDecodeSegment],
+        *,
+        drafter: DraftModelProposer,
+        sampler: Sampler,
+        vocab_size: int,
+        use_native_sampling: bool,
+    ) -> list[list[int]]:
+        """Verify random proposals using the ordinary decode distributions.
+
+        Each request returns its accepted draft prefix and one correction or
+        bonus token. The caller supplies the ordinary decode sampling backend
+        policy and handles greedy requests separately.
+        """
+        if len(decode_reqs) != len(decode_segments):
+            raise ValueError("decode_reqs and decode_segments must have equal length")
+        if not decode_segments:
+            return []
+        if logits.ndim != 3 or logits.shape[0] != 1:
+            raise ValueError("Expected packed target logits of shape [1, rows, vocab]")
+
+        target_rows = []
+        sampling_params = []
+        prompts: list[list[int]] = []
+        histories: list[list[int]] = []
+        generators: dict[int, torch.Generator] = {}
+        for (req_id, state), segment in zip(decode_reqs, decode_segments, strict=True):
+            if req_id != segment.req_id:
+                raise ValueError(
+                    "Speculative decode verification received mismatched request "
+                    f"metadata: {req_id!r} != {segment.req_id!r}"
+                )
+            if segment.bonus_row >= logits.shape[1]:
+                raise ValueError(f"Missing target verification rows for {req_id!r}")
+            if any(
+                not 0 <= token < logits.shape[-1] for token in segment.draft_token_ids
+            ):
+                raise ValueError(
+                    f"Draft token outside the target vocabulary for {req_id!r}"
+                )
+            target_rows.append(logits[0, segment.start_row : segment.bonus_row + 1])
+            sampling_params.extend([state.sampling_params] * segment.num_query_tokens)
+            prompts.extend(
+                [state.token_ids[: state.prompt_len]] * segment.num_query_tokens
+            )
+            if state.generator is not None:
+                start = len(histories)
+                generators.update(
+                    dict.fromkeys(
+                        range(start, start + segment.num_query_tokens), state.generator
+                    )
+                )
+            # Each target row conditions on the committed output plus the
+            # preceding drafts. This is also the history for logits processors.
+            output = state.token_ids[state.prompt_len :]
+            histories.extend(
+                [*output, *segment.draft_token_ids[:i]]
+                for i in range(segment.num_query_tokens)
+            )
+
+        sampling_batch = SamplingBatch(
+            sampling_params,
+            prompts,
+            histories,
+            vocab_size=vocab_size,
+            generators=generators,
+        )
+        target_probs = compute_random_sampling_probs(
+            mx.concatenate(target_rows, axis=0),
+            sampling_batch,
+            sampler,
+            use_native_sampling=use_native_sampling,
+        )
+
+        results = []
+        start = 0
+        for (_, state), segment in zip(decode_reqs, decode_segments, strict=True):
+            end = start + segment.num_query_tokens
+            params = state.sampling_params
+            draft_probs = None
+            if segment.draft_token_ids:
+                draft_probs = drafter.draft_probs_for(
+                    segment, temperature=params.temperature
+                )
+                expected = (len(segment.draft_token_ids), target_probs.shape[-1])
+                if draft_probs.shape != expected:
+                    raise ValueError(
+                        f"Draft probabilities for {segment.req_id!r} have shape "
+                        f"{draft_probs.shape}, expected {expected}"
+                    )
+            key = (
+                native_sampling_key(
+                    params.seed, state.generated_tokens, domain="rejection"
+                )
+                if params.seed is not None
+                else None
+            )
+            results.append(
+                self._rejection_sample(
+                    target_probs[start:end], draft_probs, segment.draft_token_ids, key
+                )
+            )
+            start = end
+
+        mx.eval(*results)
+        verified = []
+        for segment, result in zip(decode_segments, results, strict=True):
+            accepted, token_id = cast(list[int], result.tolist())
+            verified.append([*segment.draft_token_ids[:accepted], token_id])
+        return verified
+
+    @staticmethod
+    def _rejection_sample(
+        target_probs: mx.array,
+        draft_probs: mx.array | None,
+        draft_token_ids: tuple[int, ...],
+        key: mx.array | None,
+    ) -> mx.array:
+        """Return the accepted prefix length and the final sampled token."""
+        accept_key, sample_key = (None, None) if key is None else mx.random.split(key)
+        if draft_probs is None:
+            token_id = mx.random.categorical(mx.log(target_probs[-1]), key=sample_key)
+            return mx.stack((mx.array(0, dtype=token_id.dtype), token_id))
+
+        width = len(draft_token_ids)
+        positions = mx.arange(width)
+        tokens = mx.array(draft_token_ids, dtype=mx.int32)
+        p = target_probs[positions, tokens]
+        q = draft_probs[positions, tokens]
+        u = mx.random.uniform(shape=(width,), key=accept_key)
+        accepted = (p >= q) | (p > u * q)
+        prefix_len = mx.min(mx.where(accepted, width, positions))
+
+        target = target_probs[prefix_len]
+        draft = draft_probs[mx.minimum(prefix_len, width - 1)]
+        residual = mx.maximum(target - draft, 0.0)
+        weights = mx.where(prefix_len == width, target, residual)
+        # Categorical sampling normalizes the positive residual implicitly.
+        token_id = mx.random.categorical(mx.log(weights), key=sample_key)
+        return mx.stack((prefix_len.astype(token_id.dtype), token_id))
 
     def build_gemma4_mtp_draft_seeds(
         self,
