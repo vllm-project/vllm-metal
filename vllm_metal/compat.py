@@ -47,15 +47,15 @@ def register_model_compat() -> None:
         return
 
     from transformers import AutoConfig
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
     from vllm.model_executor.models import ModelRegistry
 
-    from vllm_metal.patches.nanbeige_registry import NanbeigeCompatConfig
+    from vllm_metal.patches.nanbeige_config import NanbeigeConfig
 
-    try:
-        AutoConfig.for_model("nanbeige")
-    except ValueError:
-        AutoConfig.register("nanbeige", NanbeigeCompatConfig, exist_ok=True)
-        logger.debug("Registered Nanbeige config compatibility")
+    # SCAFFOLDING: remove once the pinned Transformers registers nanbeige.
+    # Without it, Nanbeige 4.2 checkpoints load only with --trust-remote-code.
+    if "nanbeige" not in CONFIG_MAPPING:
+        AutoConfig.register("nanbeige", NanbeigeConfig)
 
     # SCAFFOLDING: remove when the MLX LFM3 adapters accept the placeholders and
     # processor outputs of vLLM's native LFM3-VL and LFM3-Audio classes; until

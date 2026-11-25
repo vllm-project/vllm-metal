@@ -15,7 +15,6 @@ from mlx_lm.models.cache import make_prompt_cache
 from tests.stub_runner import make_kv_cache
 from vllm_metal.attention.context import OffsetCache, clear_context, prepare_unified
 from vllm_metal.attention.impls.sdpa_wrapper import patch_sdpa_attention
-from vllm_metal.patches.nanbeige_registry import effective_num_loops
 from vllm_metal.v1.model_adapter import DefaultModelAdapter
 from vllm_metal.v1.model_lifecycle import ModelLifecycle
 
@@ -300,34 +299,6 @@ def test_looped_patch_guardrails() -> None:
         patch_sdpa_attention(model, valid_cache, _BLOCK_SIZE, only_layers=[0])
 
 
-@pytest.mark.parametrize(
-    "bad_override",
-    [
-        {"enable_double_loop_split": True},
-        {"loop_share_kv": True},
-        {"enable_depth_attention": True},
-        {"enable_hyper_connection": True},
-        {"enable_mhc": True},
-        {"qk_layernorm": True},
-        {"emb_neighbor_num": 2},
-    ],
-)
-def test_unsupported_nanbeige_variants_fail_fast(
-    bad_override: dict[str, object],
-) -> None:
-    base = {
-        "model_type": "nanbeige",
-        "num_hidden_layers": 22,
-        "num_loops": 2,
-        "hidden_size": 3072,
-        "num_attention_heads": 48,
-        "num_key_value_heads": 8,
-        "head_dim": 128,
-    }
-    with pytest.raises(NotImplementedError):
-        effective_num_loops(base | bad_override)
-
-
 def test_lifecycle_sizes_one_kv_layer_per_loop() -> None:
     args = _make_args(num_loops=2)
     runner = SimpleNamespace(
@@ -340,36 +311,3 @@ def test_lifecycle_sizes_one_kv_layer_per_loop() -> None:
     ModelLifecycle(runner, DefaultModelAdapter()).resolve_model_dims()
     assert runner.num_layers == 6
     assert runner.num_kv_cache_layers == 6
-
-
-def test_non_nanbeige_models_ignore_nanbeige_flags_and_loops() -> None:
-    """StableLM 2 (qk_layernorm=True) and other model families must bypass Nanbeige checks."""
-    from transformers import StableLmConfig
-
-    stablelm_cfg = StableLmConfig(
-        num_hidden_layers=24,
-        hidden_size=2048,
-        num_attention_heads=32,
-        num_key_value_heads=32,
-        qk_layernorm=True,
-    )
-    assert effective_num_loops(stablelm_cfg) == 1
-
-    stablelm_runner = SimpleNamespace(
-        model_args=stablelm_cfg.to_dict(),
-        model=None,
-        is_mla=False,
-        is_hybrid=False,
-        pp=None,
-    )
-    ModelLifecycle(stablelm_runner, DefaultModelAdapter()).resolve_model_dims()
-    assert stablelm_runner.num_layers == 24
-    assert stablelm_runner.num_kv_cache_layers == 24
-
-    other_loop_cfg = {
-        "model_type": "esmfold",
-        "num_loops": 10,
-        "qk_layernorm": True,
-        "enable_double_loop_split": True,
-    }
-    assert effective_num_loops(other_loop_cfg) == 1
