@@ -298,6 +298,7 @@ class TestSleepMode:
         runner = SimpleNamespace(
             release_kv_cache_memory=lambda: calls.append("release"),
             restore_kv_cache_memory=lambda: calls.append("restore"),
+            paged_attention_runtime=None,
         )
         return _make_worker(runner), calls
 

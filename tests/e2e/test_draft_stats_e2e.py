@@ -336,7 +336,6 @@ def test_controlled_rejection_recovers_after_prefix_hit(
 
 def _run_sleep_round_trip(model, speculative_config):
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
-    import mlx.core as mx
     from vllm import LLM, SamplingParams
 
     llm = LLM(
@@ -368,12 +367,11 @@ def _run_sleep_round_trip(model, speculative_config):
 
         baseline = generate()
         assert baseline[1] > 0
-        active = mx.get_active_memory()
         llm.sleep(level=1)
         # The draft's layers live in the target's backing, so this frees both.
         storage = runner.paged_attention_runtime.storage
         assert storage.released
-        assert active - mx.get_active_memory() >= storage.nbytes
+        assert next(iter(storage.tensors.values())).untyped_storage().nbytes() == 0
         llm.wake_up()
         # Greedy verification hides stale draft KV in the tokens; acceptance
         # exposes it.

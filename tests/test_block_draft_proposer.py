@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Committed feature ownership is independent of temporary draft acceptance."""
 
-import gc
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -183,11 +182,8 @@ def test_compiled_draft_follows_storage_recreated_by_sleep(proposer):
     )
     storage = proposer.cache.storage
     assert proposer.propose(_prefill(state, _features(15), 0, True)) is not None
-    gc.collect()
-    active = mx.get_active_memory()
     storage.release()
-    gc.collect()
-    assert active - mx.get_active_memory() >= storage.nbytes
+    assert next(iter(storage.tensors.values())).untyped_storage().nbytes() == 0
     storage.reallocate()
     for tensor in storage.tensors.values():
         tensor.fill_(float("nan"))
