@@ -538,10 +538,12 @@ static void dispatch_paged_attention_tiled(
 // tmp_out[token, head, partition, :].
 static MTL::ComputePipelineState* paged_attention_v2_reduce_kernel(
     metal::Device& d, const std::string& dt, int head_size,
-    int partition_size, bool use_sinks, bool use_tq_fc, bool compact = false) {
+    int partition_size, bool use_sinks, bool use_tq_fc, bool compact = false,
+    bool windowed = false) {
   auto rname = kernels::paged_reduce_kernel_name(dt, head_size, partition_size);
-  // The reduce kernel reads sinks (40), TurboQuant (50) and compact scratch
-  // (130); other function constants are inert for it. TurboQuant batches take this
+  // The reduce kernel reads sinks (40), TurboQuant (50), compact scratch
+  // (130) and the windowed GQA producer's visible window (150); other function
+  // constants are inert for it. TurboQuant batches take this
   // path (use_tq_fc varies: the TQ reduce applies the deferred inverse FWHT),
   // and sinks are folded here rather than in the partitioned kernel so the
   // sink logit is counted once globally.  The cache key MUST encode every
@@ -551,13 +553,15 @@ static MTL::ComputePipelineState* paged_attention_v2_reduce_kernel(
   std::string rhash = rname + "_v2reduce"
       + "_tq" + (use_tq_fc ? "1" : "0")
       + "_sk" + (use_sinks ? "1" : "0")
-      + "_compact" + (compact ? "1" : "0");
+      + "_compact" + (compact ? "1" : "0")
+      + "_vw" + (windowed ? "1" : "0");
   auto* lib = d.get_library("paged_attention_v2_kern");
   return d.get_kernel(
       rname, lib, rhash,
       {{&use_sinks, MTL::DataType::DataTypeBool, NS::UInteger(40)},
        {&use_tq_fc, MTL::DataType::DataTypeBool, NS::UInteger(50)},
-       {&compact, MTL::DataType::DataTypeBool, NS::UInteger(130)}});
+       {&compact, MTL::DataType::DataTypeBool, NS::UInteger(130)},
+       {&windowed, MTL::DataType::DataTypeBool, NS::UInteger(150)}});
 }
 
 static void dispatch_paged_attention_v2_reduce(
@@ -572,7 +576,7 @@ static void dispatch_paged_attention_v2_reduce(
   if (rkernel == nullptr) {
     rkernel = paged_attention_v2_reduce_kernel(
         d, dt, head_size, partition_size, use_sinks, use_tq_fc,
-        partition_offsets != nullptr);
+        partition_offsets != nullptr, visible_window > 0);
   }
   const size_t reduce_shmem = kernels::paged_reduce_threadgroup_bytes(max_num_partitions);
   const size_t capacity = d.mtl_device()->maxThreadgroupMemoryLength();
@@ -597,8 +601,10 @@ static void dispatch_paged_attention_v2_reduce(
   int32_t num_seqs_i = static_cast<int32_t>(num_seqs);
   enc.set_bytes(num_seqs_i, 8);
   if (partition_offsets != nullptr) enc.set_input_array(*partition_offsets, 9);
-  int32_t visible_window_i = static_cast<int32_t>(visible_window);
-  enc.set_bytes(visible_window_i, 10);
+  if (visible_window > 0) {
+    int32_t visible_window_i = static_cast<int32_t>(visible_window);
+    enc.set_bytes(visible_window_i, 10);
+  }
   enc.dispatch_threadgroups(
       MTL::Size::Make(num_heads, total_q_tokens, 1),
       MTL::Size::Make(256, 1, 1));
@@ -685,6 +691,8 @@ struct PagedAttentionPlan {
   bool partition = false;
   int gqa_partition_size = 0;
   int64_t gqa_partitions = 0;
+  // The window the GQA producer tiles and its reducer counts; -1 for none.
+  int gqa_window = -1;
   const std::vector<int64_t>* offsets = nullptr;
   bool compact = false;
 };
@@ -870,6 +878,7 @@ static PagedAttentionPlan select_paged_attention_route(
   plan.partition = partition;
   plan.gqa_partition_size = gqa_partition_size;
   plan.gqa_partitions = partitions;
+  plan.gqa_window = gqa_windowed ? m.sliding_window : -1;
   plan.offsets = offsets;
   plan.compact = compact;
   plan.fallback = window_batch
@@ -1040,7 +1049,7 @@ static void dispatch_paged_attention_gqa_decode(
   bind_paged_attn_strides(enc, arrays.query, arrays.key_cache, metadata.block_size);
   if (plan.compact) enc.set_input_array(*g_offsets, 18);
   // Only the eligibility gate admits a window; the TurboQuant twin has none.
-  const int32_t window = metadata.sliding_window > 0 ? metadata.sliding_window : -1;
+  const int32_t window = plan.gqa_window;
   if (!tq) enc.set_bytes(window, 19);
   if (tq) bind_turboquant_buffers(enc, arrays);
   // One threadgroup per (partition, kv head, sequence); each simdgroup
@@ -1245,7 +1254,8 @@ static void dispatch_paged_attention_v2_online(
     // static workspace exceeds the device limit. Reuse this pipeline below.
     gqa_rkernel = paged_attention_v2_reduce_kernel(
         *encoding.device, encoding.dt, metadata.head_size,
-        plan.gqa_partition_size, false, metadata.use_turboquant, plan.compact);
+        plan.gqa_partition_size, false, metadata.use_turboquant, plan.compact,
+        plan.gqa_window > 0);
     // This compiled-pipeline check is the only GQA-to-per-token fallback.
     if (!paged_reduce_memory_fits(
             kernels::paged_reduce_threadgroup_bytes(plan.gqa_partitions),

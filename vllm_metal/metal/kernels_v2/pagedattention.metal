@@ -651,6 +651,11 @@ constant int v_bits [[function_constant(70)]];  // V quantization bit width (def
 // 80/81/90 in turboquant.metal, 100 in reshape_and_cache.metal, 110 below).
 constant bool use_mm_prefix [[function_constant(120)]];
 constant bool use_compact_scratch [[function_constant(130)]];
+// Reduce only: set by the windowed GQA launcher, which also binds the window.
+// Other launchers leave it unset and keep partitions over the whole context.
+constant bool use_visible_window_fc [[function_constant(150)]];
+constant bool use_visible_window = is_function_constant_defined(use_visible_window_fc)
+    ? use_visible_window_fc : false;
 // Window mode: 0 = per-token (grid.y is a query token; today's decode path).
 // > 0 = the number of PA_WINDOW_ROWS-row sub-windows per segment: grid.y is
 // a (segment, sub-window) pair and the threadgroup owns up to
@@ -1862,9 +1867,9 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
     const constant int &num_seqs [[buffer(8)]],
     const device int64_t *partition_offsets
     [[buffer(9), function_constant(use_compact_scratch)]],
-    // -1: partitions tile the whole context. Otherwise they tile only its
-    // last visible_window tokens (the windowed GQA producer).
-    const constant int &visible_window [[buffer(10)]],
+    // Partitions tile only the last visible_window tokens (windowed GQA).
+    const constant int &visible_window
+    [[buffer(10), function_constant(use_visible_window)]],
     threadgroup char *shared_mem [[threadgroup(0)]],
     uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],
     uint3 threadgroups_per_grid [[threadgroups_per_grid]],
@@ -1882,7 +1887,7 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
   const int q_pos_in_seq = q_token_idx - q_seq_start;
   const uint32_t context_len = context_lens[seq_idx];
   const int effective_context_len = (int)context_len - q_len + q_pos_in_seq + 1;
-  const int partitioned_len = visible_window >= 0
+  const int partitioned_len = use_visible_window
       ? MIN(effective_context_len, visible_window) : effective_context_len;
   const int num_partitions = DIVIDE_ROUND_UP(partitioned_len, PARTITION_SIZE);
   const int64_t out_offset = paged_attention_reduce_offset(
@@ -2627,7 +2632,8 @@ template <typename T, typename K_CACHE_T, int HEAD_SIZE, int BLOCK_SIZE,
       const constant int &num_seqs [[buffer(8)]],                              \
       const device int64_t *partition_offsets                                 \
       [[buffer(9), function_constant(use_compact_scratch)]],                   \
-      const constant int &visible_window [[buffer(10)]],                       \
+      const constant int &visible_window                                       \
+      [[buffer(10), function_constant(use_visible_window)]],                   \
       threadgroup char *shared_mem [[threadgroup(0)]],                         \
       uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],     \
       uint3 threadgroups_per_grid [[threadgroups_per_grid]],                   \
