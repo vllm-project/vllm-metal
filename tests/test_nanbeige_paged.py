@@ -12,13 +12,7 @@ from mlx_lm.models import nanbeige
 from mlx_lm.models.cache import make_prompt_cache
 
 from tests.stub_runner import make_kv_cache
-from vllm_metal.attention.context import (
-    OffsetCache,
-    PagedAttentionContext,
-    clear_context,
-    prepare_unified,
-    set_context,
-)
+from vllm_metal.attention.context import OffsetCache, clear_context, prepare_unified
 from vllm_metal.attention.impls.sdpa_wrapper import patch_sdpa_attention
 from vllm_metal.distributed.pipeline import apply_pipeline_split
 from vllm_metal.patches.nanbeige_registry import effective_num_loops
@@ -63,6 +57,11 @@ def _clone_model(
     paged_model.set_dtype(dtype)
     mx.eval(paged_model.parameters())
     return paged_model
+
+
+def _offset_caches(num_layers: int, offset: int = 0) -> list[OffsetCache]:
+    """Indexed per-layer caches, as the model runner builds them."""
+    return [OffsetCache(offset, index=i) for i in range(num_layers)]
 
 
 @pytest.mark.parametrize(
@@ -115,7 +114,7 @@ def test_paged_looped_prefill_and_decode_matches_mlx_lm(
     expected_prefill = ref_model(mx.array([prompt], dtype=mx.int32), cache=ref_cache)
     mx.eval(expected_prefill)
 
-    offset_caches = [OffsetCache(0) for _ in range(total_kv_layers)]
+    offset_caches = _offset_caches(total_kv_layers)
     prepare_unified(
         decode_requests=[],
         prefill_requests=[([0], len(prompt), 0)],
@@ -136,7 +135,7 @@ def test_paged_looped_prefill_and_decode_matches_mlx_lm(
         expected_dec = ref_model(mx.array([[tok]], dtype=mx.int32), cache=ref_cache)
         mx.eval(expected_dec)
 
-        step_caches = [OffsetCache(seq_len) for _ in range(total_kv_layers)]
+        step_caches = _offset_caches(total_kv_layers, seq_len)
         prepare_unified(
             decode_requests=[([0], seq_len)],
             prefill_requests=[],
@@ -155,7 +154,7 @@ def test_paged_looped_prefill_and_decode_matches_mlx_lm(
 
 
 def test_chunked_prefill_and_batched_decode_matches_mlx_lm() -> None:
-    """Loop call counters must advance once per packed forward and reset next step."""
+    """Packed chunked prefill and batched decode keep each request's loops apart."""
     mx.random.seed(13)
     args = _make_args(num_loops=2)
     ref_model = nanbeige.Model(args)
@@ -191,7 +190,7 @@ def test_chunked_prefill_and_batched_decode_matches_mlx_lm() -> None:
         mx.eval(
             paged_model(
                 mx.array([seq_a[:4]], dtype=mx.int32),
-                cache=[OffsetCache(0) for _ in range(total_kv_layers)],
+                cache=_offset_caches(total_kv_layers),
             )
         )
     finally:
@@ -206,7 +205,7 @@ def test_chunked_prefill_and_batched_decode_matches_mlx_lm() -> None:
     try:
         actual_packed = paged_model(
             mx.array([packed], dtype=mx.int32),
-            cache=[OffsetCache(0) for _ in range(total_kv_layers)],
+            cache=_offset_caches(total_kv_layers),
         )
         mx.eval(actual_packed)
     finally:
@@ -229,7 +228,7 @@ def test_chunked_prefill_and_batched_decode_matches_mlx_lm() -> None:
     try:
         actual_dec = paged_model(
             mx.array([[21, 22]], dtype=mx.int32),
-            cache=[OffsetCache(max_len) for _ in range(total_kv_layers)],
+            cache=_offset_caches(total_kv_layers, max_len),
         )
         mx.eval(actual_dec)
     finally:
@@ -264,7 +263,7 @@ def test_patched_model_preserves_unpaged_forward_and_selective_logits() -> None:
 
 
 def test_looped_patch_guardrails() -> None:
-    """Mismatched cache depth, remapped caches, and excess loop calls fail loud."""
+    """Mismatched cache depth and remapped caches fail loud."""
     args = _make_args(num_loops=2)
     model = nanbeige.Model(args)
     wrong_cache = make_kv_cache(
@@ -292,24 +291,6 @@ def test_looped_patch_guardrails() -> None:
         )
     with pytest.raises(NotImplementedError, match="cache_idx_map / only_layers"):
         patch_sdpa_attention(model, valid_cache, _BLOCK_SIZE, only_layers=[0])
-
-    patch_sdpa_attention(model, valid_cache, _BLOCK_SIZE)
-    wrapper = model.model.layers[0].self_attn
-    ctx = PagedAttentionContext(
-        slot_mapping=[0],
-        block_tables=[[0]],
-        context_lens=[1],
-        offsets=[0],
-        cu_seqlens=[0, 1],
-    )
-    set_context(ctx)
-    try:
-        assert wrapper._resolve_paged_cache_idx(ctx) == 0
-        assert wrapper._resolve_paged_cache_idx(ctx) == 3
-        with pytest.raises(RuntimeError, match="called 3 times"):
-            wrapper._resolve_paged_cache_idx(ctx)
-    finally:
-        clear_context()
 
 
 @pytest.mark.parametrize(

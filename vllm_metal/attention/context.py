@@ -160,10 +160,6 @@ class PagedAttentionContext:
     # Per-row Llama 4 query scale memo keyed by (beta, original_max); every
     # scaled layer of this forward shares it (``impls.sdpa.llama4_query_scale``).
     llama4_query_scales: dict[tuple[float, int], Any] = field(default_factory=dict)
-    # Per-forward call counts keyed by physical layer index for weight-tied
-    # looped decoders (e.g. Nanbeige), mapping loop k of layer i to cache slot
-    # k * num_physical_layers + i.
-    layer_call_counts: dict[int, int] = field(default_factory=dict)
 
 
 def set_context(ctx: PagedAttentionContext) -> None:
@@ -202,8 +198,11 @@ class OffsetCache:
     from this object.
     """
 
-    def __init__(self, offset: int) -> None:
+    def __init__(self, offset: int, index: int | None = None) -> None:
         self.offset = offset
+        # Position in the cache list passed to the model. A looped model hands
+        # each loop of a layer its own entry, so this names that loop's KV layer.
+        self.index = index
 
     # --- satisfy KVCache protocol expected by create_attention_mask ---------
 

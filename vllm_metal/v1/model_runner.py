@@ -1624,7 +1624,7 @@ class MetalModelRunner:
                 )
 
             # ---- forward (lazy graph + async submit) ----
-            offset_caches = [OffsetCache(0) for _ in range(self.num_layers)]
+            offset_caches = [OffsetCache(0, index=i) for i in range(self.num_layers)]
             # On a pipeline-eligible step with a pending deferred sample, the
             # decode inputs are the previous step's lazy tokens (device
             # gather) — the host list still ends in placeholders there.
