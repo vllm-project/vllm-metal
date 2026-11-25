@@ -16,6 +16,7 @@ import mlx.core as mx
 import numpy as np
 from gguf import GGML_QUANT_SIZES, GGMLQuantizationType
 
+import vllm_metal.gguf.raw_block as rb
 from tests.gguf_kquant_fixtures import build_kquant_blocks
 from vllm_metal.gguf.raw_block import GGUFRawBlockTensor
 
@@ -105,6 +106,10 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--json", help="optional JSON output path")
     args = parser.parse_args()
+
+    # Compare gather kernels, not their serving crossover heuristics.
+    rb._GATHER_QMV_MAX_ASSIGNMENTS_PER_EXPERT = 10**9
+    rb._GATHER_QMV_LEGACY_MAX_ASSIGNMENTS_PER_EXPERT = 10**9
 
     rng = random.Random(args.seed)
     mx.random.seed(args.seed)

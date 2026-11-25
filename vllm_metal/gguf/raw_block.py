@@ -52,8 +52,7 @@ _RAW_KERNEL_BITS: dict[GGMLQuantizationType, int] = {
 }
 RAW_KERNEL_GGUF_TYPES = frozenset(_RAW_KERNEL_BITS)
 
-# Above this flattened batch the per-row qmv kernel loses to a transient
-# dequantize + dense GEMM (measured; numbers in the PR).
+# SIMD QMV slows sharply above this batch size versus dequantize + GEMM.
 _QMV_MAX_BATCH = 8
 
 _Q2K_DEQUANT_SOURCE = """
@@ -307,9 +306,9 @@ _GATHER_QMV_KERNELS: dict[GGMLQuantizationType, Any] = {
     for qtype, body in _QMV_BODIES.items()
 }
 
-# Threshold for when it's likely faster to make a transient dequantized copy
-# of the expert tensor in memory first (measured; results in PR)
-_GATHER_QMV_MAX_ASSIGNMENTS_PER_EXPERT = 2
+# The SIMD gather kernel handles more assignments before dequantization wins.
+_GATHER_QMV_MAX_ASSIGNMENTS_PER_EXPERT = 8
+_GATHER_QMV_LEGACY_MAX_ASSIGNMENTS_PER_EXPERT = 2
 
 _SIMD_LANES = 32
 _SIMDGROUPS_PER_TG = 2
@@ -626,11 +625,17 @@ class GGUFRawBlockTensor:
             )
         assignment_shape = mx.broadcast_shapes(tuple(batch_dims), indices.shape)
         idx = mx.broadcast_to(indices, assignment_shape).flatten()
-        max_assignments = _GATHER_QMV_MAX_ASSIGNMENTS_PER_EXPERT * num_experts
+        use_fast_qmv = envs.VLLM_METAL_GGUF_FAST_QMV
+        assignments_per_expert = (
+            _GATHER_QMV_MAX_ASSIGNMENTS_PER_EXPERT
+            if use_fast_qmv
+            else _GATHER_QMV_LEGACY_MAX_ASSIGNMENTS_PER_EXPERT
+        )
+        max_assignments = assignments_per_expert * num_experts
         if m == 1 and 0 < idx.size <= max_assignments:
             # This arm runs when it's likely more efficient to dequantize each
             # row as it's needed within a custom kernel
-            if envs.VLLM_METAL_GGUF_FAST_QMV:
+            if use_fast_qmv:
                 batch_tuple = tuple(batch_dims)
                 can_share_x = batch_tuple == assignment_shape or (
                     len(batch_tuple) == len(assignment_shape)
