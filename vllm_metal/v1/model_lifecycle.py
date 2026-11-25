@@ -16,6 +16,7 @@ from mlx_vlm.utils import load_model as mlx_vlm_load_model
 from vllm.logger import init_logger
 
 from vllm_metal.attention.impls.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
+from vllm_metal.attention.patching import find_num_loops
 from vllm_metal.attention.runtime.factory import build_hybrid_runtime_plan
 from vllm_metal.compat import (
     apply_compat_patches,
@@ -27,7 +28,6 @@ from vllm_metal.config import get_config
 from vllm_metal.gguf.source import GGUFLoadSource
 from vllm_metal.moe_offload import ExpertStore
 from vllm_metal.multimodal.gemma4 import Gemma4VisionSidecar
-from vllm_metal.patches.nanbeige_registry import effective_num_loops
 from vllm_metal.quant.awq_loader import AWQQuantLoader
 from vllm_metal.tensor_bridge import TORCH_TO_MLX_DTYPE
 from vllm_metal.utils import get_model_download_path, resolve_mlx_lm_model_path
@@ -246,7 +246,7 @@ class ModelLifecycle:
     def resolve_model_dims(self) -> None:
         """Resolve loaded model args into runner attention/cache dimensions."""
         args = self._runner.model_args
-        num_loops = effective_num_loops(args)
+        num_loops = find_num_loops(self._runner.model)
         default_head_dim = self._install_runner_attention_dims(args, num_loops)
         self._install_yoco_cache_mapping(args)
         self._install_per_layer_attention_metadata(args, default_head_dim)

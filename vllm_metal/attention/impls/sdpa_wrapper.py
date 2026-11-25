@@ -28,7 +28,7 @@ from vllm_metal.attention.impls.sdpa import (
     _float32_sinks,
     sdpa_forward,
 )
-from vllm_metal.attention.patching import find_layers, walk_and_wrap
+from vllm_metal.attention.patching import find_layers, find_num_loops, walk_and_wrap
 
 # ---------------------------------------------------------------------------
 # Wrapper nn.Module
@@ -257,18 +257,6 @@ class SDPAPagedAttentionWrapper(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-def _resolve_num_loops(model: Any) -> int:
-    """Return the backbone's executed loop count (1 for standard models)."""
-    root = getattr(model, "language_model", model)
-    backbone = getattr(root, "model", root)
-    raw = getattr(backbone, "num_loops", 1)
-    if isinstance(raw, bool) or not isinstance(raw, int):
-        return 1
-    if raw < 1:
-        raise ValueError(f"num_loops must be >= 1, got {raw}")
-    return raw
-
-
 def _llama4_scaling(model: Any) -> tuple[float, int] | None:
     """Return Ministral 3's ``(beta, original_max_position_embeddings)``.
 
@@ -311,21 +299,20 @@ def patch_sdpa_attention(
     """
 
     llama4_scaling = _llama4_scaling(model)
-    num_loops = _resolve_num_loops(model)
+    num_loops = find_num_loops(model)
     looped = num_loops > 1
     if looped:
         if cache_idx_map is not None or only_layers is not None:
             raise NotImplementedError(
-                "Looped transformer models (num_loops > 1) do not support "
-                "partial or remapped KV caches (cache_idx_map / only_layers)."
+                "Looped models (num_loops > 1) need one KV cache layer per "
+                "loop of every layer; cache_idx_map / only_layers are unsupported."
             )
-        n_physical = len(find_layers(model))
-        cache_layers = getattr(kv_cache, "num_layers", None)
-        if isinstance(cache_layers, int) and cache_layers != num_loops * n_physical:
+        num_layers = len(find_layers(model))
+        if kv_cache.num_layers != num_loops * num_layers:
             raise ValueError(
-                f"Looped model expects {num_loops * n_physical} KV cache layers "
-                f"({num_loops} loops * {n_physical} physical layers), "
-                f"got {cache_layers}."
+                f"Looped model needs {num_loops * num_layers} KV cache layers "
+                f"({num_loops} loops x {num_layers} layers), "
+                f"got {kv_cache.num_layers}."
             )
 
     def wrap_layer(layer_idx: int, attn: Any) -> Any:

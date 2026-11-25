@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from dataclasses import asdict
 from types import SimpleNamespace
 
 import mlx.core as mx
@@ -247,7 +248,15 @@ def test_patched_model_preserves_unpaged_forward_and_selective_logits() -> None:
     expected = model(tokens)
     mx.eval(expected)
 
-    patch_sdpa_attention(model, object(), _BLOCK_SIZE)
+    kv_cache = make_kv_cache(
+        num_layers=2 * args.num_hidden_layers,
+        num_kv_heads=args.num_key_value_heads,
+        head_dim=args.head_dim,
+        num_blocks=1,
+        block_size=_BLOCK_SIZE,
+        dtype=mx.float32,
+    )
+    patch_sdpa_attention(model, kv_cache, _BLOCK_SIZE)
     actual = model(tokens)
     mx.eval(actual)
     assert mx.array_equal(actual, expected).item()
@@ -274,7 +283,7 @@ def test_looped_patch_guardrails() -> None:
         block_size=_BLOCK_SIZE,
         dtype=mx.float32,
     )
-    with pytest.raises(ValueError, match="expects 6 KV cache layers"):
+    with pytest.raises(ValueError, match="needs 6 KV cache layers"):
         patch_sdpa_attention(model, wrong_cache, _BLOCK_SIZE)
 
     valid_cache = make_kv_cache(
@@ -322,27 +331,18 @@ def test_unsupported_nanbeige_variants_fail_fast(
 
 
 def test_lifecycle_draft_and_pp_loop_contracts() -> None:
-    """Lifecycle and draft sizing multiply physical layers by effective_num_loops; PP rejects loops."""
+    """Lifecycle sizing reads the loaded model's loops; draft sizing multiplies them; PP rejects loops."""
+    args = _make_args(num_loops=2)
     runner = SimpleNamespace(
-        model_args={
-            "model_type": "nanbeige",
-            "num_hidden_layers": 22,
-            "num_loops": 2,
-            "hidden_size": 3072,
-            "num_attention_heads": 48,
-            "num_key_value_heads": 8,
-            "head_dim": 128,
-        },
-        model=None,
+        model_args=asdict(args),
+        model=nanbeige.Model(args),
         is_mla=False,
         is_hybrid=False,
         pp=None,
     )
     ModelLifecycle(runner, DefaultModelAdapter()).resolve_model_dims()
-    assert runner.num_layers == 44
-    assert runner.num_kv_cache_layers == 44
-    assert runner.num_kv_heads == 8
-    assert runner.head_dim == 128
+    assert runner.num_layers == 6
+    assert runner.num_kv_cache_layers == 6
 
     draft_cfg = SimpleNamespace(
         hf_text_config=SimpleNamespace(
