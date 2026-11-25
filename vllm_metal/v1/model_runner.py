@@ -140,6 +140,7 @@ from vllm_metal.v1.spec_decode import (
 from vllm_metal.v1.structured_output import MetalStructuredOutputApplier
 
 if TYPE_CHECKING:
+    from vllm_metal.attention.runtime.inkling2 import Inkling2Plan
     from vllm_metal.moe_offload import ExpertStore
     from vllm_metal.patches.aux_hidden_states import AuxHiddenStateCapture
     from vllm_metal.v1.kv_offload.connector import MetalOffloadingConnector
@@ -517,6 +518,7 @@ class MetalModelRunner:
         self._yoco_cache_mapping: tuple[int, dict[int, int]] | None = None
         # Resolved by ModelLifecycle at load; None for non-hybrid models.
         self.hybrid_runtime_plan: HybridRuntimePlan | None = None
+        self.inkling2_plan: Inkling2Plan | None = None
 
         # Whether the adapter can run projection-free intermediate forwards
         # for the loaded model; resolved once in load_model().

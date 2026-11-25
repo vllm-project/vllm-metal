@@ -164,6 +164,7 @@ and TurboQuant are not validated.
 | Qwen3-Next | ✅ | | Hybrid SDPA + GDN linear | 🔵 | `mlx-community/Qwen3-Next-80B-A3B-Instruct-8bit` |
 | LFM2 / LFM2.5 | ✅ | 🔵 | Hybrid SDPA + ShortConv | ✅ | `LiquidAI/LFM2.5-1.2B-Instruct` |
 | LFM3 | 🔵 | | Hybrid full/sliding SDPA + ShortConv | ✅ | `LiquidAI/LFM3-1.7B-MLX-4bit` |
+| Inkling 2 Mini | 🔵 | | Looped relative-position GQA + short convolutions; native paged Metal attention | ✅ | `thinkingmachines/Inkling-2-Mini` |
 | Nemotron-H (Nemotron 3.5 Lightning) | 🔵 | | Hybrid SDPA + Mamba-2 (MoE) | ❌ | `mlx-community/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-4bit` |
 | Granite 4.0-h-micro | 🔵 | | Hybrid SDPA + Mamba-2 | ❌ | `mlx-community/granite-4.0-h-micro-4bit` |
 | Gemma 4 | ✅ | | GQA + per-layer sliding window + YOCO | ✅ | `mlx-community/gemma-4-e2b-it-4bit` |
@@ -202,6 +203,13 @@ and TurboQuant are not validated.
 LFM3 support covers text generation with BF16 and MLX-quantized checkpoints.
 LFM3-VL image input and LFM3-Audio audio input are listed under multimodal models.
 Omni and d1 variants require separate integrations.
+
+Inkling 2 Mini supports text generation from the official mixed NVFP4/MXFP8
+checkpoint through MLX-VLM. Each loop visit has separate KV and convolution
+history, including for chunked prefill and prefix reuse. Metal attention reads KV pages directly and applies the learned distance
+bias and query-dependent sink. MLX-VLM supplies the model and weight loader.
+Cache block sizes 8, 16, and 32 are supported. Images, speculative decoding (including DSpark), LoRA, pipeline
+parallelism, KV transfer, and TurboQuant are unsupported.
 
 LFM3-Audio accepts waveform input through the offline API and audio chat
 requests, resampled to 16 kHz mono. Clips must be nonempty and at most

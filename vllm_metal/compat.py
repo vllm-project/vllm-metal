@@ -29,7 +29,7 @@ _EXAONE4_LAYER_TYPE = {"L": "sliding_attention", "G": "full_attention"}
 
 
 def register_model_compat() -> None:
-    """Register Metal's LFM3-VL and LFM3-Audio classes for the MLX runner.
+    """Register model metadata and processor compatibility for the MLX runner.
 
     MLX executes the model, while vLLM still queries registered model classes
     for hybrid capabilities, state-cache metadata and multimodal processing.
@@ -46,7 +46,20 @@ def register_model_compat() -> None:
     if not isinstance(current_platform, MetalPlatform):
         return
 
+    # vLLM 0.34 predates Inkling Mini. The executable model and checkpoint
+    # loader stay in mlx-vlm; this registration supplies text-serving metadata.
+    from transformers import AutoConfig
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
     from vllm.model_executor.models import ModelRegistry
+
+    from vllm_metal.patches.inkling2_config import Inkling2LoopConfig
+
+    if "inkling2_loop" not in CONFIG_MAPPING:
+        AutoConfig.register("inkling2_loop", Inkling2LoopConfig)
+    ModelRegistry.register_model(
+        "Inkling2LoopForConditionalGeneration",
+        "vllm_metal.patches.inkling2_registry:Inkling2LoopForConditionalGeneration",
+    )
 
     # SCAFFOLDING: remove when the MLX LFM3 adapters accept the placeholders and
     # processor outputs of vLLM's native LFM3-VL and LFM3-Audio classes; until

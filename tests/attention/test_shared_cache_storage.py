@@ -23,6 +23,19 @@ from vllm_metal.attention.impls.linear import GDNPagedAttentionWrapper, _GDNForw
 from vllm_metal.metal import get_ops
 
 
+@pytest.mark.parametrize("offset_limit", [32, 2**31 - 1])
+def test_gather_rows_from_padded_pages(monkeypatch, offset_limit):
+    from vllm_metal.attention.caches import storage
+
+    monkeypatch.setattr(storage, "_INT32_MAX", offset_limit)
+    values = mx.arange(64).reshape(4, 4, 4)
+    pages = values[:, :2, :3]
+    actual = storage.gather_cache_rows(pages, mx.array([0, 3, 6]), 16)
+    np.testing.assert_array_equal(
+        np.array(actual), [[0, 1, 2], [20, 21, 22], [48, 49, 50]]
+    )
+
+
 def make_storage(num_blocks=4, *, with_state=True):
     attention = FullAttentionSpec(
         block_size=16, num_kv_heads=1, head_size=32, dtype=torch.float16
