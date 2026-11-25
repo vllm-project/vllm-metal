@@ -130,6 +130,33 @@ def test_looped_packed_prefill_and_decode_preserve_request_histories(models):
         offsets = [offset + 1 for offset in offsets]
 
 
+def test_leading_one_token_requests_batch_ahead_of_prefill(models):
+    """Batched one-token rows keep each history, including ones shorter than
+    the convolution, when a multi-token request follows in the same forward."""
+    reference, paged, runtime = models
+    caches = [reference.make_cache() for _ in range(3)]
+    prompts = [[5], [1, 2, 3, 4, 5, 6]]
+    expected = [
+        reference(mx.array([ids]), cache=cache).logits
+        for ids, cache in zip(prompts, caches[:2], strict=True)
+    ]
+    actual = run_paged(paged, runtime, [(prompts[0], 0, 1), (prompts[1], 0, 40)])
+    np.testing.assert_allclose(
+        actual, np.array(mx.concatenate(expected, axis=1)), atol=2e-5, rtol=2e-5
+    )
+    inputs = [[12], [30], [8, 9, 10, 11]]
+    expected = [
+        reference(mx.array([ids]), cache=cache).logits
+        for ids, cache in zip(inputs, caches, strict=True)
+    ]
+    actual = run_paged(
+        paged, runtime, [(inputs[0], 1, 1), (inputs[1], 6, 40), (inputs[2], 0, 80)]
+    )
+    np.testing.assert_allclose(
+        actual, np.array(mx.concatenate(expected, axis=1)), atol=2e-5, rtol=2e-5
+    )
+
+
 def test_chunked_prefill_restarts_convolutions_from_cached_prefix(models):
     reference, paged, runtime = models
     ids = list(range(1, 22))
