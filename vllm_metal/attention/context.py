@@ -199,8 +199,11 @@ class OffsetCache:
     from this object.
     """
 
-    def __init__(self, offset: int) -> None:
+    def __init__(self, offset: int, index: int | None = None) -> None:
         self.offset = offset
+        # Position in the cache list passed to the model. A looped model hands
+        # each loop of a layer its own entry, so this names that loop's KV layer.
+        self.index = index
 
     # --- satisfy KVCache protocol expected by create_attention_mask ---------
 
