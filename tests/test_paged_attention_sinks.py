@@ -361,8 +361,8 @@ class TestSinkValidation:
         with pytest.raises(ValueError, match="one entry per query head"):
             self._call(mx.zeros((4,), dtype=mx.float32))
 
-    def test_rejects_non_1d(self) -> None:
-        with pytest.raises(ValueError, match="1-D"):
+    def test_rejects_wrong_query_shape(self) -> None:
+        with pytest.raises(ValueError, match="query rows"):
             self._call(mx.zeros((8, 1), dtype=mx.float32))
 
     def test_rejects_non_float32(self) -> None:
@@ -373,3 +373,110 @@ class TestSinkValidation:
         """Upstream MLX refuses sinks with a quantized cache; so do we."""
         with pytest.raises(ValueError, match="TurboQuant"):
             self._call(mx.zeros((8,), dtype=mx.float32), use_turboquant=True)
+
+
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
+@pytest.mark.parametrize("window", [-1, 37])
+@pytest.mark.parametrize("features", ["bias", "sinks", "both"])
+@pytest.mark.parametrize(
+    "prefixes,queries,verify",
+    [
+        ([15, 33], [1, 1], False),
+        ([1535, 2049], [1, 1], False),
+        ([17, 35], [35, 19], False),
+        ([1535, 2049], [3, 2], True),
+        ([8191, 35], [1, 35], False),
+    ],
+)
+def test_distance_bias_and_query_sinks_match_dense_attention(
+    dtype, window, features, prefixes, queries, verify
+):
+    """Ragged pages preserve absolute distance, cutoff, and one sink per row."""
+    mx.random.seed(7)
+    heads, kv_heads, extent = 6, 2, 29
+    lengths = [p + q for p, q in zip(prefixes, queries, strict=True)]
+    blocks = (max(lengths) + BLOCK_SIZE - 1) // BLOCK_SIZE
+    # Reverse physical pages: logical distance cannot use physical addresses.
+    tables = mx.contiguous(
+        mx.arange(2 * blocks, dtype=mx.int32).reshape(2, blocks)[:, ::-1]
+    )
+    shape = (2 * blocks, BLOCK_SIZE, kv_heads, HEAD_SIZE)
+    keys, values = (mx.random.normal(shape).astype(dtype) for _ in range(2))
+    q = mx.random.normal((sum(queries), heads, HEAD_SIZE)).astype(dtype)
+    # Strided inputs exercise the public boundary's contiguous conversion.
+    bias = mx.random.normal((sum(queries), heads, extent * 2)).astype(dtype)[..., ::2]
+    sinks = mx.random.normal((sum(queries), heads * 2))[:, ::2] * 3
+    bias = None if features == "sinks" else bias
+    sinks = None if features == "bias" else sinks
+    cu = [0, queries[0], sum(queries)]
+    out = get_ops().paged_attention_primitive(
+        q,
+        keys,
+        values,
+        kv_heads,
+        HEAD_SIZE**-0.5,
+        0.0,
+        tables,
+        mx.array(lengths, mx.int32),
+        mx.array(cu, mx.int32),
+        BLOCK_SIZE,
+        max(lengths),
+        window,
+        sinks=sinks,
+        relative_bias=bias,
+        window_seqlen_q=max(queries) if verify else 1,
+        num_decode_requests=1 if queries == [1, 35] else -1,
+        num_decode_tokens=1 if queries == [1, 35] else 0,
+        max_decode_context_len=lengths[0] if queries == [1, 35] else 0,
+    )
+    references = []
+    for i, (prefix, count) in enumerate(zip(prefixes, queries, strict=True)):
+        k = keys[tables[i]].reshape(-1, kv_heads, HEAD_SIZE)[: lengths[i]]
+        v = values[tables[i]].reshape(-1, kv_heads, HEAD_SIZE)[: lengths[i]]
+        k, v = (
+            mx.repeat(
+                a.transpose(1, 0, 2).astype(mx.float32), heads // kv_heads, axis=0
+            )
+            for a in (k, v)
+        )
+        scores = (
+            q[cu[i] : cu[i + 1]].transpose(1, 0, 2).astype(mx.float32)
+            @ k.transpose(0, 2, 1)
+            * HEAD_SIZE**-0.5
+        )
+        distance = prefix + mx.arange(count)[:, None] - mx.arange(lengths[i])[None]
+        if bias is not None:
+            band = bias[cu[i] : cu[i + 1]].transpose(1, 0, 2).astype(mx.float32)
+            gathered = mx.take_along_axis(
+                band,
+                mx.broadcast_to(
+                    mx.clip(distance, 0, extent - 1), (heads, count, lengths[i])
+                ),
+                axis=-1,
+            )
+            scores += mx.where((distance >= 0) & (distance < extent), gathered, 0)
+        visible = distance >= 0
+        if window > 0:
+            visible &= distance < window
+        scores = mx.where(visible, scores, -float("inf"))
+        if sinks is not None:
+            scores = mx.concatenate(
+                [scores, sinks[cu[i] : cu[i + 1]].T[..., None]], axis=-1
+            )
+            v = mx.concatenate([v, mx.zeros((heads, 1, HEAD_SIZE))], axis=1)
+        references.append((mx.softmax(scores, axis=-1) @ v).transpose(1, 0, 2))
+    _assert_close(out, mx.concatenate(references).astype(dtype), dtype)
+
+
+@pytest.mark.parametrize(
+    "shape,dtype",
+    [
+        ((1, 8, 0), mx.float32),
+        ((2, 8, 4), mx.float32),
+        ((1, 7, 4), mx.float32),
+        ((1, 8, 4), mx.float16),
+    ],
+)
+def test_rejects_invalid_relative_bias(shape, dtype):
+    with pytest.raises(ValueError, match="relative_bias"):
+        TestSinkValidation()._call(mx.zeros((8,)), relative_bias=mx.zeros(shape, dtype))

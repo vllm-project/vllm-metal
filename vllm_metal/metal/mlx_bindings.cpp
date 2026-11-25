@@ -390,7 +390,8 @@ NB_MODULE(_paged_ops, m) {
            int num_decode_tokens,
            int max_decode_context_len, bool gqa_disabled,
            const std::optional<GqaDecodeLengthPlan>& gqa_length_plan,
-           int nax_split_hint, int nax_prefill_split_hint) {
+           int nax_split_hint, int nax_prefill_split_hint,
+           const array* relative_bias) {
           return paged_attention_primitive_fn(
               query, key_cache, value_cache,
               num_kv_heads, scale, softcap,
@@ -401,7 +402,7 @@ NB_MODULE(_paged_ops, m) {
               window_seqlen_q, sinks, mm_prefix_ranges, num_decode_requests,
               num_decode_tokens, max_decode_context_len, gqa_disabled,
               /*force_gqa=*/false, gqa_length_plan, nax_split_hint,
-              nax_prefill_split_hint);
+              nax_prefill_split_hint, relative_bias);
         },
         nb::arg("query"),
         nb::arg("key_cache"), nb::arg("value_cache"),
@@ -427,6 +428,7 @@ NB_MODULE(_paged_ops, m) {
         nb::arg("gqa_length_plan") = nb::none(),
         nb::arg("nax_split_hint") = -1,
         nb::arg("nax_prefill_split_hint") = -1,
+        nb::arg("relative_bias").none() = nb::none(),
         // Window validation may evaluate metadata with a Python-backed reader.
         nb::call_guard<nb::gil_scoped_release>(),
         "Return a lazy paged attention array (read-only). Cache writes are handled "
@@ -434,9 +436,13 @@ NB_MODULE(_paged_ops, m) {
         "longest cu_seqlens_q segment (validated when > 1); small "
         "multi-token batches (spec-decode verification windows) route to "
         "the per-token kernel's window mode.  sinks is an optional float32 "
-        "array of one learned logit per query head (GPT-OSS style attention "
+        "array [heads] or [query rows, heads] of logits (attention "
         "sinks); it joins the softmax denominator without contributing a "
         "value row, and is rejected together with TurboQuant.  "
+        "relative_bias is an optional [query rows, heads, extent] array in query "
+        "dtype: entry d is added after score scaling/softcap at distance d. "
+        "Older keys receive zero bias; causal and window masks still apply. "
+        "It is rejected with TurboQuant.  "
         "mm_prefix_ranges is an optional (query rows, 2) int32 array of "
         "inclusive absolute image-block bounds per query row, (-1, -1) "
         "elsewhere (Gemma 4 vision): the tiled prefill kernel unmasks the "
