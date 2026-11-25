@@ -1378,6 +1378,32 @@ def test_add_adapter_rejects_embedding_lora_metal_cannot_apply(extra: str) -> No
     assert manager.list_adapters() == set()
 
 
+def test_add_adapter_rejects_moe_expert_lora_metal_cannot_apply() -> None:
+    """Metal does not wrap mlx_lm SwitchLinear experts, so an adapter with
+    expert LoRA would serve without those deltas; the load must fail instead."""
+    adapter = _adapter_with_extra_module("model.layers.0.mlp.experts.0.gate_proj")
+    for name in (
+        "model.layers.0.mlp.experts.1.gate_proj",
+        "model.layers.1.mlp.experts.0.gate_proj",
+    ):
+        adapter.weights[name] = dataclasses.replace(
+            adapter.weights["fc1"], module_name=name
+        )
+    manager = model_manager_mod.MLXLoRAModelManager(
+        model=_TwoLinearModel(),
+        lora_config=_lora_config_stub(max_loras=1, max_lora_rank=1),
+        max_num_seqs=1,
+        max_num_batched_tokens=2,
+        dtype=mx.float32,
+    )
+    with pytest.raises(
+        ValueError,
+        match=r"\['model\.layers\.\*\.mlp\.experts\.\*\.gate_proj'\].*cannot apply",
+    ):
+        manager.add_adapter(adapter)
+    assert manager.list_adapters() == set()
+
+
 @pytest.mark.parametrize(
     "target_modules",
     [
