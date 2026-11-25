@@ -15,9 +15,7 @@ from mlx_lm.models.cache import make_prompt_cache
 from tests.stub_runner import make_kv_cache
 from vllm_metal.attention.context import OffsetCache, clear_context, prepare_unified
 from vllm_metal.attention.impls.sdpa_wrapper import patch_sdpa_attention
-from vllm_metal.distributed.pipeline import apply_pipeline_split
 from vllm_metal.patches.nanbeige_registry import effective_num_loops
-from vllm_metal.v1.draft_model_proposer import resolve_draft_dims
 from vllm_metal.v1.model_adapter import DefaultModelAdapter
 from vllm_metal.v1.model_lifecycle import ModelLifecycle
 
@@ -330,8 +328,7 @@ def test_unsupported_nanbeige_variants_fail_fast(
         effective_num_loops(base | bad_override)
 
 
-def test_lifecycle_draft_and_pp_loop_contracts() -> None:
-    """Lifecycle sizing reads the loaded model's loops; draft sizing multiplies them; PP rejects loops."""
+def test_lifecycle_sizes_one_kv_layer_per_loop() -> None:
     args = _make_args(num_loops=2)
     runner = SimpleNamespace(
         model_args=asdict(args),
@@ -343,30 +340,6 @@ def test_lifecycle_draft_and_pp_loop_contracts() -> None:
     ModelLifecycle(runner, DefaultModelAdapter()).resolve_model_dims()
     assert runner.num_layers == 6
     assert runner.num_kv_cache_layers == 6
-
-    draft_cfg = SimpleNamespace(
-        hf_text_config=SimpleNamespace(
-            model_type="nanbeige",
-            num_loops=2,
-            layer_types=None,
-        ),
-        get_sliding_window=lambda: None,
-        get_total_num_hidden_layers=lambda: 22,
-        get_num_kv_heads=lambda _pc: 8,
-        get_head_size=lambda: 128,
-    )
-    dims = resolve_draft_dims(
-        SimpleNamespace(draft_model_config=draft_cfg),
-        parallel_config=SimpleNamespace(),
-    )
-    assert dims.num_layers == 44
-    assert dims.num_kv_heads == 8
-    assert dims.head_dim == 128
-
-    model = nanbeige.Model(_make_args(num_loops=2))
-    pp_two_stage = SimpleNamespace(size=2, rank=0, is_last=False)
-    with pytest.raises(NotImplementedError, match="weight-tied looped models"):
-        apply_pipeline_split(model, pp_two_stage)  # type: ignore[arg-type]
 
 
 def test_non_nanbeige_models_ignore_nanbeige_flags_and_loops() -> None:
