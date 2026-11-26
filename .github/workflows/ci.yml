@@ -18,8 +18,6 @@ jobs:
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-      with:
-        submodules: recursive
 
     - name: Lint
       run: |
@@ -30,17 +28,17 @@ jobs:
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
       MACOSX_DEPLOYMENT_TARGET: "15.0"
+      VLLM_METAL_PYTHON: ${{ matrix.python }}
     permissions:
       contents: read
     strategy:
       matrix:
         os: [macos-15]
+        python: ['3.12', '3.13']
 
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-      with:
-        submodules: recursive
 
     - name: Fingerprint native build toolchain
       id: native-toolchain
@@ -52,7 +50,8 @@ jobs:
         # guaranteed usable here before we read its version.
         ensure_metal_toolchain
         ensure_uv
-        py=$(uv python find 3.12)
+        uv python install "$VLLM_METAL_PYTHON"
+        py=$(uv python find "$VLLM_METAL_PYTHON")
         {
           # InstalledDir is a per-boot cryptex mount path; drop it.
           xcrun -sdk macosx metal --version | grep -v '^InstalledDir:'

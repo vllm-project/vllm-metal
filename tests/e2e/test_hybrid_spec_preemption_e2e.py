@@ -39,7 +39,6 @@ def _local_model_path(model_id: str, env_var: str) -> str:
 
 def _run_arm(case: str, enable_spec: bool, out_path: str, model: str):
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
-    os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1"
     from vllm import LLM, SamplingParams
 
     from tools.hybrid_spec_parity import CORPUS_A, CORPUS_B, SUFFIXES
@@ -89,7 +88,6 @@ def _run_arm(case: str, enable_spec: bool, out_path: str, model: str):
         ),
     )
     try:
-        assert llm.llm_engine.vllm_config.use_v2_model_runner
         tokenizer = llm.get_tokenizer()
         if case == "divergent":
             prompts = []
@@ -131,7 +129,6 @@ def _run_arm(case: str, enable_spec: bool, out_path: str, model: str):
             "tokens": [list(out.outputs[0].token_ids) for out in outputs],
             "readmitted": readmitted,
             "verify": records,
-            "use_v2": llm.llm_engine.vllm_config.use_v2_model_runner,
             "async_scheduling": (
                 llm.llm_engine.vllm_config.scheduler_config.async_scheduling
             ),
@@ -143,7 +140,7 @@ def _run_arm(case: str, enable_spec: bool, out_path: str, model: str):
 
 @pytest.mark.slow
 @pytest.mark.skipif(os.environ.get("VLLM_METAL_E2E", "1") != "1", reason="e2e disabled")
-def test_ngram_spec_divergent_hybrid_preemption_structure_v2(
+def test_ngram_spec_divergent_hybrid_preemption_structure(
     run_in_spawn_process, tmp_path
 ):
     model = _local_model_path("Qwen/Qwen3.5-0.8B", "QWEN35_MODEL_PATH")
@@ -152,7 +149,6 @@ def test_ngram_spec_divergent_hybrid_preemption_structure_v2(
     path = tmp_path / "divergent.json"
     run_in_spawn_process(_run_arm, "divergent", True, str(path), model)
     arm = json.loads(path.read_text(encoding="utf-8"))
-    assert arm["use_v2"]
     assert arm["async_scheduling"] is False
     assert arm["readmitted"], "No request was readmitted"
     resumed_records = [record for record in arm["verify"] if record[3]]
@@ -179,7 +175,7 @@ def test_ngram_spec_divergent_hybrid_preemption_structure_v2(
         pytest.param("Qwen/Qwen3-0.6B", "QWEN3_MODEL_PATH", id="non-hybrid"),
     ],
 )
-def test_ngram_spec_repeated_is_lossless_across_preemption_v2(
+def test_ngram_spec_repeated_is_lossless_across_preemption(
     run_in_spawn_process, tmp_path, model_id, model_env
 ):
     model = _local_model_path(model_id, model_env)
@@ -191,7 +187,6 @@ def test_ngram_spec_repeated_is_lossless_across_preemption_v2(
             _run_arm, "repeated", enable_spec, str(path), model, label=label
         )
         arm = json.loads(path.read_text(encoding="utf-8"))
-        assert arm["use_v2"], label
         assert arm["async_scheduling"] is False, label
         assert arm["readmitted"], f"{label}: no request was readmitted"
         assert len(arm["tokens"]) == 8, label

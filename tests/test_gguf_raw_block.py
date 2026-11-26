@@ -8,14 +8,13 @@ oracle for what the blocks mean.
 
 from __future__ import annotations
 
+import gguf
 import mlx.core as mx
 import numpy as np
 import pytest
 
-gguf = pytest.importorskip("gguf")
-
-from tests.gguf_kquant_fixtures import build_kquant_blocks  # noqa: E402
-from vllm_metal.gguf.raw_block import GGUFRawBlockTensor  # noqa: E402
+from tests.gguf_kquant_fixtures import build_kquant_blocks
+from vllm_metal.gguf.raw_block import GGUFRawBlockTensor
 
 GGMLQuantizationType = gguf.GGMLQuantizationType
 

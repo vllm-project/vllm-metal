@@ -618,14 +618,15 @@ def test_mps_sampler_matches_upstream_with_padding(run_in_spawn_process):
 
 
 def _check_mps_sampler_against_upstream():
-    from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+    from vllm.v1.worker.gpu.sample import sampler
 
-    from vllm_metal.pytorch_backend.bindings import register_kernel_overrides
+    from vllm_metal.pytorch_backend.bindings import install, register_kernel_overrides
 
     register_kernel_overrides()
+    install()
     for logits, seeds, positions, temperatures, expected in _sampling_golden_cases():
         mps_logits = torch.nn.functional.pad(logits.to("mps"), (1, 2), value=1000.0)
-        mps_ids = gumbel_sample(
+        mps_ids = sampler.gumbel_sample(
             mps_logits[:, 1:-2],
             torch.arange(len(seeds), dtype=torch.int32, device="mps"),
             torch.tensor(temperatures, device="mps"),

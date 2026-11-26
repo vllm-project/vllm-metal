@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Device adapters for vLLM 0.32's upstream MRV2 runner.
+"""Device adapters for vLLM's upstream MRV2 runner.
 
 PyTorch's native streams and events use the single MPS default queue. Staging
 buffers use explicit CPU-to-MPS copies.
@@ -66,8 +66,9 @@ def staged_write(self):
         offsets.extend(range(row * stride + col, row * stride + col + end - start))
         start = end
     indices = torch.tensor(offsets, device=self.device, dtype=torch.int64)
-    values = torch.tensor(
-        self._staged_write_contents, device=self.device, dtype=self.dtype
+    # Upstream keeps ndarray and array writes as separate by-reference chunks.
+    values = self.write_contents.copy_chunks_to_uva(
+        self._staged_chunks(), self._staged_write_len
     )
     self.gpu.view(-1).index_copy_(0, indices, values)
     self.clear_staged_writes()

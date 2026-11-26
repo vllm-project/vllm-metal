@@ -40,7 +40,6 @@ def speech_server(tmp_path_factory):
         VLLM_METAL_BACKEND="mps",
         PYTORCH_ENABLE_MPS_FALLBACK="0",
         VLLM_NO_USAGE_STATS="1",
-        VLLM_USE_V2_MODEL_RUNNER="1",
         HF_HUB_OFFLINE="1",
     )
     with log.open("w") as output:

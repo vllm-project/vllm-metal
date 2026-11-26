@@ -12,7 +12,6 @@ from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
 
 from vllm_metal.stt.runtime import STTRuntimeAdapter
 
@@ -267,11 +266,6 @@ class WhisperModel(nn.Module):
             dtype,
         )
 
-        # Alignment heads for word timestamps
-        all_heads = np.zeros((config.n_text_layer, config.n_text_head), dtype=bool)
-        all_heads[config.n_text_layer // 2 :] = True
-        self._alignment_heads = mx.array(np.asarray(all_heads.nonzero()).T)
-
     def create_runtime_adapter(self, model_path: str) -> STTRuntimeAdapter:
         """Create the model-owned runtime adapter used by the vLLM runner."""
         # Local import: avoid import-time cycles (adapter imports transcriber).
@@ -316,10 +310,6 @@ class WhisperModel(nn.Module):
     @property
     def is_multilingual(self) -> bool:
         return self.config.n_vocab >= 51865
-
-    @property
-    def num_languages(self) -> int:
-        return self.config.n_vocab - 51765 - int(self.is_multilingual)
 
     # HuggingFace -> MLX weight key mapping.
     # Each tuple is (old_substring, new_substring).  ``None`` means skip.

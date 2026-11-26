@@ -51,16 +51,18 @@ fetch_release() {
   echo "$release_data"
 }
 
-# Print "<tag>\n<wheel url>" from a GitHub release payload on stdin.
+# Print "<tag>\n<wheel url>" for the running Python's wheel tag from a GitHub
+# release payload on stdin.
 extract_wheel_url() {
   local channel="$1"
 
-  CHANNEL="$channel" python3 -c '
+  CHANNEL="$channel" python -c '
 import json
 import os
 import sys
 
 channel = os.environ["CHANNEL"]
+python_tag = f"cp{sys.version_info.major}{sys.version_info.minor}"
 try:
     data = json.load(sys.stdin)
 except Exception:
@@ -76,7 +78,15 @@ else:
 
 for release in releases:
     for asset in release.get("assets", []):
-        if (asset.get("name") or "").endswith(".whl"):
+        name = asset.get("name") or ""
+        parts = name.rsplit("-", 3)
+        if (
+            name.startswith("vllm_metal-")
+            and len(parts) == 4
+            and parts[1:3] == [python_tag, python_tag]
+            and parts[3].startswith("macosx_")
+            and parts[3].endswith("_arm64.whl")
+        ):
             print(release.get("tag_name", ""))
             print(asset.get("browser_download_url", ""))
             sys.exit(0)
@@ -113,13 +123,7 @@ fetch_release_vllm_tag() {
 install_vllm() {
   local vllm_release_tag="$1"
   local vllm_version="${vllm_release_tag#v}"
-  local download_tag="$vllm_release_tag"
-  # SCAFFOLDING: remove when .github/vllm-release-tag.commit moves past v0.33.0.
-  # vLLM published v0.33.0 on tag v0.33.0rc3 (same commit); the wheel is 0.33.0.
-  if [[ "$vllm_release_tag" == "v0.33.0" ]]; then
-    download_tag="v0.33.0rc3"
-  fi
-  local download_url="https://github.com/vllm-project/vllm/releases/download/${download_tag}"
+  local download_url="https://github.com/vllm-project/vllm/releases/download/${vllm_release_tag}"
   # vLLM's prebuilt macOS arm64 wheel is tagged cp38-abi3.
   local vllm_wheel_url="${download_url}/vllm-${vllm_version}%2Bcpu-cp38-abi3-macosx_11_0_arm64.whl"
 
@@ -209,6 +213,8 @@ Options:
   -h, --help        Show this help.
 
 The channel can also be set with VLLM_METAL_CHANNEL=dev|stable.
+Set VLLM_METAL_PYTHON=3.12|3.13 to select Python (default: 3.12).
+Set VLLM_METAL_VENV to override the environment directory.
 EOF
         exit 0
         ;;
@@ -273,6 +279,7 @@ EOF
     venv="$script_dir/.venv-vllm-metal"
   fi
 
+  venv="${VLLM_METAL_VENV:-$venv}"
   ensure_venv "$venv"
   if ! require_arm64_python python; then
     exit 1
@@ -304,7 +311,7 @@ EOF
     fi
 
     if [[ -z "$wheel_url" ]]; then
-      error "No wheel file found in the latest ${channel} release."
+      error "No compatible wheel found for Python ${VLLM_METAL_PYTHON:-3.12} in the ${channel} releases."
       exit 1
     fi
 

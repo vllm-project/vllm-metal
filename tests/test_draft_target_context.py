@@ -5,25 +5,13 @@ import json
 
 from vllm.engine.arg_utils import EngineArgs
 
+from tests.tiny_configs import TINY_QWEN3_CONFIG
 from vllm_metal.config import reset_config
 from vllm_metal.patches.draft_context_limit import register
 
-_TINY_QWEN3_CONFIG = {
-    "architectures": ["Qwen3ForCausalLM"],
-    "model_type": "qwen3",
-    "hidden_size": 256,
-    "intermediate_size": 128,
-    "num_hidden_layers": 2,
-    "num_attention_heads": 4,
-    "num_key_value_heads": 2,
-    "head_dim": 64,
-    "vocab_size": 256,
-    "max_position_embeddings": 4096,
-}
-
 
 def test_shorter_draft_model_keeps_target_context(tmp_path) -> None:
-    (tmp_path / "config.json").write_text(json.dumps(_TINY_QWEN3_CONFIG))
+    (tmp_path / "config.json").write_text(json.dumps(TINY_QWEN3_CONFIG))
     register()
     reset_config()
     try:
