@@ -40,11 +40,12 @@ def _grouped_inputs(q, prefix, geometry, cache_page):
         # Q, split hint, (heads, KV heads, D, kernel page), physical page,
         # prefix, GPU cores, expected width and compiled shader suffix.
         pytest.param(
-            (144, 0, (24, 4, 256, 16), 784, 31360, 20, 3, "_gqa6_sub_full"),
+            (144, 0, (24, 4, 256, 16), 784, 31360, 20, 3, "_gqa6_h3_full"),
             id="gqa6-h3",
         ),
         pytest.param(
-            (1328, 1, (24, 4, 256, 16), 784, 31360, 10, 6, "_gqa6_full"), id="gqa6-h6"
+            (1328, 1, (24, 4, 256, 16), 784, 31360, 10, 6, "_gqa6_h6_full"),
+            id="gqa6-h6",
         ),
         pytest.param(
             (64, 0, (24, 4, 256, 16), 784, 31360, 20, 2, "_gqa6_h2_full"), id="gqa6-h2"
@@ -53,7 +54,7 @@ def _grouped_inputs(q, prefix, geometry, cache_page):
             (16, 0, (16, 2, 256, 32), 1056, 31680, 40, 2, "_gqa8_h2_full"), id="gqa8-h2"
         ),
         pytest.param(
-            (128, 0, (16, 2, 256, 32), 544, 31681, 10, 4, "_gqa8_full"),
+            (128, 0, (16, 2, 256, 32), 544, 31681, 10, 4, "_gqa8_h4_full"),
             id="gqa8-h4-kv-tail",
         ),
         pytest.param(

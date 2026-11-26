@@ -134,12 +134,8 @@ inline std::string nax_name(
       "_hs" + std::to_string(head_size) +
       "_bs" + std::to_string(block_size);
   if (cfg.HEADS_PER_TG > 1) {
-    name += "_gqa" + std::to_string(cfg.GQA_RATIO);
-    if (cfg.HEADS_PER_TG == 2 || cfg.HEADS_PER_TG == 8)
-      name += "_h" + std::to_string(cfg.HEADS_PER_TG);
-    else if (cfg.HEADS_PER_TG == 3)
-      name += "_sub";
-    name += "_full";
+    name += "_gqa" + std::to_string(cfg.GQA_RATIO) +
+        "_h" + std::to_string(cfg.HEADS_PER_TG) + "_full";
   }
   return name;
 }

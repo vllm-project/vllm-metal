@@ -899,12 +899,12 @@ void paged_attention_nax_grouped_full(
   }
 }
 
-#define instantiate_paged_attention_nax_grouped_full(                             \
-    type, block_size, ratio, width, suffix)                                    \
-  template [[host_name("paged_attention_nax_" #type                          \
-                       "_hs256_bs" #block_size "_gqa" #ratio #suffix)]]    \
-  [[kernel]] void paged_attention_nax_grouped_full<                               \
-      type, block_size, ratio, width>(                                    \
+#define instantiate_paged_attention_nax_grouped_full(                        \
+    type, block_size, ratio, width)                                          \
+  template [[host_name("paged_attention_nax_" #type "_hs256_bs" #block_size  \
+                       "_gqa" #ratio "_h" #width "_full")]]                  \
+  [[kernel]] void paged_attention_nax_grouped_full<                          \
+      type, block_size, ratio, width>(                                       \
       device type *out [[buffer(2)]],                                        \
       device const type *q [[buffer(3)]],                                    \
       device const type *k_cache [[buffer(4)]],                              \
@@ -927,11 +927,9 @@ void paged_attention_nax_grouped_full(
       uint3 tgpg [[threadgroups_per_grid]],                                  \
       uint sg_idx [[simdgroup_index_in_threadgroup]]);
 
-instantiate_paged_attention_nax_grouped_full(bfloat16_t, 16, 6, 6, _full);
-instantiate_paged_attention_nax_grouped_full(bfloat16_t, 16, 6, 3, _sub_full);
-instantiate_paged_attention_nax_grouped_full(bfloat16_t, 32, 8, 4, _full);
-
-// Narrow and full-ratio candidates share the same per-head calculation.
-instantiate_paged_attention_nax_grouped_full(bfloat16_t, 16, 6, 2, _h2_full);
-instantiate_paged_attention_nax_grouped_full(bfloat16_t, 32, 8, 2, _h2_full);
-instantiate_paged_attention_nax_grouped_full(bfloat16_t, 32, 8, 8, _h8_full);
+instantiate_paged_attention_nax_grouped_full(bfloat16_t, 16, 6, 2);
+instantiate_paged_attention_nax_grouped_full(bfloat16_t, 16, 6, 3);
+instantiate_paged_attention_nax_grouped_full(bfloat16_t, 16, 6, 6);
+instantiate_paged_attention_nax_grouped_full(bfloat16_t, 32, 8, 2);
+instantiate_paged_attention_nax_grouped_full(bfloat16_t, 32, 8, 4);
+instantiate_paged_attention_nax_grouped_full(bfloat16_t, 32, 8, 8);
