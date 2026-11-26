@@ -449,6 +449,8 @@ def _nax_plan_config(
     [
         ({}, (16, 2, 64)),
         ({"cores": 10, "q": 128}, (16, 4, 128)),
+        # The 32-token KV tile selects h4 for this short cached prefill.
+        ({"q": 128, "prefix": 256, "cores": 16}, (16, 4, 128)),
         ({"q": 63}, (64, 1, 128)),
         ({"q": 64, "split": 1}, (64, 1, 128)),
         ({"q": 1056, "prefix": 15840, "split": 1}, (16, 4, 128)),
