@@ -15,19 +15,18 @@ from __future__ import annotations
 
 import os
 
+import gguf
 import mlx.core as mx
 import numpy as np
 import pytest
 
-gguf = pytest.importorskip("gguf")
-
-import vllm_metal.gguf.mlx_native as mlx_native  # noqa: E402
-from tests.gguf_kquant_fixtures import (  # noqa: E402
+import vllm_metal.gguf.mlx_native as mlx_native
+from tests.gguf_kquant_fixtures import (
     build_iq3s_blocks,
     build_iq4_blocks,
     build_kquant_blocks,
 )
-from vllm_metal.gguf.mlx_native import (  # noqa: E402
+from vllm_metal.gguf.mlx_native import (
     AFFINE_GGUF_TYPES,
     GGUFMLXQuantizedTensor,
 )

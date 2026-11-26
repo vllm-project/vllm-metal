@@ -122,9 +122,6 @@ def test_lfm3_scheduler_preserves_conv_sliding_and_full_attention():
     """The tri-hybrid model must retain all three kinds of scheduler state."""
     from mlx_vlm.models.lfm3 import Model, ModelConfig
 
-    from vllm_metal.compat import register_model_compat
-
-    register_model_compat()
     model = Model(
         ModelConfig(
             vocab_size=32,

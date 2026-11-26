@@ -1278,16 +1278,23 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
             return None
         # TODO: Contribute a per-layer attention-layout API to mlx-lm, then
         # read that metadata here instead of inferring it from KV cache classes.
-        from mlx_lm.models.cache import KVCache, RotatingKVCache
+        from mlx_lm.models import cache as lm_cache
+        from mlx_vlm.models import cache as vlm_cache
+
+        rotating_cache_types = (
+            lm_cache.RotatingKVCache,
+            vlm_cache.RotatingKVCache,
+        )
+        full_cache_types = (lm_cache.KVCache, vlm_cache.KVCache)
 
         caches = make_cache()
         if len(caches) != num_layers:
             return None
         windows: list[int] = []
         for cache in caches:
-            if isinstance(cache, RotatingKVCache) and cache.keep == 0:
+            if isinstance(cache, rotating_cache_types) and cache.keep == 0:
                 windows.append(int(cache.max_size))
-            elif isinstance(cache, KVCache):
+            elif isinstance(cache, full_cache_types):
                 windows.append(-1)
             else:
                 return None

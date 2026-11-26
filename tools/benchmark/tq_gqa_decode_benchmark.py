@@ -74,7 +74,7 @@ def _arms(ops, geometry, context, requests, dtype, k_quant, v_bits, seed):
         return ops._gqa_turboquant_paged_attention_for_test(
             query, k_cache, v_cache, k_scale, v_scale, k_zero, centroids,
             k_quant, v_bits, scale, tables, lengths, block_size, context,
-            256, plan,
+            gqa_length_plan=plan,
         )  # fmt: skip
 
     return {"established": established, "gqa": gqa}

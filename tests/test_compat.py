@@ -6,7 +6,6 @@ from __future__ import annotations
 import builtins
 import importlib.util
 import json
-import os
 import sys
 from types import ModuleType, SimpleNamespace
 
@@ -276,13 +275,16 @@ class TestApplyCompatPatches:
         ]
 
 
-_METADATA_ARCHS = frozenset(
-    {
-        "Lfm3ForCausalLM",
-        "Lfm3VlForConditionalGeneration",
-        "Lfm3AudioForConditionalGeneration",
-    }
-)
+# vLLM's own LFM3 registrations (vllm/model_executor/models/registry.py).
+_VLLM_LFM3 = {
+    "Lfm3ForCausalLM": "vllm.model_executor.models.lfm3:Lfm3ForCausalLM",
+    "Lfm3VlForConditionalGeneration": (
+        "vllm.model_executor.models.lfm3_vl:Lfm3VlForConditionalGeneration"
+    ),
+    "Lfm3AudioForConditionalGeneration": (
+        "vllm.model_executor.models.lfm3_audio:Lfm3AudioForConditionalGeneration"
+    ),
+}
 
 
 class TestModelMetadataCompat:
@@ -296,39 +298,50 @@ class TestModelMetadataCompat:
         monkeypatch.setattr(platforms, "current_platform", MetalPlatform())
 
     @pytest.fixture
-    def without_metadata(self, monkeypatch):
-        """Hide the fallback architecture registrations."""
+    def registry(self, monkeypatch):
+        """vLLM's model registry with its own LFM3 entries, restored after the test.
+
+        Any earlier test that loads vLLM's general plugins has already run
+        ``register_model_compat`` on the shared registry.
+        """
         from vllm.model_executor.models import ModelRegistry
 
         monkeypatch.setattr(ModelRegistry, "models", dict(ModelRegistry.models))
-        for arch in _METADATA_ARCHS:
-            ModelRegistry.models.pop(arch, None)
+        for architecture, model_cls in _VLLM_LFM3.items():
+            ModelRegistry.register_model(architecture, model_cls)
         return ModelRegistry
 
-    def test_missing_model_metadata_loads(self, without_metadata) -> None:
-        compat.register_model_compat()
-        compat.register_model_compat()
-
-        assert _METADATA_ARCHS <= set(without_metadata.get_supported_archs())
-
-    @pytest.mark.parametrize("architecture", sorted(_METADATA_ARCHS))
-    def test_existing_registrations_are_kept(
-        self, without_metadata, architecture
+    @pytest.mark.parametrize(
+        ("architecture", "expected"),
+        [
+            ("Lfm3ForCausalLM", _VLLM_LFM3["Lfm3ForCausalLM"]),
+            (
+                "Lfm3VlForConditionalGeneration",
+                "vllm_metal.patches.lfm3_registry:Lfm3VlForConditionalGeneration",
+            ),
+            (
+                "Lfm3AudioForConditionalGeneration",
+                "vllm_metal.patches.lfm3_audio_registry:"
+                "Lfm3AudioForConditionalGeneration",
+            ),
+        ],
+        ids=["text-stays-native", "vl", "audio"],
+    )
+    def test_mlx_overrides_only_lfm3_vl_and_audio(
+        self, registry, architecture, expected
     ) -> None:
-        without_metadata.register_model(
-            architecture, "vllm.model_executor.models.llama:LlamaForCausalLM"
-        )
-
+        compat.register_model_compat()
         compat.register_model_compat()
 
-        assert without_metadata.models[architecture].class_name == "LlamaForCausalLM"
+        registered = registry.models[architecture]
+        assert f"{registered.module_name}:{registered.class_name}" == expected
 
     @pytest.mark.parametrize(
         ("is_metal", "backend"),
         [(False, "mlx"), (True, "mps")],
     )
-    def test_other_platforms_and_backends_keep_models_unregistered(
-        self, without_metadata, monkeypatch, is_metal, backend
+    def test_other_platforms_and_backends_keep_vllms_native_lfm3(
+        self, registry, monkeypatch, is_metal, backend
     ) -> None:
         import vllm.platforms as platforms
         from vllm.platforms.cpu import CpuPlatform
@@ -339,7 +352,80 @@ class TestModelMetadataCompat:
 
         compat.register_model_compat()
 
-        assert _METADATA_ARCHS.isdisjoint(without_metadata.get_supported_archs())
+        registered = {
+            architecture: f"{entry.module_name}:{entry.class_name}"
+            for architecture, entry in registry.models.items()
+            if architecture in _VLLM_LFM3
+        }
+        assert registered == _VLLM_LFM3
+
+
+def _write_nanbeige_config(path) -> None:
+    (path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["NanbeigeForCausalLM"],
+                "model_type": "nanbeige",
+                "hidden_size": 3072,
+                "num_hidden_layers": 22,
+                "num_attention_heads": 48,
+                "num_key_value_heads": 8,
+                "head_dim": 128,
+                "num_loops": 2,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+class TestNanbeigeCompat:
+    @pytest.fixture(autouse=True)
+    def metal_mlx(self, monkeypatch):
+        import vllm.platforms as platforms
+
+        from vllm_metal.platform import MetalPlatform
+
+        monkeypatch.delenv("VLLM_METAL_BACKEND", raising=False)
+        monkeypatch.setattr(platforms, "current_platform", MetalPlatform())
+
+    @pytest.fixture(autouse=True)
+    def without_nanbeige(self, monkeypatch):
+        """Hide any Nanbeige config registration in Transformers."""
+        from transformers.models.auto import configuration_auto
+
+        config_mapping = configuration_auto.CONFIG_MAPPING
+        monkeypatch.setattr(config_mapping, "_mapping", dict(config_mapping._mapping))
+        monkeypatch.setattr(
+            config_mapping, "_extra_content", dict(config_mapping._extra_content)
+        )
+        config_mapping._mapping.pop("nanbeige", None)
+        config_mapping._extra_content.pop("nanbeige", None)
+
+    def test_checkpoint_config_loads_and_pickles(self, tmp_path) -> None:
+        """vllm.LLM sends the config to spawned EngineCore workers by pickle."""
+        import pickle
+
+        from transformers import AutoConfig
+
+        _write_nanbeige_config(tmp_path)
+        compat.register_model_compat()
+        config = pickle.loads(pickle.dumps(AutoConfig.from_pretrained(tmp_path)))
+
+        assert config.model_type == "nanbeige"
+        assert config.num_hidden_layers == 22
+        assert config.num_loops == 2
+
+    def test_existing_registration_is_kept(self) -> None:
+        """Once Transformers knows nanbeige, the hook must leave it alone."""
+        from transformers import AutoConfig
+        from transformers.models.auto import configuration_auto
+
+        existing = type("ExistingConfig", (), {"model_type": "nanbeige"})
+        AutoConfig.register("nanbeige", existing, exist_ok=True)
+
+        compat.register_model_compat()
+
+        assert configuration_auto.CONFIG_MAPPING["nanbeige"] is existing
 
 
 def _install_fake_qwen35_modules(monkeypatch, *, include_moe: bool):
@@ -469,25 +555,17 @@ class TestQwen35Fp8CompatPatch:
         assert dequantized.shape == (129, 130)
         np.testing.assert_allclose(dequantized, expected)
 
-    def test_dequant_real_mlx_fp8_values_when_enabled(self) -> None:
-        if os.environ.get("VLLM_METAL_RUN_REAL_MLX_FP8_TESTS") != "1":
-            pytest.skip("VLLM_METAL_RUN_REAL_MLX_FP8_TESTS=1 not set")
-
+    def test_dequantizes_real_fp8_values_with_block_scale(self) -> None:
         import mlx.core as mx
 
-        fp8_dtype = getattr(mx, "float8_e4m3fn", None)
-        if fp8_dtype is None:
-            pytest.skip("mlx.core has no float8_e4m3fn dtype")
-
-        weight = mx.array([[1.0, -2.0], [0.5, 4.0]], dtype=mx.float32).astype(fp8_dtype)
-        scale_inv = mx.array([[2.0]], dtype=mx.float32)
+        weight = mx.to_fp8(mx.array([[1.0, -2.0], [0.5, 4.0]]))
+        scale_inv = mx.array([[2.0]])
 
         dequantized = compat._dequantize_qwen35_fp8_weight(weight, scale_inv, mx)
-        mx.eval(dequantized)
 
         np.testing.assert_allclose(
-            np.array(dequantized, dtype=np.float32),
-            np.array([[2.0, -4.0], [1.0, 8.0]], dtype=np.float32),
+            np.array(dequantized.astype(mx.float32)),
+            [[2.0, -4.0], [1.0, 8.0]],
         )
 
     def test_rejects_unexpected_fp8_block_scale_shape(self, monkeypatch) -> None:

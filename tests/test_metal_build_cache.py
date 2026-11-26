@@ -890,9 +890,9 @@ def test_metallib_toolchain_change_rebuilds(metallib_env):
     build.build_metallibs()
     assert set(metallib_env["compiled"]) == {_LIB, "nax_fake"}
     old_dir, new_dir = metallib_env["build_dirs"]
-    assert old_dir.parent.parent.name == "tc-a"
-    assert new_dir.parent.parent.name == "tc-b"
-    assert old_dir.name == new_dir.name == build._input_hash()
+    assert old_dir.parent.parent.parent.name == "tc-a"
+    assert new_dir.parent.parent.parent.name == "tc-b"
+    assert old_dir.parent.name == new_dir.parent.name == build._input_hash()
 
 
 @pytest.mark.parametrize(
@@ -944,6 +944,17 @@ def test_metallib_unavailable_toolchain_never_skips(metallib_env):
     build.build_metallibs()
     assert metallib_env["build_dirs"][-1] != first_dir
     assert not first_dir.exists()
+
+
+def test_each_python_abi_gets_its_own_cmake_tree(patched, metallib_env, monkeypatch):
+    monkeypatch.setattr(build, "_EXT_SUFFIX", ".cpython-312-darwin.so")
+    build.build_metallibs()
+    patched.out.unlink()
+    monkeypatch.setattr(build, "_EXT_SUFFIX", ".cpython-313-darwin.so")
+    build.build_metallibs()
+    first_dir, second_dir = metallib_env["build_dirs"]
+    assert first_dir.name == "cpython-312-darwin.so"
+    assert second_dir == first_dir.parent / "cpython-313-darwin.so"
 
 
 def test_runtime_staleness_does_not_query_toolchain(monkeypatch, tmp_path):

@@ -12,10 +12,7 @@ from tests.e2e.test_block_draft_serving_e2e import (
     _serve,
     _spawn_env,
 )
-from tests.scheduler_helpers import (
-    assert_v2_model_runner,
-    track_preemptions_and_resumptions,
-)
+from tests.scheduler_helpers import track_preemptions_and_resumptions
 
 
 def _serve_scheduled(
@@ -109,7 +106,6 @@ def _serve_scheduled(
         return result
 
     proposer.propose = record_propose
-    assert_v2_model_runner(llm)
     track_preemptions_and_resumptions(scheduler, stats)
     runner._spec_decode_controller.verify_greedy = record_verify
 

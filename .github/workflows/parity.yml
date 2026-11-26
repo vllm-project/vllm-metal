@@ -78,7 +78,6 @@ jobs:
         with:
           repository: ${{ needs.resolve.outputs.repository }}
           ref: ${{ needs.resolve.outputs.sha }}
-          submodules: recursive
           persist-credentials: false
       - name: Install the tested checkout
         id: install

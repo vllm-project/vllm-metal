@@ -579,7 +579,6 @@ class DiffusionGemmaRuntime:
         runtime.materialize_pending_state()
         return ModelRunnerOutput(
             req_ids=req_ids,
-            req_id_to_index={req_id: i for i, req_id in enumerate(req_ids)},
             sampled_token_ids=[sampled.get(req_id, []) for req_id in req_ids],
             logprobs=join_canvas_logprobs(req_ids, logprobs),
         )

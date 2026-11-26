@@ -37,6 +37,19 @@ def find_layers(model: Any) -> list[Any]:
         )
 
 
+def find_num_loops(model: Any) -> int:
+    """Return how many times the backbone runs its layer stack per forward.
+
+    Weight-tied looped decoders (Nanbeige 4.2) set ``num_loops`` on the
+    backbone and pass each loop its own cache entries; other models run once.
+    """
+    root = getattr(model, "language_model", model)
+    num_loops = getattr(getattr(root, "model", root), "num_loops", 1)
+    if type(num_loops) is not int or num_loops < 1:
+        raise ValueError(f"num_loops must be a positive int, got {num_loops!r}")
+    return num_loops
+
+
 # Attribute names to probe on each layer, in priority order. LFM2 uses
 # ``conv`` for its ShortConv layers, which have no attention submodule.
 DEFAULT_ATTN_ATTR_NAMES = ("self_attn", "linear_attn", "attention", "conv")

@@ -9,7 +9,7 @@ python tools/check_parity.py --model Qwen/Qwen3-0.6B
 VLLM_METAL_BACKEND=mps PYTORCH_ENABLE_MPS_FALLBACK=0 \
   python tools/check_parity.py --model Qwen/Qwen3-0.6B --top-k 5
 python tools/check_parity.py --model /path/to/checkpoint --top-k 5 --batch-size 1 2 --output-dir parity-results
-python tools/check_parity.py --model LiquidAI/LFM3-1.7B-MLX-4bit --reference-backend mlx-vlm --trust-remote-code --top-k 5
+python tools/check_parity.py --model LiquidAI/LFM3-1.7B-MLX-4bit --reference-backend mlx-vlm --top-k 5
 python tools/check_parity.py --model /path/to/Qwen3.5-0.8B-Q6_K.gguf --reference-model Qwen/Qwen3.5-0.8B --top-k 8
 ```
 
@@ -17,7 +17,7 @@ The tool generates the native MLX reference once and exits that process before s
 
 For a local GGUF file, set `--reference-model` to the checkpoint it was converted from.
 
-The default is the 40 prompts in `tools/parity_prompts.py`, greedy decoding, and 10 output tokens, ignoring EOS. Use `--prompt` for custom text, `--max-tokens` for output length, `--trust-remote-code` for checkpoints that ship their own config code, and `--help` for all options. Inputs are plain text without a chat template. Logs, the native reference, and a summary are saved to `--output-dir`, or a new temporary directory printed at startup. The tool selects an available localhost port automatically.
+The default is the 40 prompts in `tools/parity_prompts.py`, greedy decoding, and 10 output tokens, ignoring EOS. Use `--prompt` for custom text, `--max-tokens` for output length, `--trust-remote-code` for checkpoints whose model type vLLM does not know and that ship their own config code, and `--help` for all options. Inputs are plain text without a chat template. Logs, the native reference, and a summary are saved to `--output-dir`, or a new temporary directory printed at startup. The tool selects an available localhost port automatically.
 
 - `EXACT`: every output token matches.
 - `TOP_K_MATCH`: the first divergence passes mutual top-K membership; later tokens are not compared. Enabled with `--top-k K`.

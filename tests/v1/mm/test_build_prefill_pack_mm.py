@@ -51,10 +51,11 @@ def _make_prefill_entry(
     )
 
 
-def _new_req(req_id: str, prompt_token_ids: list[int] | None) -> NewRequestData:
+def _new_req(req_id: str, prompt_token_ids: list[int]) -> NewRequestData:
     return NewRequestData(
         req_id=req_id,
         prompt_token_ids=prompt_token_ids,
+        prefill_token_ids=prompt_token_ids,
         mm_features=[],
         sampling_params=None,
         pooling_params=None,

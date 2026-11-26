@@ -206,6 +206,8 @@ class TestTurboQuantHybridAlignment:
             ),
             scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
             kv_transfer_config=None,
+            # The hybrid alignment's mamba_state_alignment reads this property.
+            use_flashinfer_replayssm=False,
         )
 
     def _stub_model_cls(self) -> SimpleNamespace:

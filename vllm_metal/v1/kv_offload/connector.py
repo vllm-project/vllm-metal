@@ -1,14 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """OffloadingConnector that registers Metal's ``KVCacheStorage``.
 
-Upstream's worker copies through a CUDA-only engine, so only worker
-registration changes; the scheduler side is inherited. No mlx import here:
-the scheduler process loads this module.
+Upstream's worker copies through a CUDA-only engine, so the Metal spec
+supplies the worker that upstream's registration builds; the scheduler side
+is inherited. No mlx import here: the scheduler process loads this module.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import weakref
+from typing import TYPE_CHECKING, ClassVar
 
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorRole
@@ -51,6 +52,11 @@ def validate_metal_support(kv_cache_config: KVCacheConfig) -> None:
 
 
 class MetalOffloadingConnector(OffloadingConnector):
+    # The uni executor runs these in the worker's process, one per engine id.
+    _scheduler_connectors: ClassVar[
+        weakref.WeakValueDictionary[str, MetalOffloadingConnector]
+    ] = weakref.WeakValueDictionary()
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -61,6 +67,12 @@ class MetalOffloadingConnector(OffloadingConnector):
         if role == KVConnectorRole.WORKER:
             validate_metal_support(kv_cache_config)
         super().__init__(vllm_config, role, kv_cache_config)
+        kv_transfer_config = vllm_config.kv_transfer_config
+        assert kv_transfer_config is not None
+        assert kv_transfer_config.engine_id is not None
+        self._engine_id = kv_transfer_config.engine_id
+        if role == KVConnectorRole.SCHEDULER:
+            self._scheduler_connectors[self._engine_id] = self
 
     def register_kv_caches(self, kv_caches) -> None:
         from vllm_metal.attention.caches.storage import KVCacheStorage
@@ -77,16 +89,20 @@ class MetalOffloadingConnector(OffloadingConnector):
                 "MetalOffloadingConnector requires MetalTieringOffloadingSpec "
                 f"(got {type(spec).__name__}); check kv_connector_extra_config"
             )
-        # Upstream's _init_worker only sets self.worker.
-        self.connector_worker.worker = spec.get_metal_worker(kv_caches)
+        spec.bind_storage(kv_caches)
+        self.connector_worker.register_kv_caches(kv_caches.tensors)
 
     def release_host_pool(self) -> None:
         """Free the host pool for sleep mode.
 
-        vLLM resets the connector before it discards the KV cache. That
-        empties the pool's index, so nothing reads the pool until wake.
+        vLLM resets the connector first only with ``reset_connector=True``.
+        Reset it here either way, so no offload hit outlives the freed pages.
+        This departs from upstream, which keeps the offloaded blocks with
+        ``False``: on unified memory the pool shares the RAM that sleep frees.
+        Disk tiers keep their blocks either way.
         """
         if (worker := self._metal_worker()) is not None:
+            self._scheduler_connectors[self._engine_id].reset_cache()
             worker.release_host_pool()
 
     def restore_host_pool(self) -> None:

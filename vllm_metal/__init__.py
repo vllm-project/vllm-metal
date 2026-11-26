@@ -93,14 +93,9 @@ def _apply_mlx_buffer_defaults() -> None:
         os.environ.setdefault(name, value)
 
 
-def _apply_model_runner_default() -> None:
-    """Select the runner contract implemented by the chosen Metal backend.
-
-    Preserve explicit values so configuration can reject unsupported choices.
-    """
-    mps = os.environ.get("VLLM_METAL_BACKEND") == "mps"
-    os.environ.setdefault("VLLM_USE_V2_MODEL_RUNNER", "1")
-    if mps:
+def _apply_mps_defaults() -> None:
+    """Default the MPS backend to vLLM's hardware-agnostic layers."""
+    if os.environ.get("VLLM_METAL_BACKEND") == "mps":
         os.environ.setdefault("VLLM_USE_HW_AGNOSTIC", "1")
 
 
@@ -164,7 +159,7 @@ def _register() -> str | None:
     from vllm_metal.platform import MetalPlatform
 
     if MetalPlatform.is_available():
-        _apply_model_runner_default()
+        _apply_mps_defaults()
         return "vllm_metal.platform.MetalPlatform"
     return None
 

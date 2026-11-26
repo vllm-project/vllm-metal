@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 import torch
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+from vllm.v1.token_buffer import TokenBuffer
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.states import RequestState
 
@@ -119,6 +120,19 @@ def test_gather_clears_rows_left_by_larger_batch():
 
     assert view.tolist() == [[3, 3, 3]]
     assert tables.input_block_tables[0][1:].count_nonzero().item() == 0
+
+
+def test_token_buffer_prompts_reach_request_state(state):
+    # The scheduler admits prompts as TokenBuffers, which vLLM stages by reference.
+    state.add_request("a", 3, TokenBuffer([5, 6, 7]), 1, 4)
+    state.add_request("b", 2, TokenBuffer([8, 9]), 0, 4)
+    slots = [state.req_id_to_index[req_id] for req_id in ("a", "b")]
+
+    state.apply_staged_writes()
+
+    assert state.all_token_ids.gpu[slots, :3].tolist() == [[5, 6, 7], [8, 9, 0]]
+    assert state.total_len.gpu[slots].tolist() == [3, 2]
+    assert state.num_computed_tokens.gpu[slots].tolist() == [1, 0]
 
 
 def test_post_update_stores_drafts_by_request_slot(state):
@@ -249,7 +263,7 @@ def test_cache_budget_handles_model_dimensions(mps_memory, config_name, fields, 
     hf = getattr(transformers, config_name)(**fields)
     worker = SimpleNamespace(
         cache_config=SimpleNamespace(
-            kv_cache_memory_bytes=None, gpu_memory_utilization=0.5
+            kv_cache_memory_bytes=None, resolved_gpu_memory_utilization=0.5
         ),
         model_config=SimpleNamespace(
             hf_text_config=hf, get_hidden_size=lambda: hf.hidden_size
@@ -278,7 +292,7 @@ def test_cache_budget_fits_one_metal_buffer(mps_memory, limit, largest):
     hf = transformers.Qwen3Config(hidden_size=64, intermediate_size=192)
     worker = SimpleNamespace(
         cache_config=SimpleNamespace(
-            kv_cache_memory_bytes=None, gpu_memory_utilization=0.9
+            kv_cache_memory_bytes=None, resolved_gpu_memory_utilization=0.9
         ),
         model_config=SimpleNamespace(hf_text_config=hf, get_hidden_size=lambda: 64),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=8),
@@ -726,6 +740,53 @@ def _check_chunked_verification(logprobs):
         assert chunked_scores.cu_num_generated_tokens == scores.cu_num_generated_tokens
 
 
+def test_eagle3_draft_decode_inputs_run_on_mps(run_in_spawn_process):
+    run_in_spawn_process(_check_eagle3_draft_decode_inputs)
+
+
+def _check_eagle3_draft_decode_inputs():
+    from vllm.v1.worker.gpu.spec_decode.eagle.speculator import EagleSpeculator
+
+    from vllm_metal.pytorch_backend.bindings import register_kernel_overrides
+
+    register_kernel_overrides()
+    device = torch.device("mps")
+    buffers = SimpleNamespace(
+        input_ids=torch.zeros(4, dtype=torch.int32, device=device),
+        positions=torch.tensor([5, 9, 7, 7], device=device),
+        query_start_loc=torch.full((5,), 7, dtype=torch.int32, device=device),
+        seq_lens=torch.full((4,), 7, dtype=torch.int32, device=device),
+    )
+    speculator = SimpleNamespace(
+        draft_tokens=torch.tensor([[11, 0], [12, 0], [0, 0], [0, 0]], device=device),
+        input_buffers=buffers,
+        sample_src_positions=torch.tensor([3, 4, 0, 0], device=device),
+        max_model_len=10,
+        max_num_reqs=4,
+        advance_draft_positions=True,
+    )
+    batch = SimpleNamespace(
+        seq_lens=torch.tensor([6, 10, 0, 0], dtype=torch.int32, device=device)
+    )
+    num_rejected = torch.tensor([1, 0], dtype=torch.int32, device=device)
+
+    EagleSpeculator._prepare_decode_inputs(
+        speculator,
+        batch,
+        num_rejected,
+        num_reqs=2,
+        skip_attn=False,
+        batch_desc=None,
+    )
+
+    assert buffers.input_ids.tolist() == [11, 12, 0, 0]
+    # The second request is at max_model_len, so its position and length clamp.
+    assert buffers.positions.tolist() == [6, 9, 7, 7]
+    assert buffers.seq_lens.tolist() == [6, 10, 0, 0]
+    assert buffers.query_start_loc.tolist() == [0, 1, 2, 2, 2]
+    assert speculator.sample_src_positions.tolist() == [4, 5, 0, 0]
+
+
 def test_mrope_positions_preserve_ragged_prefill_and_decode():
     from vllm_metal.pytorch_backend.input_ops import prepare_rope_positions
 
@@ -860,10 +921,11 @@ def test_gdn_state_carries_across_chunked_prefill_and_decode(pooled):
             start += t.numel()
     untouched = [t[2].clone() for t in layer.kv_cache]
     qkv = torch.randn(76, channels, device="mps")
-    b, a = torch.randn(2, 76, v_heads, device="mps")
+    ba = torch.randn(76, 2 * v_heads, device="mps")
+    b, a = ba.chunk(2, dim=-1)
 
     def step(lo, hi, decode, resumed):
-        # A padded decode row rides along with every prefill; it must stay zero.
+        # A padded decode row rides along with every prefill; it must stay untouched.
         x = torch.cat([qkv[:1] * 0, qkv[lo:hi]])
         md = SimpleNamespace(
             num_decodes=2 if decode else 1,
@@ -874,16 +936,11 @@ def test_gdn_state_carries_across_chunked_prefill_and_decode(pooled):
             non_spec_query_start_loc=torch.tensor([0, 1, 1 + hi - lo], device="mps"),
             has_initial_state=torch.tensor([False, resumed], device="mps"),
         )
-        out = torch.zeros(len(x), v_heads, v_dim, device="mps")
-        _gdn_core(
-            layer,
-            x,
-            torch.cat([b[:1], b[lo:hi]]),
-            torch.cat([a[:1], a[lo:hi]]),
-            out,
-            md,
-        )
-        assert torch.equal(out[0], torch.zeros_like(out[0]))
+        # vLLM's GDN forward passes strided b/a views and an uninitialized output.
+        step_b, step_a = torch.cat([ba[:1], ba[lo:hi]]).chunk(2, dim=-1)
+        out = torch.full((len(x), v_heads, v_dim), float("nan"), device="mps")
+        _gdn_core(layer, x, step_b, step_a, out, md)
+        assert out[0].isnan().all()
         return out[1:].cpu()
 
     got = torch.cat(
@@ -935,11 +992,13 @@ def test_seeded_sampling_preserves_distribution_and_batch_isolation(
 
 
 def _check_seeded_sampling():
-    from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+    from vllm.v1.worker.gpu.sample import sampler
 
     from vllm_metal.pytorch_backend.bindings import register_kernel_overrides
 
     register_kernel_overrides()
+    install()
+    gumbel_sample = sampler.gumbel_sample
     rows = 8192
     # Cross a reduction-block boundary, including a partial final block.
     token_ids = torch.tensor([0, 1023, 1024])
@@ -965,18 +1024,6 @@ def _check_seeded_sampling():
         logits, mapping, temperature * 0, seed, positions, False, False
     )
     assert greedy.eq(1024).all()
-    with pytest.raises(NotImplementedError, match="probabilistic draft sampling"):
-        gumbel_sample(
-            logits[:1],
-            mapping[:1],
-            temperature,
-            seed,
-            positions[:1],
-            apply_temperature=True,
-            is_drafting=True,
-            logits_cache=logits[:1, None, :],
-            logits_cache_col=positions[:1],
-        )
 
 
 def test_mrv2_sampling_filters_preserve_request_mapping(run_in_spawn_process):

@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from vllm.config import AuxOutputConfig
+from vllm.config import AuxOutputConfig, CacheConfig
 
 from vllm_metal.config import reset_config
 from vllm_metal.platform import MetalPlatform
@@ -26,14 +26,18 @@ _CONFIG_LOGGER = "vllm_metal.v1.kv_offload.config"
 
 def _base_config(**cache_overrides) -> SimpleNamespace:
     cache_config = SimpleNamespace(
-        block_size=None,
+        # What vLLM fills for an unset --block-size before the platform hook.
+        block_size=CacheConfig.DEFAULT_BLOCK_SIZE,
+        user_specified_block_size=False,
+        mamba_block_size=None,
+        num_gpu_blocks=None,
         enable_prefix_caching=False,
         kv_offloading_size=None,
         kv_offloading_backend="native",
         prefix_caching_hash_algo="sha256",
         cache_dtype="auto",
         # Read by _pick_mb_buffer_default (#637).
-        gpu_memory_utilization=0.9,
+        resolved_gpu_memory_utilization=0.9,
         # Populated by --kv-cache-dtype turboquant_*; Metal rejects it up
         # front (TurboQuant runs off --additional-config).
         kv_cache_dtype_skip_layers=[],
@@ -151,7 +155,7 @@ def test_block_drafting_rejects_kv_offloading(method, prefix_caching, source):
         kv_offloading_size=1.0 if source == "size" else None,
     )
     vllm_config.speculative_config = SimpleNamespace(
-        method=method, use_heterogeneous_vocab=False, num_speculative_tokens=3
+        method=method, custom_method=None, num_speculative_tokens=3
     )
     if source not in (None, "size"):
         vllm_config.kv_transfer_config = SimpleNamespace(
