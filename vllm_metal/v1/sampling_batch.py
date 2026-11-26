@@ -29,8 +29,11 @@ from vllm_metal.v1.sampling.builtin_logits_processors import (
 )
 from vllm_metal.v1.sampling.torch_utils import make_tensor_with_pad
 from vllm_metal.v1.sampling_policy import (
-    GREEDY_TEMPERATURE_EPS,
     any_min_tokens_pending,
+    has_penalties,
+    is_greedy_temperature,
+    needs_full_vocab_sample_logprobs,
+    needs_sample_logprobs,
     params_allow_native_greedy,
     params_allow_native_random,
 )
@@ -87,13 +90,9 @@ class SamplingBatch:
         self.output_token_id_lists = list(output_token_id_lists)
         self.vocab_size = vocab_size
         self.generators = {} if generators is None else generators
-        self.all_greedy = all(
-            sampling_params.temperature < GREEDY_TEMPERATURE_EPS
-            for sampling_params in self.sampling_params_list
-        )
-        self.all_random = not self.all_greedy and all(
-            sampling_params.temperature >= GREEDY_TEMPERATURE_EPS
-            for sampling_params in self.sampling_params_list
+        self.all_greedy = all(map(is_greedy_temperature, self.sampling_params_list))
+        self.all_random = not self.all_greedy and not any(
+            map(is_greedy_temperature, self.sampling_params_list)
         )
         self.no_top_p = all(
             sampling_params.top_p == 1.0
@@ -102,12 +101,7 @@ class SamplingBatch:
         self.no_top_k = all(
             sampling_params.top_k <= 0 for sampling_params in self.sampling_params_list
         )
-        self.no_penalties = all(
-            sampling_params.frequency_penalty == 0.0
-            and sampling_params.presence_penalty == 0.0
-            and sampling_params.repetition_penalty == 1.0
-            for sampling_params in self.sampling_params_list
-        )
+        self.no_penalties = not any(map(has_penalties, self.sampling_params_list))
 
     @property
     def max_num_logprobs(self) -> int | None:
@@ -117,16 +111,13 @@ class SamplingBatch:
             for sampling_params in self.sampling_params_list
             if sampling_params.logprobs is not None
         ]
-        if any(num_logprobs == -1 for num_logprobs in requested):
+        if any(map(needs_full_vocab_sample_logprobs, self.sampling_params_list)):
             raise NotImplementedError("Metal runner does not support logprobs=-1 yet")
         return max(requested) if requested else None
 
     @property
     def needs_logprobs(self) -> bool:
-        return any(
-            sampling_params.num_logprobs is not None
-            for sampling_params in self.sampling_params_list
-        )
+        return any(map(needs_sample_logprobs, self.sampling_params_list))
 
     @staticmethod
     def merge_logprobs_rows(
@@ -202,40 +193,6 @@ class SamplingBatch:
             self.sampling_params_list, self.output_lengths
         )
 
-    @staticmethod
-    def params_allow_native_greedy(
-        sampling_params_list: Sequence[SamplingParams],
-        output_lengths: Sequence[int] | None = None,
-    ) -> bool:
-        """Compatibility alias for the shared policy gate.
-
-        See
-        :func:`vllm_metal.v1.sampling_policy.params_allow_native_greedy`;
-        kept so callers that gate before constructing a
-        :class:`SamplingBatch` (e.g. the decode pipeline) and the
-        sampling-time check cannot drift apart.
-        """
-        return params_allow_native_greedy(sampling_params_list, output_lengths)
-
-    @staticmethod
-    def params_allow_native_random(
-        sampling_params_list: Sequence[SamplingParams],
-        output_lengths: Sequence[int] | None = None,
-        *,
-        allow_seed: bool = False,
-    ) -> bool:
-        """Compatibility alias for the shared policy gate.
-
-        See
-        :func:`vllm_metal.v1.sampling_policy.params_allow_native_random`;
-        ``output_lengths`` and ``allow_seed`` keep their meanings there
-        (min-tokens pending-ness and seeded-row admission for the
-        native-random path).
-        """
-        return params_allow_native_random(
-            sampling_params_list, output_lengths, allow_seed=allow_seed
-        )
-
     @classmethod
     def native_sample_tokens(
         cls,
@@ -275,7 +232,7 @@ class SamplingBatch:
                     for sp, n in zip(sampling_params_list, output_lengths, strict=True)
                 ]
             needs_engine_key = any(
-                sp.seed is None and sp.temperature >= GREEDY_TEMPERATURE_EPS
+                sp.seed is None and not is_greedy_temperature(sp)
                 for sp in sampling_params_list
             )
             return cls._native_random_tokens(
@@ -365,7 +322,7 @@ class SamplingBatch:
         top_p: list[float] = []
         min_p: list[float] = []
         for sp in sampling_params_list:
-            if sp.temperature < GREEDY_TEMPERATURE_EPS:
+            if is_greedy_temperature(sp):
                 temperatures.append(0.0)
                 top_k.append(0)
                 top_p.append(1.0)
@@ -710,7 +667,7 @@ def create_request_generator(
     """
     if sampling_params.seed is None:
         return None
-    if sampling_params.temperature < GREEDY_TEMPERATURE_EPS:
+    if is_greedy_temperature(sampling_params):
         return None
     generator = torch.Generator(device=SamplingBatch.SAMPLER_DEVICE)
     generator.manual_seed(sampling_params.seed)

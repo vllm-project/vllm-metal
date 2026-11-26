@@ -354,17 +354,16 @@ class MetalPlatform(Platform):
                 "prompt_logprob_token_ids is not supported on Metal.",
                 parameter="prompt_logprob_token_ids",
             )
-        if params.prompt_logprob_start and envs.VLLM_METAL_BACKEND == "mlx":
-            raise VLLMValidationError(
-                "prompt_logprob_start is not supported on the MLX backend.",
-                parameter="prompt_logprob_start",
-            )
-        # vLLM admits logprobs=-1 when --max-logprobs is -1 or >= the vocab size.
-        if params.logprobs == -1 and envs.VLLM_METAL_BACKEND == "mlx":
-            raise VLLMValidationError(
-                "logprobs=-1 is not supported on the MLX backend.",
-                parameter="logprobs",
-            )
+        if envs.VLLM_METAL_BACKEND == "mlx":
+            from vllm_metal.v1.sampling_policy import unsupported_mlx_scoring_option
+
+            option = unsupported_mlx_scoring_option(params)
+            if option is not None:
+                parameter, description = option
+                raise VLLMValidationError(
+                    f"{description} is not supported on the MLX backend.",
+                    parameter=parameter,
+                )
 
         unsupported_controls = [
             name

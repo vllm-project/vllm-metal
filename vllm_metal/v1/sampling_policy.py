@@ -3,11 +3,11 @@
 
 One place that decides which sampling features a request or batch uses,
 consumed by the MLX native-path gates (:class:`~vllm_metal.v1.sampling_batch.SamplingBatch`),
-the greedy-only spec-decode gate, and the MPS request-control validation in
-``platform.validate_request``. Pure Python: rows are duck-typed
-``SamplingParams``-shaped objects, so this module imports no MLX, Torch, or
-model code at module scope and stays importable before vLLM selects a
-platform.
+the greedy-only spec-decode gate, and the MLX score-option and MPS
+request-control checks in ``platform.validate_request``. Pure Python: rows
+are duck-typed ``SamplingParams``-shaped objects, so this module imports no
+MLX, Torch, or model code at module scope and stays importable before vLLM
+selects a platform.
 
 RFC #1314's feature x backend x sync/deferred direction without its
 undecided pieces (no RNG migration, no generic framework). Each function
@@ -52,6 +52,15 @@ def needs_sample_logprobs(params: SamplingParams) -> bool:
     Prompt logprobs are gathered before sampling and do not count.
     """
     return params.num_logprobs is not None
+
+
+def needs_full_vocab_sample_logprobs(params: SamplingParams) -> bool:
+    """Whether the row asks for sample logprobs over the whole vocabulary.
+
+    vLLM admits ``logprobs=-1`` when ``--max-logprobs`` is -1 or at least the
+    vocabulary size. The MLX runner cannot serve it.
+    """
+    return params.logprobs == -1
 
 
 def has_token_constraints(params: SamplingParams) -> bool:
@@ -153,6 +162,22 @@ def params_allow_native_random(
         and not has_logit_bias(params)
         for params in sampling_params_list
     )
+
+
+def unsupported_mlx_scoring_option(
+    params: SamplingParams,
+) -> tuple[str, str] | None:
+    """``(parameter, description)`` of the first score request MLX rejects.
+
+    Checked at admission so the request gets a 400 instead of reaching the
+    runner, where ``logprobs=-1`` raises inside ``sample_tokens`` and is
+    fatal to the engine. MPS serves both through MRv2.
+    """
+    if params.prompt_logprob_start:
+        return "prompt_logprob_start", "prompt_logprob_start"
+    if needs_full_vocab_sample_logprobs(params):
+        return "logprobs", "logprobs=-1"
+    return None
 
 
 def unsupported_request_controls(

@@ -28,6 +28,7 @@ from vllm_metal.v1.sampling_policy import (
     GREEDY_TEMPERATURE_EPS,
     params_allow_native_greedy,
     params_allow_native_random,
+    unsupported_mlx_scoring_option,
     unsupported_request_controls,
 )
 
@@ -329,3 +330,32 @@ class TestSamplingPolicyMatrix:
             "min_tokens",
             "logprob_token_ids",
         ]
+
+
+class TestMlxScoringOption:
+    """MLX rejects these at admission; MPS serves them through MRv2."""
+
+    @pytest.mark.parametrize(
+        ("params", "expected"),
+        [
+            (_sp(temperature=0, logprobs=5), None),
+            (_sp(temperature=0, prompt_logprobs=1, prompt_logprob_start=0), None),
+            (_sp(temperature=0, logprobs=-1), ("logprobs", "logprobs=-1")),
+            (
+                _sp(temperature=0, prompt_logprobs=1, prompt_logprob_start=2),
+                ("prompt_logprob_start", "prompt_logprob_start"),
+            ),
+            (
+                _sp(
+                    temperature=0,
+                    logprobs=-1,
+                    prompt_logprobs=1,
+                    prompt_logprob_start=2,
+                ),
+                ("prompt_logprob_start", "prompt_logprob_start"),
+            ),
+        ],
+        ids=["top-k", "prompt-start-0", "full-vocab", "prompt-start", "both"],
+    )
+    def test_first_rejected_option(self, params, expected) -> None:
+        assert unsupported_mlx_scoring_option(params) == expected
