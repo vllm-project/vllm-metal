@@ -760,6 +760,27 @@ def _stack_qwen36_moe_per_expert_weights(
     return new_weights
 
 
+def _retain_qwen3_block_fp8_config(args_cls: Any) -> None:
+    # mlx-lm passes the checkpoint config to from_dict, but Qwen3 ModelArgs
+    # drops quantization_config before the loader calls model.sanitize().
+    from_dict = args_cls.from_dict.__func__
+
+    @wraps(from_dict)
+    def from_checkpoint(cls, params):
+        args = from_dict(cls, params)
+        quant = params.get("quantization_config") or {}
+        args._vllm_metal_block_fp8 = (
+            params.get("quantization") is None
+            and quant.get("quant_method") == "fp8"
+            and quant.get("fmt", "e4m3") == "e4m3"
+            and quant.get("scale_fmt", "float") == "float"
+            and quant.get("weight_block_size", [128, 128]) in ([128, 128], (128, 128))
+        )
+        return args
+
+    args_cls.from_dict = classmethod(from_checkpoint)
+
+
 def _patch_mlx_lm_qwen35_fp8_sanitize() -> None:
     """Consume block-FP8 scales before mlx_lm remaps Qwen checkpoint weights.
 
@@ -803,9 +824,24 @@ def _patch_mlx_lm_qwen35_fp8_sanitize() -> None:
         )
         return
 
-    # Dense qwen3 and qwen3_5 checkpoints only need FP8 dequant — they have no expert
-    # tensors to stack. Keep the dense patch narrow.
     def _transform_dense(_self, weights):
+        return _dequantize_qwen35_fp8_weights(weights, mx)
+
+    def _transform_qwen3(model, weights):
+        if not getattr(model.args, "_vllm_metal_block_fp8", False):
+            return weights
+        # mx.load represents e4m3 as raw uint8. A missing scale would leave
+        # those bytes in an ordinary Linear even when strict loading succeeds.
+        for key, tensor in weights.items():
+            scale_key = f"{key}_scale_inv"
+            if (
+                key.endswith(".weight")
+                and tensor.dtype == mx.uint8
+                and scale_key not in weights
+            ):
+                raise ValueError(
+                    f"Qwen3 block-FP8 weight {key!r} requires {scale_key!r}."
+                )
         return _dequantize_qwen35_fp8_weights(weights, mx)
 
     # qwen3_5_moe (Qwen-org Qwen3.6-MoE FP8) needs FP8 dequant followed by
@@ -818,7 +854,7 @@ def _patch_mlx_lm_qwen35_fp8_sanitize() -> None:
         return weights
 
     transforms_by_module: dict[str, Any] = {
-        "mlx_lm.models.qwen3": _transform_dense,
+        "mlx_lm.models.qwen3": _transform_qwen3,
         "mlx_lm.models.qwen3_5": _transform_dense,
         "mlx_lm.models.qwen3_5_moe": _transform_moe,
     }
@@ -840,6 +876,8 @@ def _patch_mlx_lm_qwen35_fp8_sanitize() -> None:
             "_vllm_metal_qwen35_fp8_patch",
             transform,
         ):
+            if short_name == "qwen3":
+                _retain_qwen3_block_fp8_config(module.ModelArgs)
             patched_modules.append(short_name)
     if patched_modules:
         logger.debug(
@@ -874,8 +912,11 @@ def _wrap_model_sanitize(
     sanitize = getattr(model_cls, "sanitize", None)
     if sanitize is None:
         return False
-    if getattr(sanitize, sentinel_attr, False):
-        return False
+    wrapped = sanitize
+    while wrapped is not None:
+        if getattr(wrapped, sentinel_attr, False):
+            return False
+        wrapped = getattr(wrapped, "_vllm_metal_original_sanitize", None)
 
     original_sanitize = sanitize
 

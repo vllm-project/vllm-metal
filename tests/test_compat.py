@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import builtins
 import importlib.util
+import inspect
 import json
 import sys
+from dataclasses import asdict
 from types import ModuleType, SimpleNamespace
 
 import numpy as np
@@ -428,9 +430,7 @@ class TestNanbeigeCompat:
         assert configuration_auto.CONFIG_MAPPING["nanbeige"] is existing
 
 
-def _install_fake_qwen35_modules(
-    monkeypatch, *, include_moe: bool, dense_name: str = "mlx_lm.models.qwen3_5"
-):
+def _install_fake_qwen35_modules(monkeypatch, *, include_moe: bool):
     mlx_pkg = ModuleType("mlx")
     mlx_core = ModuleType("mlx.core")
     mlx_core.bfloat16 = np.float32
@@ -448,15 +448,15 @@ def _install_fake_qwen35_modules(
     monkeypatch.setitem(sys.modules, "mlx_lm", mlx_lm_pkg)
     monkeypatch.setitem(sys.modules, "mlx_lm.models", mlx_lm_models)
 
-    dense_module = ModuleType(dense_name)
+    dense_module = ModuleType("mlx_lm.models.qwen3_5")
 
     class DenseModel:
         def sanitize(self, weights):
             return dict(weights)
 
     dense_module.Model = DenseModel
-    monkeypatch.setitem(sys.modules, dense_name, dense_module)
-    setattr(mlx_lm_models, dense_name.rsplit(".", 1)[-1], dense_module)
+    monkeypatch.setitem(sys.modules, "mlx_lm.models.qwen3_5", dense_module)
+    mlx_lm_models.qwen3_5 = dense_module
 
     moe_module = None
     if include_moe:
@@ -471,7 +471,7 @@ def _install_fake_qwen35_modules(
         mlx_lm_models.qwen3_5_moe = moe_module
 
     def _fake_find_spec(name: str):
-        if name == dense_name:
+        if name == "mlx_lm.models.qwen3_5":
             return object()
         if name == "mlx_lm.models.qwen3_5_moe":
             return object() if include_moe else None
@@ -518,16 +518,14 @@ class TestQwen35Fp8CompatPatch:
 
         assert any("mlx.core is unavailable" in warning for warning in warnings)
 
-    @pytest.mark.parametrize(
-        "dense_name", ["mlx_lm.models.qwen3", "mlx_lm.models.qwen3_5"]
-    )
-    def test_dense_fp8_sanitize_without_moe(self, monkeypatch, dense_name) -> None:
-        dense_module, _ = _install_fake_qwen35_modules(
-            monkeypatch, include_moe=False, dense_name=dense_name
-        )
+    def test_patches_dense_qwen35_even_when_moe_module_is_missing(
+        self, monkeypatch
+    ) -> None:
+        dense_module, _ = _install_fake_qwen35_modules(monkeypatch, include_moe=False)
+
         compat._patch_mlx_lm_qwen35_fp8_sanitize()
 
-        key = "model.layers.0.mlp.down_proj.weight"
+        key = "language_model.layers.0.linear.weight"
         sanitized = dense_module.Model().sanitize(
             {key: np.array([[1.0, -2.0]]), f"{key}_scale_inv": np.array([[3.0]])}
         )
@@ -993,6 +991,109 @@ def _tiny_qwen3_args(tie_word_embeddings: bool):
         head_dim=8,
         tie_word_embeddings=tie_word_embeddings,
     )
+
+
+@pytest.fixture
+def fp8_patched_qwen3(monkeypatch):
+    from mlx_lm.models import qwen3, qwen3_5, qwen3_5_moe
+
+    # Restore every class-level patch when this test finishes.
+    for module in (qwen3, qwen3_5, qwen3_5_moe):
+        monkeypatch.setattr(module.Model, "sanitize", module.Model.sanitize)
+    monkeypatch.setattr(
+        qwen3.ModelArgs,
+        "from_dict",
+        inspect.getattr_static(qwen3.ModelArgs, "from_dict"),
+    )
+    compat._patch_mlx_lm_qwen35_fp8_sanitize()
+    return qwen3.Model(_tiny_qwen3_args(tie_word_embeddings=True))
+
+
+@pytest.mark.parametrize("has_other_scale", [False, True])
+def test_qwen3_block_fp8_requires_each_encoded_weight_scale(
+    tmp_path, fp8_patched_qwen3, has_other_scale
+) -> None:
+    import mlx.core as mx
+    import torch
+    from mlx.utils import tree_flatten
+    from mlx_lm.utils import load_model
+    from safetensors.torch import save_file
+
+    config = asdict(fp8_patched_qwen3.args)
+    config["quantization_config"] = {
+        "quant_method": "fp8",
+        "fmt": "e4m3",
+        "weight_block_size": [128, 128],
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    weights = {
+        key: torch.ones(value.shape, dtype=torch.bfloat16)
+        for key, value in tree_flatten(fp8_patched_qwen3.parameters())
+    }
+    key = "model.layers.0.mlp.down_proj.weight"
+    weights[key] = weights[key].to(torch.float8_e4m3fn)
+    if has_other_scale:
+        other = "model.layers.0.mlp.up_proj.weight"
+        weights[other] = weights[other].to(torch.float8_e4m3fn)
+        weights[f"{other}_scale_inv"] = torch.ones((1, 1))
+    shard = tmp_path / "model.safetensors"
+    save_file(weights, shard)
+
+    with pytest.raises(ValueError) as exc_info:
+        load_model(tmp_path, strict=True)
+    assert f"{key}_scale_inv" in str(exc_info.value)
+
+    weights[f"{key}_scale_inv"] = torch.full((1, 1), 3.0)
+    save_file(weights, shard)
+    loaded, _ = load_model(tmp_path, strict=True)
+    mlp = loaded.model.layers[0].mlp
+    assert mlp.down_proj.weight.dtype == mx.bfloat16
+    assert mx.all(mlp.down_proj.weight == 3).item()
+    assert mx.all(mlp.gate_proj.weight == 1).item()
+
+
+def test_qwen3_mlx_affine_weights_load_with_fp8_patch(
+    tmp_path, fp8_patched_qwen3
+) -> None:
+    import mlx.core as mx
+    import mlx.nn as nn
+    from mlx.utils import tree_flatten
+    from mlx_lm.utils import load_model
+
+    model = fp8_patched_qwen3
+    quantization = {"bits": 4, "group_size": 32}
+    nn.quantize(
+        model,
+        **quantization,
+        class_predicate=lambda path, _: path.endswith("down_proj"),
+    )
+    config = {**asdict(model.args), "quantization": quantization}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    weights = dict(tree_flatten(model.parameters()))
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
+
+    loaded, _ = load_model(tmp_path, strict=True)
+    packed = loaded.model.layers[0].mlp.down_proj.weight
+    assert packed.dtype == mx.uint32
+    assert mx.array_equal(packed, model.model.layers[0].mlp.down_proj.weight).item()
+
+
+def test_qwen3_uint8_without_block_fp8_config_passes_through(fp8_patched_qwen3) -> None:
+    import mlx.core as mx
+
+    key = "model.layers.0.mlp.down_proj.weight"
+    weight = mx.array([[93]], dtype=mx.uint8)
+    assert fp8_patched_qwen3.sanitize({key: weight})[key] is weight
+
+
+def test_reinstalling_qwen3_fp8_patch_under_flat_prefix_is_a_noop(
+    fp8_patched_qwen3,
+) -> None:
+    model_cls = type(fp8_patched_qwen3)
+    compat._patch_mlx_lm_qwen3_flat_weight_prefix()
+    once = model_cls.sanitize
+    compat._patch_mlx_lm_qwen35_fp8_sanitize()
+    assert model_cls.sanitize is once
 
 
 def _official_flat_weights(model) -> dict[str, object]:
