@@ -71,6 +71,11 @@ def mlx_generate(
         from mlx_lm import load
         from mlx_lm.generate import generate_step
 
+        # Native mlx-lm otherwise rejects block-FP8 Qwen scale tensors before
+        # it can generate the reference for the same checkpoint as the server.
+        from vllm_metal.compat import _patch_mlx_lm_qwen_fp8_sanitize
+
+        _patch_mlx_lm_qwen_fp8_sanitize()
         model, tokenizer = load(
             model_path, tokenizer_config={"trust_remote_code": trust_remote_code}
         )

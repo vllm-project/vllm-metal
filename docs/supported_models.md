@@ -141,6 +141,11 @@ Q5_K_M, and 9B Q4_K_M, and on Gemma 3 4B Q4_K_M
 ([#415](https://github.com/vllm-project/vllm-metal/issues/415),
 [#761](https://github.com/vllm-project/vllm-metal/issues/761)).
 
+The MLX text loader dequantizes 128x128 block-FP8 (e4m3) weights to bf16 for
+`qwen3`, `qwen3_5`, and `qwen3_5_moe` checkpoints, including
+`Qwen/Qwen3-0.6B-FP8`. Budget two bytes per dequantized weight, not one.
+This loader patch does not cover `qwen3_moe`.
+
 Mistral Small 3.1 (`mlx-community/Mistral-Small-3.1-24B-Instruct-2503-4bit`) is
 a vision-language model. By default vllm-metal serves its text backbone through
 mlx_lm and rejects image input. Ministral 3 and Devstral Small 2 take the same
