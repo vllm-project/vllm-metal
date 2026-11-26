@@ -3,13 +3,17 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx_lm.models.switch_layers import QuantizedSwitchLinear, SwitchGLU, SwitchLinear
 
 if TYPE_CHECKING:
     from .punica_wrapper import EncoderPunicaWrapperMLX, PunicaWrapperMLX
+
+SWITCH_GLU_PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
 
 
 def can_wrap(module: Any) -> bool:
@@ -34,6 +38,13 @@ def can_wrap_qlora(module: Any) -> bool:
         and hasattr(module, "bits")
         and hasattr(module, "group_size")
         and callable(module)
+    )
+
+
+def can_wrap_switch_glu(module: Any) -> bool:
+    return isinstance(module, SwitchGLU) and all(
+        isinstance(getattr(module, p), (SwitchLinear, QuantizedSwitchLinear))
+        for p in SWITCH_GLU_PROJECTIONS
     )
 
 
@@ -232,3 +243,167 @@ class MLXQuantizedLinearWithLoRA(_LoRALinearBase):
             lora_ranks=self._lora_ranks,
         )
         return output if output.shape == output_shape else output.reshape(output_shape)
+
+
+class MLXSwitchLinearWithLoRA(nn.Module):
+    """Per-expert LoRA slots for one ``SwitchGLU`` projection.
+
+    Flattened, slot ``s`` of expert ``e`` is row ``e * max_loras + s``, so rows
+    sorted by expert are also sorted for the LoRA gathers. The projection
+    itself stays in the ``SwitchGLU``.
+    """
+
+    _lora_name = "MoE expert LoRA"
+
+    def __init__(
+        self,
+        base_layer: SwitchLinear | QuantizedSwitchLinear,
+        max_loras: int,
+        max_lora_rank: int,
+        dtype: mx.Dtype,
+    ) -> None:
+        super().__init__()
+        self.num_experts = int(base_layer.num_experts)
+        self.input_size = int(base_layer.input_dims)
+        self.output_size = int(base_layer.output_dims)
+        self.max_loras, self.max_lora_rank = max_loras, max_lora_rank
+        slots = (self.num_experts, max_loras)
+        self.lora_a_stacked = mx.zeros((*slots, max_lora_rank, self.input_size), dtype)
+        self.lora_b_stacked = mx.zeros((*slots, self.output_size, max_lora_rank), dtype)
+        object.__setattr__(self, "_lora_ranks", [0] * max_loras)
+
+    def has_lora(self, slots: Iterable[int]) -> bool:
+        return any(self._lora_ranks[slot] for slot in slots)
+
+    def lora_delta(self, x: mx.array, keys: mx.array, sorted_indices: bool) -> mx.array:
+        rows = self.num_experts * self.max_loras
+        lora_a = self.lora_a_stacked.reshape(rows, self.max_lora_rank, self.input_size)
+        lora_b = self.lora_b_stacked.reshape(rows, self.output_size, self.max_lora_rank)
+        if x.dtype != lora_a.dtype:
+            x = x.astype(lora_a.dtype)
+        h = mx.gather_mm(
+            x, lora_a.swapaxes(-1, -2), rhs_indices=keys, sorted_indices=sorted_indices
+        )
+        return mx.gather_mm(
+            h, lora_b.swapaxes(-1, -2), rhs_indices=keys, sorted_indices=sorted_indices
+        )
+
+    def prepare_lora_weights(
+        self, slot: int, lora_a: mx.array, lora_b: mx.array
+    ) -> tuple[mx.array, mx.array]:
+        """Pad per-expert A ``(E, rank, in)`` and B ``(E, out, rank)`` to the slot."""
+        if lora_a.ndim != 3 or lora_b.ndim != 3:
+            raise ValueError(
+                f"{self._lora_name} weight shape mismatch for slot {slot}: "
+                f"expected A=(experts, rank, in) and B=(experts, out, rank), got "
+                f"A={tuple(lora_a.shape)}, B={tuple(lora_b.shape)}"
+            )
+        experts, rank, in_ = (int(d) for d in lora_a.shape)
+        b_experts, out, b_rank = (int(d) for d in lora_b.shape)
+        if (experts, b_experts, in_, out, b_rank) != (
+            self.num_experts,
+            self.num_experts,
+            self.input_size,
+            self.output_size,
+            rank,
+        ):
+            raise ValueError(
+                f"{self._lora_name} weight shape mismatch for slot {slot}: "
+                f"A={tuple(lora_a.shape)}, B={tuple(lora_b.shape)}; expected "
+                f"experts={self.num_experts}, in={self.input_size}, "
+                f"out={self.output_size} and matching ranks"
+            )
+        if rank > self.max_lora_rank:
+            raise ValueError(
+                f"{self._lora_name} rank {rank} exceeds "
+                f"max_lora_rank {self.max_lora_rank}"
+            )
+        a = mx.zeros_like(self.lora_a_stacked[:, slot])
+        b = mx.zeros_like(self.lora_b_stacked[:, slot])
+        a[:, :rank, :] = lora_a.astype(a.dtype)
+        b[:, :, :rank] = lora_b.astype(b.dtype)
+        return a, b
+
+    def set_prepared_lora(
+        self, slot: int, lora_a: mx.array, lora_b: mx.array, *, rank: int
+    ) -> None:
+        self.lora_a_stacked[:, slot], self.lora_b_stacked[:, slot] = lora_a, lora_b
+        self._lora_ranks[slot] = rank
+
+    def reset_lora(self, slot: int) -> None:
+        self.lora_a_stacked[:, slot] = mx.zeros_like(self.lora_a_stacked[:, slot])
+        self.lora_b_stacked[:, slot] = mx.zeros_like(self.lora_b_stacked[:, slot])
+        self._lora_ranks[slot] = 0
+
+
+class MLXSwitchGLUWithLoRA(nn.Module):
+    """``SwitchGLU`` that adds each token's adapter delta to its experts.
+
+    Without an active expert adapter it runs mlx_lm's ``SwitchGLU`` unchanged.
+    Otherwise rows are sorted by ``expert * max_loras + slot``: the base
+    gathers see sorted experts and the LoRA gathers see sorted slot rows.
+    """
+
+    def __init__(
+        self,
+        base_layer: SwitchGLU,
+        lora: dict[str, MLXSwitchLinearWithLoRA],
+        punica_wrapper: PunicaWrapperMLX,
+        max_loras: int,
+    ) -> None:
+        super().__init__()
+        self.base_layer = base_layer
+        self.lora = lora
+        self.max_loras = max_loras
+        self.punica_wrapper = punica_wrapper
+
+    def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
+        base, punica = self.base_layer, self.punica_wrapper
+        if punica.no_lora or not any(
+            proj.has_lora(punica.active_slots) for proj in self.lora.values()
+        ):
+            return base(x, indices)
+
+        slots = punica.token_slots
+        if slots.size * indices.shape[-1] != indices.size:
+            raise ValueError(
+                "MoE LoRA routing row count mismatch: "
+                f"metadata={slots.size}, indices={tuple(indices.shape)}"
+            )
+        slots = slots.reshape(indices.shape[:-1])
+        keys = indices  # one slot: the key is the expert
+        if self.max_loras > 1:
+            keys = indices.astype(mx.int32) * self.max_loras
+            keys = keys + mx.maximum(slots, 0)[..., None]
+        adapted = slots >= 0 if punica.has_unadapted_tokens else None
+        x = mx.expand_dims(x, (-2, -3))
+        # Same threshold as SwitchGLU, so the base gathers see the same layout.
+        do_sort = indices.size >= 64
+        experts = indices
+        inv_order = None
+        if do_sort:
+            order = mx.argsort(keys.flatten())
+            inv_order = mx.argsort(order)
+            tokens = order // indices.shape[-1]
+            x = x.flatten(0, -3)[tokens]
+            keys = keys.flatten()[order]
+            experts = keys // self.max_loras if self.max_loras > 1 else keys
+            if adapted is not None:
+                adapted = adapted.flatten()[tokens][:, None, None]
+        elif adapted is not None:
+            adapted = adapted[..., None, None, None]
+
+        def project(name: str, h: mx.array) -> mx.array:
+            y = getattr(base, name)(h, experts, sorted_indices=do_sort)
+            if (lora := self.lora.get(name)) is not None:
+                delta = lora.lora_delta(h, keys, do_sort)
+                if adapted is not None:
+                    delta = mx.where(adapted, delta, 0)
+                y = y + delta.astype(y.dtype)
+            return y
+
+        h = base.activation(project("up_proj", x), project("gate_proj", x))
+        y = project("down_proj", h)
+        if inv_order is not None:
+            y = mx.unflatten(y[inv_order], 0, indices.shape)
+        return y.squeeze(-2)
