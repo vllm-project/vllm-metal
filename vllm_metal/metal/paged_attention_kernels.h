@@ -55,7 +55,6 @@ inline std::optional<TileConfig> select_tile_config(int head_size) {
   }
 }
 
-inline constexpr int kNaxBQ = 64;
 inline constexpr int kNaxThreads = 128;
 
 struct NaxConfig {
@@ -81,7 +80,7 @@ inline NaxConfig select_nax_config(
       geometry.key_token_stride != geometry.kv_heads * geometry.key_head_stride) return kNaxBaseline;
 
   const auto cost = [&](NaxConfig cfg) {
-    return nax_prefill_cost(sequence, geometry, {cfg.BQ, 32, cfg.HEADS_PER_TG},
+    return nax_prefill_cost(sequence, geometry, {cfg.BQ, kNaxKvTile, cfg.HEADS_PER_TG},
                             cfg.HEADS_PER_TG > 1 || upstream_split, cores);
   };
   constexpr double kMinimumGain = 0.10;

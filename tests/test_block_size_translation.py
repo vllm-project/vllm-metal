@@ -314,7 +314,8 @@ int main(int argc, char** argv) {
     int q, prefix, heads, groups, bq, split;
     std::cout << std::setprecision(17);
     while (std::cin >> q >> prefix >> heads >> groups >> bq >> split) {
-      const auto w = nax_sequence_work({q, q + prefix}, heads, {bq, 32, groups}, split);
+      const auto w = nax_sequence_work(
+          {q, q + prefix}, heads, {bq, kNaxKvTile, groups}, split);
       std::cout << w.visits << ' ' << w.guarded_visits << ' ' << w.groups << ' '
                 << w.longest_full_scan << ' ' << w.tail_scan << '\n';
     }

@@ -7,6 +7,9 @@
 
 namespace vllm_metal::kernels {
 
+inline constexpr int kNaxBQ = 64;
+inline constexpr int kNaxKvTile = 32;
+
 struct NaxSequence {
   int query_tokens;
   int kv_tokens;
@@ -74,15 +77,11 @@ inline NaxPrefillWork nax_sequence_work(
       tail_scan};
 }
 
-// Relative costs from paired fixed-width D256 measurements on 10, 20 and 40
-// GPU cores (PR #1300); the wide-tile state rate was re-fit against the 40-core
-// paired archive after measured 32K cold prefill preferred h6 over h3 where the
-// first fit ranked them 1% apart. All widths use the same coefficients and
-// work units.
 inline double nax_prefill_cost(
     NaxSequence sequence, const NaxGeometry& geometry, NaxLayout layout,
     bool split, int cores) {
   const auto work = nax_sequence_work(sequence, geometry.heads, layout, split);
+  // Fit to paired fixed-width D256 timings (https://github.com/vllm-project/vllm-metal/pull/1300).
   constexpr double kGuardOverhead = 0.2;
   constexpr double kTilesPerCore = 8.;
   constexpr double kKvReadCost = 1. / 3.;
@@ -93,7 +92,7 @@ inline double nax_prefill_cost(
   // A wider group shares KV reads across heads but holds more live Q rows.
   // D256 is common to all candidates, so state scales with rows per group.
   const double width = layout.heads_per_group;
-  const double extra_state = std::max(0., layout.query_tile * width / 64. - 1.);
+  const double extra_state = std::max(0., layout.query_tile * width / kNaxBQ - 1.);
   const double scarcity = std::min(1., kGroupsPerCore * cores / work.groups);
   const double tile_work = work.visits + kGuardOverhead * work.guarded_visits;
   const double bulk = tile_work * (1. + kKvReadCost / width)
