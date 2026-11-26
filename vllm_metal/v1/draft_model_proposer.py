@@ -20,7 +20,7 @@ draft cache's blocks "cached" based on its own per-step bookkeeping,
 trusting that whatever it scheduled, the worker actually computed -- for
 *every* registered group, uniformly, every step. But
 ``SpeculativeDecodeController.draft_eligible_requests`` intentionally
-excludes non-greedy requests and intermediate prefill chunks from
+excludes unsupported sampling requests and intermediate prefill chunks from
 *drafting*. If those rows also skipped *ingest*, the scheduler would believe
 their draft cache blocks hold real KV when they never did, and a later,
 unrelated request whose prompt happens to hash-match that prefix could be
@@ -35,7 +35,7 @@ positions beyond it are never read by this proposer.
 Each step: ingest advances every row's committed KV to ``committed_len``,
 then ``num_speculative_tokens - 1`` single-token decode steps run for
 drafting rows only. Drafts are handed back via ``take_draft_token_ids`` and
-verified next step by ``SpeculativeDecodeController.verify_greedy``.
+verified by the target on the next scheduled decode step.
 
 **Skipping already-valid speculative KV (#482, direction 2).** The
 lookahead draft steps write KV for drafts ``d1..d(K-1)`` at positions
@@ -565,10 +565,7 @@ class DraftModelProposer(NoOwnKVProposer):
     def _collect_draft_plans(
         self, ctx: ProposeContext, num_speculative_tokens: int
     ) -> list[_DraftPlan]:
-        # can_draft_greedy/draft_eligible_requests decide *drafting*
-        # eligibility only here (greedy + non-intermediate prefill +
-        # greedy-only sampling); ingest itself runs for every active row
-        # regardless -- see module docstring.
+        # Ingest runs for every active row, including requests that cannot draft.
         drafting_req_ids: set[str] = set()
         for req_id, state in self._controller.draft_eligible_requests(
             ctx.decode_reqs,
@@ -577,6 +574,7 @@ class DraftModelProposer(NoOwnKVProposer):
             ctx.prefill_token_ids,
             ctx.prefill_result_modes,
             ctx.request_states,
+            speculative_config=self._spec_config,
         ):
             if num_speculative_tokens <= 0:
                 continue

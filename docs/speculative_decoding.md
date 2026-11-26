@@ -23,9 +23,9 @@ scheduler-owned prefix reuse and verifies greedy proposals on the target.
 
 These methods currently have these Metal-specific constraints:
 
-- Only plain greedy requests (`temperature=0`, without penalties, token
-  constraints, or sample logprobs) are drafted. Other requests run without
-  speculation.
+- All methods draft plain greedy requests (`temperature=0`, without penalties,
+  token constraints, or sample logprobs). Draft models also support stochastic
+  requests with probabilistic drafting and standard rejection sampling.
 - Scheduling must be synchronous. The Metal platform disables async scheduling
   when speculative decoding is configured.
 - Pipeline parallelism is not supported with speculative decoding.
@@ -110,6 +110,11 @@ Remote Hugging Face checkpoints are supported. Pin `revision` in
 `speculative_config` when publishing benchmark results.
 
 ## Draft model
+
+Set `"draft_sample_method": "probabilistic"` to draft for stochastic requests
+with standard rejection sampling. Verification applies the target's sampling
+parameters, including top-k, top-p, and penalties. Stochastic requests with
+sample logprobs or structured outputs use ordinary decoding.
 
 Follow the upstream [draft-model guide](https://docs.vllm.ai/en/latest/features/speculative_decoding/draft_model/)
 for configuration details. The draft must use the target vocabulary and full

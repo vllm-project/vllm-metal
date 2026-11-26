@@ -126,6 +126,7 @@ from vllm_metal.v1.proposer import (
 )
 from vllm_metal.v1.sampling import Sampler
 from vllm_metal.v1.sampling_batch import (
+    GREEDY_TEMPERATURE_EPS,
     SamplingBatch,
     create_request_generator,
     native_sampling_key,
@@ -1996,8 +1997,6 @@ class MetalModelRunner:
 
         # ---- sample tokens ----
         vocab_size = self._vocab_size
-        # Draft rows use the greedy verifier below. Only plain decode rows
-        # and completed prefills can use the native sampling key.
         next_native_rng_key = (
             self._next_native_sample_key
             if self._native_sampling_enabled
@@ -2008,19 +2007,39 @@ class MetalModelRunner:
         decode_token_ids: list[list[int]] = [[] for _ in decode_reqs]
         decode_logprobs_rows: list[LogprobsLists | None] = [None for _ in decode_reqs]
         if has_scheduled_drafts:
-            spec_items = [
-                (i, req, segment)
-                for i, (req, segment) in enumerate(
-                    zip(decode_reqs, decode_segments, strict=True)
-                )
-                if segment.draft_token_ids
-            ]
-            if spec_items:
-                spec_token_ids = self._spec_decode_controller.verify_greedy(
-                    logits,
-                    [req for _, req, _ in spec_items],
-                    [segment for _, _, segment in spec_items],
-                )
+            greedy_items = []
+            rejection_items = []
+            plain_items = []
+            for i, (req, segment) in enumerate(
+                zip(decode_reqs, decode_segments, strict=True)
+            ):
+                if not segment.draft_token_ids:
+                    plain_items.append((i, req, segment))
+                elif req[1].sampling_params.temperature >= GREEDY_TEMPERATURE_EPS:
+                    rejection_items.append((i, req, segment))
+                else:
+                    greedy_items.append((i, req, segment))
+
+            for use_rejection, spec_items in (
+                (False, greedy_items),
+                (True, rejection_items),
+            ):
+                if not spec_items:
+                    continue
+                spec_reqs = [req for _, req, _ in spec_items]
+                spec_segments = [segment for _, _, segment in spec_items]
+                if use_rejection:
+                    spec_token_ids = self._verify_random_drafts(
+                        logits,
+                        spec_reqs,
+                        spec_segments,
+                        decode_reqs=decode_reqs,
+                        allow_native_sampling=next_native_rng_key is not None,
+                    )
+                else:
+                    spec_token_ids = self._spec_decode_controller.verify_greedy(
+                        logits, spec_reqs, spec_segments
+                    )
                 for (decode_index, _, _), sampled_ids in zip(
                     spec_items,
                     spec_token_ids,
@@ -2028,13 +2047,6 @@ class MetalModelRunner:
                 ):
                     decode_token_ids[decode_index] = sampled_ids
 
-            plain_items = [
-                (i, req, segment)
-                for i, (req, segment) in enumerate(
-                    zip(decode_reqs, decode_segments, strict=True)
-                )
-                if not segment.draft_token_ids
-            ]
             if plain_items:
                 plain_logits = mx.stack(
                     [logits[0, segment.start_row, :] for _, _, segment in plain_items]
@@ -2193,6 +2205,47 @@ class MetalModelRunner:
         )
 
         return batch, scheduler_output
+
+    def _verify_random_drafts(
+        self,
+        logits: mx.array,
+        spec_reqs: Sequence[tuple[str, RequestState]],
+        spec_segments: Sequence[PagedDecodeSegment],
+        *,
+        decode_reqs: Sequence[tuple[str, RequestState]],
+        allow_native_sampling: bool,
+    ) -> list[list[int]]:
+        self._spec_decode_controller.validate_draft_sampling(
+            spec_reqs, self.vllm_config.speculative_config
+        )
+        drafter = self._drafter
+        if not isinstance(drafter, DraftModelProposer):
+            raise RuntimeError(
+                "Random draft verification requires a draft model proposer."
+            )
+
+        # Match the backend ordinary decode would use for this batch.
+        use_native_sampling = (
+            allow_native_sampling
+            and all(
+                state.generator is None or state.sampling_params.seed is not None
+                for _, state in decode_reqs
+            )
+            and SamplingBatch.params_allow_native_random(
+                [state.sampling_params for _, state in decode_reqs],
+                [len(state.token_ids) - state.prompt_len for _, state in decode_reqs],
+                allow_seed=True,
+            )
+        )
+        return self._spec_decode_controller.verify_rejection(
+            logits,
+            spec_reqs,
+            spec_segments,
+            drafter=drafter,
+            sampler=self._sampler,
+            vocab_size=self._vocab_size,
+            use_native_sampling=use_native_sampling,
+        )
 
     def _hybrid_draft_caps(
         self,

@@ -213,7 +213,7 @@ class SpeculativeDecodeController:
                 )
             draft_reqs.append((req_id, request_by_id[req_id]))
 
-        self._validate_greedy_sampling(draft_reqs)
+        self.validate_draft_sampling(draft_reqs, speculative_config)
 
     def build_decode_segments(
         self,
@@ -281,7 +281,7 @@ class SpeculativeDecodeController:
                     f"metadata: {req_id!r} != {segment.req_id!r}"
                 )
 
-        self._validate_greedy_sampling(decode_reqs)
+        self.validate_draft_sampling(decode_reqs)
 
         num_decode_rows = max(
             segment.start_row + segment.num_query_tokens for segment in decode_segments
@@ -522,6 +522,15 @@ class SpeculativeDecodeController:
         sampled_ids: Sequence[int],
     ) -> bool:
         """Whether a request may be drafted under greedy-only spec decode."""
+        return self._can_draft(req_id, request_state, sampled_ids, None)
+
+    def _can_draft(
+        self,
+        req_id: str,
+        request_state: _SpecDecodeRequestStateLike,
+        sampled_ids: Sequence[int],
+        speculative_config: SpeculativeConfig | None,
+    ) -> bool:
         # Sampling updates the output count before the scheduler retires a request.
         sampling_params = request_state.sampling_params
         max_tokens = sampling_params.max_tokens
@@ -536,7 +545,7 @@ class SpeculativeDecodeController:
         ):
             return False
         try:
-            self._validate_greedy_sampling([(req_id, request_state)])
+            self.validate_draft_sampling([(req_id, request_state)], speculative_config)
         except NotImplementedError:
             return False
         return True
@@ -549,12 +558,14 @@ class SpeculativeDecodeController:
         prefill_token_ids: Sequence[int],
         prefill_result_modes: Sequence[str],
         request_states: Mapping[str, _SpecDecodeRequestStateLike],
+        *,
+        speculative_config: SpeculativeConfig | None = None,
     ) -> Sequence[tuple[str, RequestState]]:
         """Filter ``ctx`` to requests eligible for drafting this step.
 
         Shared eligibility filter for block-draft, draft-model and n-gram
         proposers: skip decode rows that did not sample this step, skip
-        finished or non-greedy requests via :meth:`can_draft_greedy`, skip
+        finished requests or unsupported sampling settings, skip
         intermediate prefill chunks, and de-duplicate prefill rows whose
         ``req_id`` was already admitted through decode.
 
@@ -571,7 +582,7 @@ class SpeculativeDecodeController:
         ):
             if not sampled_ids:
                 continue
-            if not self.can_draft_greedy(req_id, state, sampled_ids):
+            if not self._can_draft(req_id, state, sampled_ids, speculative_config):
                 continue
             eligible.append((req_id, state))  # type: ignore[arg-type]
             seen.add(req_id)
@@ -582,20 +593,38 @@ class SpeculativeDecodeController:
             if result_mode == "intermediate" or prefill.req_id in seen:
                 continue
             state = request_states.get(prefill.req_id)
-            if state is None or not self.can_draft_greedy(
-                prefill.req_id, state, (prefill_token_ids[i],)
+            if state is None or not self._can_draft(
+                prefill.req_id, state, (prefill_token_ids[i],), speculative_config
             ):
                 continue
             eligible.append((prefill.req_id, state))  # type: ignore[arg-type]
 
         return eligible
 
-    def _validate_greedy_sampling(
-        self,
+    @staticmethod
+    def validate_draft_sampling(
         decode_reqs: Sequence[tuple[str, _SpecDecodeRequestStateLike]],
+        speculative_config: SpeculativeConfig | None = None,
     ) -> None:
         for _, request_state in decode_reqs:
             sampling_params = request_state.sampling_params
+            if (
+                sampling_params.temperature >= GREEDY_TEMPERATURE_EPS
+                and speculative_config is not None
+                and speculative_config.method == "draft_model"
+                and speculative_config.draft_sample_method == "probabilistic"
+                and speculative_config.rejection_sample_method == "standard"
+            ):
+                if (
+                    sampling_params.num_logprobs is not None
+                    or sampling_params.structured_outputs is not None
+                ):
+                    raise NotImplementedError(
+                        "Probabilistic draft verification does not support "
+                        "sample logprobs or structured outputs."
+                    )
+                continue
+
             unsupported = (
                 sampling_params.temperature >= GREEDY_TEMPERATURE_EPS
                 or sampling_params.top_k > 0
