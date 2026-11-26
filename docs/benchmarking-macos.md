@@ -51,19 +51,15 @@ substituted for serving results.
 
 ## Measure short requests during a long prefill
 
-Measure each request alone first. Then send the same short request at a fixed
-offset after dispatching a long prompt that spans several prefill chunks. Choose
-an offset before the long prompt's first generated token and verify the requests
-overlapped. Repeat with a burst of short requests when that reflects your
-workload. Report each class's first-token latency and the long request's TTFT
-in isolation.
+Measure each request alone, then send the same short request at a fixed
+offset during a multi-chunk long prefill. Verify overlap and report the
+first-token latency of both requests.
 
-Compare `--long-prefill-token-threshold` values with
-`--max-num-batched-tokens` fixed. The threshold caps a long prefill chunk when
-another request is eligible. A lone request can still use the full batch budget.
-Test a smaller `--max-num-batched-tokens` separately if a short request
-waits on a long chunk already in flight. Check both the short-request
-latency and the cost to solo long prompts and similarly sized peers.
+Compare `--long-prefill-token-threshold` values at a fixed batch capacity
+and scheduling budget. vLLM can waive the cap for a lone prefill. To
+test shorter solo chunks, vary `--max-num-scheduled-tokens` separately
+and keep `--max-num-batched-tokens` fixed. Report the cost to cold solo
+prefill alongside any improvement in late-peer latency.
 
 Keep sampling and async scheduling fixed across arms. Use cold prefixes for
 the timed mix and record the cached-token count when measuring a warm repeat.
