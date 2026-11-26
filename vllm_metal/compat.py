@@ -29,7 +29,7 @@ _EXAONE4_LAYER_TYPE = {"L": "sliding_attention", "G": "full_attention"}
 
 
 def register_model_compat() -> None:
-    """Register Metal's LFM3 overrides and missing Nanbeige config metadata.
+    """Register Metal's LFM3 overrides and missing HF config metadata.
 
     MLX executes the model, while vLLM still queries registered model classes
     and HF configs for hybrid capabilities, state-cache metadata and multimodal
@@ -51,11 +51,17 @@ def register_model_compat() -> None:
     from vllm.model_executor.models import ModelRegistry
 
     from vllm_metal.patches.nanbeige_config import NanbeigeConfig
+    from vllm_metal.patches.prism_hadamard_config import PrismHadamardQwen35Config
 
     # SCAFFOLDING: remove once the pinned Transformers registers nanbeige.
     # Without it, Nanbeige 4.2 checkpoints load only with --trust-remote-code.
     if "nanbeige" not in CONFIG_MAPPING:
         AutoConfig.register("nanbeige", NanbeigeConfig)
+
+    # SCAFFOLDING: remove once Transformers registers prism_hadamard_qwen35 and
+    # the packs declare architectures.
+    if "prism_hadamard_qwen35" not in CONFIG_MAPPING:
+        AutoConfig.register("prism_hadamard_qwen35", PrismHadamardQwen35Config)
 
     # SCAFFOLDING: remove when the MLX LFM3 adapters accept the placeholders and
     # processor outputs of vLLM's native LFM3-VL and LFM3-Audio classes; until
