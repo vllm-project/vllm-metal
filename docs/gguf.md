@@ -58,8 +58,8 @@ missing, ambiguous, or shard-only matches also fail before model load.
 - Supported qtypes: Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q2_K, Q3_K, Q4_K, Q5_K,
   Q6_K, IQ4_NL, IQ4_XS, IQ3_S, and IQ3_XXS, plus plain F32/F16/BF16 tensors,
   mixed freely within one file, so llama.cpp's Q4_K_M, Q5_K_M, IQ3_M and IQ3_XS
-  exports, bartowski's Q4_K_L, and unsloth's UD-Q4_K_XL load. IQ3_XXS exports
-  also carry IQ2_S tensors, so they do not load yet. Remote reference tags
+  exports, bartowski's Q4_K_L, and unsloth's UD-Q4_K_XL load. Most IQ3_XXS
+  exports also carry IQ2_S tensors, so they do not load. Remote reference tags
   accept Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q2_K and Q2_K_S/M/L, Q3_K and
   Q3_K_S/M/L, Q4_K_S/M/L, Q5_K_S/M/L, Q6_K, Q6_K_L, IQ4_NL, IQ4_XS, IQ3_S,
   IQ3_M, and the plain types.
