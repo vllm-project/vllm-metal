@@ -131,11 +131,7 @@ def _make_worker(model_runner: object) -> MetalWorker:
     worker = MetalWorker.__new__(MetalWorker)
     worker.model_runner = model_runner  # type: ignore[assignment]
     worker.metal_config = MetalConfig(mlx_device="gpu")
-    worker.cache_config = SimpleNamespace(
-        block_size=16,
-        gpu_memory_utilization=0.92,
-        num_gpu_blocks_override=None,
-    )
+    worker.cache_config = CacheConfig(block_size=16)
     worker.vllm_config = SimpleNamespace(
         cache_config=worker.cache_config, kv_transfer_config=None
     )
@@ -321,11 +317,14 @@ class TestSleepMode:
 
         assert calls == ["release"]
 
-    def test_unsupported_level_is_rejected_before_releasing(self) -> None:
+    def test_unsupported_level_is_rejected_and_wake_up_recovers(self) -> None:
+        # vLLM has already paused the scheduler when the worker refuses, so
+        # the error must point at wake_up() and wake_up() must not fail.
         worker, calls = self._worker()
 
-        with pytest.raises(NotImplementedError, match="level 1 only"):
+        with pytest.raises(NotImplementedError, match=r"level 1 only.*wake_up"):
             MetalWorker.sleep(worker, level=2)
+        MetalWorker.wake_up(worker, tags=None)
 
         assert calls == []
 
@@ -673,21 +672,21 @@ class TestPagedAttentionPlanDiagnostics:
         assert "kv_budget=-1.10GB" in message
 
     @pytest.mark.parametrize(
-        "gpu_mem_util",
+        ("gpu_mem_util", "expected"),
         [
-            pytest.param(0.92, id="vllm_default"),
-            pytest.param(0.5, id="vllm_flag"),
+            pytest.param(None, 0.92, id="vllm_default"),
+            pytest.param(0.5, 0.5, id="vllm_flag"),
         ],
     )
     def test_memory_fraction_follows_gpu_memory_utilization(
-        self, gpu_mem_util: float
+        self, gpu_mem_util: float | None, expected: float
     ) -> None:
         worker = _make_worker(SimpleNamespace(is_hybrid=False))
         worker.cache_config.gpu_memory_utilization = gpu_mem_util
 
         fraction = WorkerCachePlanner(worker)._memory_fraction()
 
-        assert fraction == gpu_mem_util
+        assert fraction == expected
 
     @pytest.mark.parametrize(
         ("override", "expected_blocks"),

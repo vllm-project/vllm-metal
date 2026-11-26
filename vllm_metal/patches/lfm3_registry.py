@@ -26,13 +26,12 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 
-# TODO: Once the pinned vLLM registers Lfm3ForCausalLM with native hybrid
-# capabilities and ShortConv shape/dtype/copy hooks, remove this shim and its
-# LFM3 branch in compat.register_model_compat, along with the shared hook and
-# its metal_model_metadata entry point if no other fallback needs them.
-# Re-run batched and prefix-cache LFM3 parity against the native registration.
+# TODO: when compat.register_model_compat's SCAFFOLDING condition holds, delete
+# these classes, lfm3_audio_registry.py, register_model_compat and the
+# metal_model_metadata entry point, after checking on vLLM's native classes that
+# image and audio requests serve and video requests are refused cleanly.
 class Lfm3ForCausalLM(Lfm2ForCausalLM):
-    """Reuse LFM2's hybrid capabilities and short-convolution state policy."""
+    """LFM2's hybrid and ShortConv state hooks, shared by LFM3-VL and LFM3-Audio."""
 
     def __init__(self, *, vllm_config: "VllmConfig", prefix: str = "") -> None:
         raise NotImplementedError("LFM3 execution requires the Metal MLX model runner.")
@@ -52,8 +51,8 @@ class Lfm3ForCausalLM(Lfm2ForCausalLM):
 class Lfm3VlProcessingInfo(Qwen2VLProcessingInfo):
     """LFM3-VL lays images out as Qwen2-VL does: a patch grid merged 2x2.
 
-    The config comes from the checkpoint's remote code and the processor from
-    mlx-vlm, so skip Qwen2-VL's type checks. Video input is not supported yet.
+    The config comes from vLLM's ``Lfm3VlConfig`` and the processor from
+    mlx-vlm, so skip Qwen2-VL's type checks. Video input is not supported.
     """
 
     def get_hf_config(self):

@@ -1,13 +1,5 @@
 # Configuration
 
-## Model Runner
-
-Both the MLX and experimental PyTorch MPS backends require Model Runner V2.
-MLX uses `MetalModelRunner` with vLLM's V2 configuration and scheduler contract.
-Leave `VLLM_USE_V2_MODEL_RUNNER` unset (Metal defaults it to `1`) or set it to `1`.
-MLX Model Runner V1 has been removed: `VLLM_USE_V2_MODEL_RUNNER=0` fails at
-configuration time.
-
 ## Environment Variables
 
 vllm-metal validates these variables when the engine configuration is created and reports every invalid value together, so a typo fails the startup. Boolean switches treat `1` as on and any other value as off.
@@ -17,7 +9,7 @@ vllm-metal validates these variables when the engine configuration is created an
 | `VLLM_MLX_DEVICE` | `gpu` | MLX device (`gpu` or `cpu`) |
 | `VLLM_METAL_DISABLE_NAX` | `0` | Emergency override for automatic M5 NAX prefill attention. Set to `1` to force the non-NAX fallback. |
 | `VLLM_METAL_NAX_GQA_PREFILL` | `1` | Automatically select three- or six-head grouped NAX prefill on the MLX backend for single-sequence causal attention without sliding windows, softcap or sinks, using BF16, head dimension 256, GQA ratio 6 and 16-token kernel pages. The work-based selector compares query and KV lengths, query/KV heads, detected GPU cores and the actual upstream pipeline. Unsupported features, mixed batches/suffix offsets, unknown capacity or insufficient pipeline limits retain upstream. Extra six-head admission uses complete groups per GPU core and full-tile work coverage for power-of-two KV-head layouts; its guarded-query allowance is calibrated only at 10 cores. Other layouts retain the existing work score; total KV length has no fixed 32K admission cap. Complete tiles omit bounds checks while partial Q/KV tiles remain guarded. Set `0` to retain upstream NAX. Read once at worker startup; restart after changing it. `VLLM_METAL_DISABLE_NAX=1` disables all NAX. |
-| `VLLM_METAL_DISABLE_GQA_DECODE` | `0` | Set to `1` to keep eligible ordinary decode on the established per-token / split-KV kernels. Automatic GQA routing uses the [supported geometries, kernel pages and batch planning rules](gqa-decode.md), requiring 33 complete-partition SIMD groups per detected GPU core. It normally prefers the largest eligible 256/512-token partition; calibrated 10-core M3 guards narrow short-context admission and prefer P256 for supported head256 batches at longer contexts. This switch only disables the optimization. |
+| `VLLM_METAL_DISABLE_GQA_DECODE` | `0` | The MLX backend automatically uses grouped-query attention (GQA) for eligible one-token decode rows, including the decode prefix of a mixed batch. Eligibility depends on the head layout and the amount of cached context. Set to `1` before starting the server to use the per-token or split-KV kernels for those rows. |
 | `VLLM_METAL_TQ_PREFILL` | `auto` | Materialize eligible TurboQuant prefills when NAX is available. `1` explicitly enables the tiled fallback on other GPUs; `0` keeps compressed attention. Set before worker startup. |
 | `VLLM_METAL_TQ_PREFILL_MAX_MIB` | `auto` | TurboQuant prefill workspace, reserved inside `gpu_memory_utilization` before KV sizing. `auto` caps the device allowance by model and scheduler limits for non-speculative serving, and can fall below 256 MiB. A number sets an explicit MiB limit; `0` disables materialization. See [automatic sizing and memory bounds](turboquant.md#prefill-acceleration). |
 | `VLLM_METAL_MULTIMODAL_MODE` | `auto` | Multimodal serve mode: `auto` uses the compatibility allowlist (Gemma 4 gets the vision sidecar when its checkpoint allows); `multimodal-native` disables overrides; `text-only` forces the text-only path for every multimodal checkpoint |
@@ -27,7 +19,7 @@ vllm-metal validates these variables when the engine configuration is created an
 | `VLLM_METAL_GDN_LAZY_KERNELS` | `1` | Enable lazy GDN kernels for eligible hybrid batches. Set to `0` to force the eager conv / C++ recurrent fallback path. |
 | `VLLM_METAL_DECODE_PIPELINE` | `1` | One-step-ahead decode sampling pipeline: eligible pure-decode greedy or native-random steps (including seeded requests) defer the sampling sync one step so the next step's graph build and submit overlap the in-flight GPU forward. Greedy output is unchanged. Disabled automatically when speculative decoding is configured. Set to `0` to force the fully synchronous per-step sample path. |
 | `VLLM_METAL_COMPILED_MLP` | `0` | Opt-in compiled stateless-MLP dispatch: decode-shaped MLP/MoE block calls run through an `mx.compile` trace, fusing the per-layer elementwise glue and cutting the per-step op count. Outputs are bitwise identical to the eager dispatch for quantized checkpoints (unquantized fp16 fusion may differ at the ulp level). LoRA serves keep the eager path. Off by default while the dispatch gathers serve mileage; set to `1` to enable. |
-| `VLLM_METAL_NATIVE_SAMPLING` | `1` | Sample non-greedy requests (temperature, top-k, top-p, min-p) with MLX instead of torch, including prefill first tokens, mixed steps, and deferred decode; greedy output is unchanged, and random outputs can differ from torch for the same seed. Unseeded key derivation is stateless, but the runner keeps a global zero-based counter: random rows share a key hashed from the engine seed and counter in a separate domain from seeded requests. Unseeded draws depend on scheduling, sub-batch order, and batch composition, reproducible only for a fixed request schedule. Each native random sub-batch advances the counter once (decode and prefill separately), while greedy-only, seeded-only, and torch-fallback calls do not. Deferred decode advances it at graph construction, not resolution. Unseeded sequences change from the previous split-chain scheme; seeded request keys are unchanged. A seeded request draws from its own MLX key derived from the seed and its output position, so draws are reproducible given identical logits, sampling parameters, seed, and position. End-to-end token reproducibility also requires a compatible execution environment and batching conditions: batch shape can change logits numerics, and native and torch-fallback paths use different random streams. Seeded deferred decode uses the pre-submit generated-token count as its output position. A sub-batch falls back to torch when any request uses penalties, sample logprobs, allowed-token IDs, bad words, or `logit_bias`, or has not yet generated its `min_tokens`, and every sub-batch does when the step has structured output or speculative decoding is configured. The shared Metal draw changes the random stream, so seeded token sequences can change on upgrade. The PyTorch MPS backend rejects `logit_bias` and `min_tokens`. Set to `0` to sample all non-greedy steps with torch. |
+| `VLLM_METAL_NATIVE_SAMPLING` | `1` | Sample non-greedy requests (temperature, top-k, top-p, min-p) with MLX instead of torch, including prefill first tokens, mixed steps, and deferred decode; greedy output is unchanged, and random outputs can differ from torch for the same seed. Unseeded key derivation is stateless, but the runner keeps a global zero-based counter: random rows share a key hashed from the engine seed and counter in a separate domain from seeded requests. Unseeded draws depend on scheduling, sub-batch order, and batch composition, reproducible only for a fixed request schedule. Each native random sub-batch advances the counter once (decode and prefill separately), while greedy-only, seeded-only, and torch-fallback calls do not. Deferred decode advances it at graph construction, not resolution. Unseeded sequences change from the previous split-chain scheme; seeded request keys are unchanged. A seeded request draws from its own MLX key derived from the seed and its output position, so draws are reproducible given identical logits, sampling parameters, seed, and position. End-to-end token reproducibility also requires a compatible execution environment and batching conditions: batch shape can change logits numerics, and native and torch-fallback paths use different random streams. Seeded deferred decode uses the pre-submit generated-token count as its output position. A sub-batch falls back to torch when any request uses penalties, sample logprobs, allowed-token IDs, bad words, or `logit_bias`, or has not yet generated its `min_tokens`, and every sub-batch does when the step has structured output. With speculation configured, plain decode rows and completed prefills can still use native random sampling. Scheduled drafts use greedy verification. The shared Metal draw changes the random stream, so seeded token sequences can change on upgrade. The PyTorch MPS backend rejects `logit_bias` and `min_tokens`. Set to `0` to sample all non-greedy steps with torch. |
 | `VLLM_METAL_MLA_KERNEL` | `0` | Enable the experimental absorbed-MLA single-pass Metal decode kernel ([RFC #360](https://github.com/vllm-project/vllm-metal/issues/360)). Off by default; the MLA wrapper falls back to the MLX SDPA per-request slow path. Set to `1` to route absorbed-MLA decode through the kernel when the workload matches the instantiated specialization (`kv_lora_rank=512`, `qk_rope_head_dim=64`, `block_size ∈ {16, 32}`, fp16/bf16, decode-only). At startup the engine logs whether decode-only batches take the kernel and, if not, why. |
 | `VLLM_METAL_BUILD_FROM_SOURCE` | `0` | Compile the native `_paged_ops` Metal extension from source at runtime instead of loading the prebuilt artifact shipped in the wheel. For kernel developers / source installs; requires the Xcode command-line tools (`clang++`). Off by default — release wheels ship the `.so` prebuilt. See [Contributing](CONTRIBUTING.md). |
 | `VLLM_METAL_SPEC_VERIFY_WINDOW` | `0` | Enable spec-decode verification window mode ([issue #465](https://github.com/vllm-project/vllm-metal/issues/465)): the K+1 verification rows share each KV block load instead of re-reading the context per row. Off by default; non-hybrid verify windows keep the expanded per-token layout. Outputs are bitwise identical either way; the win is chip- and shape-dependent (measured up to +40% e2e at concurrency 16-32 with 8k contexts on M2/M3 Ultra, and regressions single-stream on M4 Pro and at concurrency 32 on M2 Max). Non-hybrid MLA models and head sizes above 256 use the expanded layout. Hybrid GDN targets force window mode when speculative decoding is configured (their state scan needs one segment per request); hybrid speculation with head sizes above 256 or non-GDN state families is rejected. The same opt-in also merges the `draft_model` proposer's small committed-token ingest into one window per request (head sizes above 256 keep the expanded layout there too); single-stream TPOT is within run-to-run noise of the expanded ingest (0.6B pair, 8k prefix, M4 Pro), and generated tokens are identical. With speculative decoding on, the engine logs at startup which layout the verify windows and the draft model's committed-token ingest use, and why. |
@@ -52,12 +44,13 @@ wins. Outputs are unaffected.
 
 ## PyTorch MPS Allocator Watermark
 
-On the PyTorch MPS backend the plugin defaults
-`PYTORCH_MPS_LOW_WATERMARK_RATIO` to the effective memory fraction
+On the PyTorch MPS backend each worker process defaults
+`PYTORCH_MPS_LOW_WATERMARK_RATIO` to its effective memory fraction
 (`--gpu-memory-utilization`), so PyTorch starts returning cached heaps once
-the pool passes the configured budget. PyTorch's own default is 1.4 times the
-recommended working set, which an 8 GB Mac cannot reach before Metal runs out
-of memory. Exporting either `PYTORCH_MPS_LOW_WATERMARK_RATIO` or
+the pool passes the configured budget. Colocated Omni stages each use their
+own stage's fraction. PyTorch's own default is 1.4 times the recommended
+working set, which an 8 GB Mac cannot reach before Metal runs out of memory.
+Exporting either `PYTORCH_MPS_LOW_WATERMARK_RATIO` or
 `PYTORCH_MPS_HIGH_WATERMARK_RATIO` yourself leaves both untouched.
 
 ## Multimodal Serve Modes
@@ -99,16 +92,19 @@ Sleep levels mean something different on unified memory than on a GPU:
 | Level | vLLM on a GPU | vllm-metal |
 |---|---|---|
 | 1 | Copies weights to CPU memory, discards the KV cache | Discards the KV cache. Weights stay in place: unified memory has nowhere cheaper to copy them to. |
-| 2 | Discards weights and the KV cache | Not supported yet |
+| 2 | Discards weights and the KV cache | Not supported yet. The call fails after vLLM has paused the engine and, with the default `mode="abort"`, aborted running requests. `wake_up()` resumes the engine. |
 
 - `llm.sleep(level=1)` frees the KV cache. `llm.wake_up()` re-creates it in
   well under a second, and the prefix cache starts empty.
 - `llm.sleep(level=0)` followed by `llm.release_kv_cache_memory()` also frees
   the KV cache. Restore it with `llm.wake_up(tags=["kv_cache"])`.
-- The amount freed is the part of the KV pool that was in use, because the
-  pool is allocated lazily.
+- Either way the whole KV pool is freed. The pool takes that memory again at
+  wake or with the first request after wake.
 - With [KV offloading](kv_offloading.md), sleep also frees the host pool. It
-  comes back empty at wake. Prompts already on the disk tier still restore.
+  comes back empty at wake, even with `reset_connector=False`. This differs
+  from vLLM on a GPU, where `False` keeps the offloaded blocks for requests
+  after wake. On a Mac the host pool sits in the unified memory that sleep
+  gives back. Prompts already on the disk tier still restore.
 
 Sleep mode supports dense, hybrid and MLA models on the MLX backend.
 Supported speculative decoding methods are `ngram`, `draft_model`, `dflash` and
@@ -135,61 +131,29 @@ sliding layers to release old blocks. This can improve long-context capacity,
 but not necessarily generation speed. Use `--disable-hybrid-kv-cache-manager`
 for dense allocation.
 
-The KV pool is allocated lazily. vLLM's allocator zero-fills the backing store,
-which on unified memory commits every page of the pool at startup; vllm-metal
-requests the same layout without the fill whenever vLLM does not require it
-(uniform-precision attention caches — `KVCacheConfig.needs_kv_cache_zeroing`
-covers Mamba state and mixed-precision caches, which keep the zero fill). Pages
-are then committed only as blocks are used, so `--gpu-memory-utilization` sizes
-the *capacity* the engine may reach rather than the resident footprint it pays
-for immediately: a 16 GB Mac can give the cache a multi-GB budget while a short
-request only occupies the blocks it writes. A slot a request never writes never
-reaches an output — the attention kernels mask every position past the sequence
-length — so the missing zero fill does not change results. MLA's batched decode
-also zeroes padded latent rows before attention.
+Plan for the KV pool as RAM the server holds at its full size, even when
+requests use little of it. Expect the whole pool in memory at startup or after
+the first request
+([#1198](https://github.com/vllm-project/vllm-metal/issues/1198)). The memory
+reported for the process (RSS) can show less than this.
 
-Unified memory means the pool is not a reservation either way. Nothing pins it:
-`mx.set_wired_limit()` covers MLX-allocated buffers, not this torch allocation
-that MLX imports in place, so the kernel may compress or swap any of its pages
-as soon as something else wants the RAM — zeros from the fill or KV from a
-request alike. The fill decides when the pages become resident, not whether the
-OS can take them back. Resident KV is bounded by the blocks in use, so a run
-that fills the pool peaks at the footprint the eager fill would have committed,
-and a run that leaves blocks idle never pays for them. The difference is when
-the pages are asked for: the fill paid up front, before the first request, while
-a lazy pool faults them in during serving — a long prefill can demand hundreds
-of megabytes at once, at the moment the MLX working set is also at its peak.
-Faulting a page in under pressure is satisfied from the compressor or swap — it
-costs latency, it does not raise an allocation error — and a machine that
-exhausts both ends the process the same way it would end a startup zero-fill.
-`--gpu-memory-utilization` therefore bounds cache capacity rather than
-admission: two processes sized against the same free memory will both claim it,
-where the eager fill's resident pages at least showed up as used.
+With automatic sizing, the pool and the model weights together take about the
+`--gpu-memory-utilization` fraction (default 0.92) of the memory macOS
+recommends for GPU use (Metal's recommended working set). To leave room for
+other applications, lower the fraction or set a smaller pool with
+`--kv-cache-memory-bytes`. Each server sizes itself as if it were alone, so two
+servers at the same fraction each plan for that full fraction.
 
-Because of that, the planner checks the plan against the machine before serving:
-`VLLM_METAL_KV_COMMIT_PROBE` (on by default) forces a bounded sample of the
-planned pool resident at startup — `min(capacity, 512 MiB)`, one write per
-page — and reads back how much memory was free and how much the kernel
-compressed or wrote to swap to make room. macOS answers pressure with the
-compressor first and the swap file once that fills, so paging is read from both
-cumulative counters (`vm_stat` `Compressions` and `Swapouts`): not from swap
-occupancy, which rises and falls within a probe and so can hide the writes, and
-not from psutil's `swap_memory().sout`, which on macOS is the `Pageouts`
-counter — it moves for file writeback and can stay put while the kernel is
-swapping. The `vm_stat` read has a five-second timeout; if the command is
-missing, fails, hangs or prints something unexpected, startup stops with an
-error that names `VLLM_METAL_KV_COMMIT_PROBE=0` as the opt-out, because a
-default-on safety check must not pass silently.
-The sample lives in its own mapping and is dropped as soon as the probe returns,
-so it leaves nothing resident behind — the touch itself is transient, which a
-process's peak-RSS counter will see but steady state will not. If the kernel
-paged to back the sample, the machine has no headroom to give and the pool is
-sized down to what is free, less a reserve of `max(1 GiB, 1/16 of the
-recommended working set)` and less the memory the engine holds outside the pool
-— the TurboQuant prefill workspace, and the KV offload host pool
-(`--kv-offloading-size`), which is pageable but the same RAM — with a warning.
-The budget keeps the full byte count: vLLM chooses its own grouped layout from
-the bytes it is handed. If free memory is merely below the plan, the pool keeps
-its capacity and the shortfall is logged: a plan is a cap, and only the blocks
-requests actually write are ever backed. Set `VLLM_METAL_KV_COMMIT_PROBE=0` to
-skip the touch and use the configured cache budget.
+By default, vllm-metal tests a sample of the planned pool, up to 512 MiB,
+against the machine at startup:
+
+- If macOS has to compress or swap memory to hold the sample, the pool can be
+  sized down, with a warning. Where a pool set with `--kv-cache-memory-bytes`
+  would be sized down, startup stops with an error instead.
+- If the log says the pool is larger than this machine's free memory, the pool
+  keeps its size. Make the pool smaller or close other applications.
+- If memory statistics cannot be read, startup stops with an error.
+
+The test covers a sample, so leave headroom even when no warning appears. Set
+`VLLM_METAL_KV_COMMIT_PROBE=0` to skip the test and keep the planned pool
+size.

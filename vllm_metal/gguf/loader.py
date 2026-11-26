@@ -15,8 +15,10 @@ import mlx.nn as nn
 import numpy as np
 from huggingface_hub import snapshot_download
 from mlx.utils import tree_flatten
+from mlx_lm.models.switch_layers import SwitchLinear
 from mlx_lm.utils import load_config, load_model
 
+from vllm_metal.compat import ensure_mlx_lm_gemma3_config_only_sanitize
 from vllm_metal.gguf.adapter import (
     GGUFLoadError,
     GGUFModelAdapter,
@@ -27,7 +29,7 @@ from vllm_metal.gguf.mlx_native import AFFINE_GGUF_TYPES, GGUFMLXQuantizedTensor
 from vllm_metal.gguf.raw_block import RAW_KERNEL_GGUF_TYPES, GGUFRawBlockTensor
 from vllm_metal.gguf.source import GGUFLoadSource
 from vllm_metal.gguf.tensor import GGUFTensor
-from vllm_metal.gguf.wrappers import GGUFEmbedding, GGUFLinear
+from vllm_metal.gguf.wrappers import GGUFEmbedding, GGUFLinear, GGUFSwitchLinear
 
 __all__ = ["GGUFLoadError", "GGUFModelLoader"]
 
@@ -53,7 +55,7 @@ _SUPPORTED_QTYPES_NOTE = (
 _CONFIG_ALLOW_PATTERNS = ("config.json", "generation_config.json")
 
 
-GGUFWrapper = GGUFLinear | GGUFEmbedding
+GGUFWrapper = GGUFLinear | GGUFEmbedding | GGUFSwitchLinear
 GGUFQuantTensor = GGUFMLXQuantizedTensor | GGUFRawBlockTensor
 
 
@@ -125,7 +127,11 @@ class GGUFModelLoader:
 
         # Build the mlx-lm skeleton lazily; the GGUF replaces every parameter of
         # its text model, so the skeleton's own weights are never materialized.
-        model = self._build_skeleton(config)
+        model = self._build_skeleton(
+            GGUFModelAdapter.skeleton_config(
+                config, arch=arch, embedding_rows=self._embedding_rows(reader)
+            )
+        )
         text_model = GGUFModelAdapter.text_model(model)
         tied = bool(getattr(text_model.args, "tie_word_embeddings", False))
         self._preflight_deferred_output(reader, tied=tied)
@@ -166,7 +172,8 @@ class GGUFModelLoader:
             )
         try:
             reader = gguf.GGUFReader(str(self._gguf_path))
-        except (ValueError, OSError) as exc:
+        except (ValueError, OSError, IndexError) as exc:
+            # A cut header surfaces as IndexError; all three mean unreadable input.
             raise GGUFLoadError(
                 f"Could not read GGUF file {str(self._gguf_path)!r}: {exc}"
             ) from exc
@@ -207,6 +214,7 @@ class GGUFModelLoader:
         skeleton_config = {
             key: value for key, value in config.items() if key not in _QUANTIZATION_KEYS
         }
+        ensure_mlx_lm_gemma3_config_only_sanitize()
         with TemporaryDirectory(prefix="vllm-metal-gguf-") as config_only_dir:
             (Path(config_only_dir) / "config.json").write_text(
                 json.dumps(skeleton_config)
@@ -307,8 +315,11 @@ class GGUFModelLoader:
                 self._validate_plain_shape(model, translated, bias, name)
                 biases[module_path] = bias[permute] if permute is not None else bias
             elif tensor.tensor_type in _QUANT_GGUF_TYPES:
-                qt = self._quant_tensor(tensor)
-                self._validate_quant_shape(module_path, current, qt, name)
+                is_moe = isinstance(current, SwitchLinear)
+                qt = self._quant_tensor(tensor, is_moe=is_moe)
+                self._validate_quant_shape(
+                    module_path, current, qt, name, is_moe=is_moe
+                )
                 qt = qt.permute_rows(permute) if permute is not None else qt
                 quant[module_path] = (
                     GGUFColumnPermutedTensor(qt, columns) if columns is not None else qt
@@ -331,15 +342,24 @@ class GGUFModelLoader:
         return _PartitionedTensors(quant=quant, plain=plain, biases=biases)
 
     @staticmethod
-    def _quant_tensor(tensor: Any) -> GGUFQuantTensor:
+    def _quant_tensor(tensor: Any, *, is_moe: bool) -> GGUFQuantTensor:
         """Build a quantized tensor from the reader's raw block bytes."""
         data = tensor.data.reshape(-1)
         logical = GGUFModelLoader._logical_shape(tensor)
+        if is_moe:
+            logical = GGUFModelLoader._stack_experts(logical)
         if tensor.tensor_type in AFFINE_GGUF_TYPES:
             return GGUFMLXQuantizedTensor.from_raw_blocks(
                 data, logical, tensor.tensor_type
             )
         return GGUFRawBlockTensor.from_raw_blocks(data, logical, tensor.tensor_type)
+
+    @staticmethod
+    def _stack_experts(shape: tuple[int, ...]) -> tuple[int, ...]:
+        """Map MoE experts ``(E, out, in)`` to the ``(E * out, in)`` rows they're
+        stored as."""
+        num_experts, out_features, in_features = shape
+        return (num_experts * out_features, in_features)
 
     @staticmethod
     def _plain_tensor(tensor: Any) -> mx.array:
@@ -380,11 +400,13 @@ class GGUFModelLoader:
                         "has no matching .bias tensor."
                     )
                 wrapper = GGUFLinear(qt, bias=bias)
+            elif isinstance(current, SwitchLinear):
+                wrapper = GGUFSwitchLinear(qt, current.num_experts)
             else:
                 raise GGUFLoadError(
                     f"Unsupported quantized target module "
                     f"{type(current).__name__!r} at {module_path!r}; expected "
-                    "nn.Linear or nn.Embedding."
+                    "nn.Linear, nn.Embedding or SwitchLinear."
                 )
             self._assign_path(model, module_path, wrapper)
             installed.append(
@@ -446,9 +468,13 @@ class GGUFModelLoader:
         module: Any,
         qt: GGUFQuantTensor,
         name: str,
+        *,
+        is_moe: bool,
     ) -> None:
         weight = module.weight
         expected = tuple(int(d) for d in weight.shape)
+        if is_moe:
+            expected = self._stack_experts(expected)
         actual = (qt.out_features, qt.in_features)
         if actual != expected:
             raise GGUFLoadError(
@@ -477,6 +503,25 @@ class GGUFModelLoader:
                 f"GGUF tensor {name!r} shape {actual} != expected {expected} for "
                 f"model {param_path!r}."
             )
+
+    @classmethod
+    def read_vocab_header(cls, gguf_path: str | Path) -> tuple[str, int | None]:
+        """The file's architecture and ``token_embd`` rows, read without the weights."""
+        try:
+            reader = gguf.GGUFReader(str(gguf_path))
+        except (ValueError, OSError) as exc:
+            raise GGUFLoadError(
+                f"Could not read GGUF file {str(gguf_path)!r}: {exc}"
+            ) from exc
+        return cls._gguf_arch(reader), cls._embedding_rows(reader)
+
+    @staticmethod
+    def _embedding_rows(reader: Any) -> int | None:
+        """Rows of the file's ``token_embd.weight``, or ``None`` when absent."""
+        for tensor in reader.tensors:
+            if tensor.name == "token_embd.weight":
+                return GGUFModelLoader._logical_shape(tensor)[0]
+        return None
 
     @staticmethod
     def _gguf_arch(reader: Any) -> str:

@@ -55,10 +55,16 @@ class MetalLoRARuntime:
         self._manager: MetalWorkerLoRAManager | None = None
         self._encoder_enabled = False
         self._requests_by_id: dict[int, LoRARequest] = {}
+        self._step_uses_adapter = False
 
     @property
     def enabled(self) -> bool:
         return self._manager is not None
+
+    @property
+    def step_uses_adapter(self) -> bool:
+        """Whether the step last prepared routes any row through an adapter."""
+        return self._step_uses_adapter
 
     def setup(
         self,
@@ -168,3 +174,4 @@ class MetalLoRARuntime:
             active_requests.add(lora_request)
         mapping = builder.build() if not builder.is_empty() else None
         self._manager.set_active_adapters(active_requests, mapping)
+        self._step_uses_adapter = bool(active_requests)

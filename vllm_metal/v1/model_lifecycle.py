@@ -16,6 +16,7 @@ from mlx_vlm.utils import load_model as mlx_vlm_load_model
 from vllm.logger import init_logger
 
 from vllm_metal.attention.impls.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
+from vllm_metal.attention.patching import find_num_loops
 from vllm_metal.attention.runtime.factory import build_hybrid_runtime_plan
 from vllm_metal.compat import (
     apply_compat_patches,
@@ -245,9 +246,11 @@ class ModelLifecycle:
     def resolve_model_dims(self) -> None:
         """Resolve loaded model args into runner attention/cache dimensions."""
         args = self._runner.model_args
-        default_head_dim = self._install_runner_attention_dims(args)
+        num_loops = find_num_loops(self._runner.model)
+        default_head_dim = self._install_runner_attention_dims(args, num_loops)
         self._install_yoco_cache_mapping(args)
         self._install_per_layer_attention_metadata(args, default_head_dim)
+        self._reject_unsupported_looped_configs(num_loops)
         self._reject_pipeline_parallel_with_per_layer_metadata()
         self._install_hybrid_state_plan(args)
 
@@ -413,12 +416,7 @@ class ModelLifecycle:
 
         elif awq_loader is not None:
             load_label = "AWQ model"
-            model = self._load_awq_text_model(
-                model_name,
-                awq_loader,
-                target_dtype,
-                revision=revision,
-            )
+            model = self._load_awq_text_model(model_name, awq_loader, revision=revision)
 
         else:
             load_label = "MLX-LM model"
@@ -462,16 +460,11 @@ class ModelLifecycle:
         self,
         model_name: str,
         awq_loader: AWQQuantLoader,
-        target_dtype: Any,
         *,
         revision: str | None = None,
     ) -> Any:
         with _mlx_lm_compatible_model_path(model_name) as compatible_model_name:
-            return awq_loader.load(
-                str(compatible_model_name),
-                target_dtype=target_dtype,
-                revision=revision,
-            )
+            return awq_loader.load(str(compatible_model_name), revision=revision)
 
     def _load_mlx_lm_text_model(
         self,
@@ -519,9 +512,12 @@ class ModelLifecycle:
         runner._vocab_size = int(loaded_model.model_args["vocab_size"])
         logger.debug("Model args: %s", loaded_model.model_args)
 
-    def _install_runner_attention_dims(self, args: dict[str, Any]) -> int | None:
+    def _install_runner_attention_dims(
+        self, args: dict[str, Any], num_loops: int = 1
+    ) -> int | None:
         """Install runner-wide attention dims and return the default head_dim."""
-        num_layers = args.get("num_hidden_layers") or args.get("n_layers")
+        base_num_layers = args.get("num_hidden_layers") or args.get("n_layers")
+        num_layers = int(base_num_layers) * num_loops if base_num_layers else None
         num_attention_heads = args.get("num_attention_heads")
         num_kv_heads = (
             args.get("num_key_value_heads")
@@ -559,6 +555,27 @@ class ModelLifecycle:
                 args.get("qk_rope_head_dim", MLA_DEFAULT_QK_ROPE_HEAD_DIM)
             )
         return int(default_head_dim) if default_head_dim is not None else None
+
+    def _reject_unsupported_looped_configs(self, num_loops: int) -> None:
+        if num_loops <= 1:
+            return
+        runner = self._runner
+        if runner.pp is not None and runner.pp.size > 1:
+            raise NotImplementedError(
+                "Pipeline parallelism does not support weight-tied looped models "
+                f"(num_loops={num_loops})."
+            )
+        if (
+            runner._yoco_cache_mapping is not None
+            or runner.is_hybrid
+            or runner.is_mla
+            or runner.kv_heads_per_layer is not None
+            or runner.head_dim_per_layer is not None
+        ):
+            raise NotImplementedError(
+                "Weight-tied looped models (num_loops > 1) are supported only "
+                "for uniform SDPA attention."
+            )
 
     def _install_yoco_cache_mapping(self, args: dict[str, Any]) -> None:
         """Install YOCO layer-to-cache mapping when the model uses shared KV."""

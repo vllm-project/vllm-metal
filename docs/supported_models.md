@@ -59,8 +59,8 @@ unsupported; leave `--video-pruning-rate` unset.
 | Qwen3.5 / 3.6 (dense and MoE) | 🔵 | | native multimodal paged generation | image and video input; FP8 and GGUF checkpoints stay text-only | `mlx-community/Qwen3.5-4B-MLX-4bit` |
 | PaddleOCR-VL | 🔵 | | native multimodal paged generation | image input, no video | `PaddlePaddle/PaddleOCR-VL-1.6` |
 | LFM2-VL / LFM2.5-VL | 🔵 | 🔵 | native multimodal paged generation on the ShortConv text tower | image input, no video; one tile grid plus thumbnail per image; needs a checkpoint packaged for Transformers, which the MLX conversions are not | `LiquidAI/LFM2.5-VL-1.6B` |
-| LFM3-VL | 🔵 | | native multimodal paged generation on the LFM3 text tower | image input, no video; needs `--trust-remote-code`; the image processor comes from mlx-vlm | `LiquidAI/LFM3-VL-2B-MLX-4bit` |
-| LFM3-Audio | 🔵 | | native multimodal paged generation on the LFM3 text tower | audio input to text, clips up to 30 seconds; needs `--trust-remote-code`; no speech output | `LiquidAI/LFM3-Audio-2B-MLX-4bit` |
+| LFM3-VL | 🔵 | | native multimodal paged generation on the LFM3 text tower | image input, no video; the image processor comes from mlx-vlm | `LiquidAI/LFM3-VL-2B-MLX-4bit` |
+| LFM3-Audio | 🔵 | | native multimodal paged generation on the LFM3 text tower | audio input to text, clips up to 30 seconds; no speech output | `LiquidAI/LFM3-Audio-2B-MLX-4bit` |
 | Gemma 4 | 🔵 | | mlx_lm text backbone + mlx-vlm encoder sidecar, paged generation | image input; audio and video input on E2B/E4B; bidirectional attention inside image blocks on sliding-window layers | `mlx-community/unsloth-gemma-4-26B-A4B-it-qat-oQ4`, `mlx-community/gemma-4-e2b-it-4bit` (audio, video) |
 
 Gemma 4 keeps its text path exactly as on the text-only table (mlx_lm model,
@@ -130,13 +130,14 @@ GGUF checkpoints serve by detection like AWQ, with no env flag:
 vllm-metal's GGUF engine integration sets `quantization=gguf` from the file
 (vLLM 0.24 moved its in-tree GGUF support to the CUDA/ROCm-only
 [vllm-gguf-plugin](https://github.com/vllm-project/vllm-gguf-plugin)). Dense
-`qwen2`/`qwen3`/`llama`/`mistral` and text-only Qwen3.5 (`qwen35`) checkpoints
-load from a local `.gguf` (including llama.cpp's Q4_K_M and Q5_K_M exports) or a
-remote `repo_id:quant` reference and stay quantized in memory. See
+`qwen2`/`qwen3`/`llama`/`mistral`, Qwen3 MoE (`qwen3moe`), and text-only
+Qwen3.5 (`qwen35`) and Gemma 3 (`gemma3`) checkpoints load from a local `.gguf`
+(including llama.cpp's Q4_K_M and Q5_K_M exports) or a remote `repo_id:quant`
+reference and stay quantized in memory. See
 [GGUF](gguf.md) for the supported qtypes, exclusions, and serve examples.
 Verified end-to-end on Qwen3-0.6B, Llama-3.2-1B-Instruct, and
-Mistral-7B-Instruct-v0.3 in Q8_0 and Q4_K_M, and on Qwen3.5-0.8B Q8_0, 4B
-Q5_K_M, and 9B Q4_K_M
+Mistral-7B-Instruct-v0.3 in Q8_0 and Q4_K_M, on Qwen3.5-0.8B Q8_0, 4B
+Q5_K_M, and 9B Q4_K_M, and on Gemma 3 4B Q4_K_M
 ([#415](https://github.com/vllm-project/vllm-metal/issues/415),
 [#761](https://github.com/vllm-project/vllm-metal/issues/761)).
 
@@ -162,7 +163,7 @@ and TurboQuant are not validated.
 | Qwen3.5 / 3.6 / 3.8 | ✅ | 🔵 | Hybrid SDPA + GDN linear (3.6 adds MoE) | 🔵 | `mlx-community/Qwen3.8-27B-8bit` |
 | Qwen3-Next | ✅ | | Hybrid SDPA + GDN linear | 🔵 | `mlx-community/Qwen3-Next-80B-A3B-Instruct-8bit` |
 | LFM2 / LFM2.5 | ✅ | 🔵 | Hybrid SDPA + ShortConv | ✅ | `LiquidAI/LFM2.5-1.2B-Instruct` |
-| LFM3 | 🔵 | | Hybrid full/sliding SDPA + ShortConv | ✅ | `LiquidAI/LFM3-1.7B-MLX-4bit` (needs `--trust-remote-code`) |
+| LFM3 | 🔵 | | Hybrid full/sliding SDPA + ShortConv | ✅ | `LiquidAI/LFM3-1.7B-MLX-4bit` |
 | Nemotron-H (Nemotron 3.5 Lightning) | 🔵 | | Hybrid SDPA + Mamba-2 (MoE) | ❌ | `mlx-community/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-4bit` |
 | Granite 4.0-h-micro | 🔵 | | Hybrid SDPA + Mamba-2 | ❌ | `mlx-community/granite-4.0-h-micro-4bit` |
 | Gemma 4 | ✅ | | GQA + per-layer sliding window + YOCO | ✅ | `mlx-community/gemma-4-e2b-it-4bit` |
@@ -195,6 +196,7 @@ and TurboQuant are not validated.
 | OLMoE | ✅ | | MHA + full-projection QK norm (paged) | ✅ | `mlx-community/OLMoE-1B-7B-0125-Instruct-4bit` |
 | OLMo 3 | 🔵 | | MHA + per-layer sliding window (paged) | ✅ | `mlx-community/Olmo-3-7B-Instruct-4bit` |
 | Muse Glimmer | 🔵 | | GQA + per-layer sliding window, gated attention with QK norm (paged) | ✅ | `mlx-community/Muse-Glimmer-30B-4bit` |
+| Nanbeige 4.2 | 🔵 | | GQA, weight-tied looped decoder (paged) | ✅ | `mlx-community/Nanbeige4.2-3B-OptiQ-4bit` |
 
 **Hunyuan on MPS:** use `--generation-config vllm` to override the checkpoint’s unsupported `repetition_penalty=1.05` default.
 

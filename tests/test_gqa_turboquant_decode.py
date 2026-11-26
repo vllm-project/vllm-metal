@@ -15,6 +15,7 @@ import numpy as np
 import pytest
 
 from tests.gqa_test_utils import (
+    GQA_PARTITION_SIZE,
     _assert_close,
     _dispatch_family,
     _grouped_paged_reference,
@@ -29,8 +30,7 @@ from vllm_metal.metal import get_ops
 
 GQA_CONFIG = get_ops()._gqa_decode_config_for_test()
 GQA_GEOMETRIES = tuple(tuple(row) for row in GQA_CONFIG["geometries"])
-GQA_PARTITIONS = tuple(sorted(GQA_CONFIG["partitions"]))
-assert GQA_GEOMETRIES and GQA_PARTITIONS
+assert GQA_GEOMETRIES
 
 # Signed int8, unsigned uint8, and packed 4-, 5- (byte-straddling) and 2-bit K.
 K_QUANTS = ("q8_0", "uint8", "q4_0", "q5_0", "int2")
@@ -52,7 +52,6 @@ def _run(
     *,
     kv_lens: list[int],
     geometry: tuple[int, int, int, int],
-    partition: int,
     dtype: mx.Dtype,
     k_quant: str = "q8_0",
     v_bits: int = 3,
@@ -107,12 +106,11 @@ def _run(
         lengths,
         block_size,
         max(kv_lens),
-        partition,
-        plan,
+        gqa_length_plan=plan,
     )
     mx.eval(out)
     assert _dispatch_family() == "gqa_decode"
-    assert ops.last_gqa_partition_size() == partition
+    assert ops.last_gqa_partition_size() == GQA_PARTITION_SIZE
 
     batch = len(kv_lens)
     established = ops.paged_attention_primitive(
@@ -157,14 +155,12 @@ def _run(
 
 
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
-@pytest.mark.parametrize("partition", GQA_PARTITIONS)
 @pytest.mark.parametrize("geometry", GQA_GEOMETRIES)
-def test_matches_established_turboquant_kernel(geometry, partition, dtype) -> None:
-    """Every shipped geometry and partition, with a partial final partition."""
+def test_matches_established_turboquant_kernel(geometry, dtype) -> None:
+    """Every shipped geometry, with a partial final partition."""
     out, established, reference = _run(
-        kv_lens=[2 * partition + 37],
+        kv_lens=[2 * GQA_PARTITION_SIZE + 37],
         geometry=geometry,
-        partition=partition,
         dtype=dtype,
     )
     _assert_close(out, established, dtype)
@@ -177,7 +173,6 @@ def test_key_quant_types(k_quant, dtype) -> None:
     out, established, reference = _run(
         kv_lens=[1300],
         geometry=(32, 8, 128, 16),
-        partition=256,
         dtype=dtype,
         k_quant=k_quant,
     )
@@ -190,7 +185,6 @@ def test_value_bit_widths(v_bits) -> None:
     out, established, reference = _run(
         kv_lens=[1100],
         geometry=(16, 2, 256, 32),
-        partition=512,
         dtype=mx.float16,
         v_bits=v_bits,
     )
@@ -199,13 +193,11 @@ def test_value_bit_widths(v_bits) -> None:
 
 
 @pytest.mark.parametrize("length_plan", [False, True])
-@pytest.mark.parametrize("partition", GQA_PARTITIONS)
-def test_uneven_batch(partition, length_plan) -> None:
+def test_uneven_batch(length_plan) -> None:
     """Rectangular and compact scratch with rows ending in different partitions."""
     out, established, reference = _run(
-        kv_lens=[3 * partition + 5, 17, partition, 2 * partition - 1],
+        kv_lens=[773, 17, 256, 511],
         geometry=(24, 4, 256, 16),
-        partition=partition,
         dtype=mx.bfloat16,
         length_plan=length_plan,
     )
@@ -233,5 +225,4 @@ def test_rejects_non_turboquant_cache() -> None:
             mx.array([64], dtype=mx.int32),
             16,
             64,
-            256,
         )

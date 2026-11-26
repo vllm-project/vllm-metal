@@ -15,19 +15,18 @@ from __future__ import annotations
 
 import os
 
+import gguf
 import mlx.core as mx
 import numpy as np
 import pytest
 
-gguf = pytest.importorskip("gguf")
-
-import vllm_metal.gguf.mlx_native as mlx_native  # noqa: E402
-from tests.gguf_kquant_fixtures import (  # noqa: E402
+import vllm_metal.gguf.mlx_native as mlx_native
+from tests.gguf_kquant_fixtures import (
     build_iq3_blocks,
     build_iq4_blocks,
     build_kquant_blocks,
 )
-from vllm_metal.gguf.mlx_native import (  # noqa: E402
+from vllm_metal.gguf.mlx_native import (
     AFFINE_GGUF_TYPES,
     GGUFMLXQuantizedTensor,
 )
@@ -699,4 +698,40 @@ def test_permute_rows_rejects_non_permutation():
     assert str(dup.value) == (
         "permute_rows index must be a permutation of range(64); "
         "got duplicate or out-of-range values"
+    )
+
+
+# --- MoE experts stacked as row blocks ----------------------------------------
+
+
+@pytest.mark.parametrize(
+    "qtype", [GGMLQuantizationType.Q8_0, GGMLQuantizationType.Q4_K]
+)
+@pytest.mark.parametrize("sorted_indices", [False, True])
+def test_gather_matmul_matches_expert_oracle(qtype, sorted_indices):
+    # Q8_0 keeps float16 scales and Q4_K float32; gather_qmm must take both.
+    num_experts, rows = 4, 8
+    if qtype == GGMLQuantizationType.Q8_0:
+        qt, oracle = _make_tensor(qtype, shape=(num_experts * rows, 512))
+    else:
+        qt, oracle = _make_kquant_tensor(qtype, rows=num_experts * rows)
+    if sorted_indices:
+        x = mx.random.normal((80, 1, qt.in_features))
+        indices = mx.sort(mx.random.randint(0, num_experts, (80,)))
+    else:
+        x = mx.random.normal((2, 3, 1, 1, qt.in_features))
+        indices = mx.random.randint(0, num_experts, (2, 3, 2))
+
+    out = qt.gather_matmul(
+        x, indices, num_experts=num_experts, sorted_indices=sorted_indices
+    )
+    experts = mx.array(oracle.reshape(num_experts, rows, qt.in_features))
+    expected = mx.gather_mm(
+        x, experts.swapaxes(-1, -2), rhs_indices=indices, stream=mx.cpu
+    )
+    mx.eval(out, expected)
+
+    ref_max = float(mx.max(mx.abs(expected)))
+    np.testing.assert_allclose(
+        np.array(out), np.array(expected), rtol=0, atol=ref_max * 4e-6
     )

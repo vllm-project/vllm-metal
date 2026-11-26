@@ -18,13 +18,16 @@ class MetalBackend(AttentionBackend):
     block_size, and the hybrid-block-size math via
     Platform._align_hybrid_block_size) can read Metal's MultipleOf(16)
     alignment constraint. The Metal paged-attention kernels are tuned for
-    block_size=16; advertising MultipleOf(16) makes vLLM's selector default
-    to 16 and lets hybrid models align to multiples of 16. It is never
+    block_size=16, so default-sized runs keep 16 instead of vLLM's larger
+    default, and hybrid models align to multiples of 16. It is never
     dispatched to as a real attention backend — the actual Metal paged
     attention lives in attention/impls/sdpa_wrapper.py. The
     unimplemented methods below intentionally raise: a loud failure is the
     correct behavior if upstream ever tries to use this as a real backend.
     """
+
+    # The paged kernels' tuned block size; an explicit --block-size bypasses it.
+    PREFERRED_BLOCK_SIZE = 16
 
     @staticmethod
     def get_name() -> str:
@@ -33,6 +36,10 @@ class MetalBackend(AttentionBackend):
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
         return [MultipleOf(16)]
+
+    @classmethod
+    def get_preferred_block_size(cls, default_block_size: int) -> int:
+        return cls.PREFERRED_BLOCK_SIZE
 
     @staticmethod
     def get_impl_cls():

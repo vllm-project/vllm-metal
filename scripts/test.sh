@@ -27,7 +27,7 @@ main() {
     section "Building wheel"
     wheel_build_dir=$(mktemp -d)
     trap 'rm -rf -- "$wheel_build_dir"' EXIT
-    uv build --out-dir "$wheel_build_dir"
+    uv build --python "$VIRTUAL_ENV/bin/python" --out-dir "$wheel_build_dir"
     local wheels=("$wheel_build_dir"/*.whl)
     if [ "${#wheels[@]}" -ne 1 ] || [ ! -f "${wheels[0]}" ]; then
       error "Expected exactly one wheel in ${wheel_build_dir} after uv build."

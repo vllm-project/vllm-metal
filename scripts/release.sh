@@ -87,10 +87,7 @@ main() {
   vllm_release_tag=$(read_vllm_release_tag)
   echo "vLLM release: $vllm_release_tag"
 
-  setup_dev_env
-
-  # Use the same pinned vLLM/PyTorch and native build as source installs and CI.
-  ./install.sh
+  ensure_uv
 
   local version prerelease=0
   if [ "$channel" = "dev" ]; then
@@ -111,18 +108,29 @@ main() {
   # Stamp the ephemeral checkout; the build backend reads [project].version.
   sed -i '' -E "s/^version = .*/version = \"${version}\"/" pyproject.toml
 
-  section "Building wheel"
+  section "Building wheels for Python 3.12 and 3.13"
   wheel_build_dir=$(mktemp -d)
   trap 'rm -rf -- "$wheel_build_dir"' EXIT
-  uv build --out-dir "$wheel_build_dir"
+  local python_version
+  local wheels=()
+  for python_version in 3.12 3.13; do
+    (
+      export VLLM_METAL_PYTHON="$python_version"
+      export VLLM_METAL_VENV="$wheel_build_dir/venv-$python_version"
+      # Rebuild each launcher's CPython ABI with the installer's framework pins.
+      ./install.sh
+      ensure_venv "$VLLM_METAL_VENV"
+      uv build --wheel --python "$VIRTUAL_ENV/bin/python" --out-dir "$wheel_build_dir/$python_version"
 
-  # Abort before publishing if the wheel omitted a native artifact.
-  local wheels=("$wheel_build_dir"/*.whl)
-  if [ "${#wheels[@]}" -ne 1 ] || [ ! -f "${wheels[0]}" ]; then
-    error "Expected exactly one wheel in ${wheel_build_dir} after uv build."
-    exit 1
-  fi
-  verify_wheel_artifacts "${wheels[0]}"
+      built_wheels=("$wheel_build_dir/$python_version"/*.whl)
+      if [ "${#built_wheels[@]}" -ne 1 ] || [ ! -f "${built_wheels[0]}" ]; then
+        error "Expected exactly one wheel for Python ${python_version}."
+        exit 1
+      fi
+      verify_wheel_artifacts "${built_wheels[0]}"
+    )
+    wheels+=("$wheel_build_dir/$python_version"/*.whl)
+  done
 
   local tag previous_dev_tag=""
   tag="v${version}"
@@ -153,7 +161,7 @@ main() {
       --jq '[.[] | select(.tagName | contains(".dev"))][0].tagName // ""')
   fi
 
-  gh release create "$tag" "${release_args[@]}" "${wheels[0]}"
+  gh release create "$tag" "${release_args[@]}" "${wheels[@]}"
 
   if [ -n "$previous_dev_tag" ]; then
     gh release delete "$previous_dev_tag" --yes

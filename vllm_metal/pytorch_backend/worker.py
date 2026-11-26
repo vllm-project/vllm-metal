@@ -18,20 +18,10 @@ _MPS_WATERMARK_ENVS = (
     "PYTORCH_MPS_LOW_WATERMARK_RATIO",
     "PYTORCH_MPS_HIGH_WATERMARK_RATIO",
 )
-_mps_low_watermark_default: str | None = None
 
 
 def configure_mps(config, *, omni=False):
-    global _mps_low_watermark_default
-
-    from vllm import envs as vllm_envs
     from vllm.config.compilation import CompilationMode, CUDAGraphMode
-
-    from vllm_metal import envs
-
-    if envs.VLLM_METAL_BACKEND == "mps":
-        if vllm_envs.VLLM_USE_V2_MODEL_RUNNER is not True:
-            raise ValueError("Experimental MPS requires VLLM_USE_V2_MODEL_RUNNER=1")
 
     if omni:
         from vllm.config import DeviceConfig
@@ -79,13 +69,10 @@ def configure_mps(config, *, omni=False):
         or spec.draft_sample_method != "greedy"
         or spec.rejection_sample_method != "standard"
         or spec.enable_adaptive_verification
-        or spec.parallel_drafting
         or model.has_inner_state
         or config.watermark_config is not None
     ):
         raise NotImplementedError("MPS speculation currently supports greedy EAGLE3")
-    if config.cache_config.block_size is None:
-        config.cache_config.block_size = 16
     block_size = config.cache_config.block_size
     # The engine core resets a hybrid model's block size to its smallest
     # group's, which is max_model_len for mamba groups.
@@ -100,19 +87,6 @@ def configure_mps(config, *, omni=False):
     config.compilation_config.mode = CompilationMode.NONE
     config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
     model.enforce_eager = True
-    # PyTorch proactively reclaims cached heaps past its low watermark, 1.4x the
-    # recommended working set by default. Metal runs out before that on small
-    # Macs, so start reclaiming at the configured budget instead.
-    low_env, high_env = _MPS_WATERMARK_ENVS
-    current = os.environ.get(low_env)
-    # Set the default when absent, or update it when it still matches the
-    # default we installed.
-    if high_env not in os.environ and (
-        current is None or current == _mps_low_watermark_default
-    ):
-        desired = str(config.cache_config.gpu_memory_utilization)
-        os.environ[low_env] = desired
-        _mps_low_watermark_default = desired
 
 
 class MPSWorker(MetalWorker):
@@ -125,6 +99,16 @@ class MPSWorker(MetalWorker):
         if not torch.backends.mps.is_available():
             raise RuntimeError("The experimental backend requires PyTorch MPS")
         configure_mps(self.vllm_config, omni=self.is_omni)
+        # PyTorch proactively reclaims cached heaps past its low watermark, 1.4x
+        # the recommended working set by default. Metal runs out before that on
+        # small Macs, so start reclaiming at the configured budget instead.
+        # PyTorch reads the variable when this process's allocator starts. Set it
+        # here, not in the frontend: workers inherit the frontend's environment,
+        # so colocated Omni stages would all get the last stage's budget.
+        if not any(env in os.environ for env in _MPS_WATERMARK_ENVS):
+            os.environ[_MPS_WATERMARK_ENVS[0]] = str(
+                self.cache_config.resolved_gpu_memory_utilization
+            )
         self.device = torch.device("mps:0")
         init_worker_distributed_environment(
             self.vllm_config,
@@ -174,7 +158,7 @@ class MPSWorker(MetalWorker):
         # Like the MLX backend, budget against the GPU working set, not RAM.
         budget = int(
             torch.mps.recommended_max_memory()
-            * self.cache_config.gpu_memory_utilization
+            * self.cache_config.resolved_gpu_memory_utilization
         )
         available = budget - torch.mps.driver_allocated_memory() - reserve
         if available <= 0:

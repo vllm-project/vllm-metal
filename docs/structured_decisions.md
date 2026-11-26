@@ -6,7 +6,7 @@ for `/v1/systemone` request examples, question schemas, and sampling options.
 
 ## D3 (Decision 3.0)
 
-With vLLM 0.33.0, D3 uses the native `/v1/systemone` endpoint on the model
+D3 uses the native `/v1/systemone` endpoint on the model
 server; no separate proxy is needed. See the
 [upstream D3 guide](https://docs.vllm.ai/en/latest/models/structured_decisions_models/#decision-30)
 for question schemas and options.
@@ -63,7 +63,7 @@ curl http://127.0.0.1:8000/v1/systemone \
 ```
 
 The response contains the selected option and its probabilities under
-`answers.route`. Use `/v1/systemone`: upstream vLLM 0.33.0 does not enable
+`answers.route`. Use `/v1/systemone`: upstream vLLM does not enable
 `/v1/decisions` for D3 and returns HTTP 501. D3 does not serve chat completions.
 
 Prefix caching and chunked prefill are disabled automatically, as in upstream

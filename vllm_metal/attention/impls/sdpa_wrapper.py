@@ -23,12 +23,12 @@ import mlx.nn as nn
 
 from vllm_metal.attention.attention_contracts import attention_contract_for
 from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
-from vllm_metal.attention.context import get_context
+from vllm_metal.attention.context import OffsetCache, get_context
 from vllm_metal.attention.impls.sdpa import (
     _float32_sinks,
     sdpa_forward,
 )
-from vllm_metal.attention.patching import walk_and_wrap
+from vllm_metal.attention.patching import find_layers, find_num_loops, walk_and_wrap
 
 # ---------------------------------------------------------------------------
 # Wrapper nn.Module
@@ -68,6 +68,7 @@ class SDPAPagedAttentionWrapper(nn.Module):
         block_size: int,
         *,
         cache_idx: int | None = None,
+        looped: bool = False,
         llama4_scaling: tuple[float, int] | None = None,
     ) -> None:
         super().__init__()
@@ -83,6 +84,7 @@ class SDPAPagedAttentionWrapper(nn.Module):
         object.__setattr__(self, "_mk_block_size", block_size)
         object.__setattr__(self, "_mk_attention_contract", contract)
         object.__setattr__(self, "_mk_llama4_scaling", llama4_scaling)
+        object.__setattr__(self, "_mk_looped", looped)
         # For compact caches (hybrid models), cache_idx maps to the
         # per-type cache array.  Defaults to layer_idx for non-hybrid.
         object.__setattr__(
@@ -132,15 +134,30 @@ class SDPAPagedAttentionWrapper(nn.Module):
         block_size: int,
         *,
         cache_idx: int | None = None,
+        looped: bool = False,
     ) -> None:
         """Rebind wrapper-owned paged-cache state in one place."""
         object.__setattr__(self, "_mk_kv_cache", kv_cache)
         object.__setattr__(self, "_mk_block_size", block_size)
+        object.__setattr__(self, "_mk_looped", looped)
         object.__setattr__(
             self,
             "_mk_cache_idx",
             cache_idx if cache_idx is not None else self._mk_layer_idx,
         )
+
+    def _paged_cache_idx(self, cache: Any) -> int:
+        """Return the KV cache layer this call reads and writes."""
+        if not self._mk_looped:
+            return self._mk_cache_idx
+        # A looped model calls this module once per loop and passes each call
+        # its own cache entry; the entry's index is that call's KV layer.
+        if not isinstance(cache, OffsetCache) or cache.index is None:
+            raise RuntimeError(
+                f"Looped attention layer {self._mk_layer_idx} needs an indexed "
+                f"OffsetCache, got {cache!r}."
+            )
+        return cache.index
 
     def __call__(
         self,
@@ -193,7 +210,7 @@ class SDPAPagedAttentionWrapper(nn.Module):
             x,
             ctx,
             self._mk_kv_cache,
-            self._mk_cache_idx,
+            self._paged_cache_idx(cache),
             shared_kv=shared_kv,
             position_embeddings=position_embeddings,
             attention_contract=self._mk_attention_contract,
@@ -228,7 +245,7 @@ class SDPAPagedAttentionWrapper(nn.Module):
             x,
             ctx,
             self._mk_kv_cache,
-            self._mk_cache_idx,
+            self._paged_cache_idx(cache),
             attention_contract=self._mk_attention_contract,
             llama4_scaling=self._mk_llama4_scaling,
         )
@@ -282,6 +299,21 @@ def patch_sdpa_attention(
     """
 
     llama4_scaling = _llama4_scaling(model)
+    num_loops = find_num_loops(model)
+    looped = num_loops > 1
+    if looped:
+        if cache_idx_map is not None or only_layers is not None:
+            raise NotImplementedError(
+                "Looped models (num_loops > 1) need one KV cache layer per "
+                "loop of every layer; cache_idx_map / only_layers are unsupported."
+            )
+        num_layers = len(find_layers(model))
+        if kv_cache.num_layers != num_loops * num_layers:
+            raise ValueError(
+                f"Looped model needs {num_loops * num_layers} KV cache layers "
+                f"({num_loops} loops x {num_layers} layers), "
+                f"got {kv_cache.num_layers}."
+            )
 
     def wrap_layer(layer_idx: int, attn: Any) -> Any:
         cache_idx = (
@@ -291,7 +323,7 @@ def patch_sdpa_attention(
         )
         if isinstance(attn, SDPAPagedAttentionWrapper):
             # Already patched — refresh cache reference in place.
-            attn.rebind_cache(kv_cache, block_size, cache_idx=cache_idx)
+            attn.rebind_cache(kv_cache, block_size, cache_idx=cache_idx, looped=looped)
             return attn
         return SDPAPagedAttentionWrapper(
             attn,
@@ -299,6 +331,7 @@ def patch_sdpa_attention(
             kv_cache,
             block_size,
             cache_idx=cache_idx,
+            looped=looped,
             llama4_scaling=(
                 llama4_scaling
                 if attention_contract_for(attn).llama4_query_scaling

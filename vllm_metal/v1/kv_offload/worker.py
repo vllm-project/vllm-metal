@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """OffloadingWorker moving KV chunks between ``KVCacheStorage`` and the host pool.
 
-Transfers run synchronously in ``submit_store``/``submit_load``. They move
-whole pages of ``storage.pages``, the regions of vLLM's KV allocation. Loads
-write with the native scatter, as ``KVCacheStorage.copy_blocks`` does: an MLX
-index-assign on a page view never reaches the buffer.
+Transfers run synchronously in ``submit_store``/``submit_load``. Upstream
+resolves their blocks to device pointers; the worker turns those back into
+block ids and moves whole pages of ``storage.pages``, the regions of vLLM's KV
+allocation, through MLX. Loads write with the native scatter, as
+``KVCacheStorage.copy_blocks`` does: an MLX index-assign on a page view never
+reaches the buffer.
 """
 
 from __future__ import annotations
@@ -15,7 +17,8 @@ import mlx.core as mx
 import numpy as np
 from vllm.logger import init_logger
 from vllm.v1.kv_offload.base import (
-    GPULoadStoreSpec,
+    CanonicalKVCaches,
+    DevicePointers,
     LoadStoreSpec,
     OffloadingWorker,
     TransferResult,
@@ -37,6 +40,7 @@ class MetalKVOffloadWorker(OffloadingWorker):
     def __init__(
         self,
         storage: KVCacheStorage,
+        kv_caches: CanonicalKVCaches,
         *,
         blocks_per_chunk: int,
         num_cpu_chunks: int,
@@ -48,6 +52,8 @@ class MetalKVOffloadWorker(OffloadingWorker):
                 f"region has {region.num_chunks} chunks, expected {num_cpu_chunks}"
             )
         self.storage = storage
+        # The caches upstream resolves this worker's device pointers against.
+        self.kv_caches = kv_caches
         self.blocks_per_chunk = blocks_per_chunk
         self.num_cpu_chunks = num_cpu_chunks
         self.region: MetalSharedOffloadRegion | None = region
@@ -91,47 +97,47 @@ class MetalKVOffloadWorker(OffloadingWorker):
         )
 
     def submit_store(
-        self, job_id: int, src_spec: GPULoadStoreSpec, dst_spec: LoadStoreSpec
+        self, job_id: int, device_ptrs: DevicePointers, dst_spec: LoadStoreSpec
     ) -> bool:
-        if not isinstance(src_spec, GPULoadStoreSpec) or not isinstance(
+        if not isinstance(device_ptrs, DevicePointers) or not isinstance(
             dst_spec, CPULoadStoreSpec
         ):
             raise ValueError(
-                f"unexpected store spec types {type(src_spec).__name__} -> "
+                f"unexpected store spec types {type(device_ptrs).__name__} -> "
                 f"{type(dst_spec).__name__}"
             )
-        self._submit(job_id, src_spec, dst_spec, store=True)
+        self._submit(job_id, device_ptrs, dst_spec, store=True)
         return True
 
     def submit_load(
         self,
         job_id: int,
         src_spec: LoadStoreSpec,
-        dst_spec: GPULoadStoreSpec,
+        device_ptrs: DevicePointers,
         expedited: bool = False,
     ) -> bool:
         # Transfers finish inside submission, so an expedited load never queues.
         if not isinstance(src_spec, CPULoadStoreSpec) or not isinstance(
-            dst_spec, GPULoadStoreSpec
+            device_ptrs, DevicePointers
         ):
             raise ValueError(
                 f"unexpected load spec types {type(src_spec).__name__} -> "
-                f"{type(dst_spec).__name__}"
+                f"{type(device_ptrs).__name__}"
             )
-        self._submit(job_id, dst_spec, src_spec, store=False)
+        self._submit(job_id, device_ptrs, src_spec, store=False)
         return True
 
     def _submit(
         self,
         job_id: int,
-        gpu_spec: GPULoadStoreSpec,
+        device_ptrs: DevicePointers,
         cpu_spec: CPULoadStoreSpec,
         *,
         store: bool,
     ) -> None:
         start = time.perf_counter()
         num_bytes = 0
-        for gpu_ids, chunks, subs in self._slices(gpu_spec, cpu_spec, store=store):
+        for gpu_ids, chunks, subs in self._slices(device_ptrs, cpu_spec, store=store):
             if store:
                 num_bytes += self._store(gpu_ids, chunks, subs)
             else:
@@ -145,7 +151,7 @@ class MetalKVOffloadWorker(OffloadingWorker):
             )
         )
 
-    def _slices(self, gpu_spec, cpu_spec, *, store: bool):
+    def _slices(self, device_ptrs: DevicePointers, cpu_spec, *, store: bool):
         """Validate a transfer and yield it in slices of (gpu, chunk, sub-slot).
 
         The first chunk may be entered mid-chunk: ``block_indices[0] %
@@ -154,26 +160,23 @@ class MetalKVOffloadWorker(OffloadingWorker):
         # Raise, not assert: bad ids corrupt silently and must fail under -O.
         if self.region is None:
             raise RuntimeError("KV offloading worker is shut down")
-        if len(gpu_spec.group_sizes) != 1:
-            raise ValueError(
-                f"expected a single KV cache group, got {gpu_spec.group_sizes!r}"
-            )
-        # Upstream asserts this in the spec's __init__; asserts vanish under -O.
-        if len(gpu_spec.block_indices) != len(gpu_spec.group_sizes):
+        group_sizes = device_ptrs.group_block_counts
+        if len(group_sizes) != 1:
+            raise ValueError(f"expected a single KV cache group, got {group_sizes!r}")
+        # Upstream asserts this while resolving; asserts vanish under -O.
+        if len(device_ptrs.block_indices) != len(group_sizes):
             raise ValueError(
                 f"block_indices must have one entry per KV cache group, got "
-                f"{gpu_spec.block_indices!r} for {gpu_spec.group_sizes!r}"
+                f"{device_ptrs.block_indices!r} for {group_sizes!r}"
             )
-        if gpu_spec.block_indices[0] < 0:
+        if device_ptrs.block_indices[0] < 0:
             raise ValueError(
-                f"block index must be non-negative, got {gpu_spec.block_indices[0]}"
+                f"block index must be non-negative, got {device_ptrs.block_indices[0]}"
             )
-        group_size = gpu_spec.group_sizes[0]
+        group_size = group_sizes[0]
         if group_size == 0:
             return
-        gpu_ids = gpu_spec.block_ids
-        if len(gpu_ids) != group_size:
-            raise ValueError(f"{len(gpu_ids)} GPU block ids != group size {group_size}")
+        gpu_ids = self._block_ids(device_ptrs.ptrs[:group_size])
         if int(gpu_ids.min()) < 0 or int(gpu_ids.max()) >= self._num_gpu_blocks:
             raise ValueError(
                 f"GPU block ids out of range [{int(gpu_ids.min())}, "
@@ -183,7 +186,7 @@ class MetalKVOffloadWorker(OffloadingWorker):
         if not store and len(np.unique(gpu_ids)) != len(gpu_ids):
             raise ValueError("duplicate GPU block ids in a load")
         factor = self.blocks_per_chunk
-        skip = gpu_spec.block_indices[0] % factor
+        skip = device_ptrs.block_indices[0] % factor
         cpu_ids = cpu_spec.block_ids
         if int(cpu_ids.min()) < 0 or int(cpu_ids.max()) >= self.num_cpu_chunks:
             raise ValueError(
@@ -199,6 +202,18 @@ class MetalKVOffloadWorker(OffloadingWorker):
         step = self._blocks_per_slice
         for lo in range(0, group_size, step):
             yield gpu_ids[lo : lo + step], chunks[lo : lo + step], subs[lo : lo + step]
+
+    def _block_ids(self, ptrs: np.ndarray) -> np.ndarray:
+        """Invert ``resolve_device_pointers`` for the group's first data ref.
+
+        Every data ref of a group addresses the same blocks, and the copies
+        move every page, so one ref is enough.
+        """
+        ref = self.kv_caches.group_data_refs[0][0]
+        tensor = self.kv_caches.tensors[ref.tensor_idx].tensor
+        # A pointer below the base wraps outside the range _slices accepts.
+        offsets = ptrs - np.uint64(tensor.data_ptr())
+        return (offsets // np.uint64(tensor.stride(0))).astype(np.int64)
 
     def _store(self, gpu_ids, chunks, subs) -> int:
         src = mx.array(gpu_ids, dtype=mx.int32)

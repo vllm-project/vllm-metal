@@ -64,6 +64,7 @@ def _metal_shared_region() -> Iterator[None]:
 class MetalTieringOffloadingSpec(TieringOffloadingSpec):
     """Host pool plus optional ``fs`` disk tiers, on Metal."""
 
+    _storage: KVCacheStorage | None = None
     _metal_worker: MetalKVOffloadWorker | None = None
 
     def __init__(self, config: OffloadingConfig):
@@ -81,27 +82,33 @@ class MetalTieringOffloadingSpec(TieringOffloadingSpec):
             cpu_page_size=self.cpu_page_size_per_worker,
         )
 
-    def get_worker(self, kv_caches: CanonicalKVCaches) -> OffloadingWorker:
-        raise NotImplementedError(
-            "Metal builds its worker from KVCacheStorage via "
-            "MetalOffloadingConnector.register_kv_caches"
-        )
+    def bind_storage(self, storage: KVCacheStorage) -> None:
+        """Bind the storage the worker copies, before its tensors register."""
+        if self._storage is not None and self._storage is not storage:
+            raise RuntimeError("KV offloading worker is bound to another KV storage")
+        self._storage = storage
 
-    def get_metal_worker(self, storage: KVCacheStorage) -> MetalKVOffloadWorker:
+    @override
+    def get_worker(self, kv_caches: CanonicalKVCaches) -> OffloadingWorker:
+        """The bound storage's worker, resolving pointers in ``kv_caches``."""
+        if self._storage is None:
+            raise NotImplementedError(
+                "Metal builds its worker from KVCacheStorage via "
+                "MetalOffloadingConnector.register_kv_caches"
+            )
         if self._metal_worker is None:
             # Imported here so the scheduler side never imports mlx.
             from vllm_metal.v1.kv_offload.worker import MetalKVOffloadWorker
 
             self._metal_worker = MetalKVOffloadWorker(
-                storage,
+                self._storage,
+                kv_caches,
                 blocks_per_chunk=self.blocks_per_chunk,
                 num_cpu_chunks=self.num_chunks,
                 # One process, one worker rank (uni executor).
                 region=self._make_region(rank=0),
                 kv_bytes_per_chunk=self.kv_bytes_per_chunk,
             )
-        elif self._metal_worker.storage is not storage:
-            raise RuntimeError("KV offloading worker is bound to another KV storage")
         return self._metal_worker
 
     @override

@@ -78,13 +78,7 @@ jobs:
         with:
           repository: ${{ needs.resolve.outputs.repository }}
           ref: ${{ needs.resolve.outputs.sha }}
-          submodules: recursive
           persist-credentials: false
-      - uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
-        id: models
-        with:
-          path: ~/.cache/huggingface/hub
-          key: parity-hf-${{ runner.os }}-${{ matrix.model.name }}-${{ matrix.model.revision }}${{ matrix.model.gguf_revision && format('-{0}', matrix.model.gguf_revision) || '' }}
       - name: Install the tested checkout
         id: install
         run: |
@@ -94,6 +88,7 @@ jobs:
           ./install.sh
       - name: Prepare checkpoint
         id: checkpoint
+        # Reuse pinned downloads in the self-hosted runner's persistent HF cache.
         run: |
           source .venv-vllm-metal/bin/activate
           python - <<'PY'
@@ -121,11 +116,6 @@ jobs:
               with open(os.environ["GITHUB_ENV"], "a") as f:
                   print(f"GGUF_PATH={gguf}", file=f)
           PY
-      - uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
-        if: success() && github.event_name == 'schedule' && steps.models.outputs.cache-hit != 'true'
-        with:
-          path: ~/.cache/huggingface/hub
-          key: ${{ steps.models.outputs.cache-primary-key }}
       - name: Compare parity through HTTP serving
         run: |
           source .venv-vllm-metal/bin/activate

@@ -22,7 +22,12 @@ from vllm.distributed.kv_transfer import (
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorHandshakeMetadata,
 )
-from vllm.distributed.parallel_state import get_pp_group, get_tp_group
+from vllm.distributed.parallel_state import (
+    checkpoint_prepare_distributed_state,
+    checkpoint_restore_distributed_state,
+    get_pp_group,
+    get_tp_group,
+)
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.tasks import SupportedTask
@@ -232,16 +237,6 @@ class MetalWorker(WorkerBase):
         """
         return self.model_runner.get_kv_cache_spec()
 
-    def initialize_cache(self, num_gpu_blocks: int, num_cpu_blocks: int) -> None:
-        """Initialize the KV cache.
-
-        Args:
-            num_gpu_blocks: Number of GPU cache blocks
-            num_cpu_blocks: Number of CPU cache blocks (unused on Metal)
-        """
-        self.cache_config.num_gpu_blocks = num_gpu_blocks
-        self.cache_config.num_cpu_blocks = num_cpu_blocks
-
     def get_supported_kv_cache_layouts(self) -> list[str]:
         """Report Metal's own page order instead of the CPU backend's LBHNC."""
         return [KV_CACHE_LAYOUT]
@@ -393,8 +388,11 @@ class MetalWorker(WorkerBase):
         level 1 keeps them in place instead of copying them to the CPU.
         """
         if level != 1:
+            # vLLM pauses the scheduler before it calls the worker, and a
+            # refused sleep leaves it paused until wake_up().
             raise NotImplementedError(
-                f"Metal supports sleep level 1 only, got {level}."
+                f"Metal supports sleep level 1 only, got {level}. The engine "
+                "is paused; call wake_up() (POST /wake_up) to resume it."
             )
         self.discard(("kv_cache",))
 
@@ -404,6 +402,12 @@ class MetalWorker(WorkerBase):
         if self._kv_cache_released and (tags is None or "kv_cache" in tags):
             self.model_runner.restore_kv_cache_memory()
             self._kv_cache_released = False
+
+    def checkpoint_prepare(self) -> None:
+        checkpoint_prepare_distributed_state()
+
+    def checkpoint_restore(self) -> None:
+        checkpoint_restore_distributed_state()
 
     def discard(self, tags: tuple[str, ...]) -> None:
         if set(tags) != {"kv_cache"}:

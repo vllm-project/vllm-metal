@@ -15,12 +15,12 @@ VLLM_METAL_BACKEND=mps PYTORCH_ENABLE_MPS_FALLBACK=0 \
 
 Release wheels include both native launchers and the shared Metal shaders;
 no compiler is needed. Source checkouts use the [development setup](CONTRIBUTING.md#development-setup).
-Selecting MPS defaults to MRv2. Use unquantized FP16/BF16 checkpoints.
+Use unquantized FP16/BF16 checkpoints.
 Greedy decoding and seeded sampling with temperature, top-k, top-p, and min-p
 are supported. Output-token and prompt logprobs are supported; explicit token-ID
 scoring is not yet supported.
 
-For speech and image generation, see [Omni](omni.md).
+For speech and image generation and duplex conversations, see [Omni](omni.md).
 
 ## EAGLE3 speculative decoding
 

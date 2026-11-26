@@ -2,8 +2,8 @@
 """Time TurboQuant decode attention: established kernels vs the GQA producer.
 
 The ``established`` arm runs the per-token / split-KV TurboQuant kernels with
-GQA disabled. The ``gqa_p256`` / ``gqa_p512`` arms force the GQA producer
-through the private test entry on the same quantized cache. Arms run interleaved in a random order
+GQA disabled. The ``gqa`` arm forces the GQA producer through the private
+test entry on the same quantized cache. Arms run interleaved in a random order
 per repetition, and every arm's output is checked against ``established``
 before timing. One JSON line per shape records the chip, the detected GPU core
 count, and the executed dispatch family of every arm.
@@ -70,14 +70,14 @@ def _arms(ops, geometry, context, requests, dtype, k_quant, v_bits, seed):
             gqa_length_plan=plan, gqa_disabled=True,
         )  # fmt: skip
 
-    def gqa(partition):
-        return lambda: ops._gqa_turboquant_paged_attention_for_test(
+    def gqa():
+        return ops._gqa_turboquant_paged_attention_for_test(
             query, k_cache, v_cache, k_scale, v_scale, k_zero, centroids,
             k_quant, v_bits, scale, tables, lengths, block_size, context,
-            partition, plan,
+            gqa_length_plan=plan,
         )  # fmt: skip
 
-    return {"established": established, "gqa_p256": gqa(256), "gqa_p512": gqa(512)}
+    return {"established": established, "gqa": gqa}
 
 
 def _time(fn, calls: int) -> float:
@@ -146,12 +146,12 @@ def main() -> None:
                 for name in names:
                     samples[name].append(_time(arms[name], args.calls))
             median = {name: statistics.median(v) for name, v in samples.items()}
-            ratio = min(median["gqa_p256"], median["gqa_p512"]) / median["established"]
+            ratio = median["gqa"] / median["established"]
             print(
                 f"{geometry} {dtype} K={k_quant} V={v_bits}b B={requests} "
                 f"ctx={context}: "
                 + " ".join(f"{n}={m:.3f}" for n, m in median.items())
-                + f" ms, best GQA / established = {ratio:.2f}",
+                + f" ms, GQA / established = {ratio:.2f}",
                 flush=True,
             )
             if args.output:

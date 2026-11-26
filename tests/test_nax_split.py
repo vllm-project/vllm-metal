@@ -5,8 +5,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from tests.gqa_test_utils import _primitive
-from tests.test_gqa_decode_routing import _mixed_call, _mixed_inputs
+from tests.gqa_test_utils import _mixed_call, _mixed_inputs, _primitive
 from vllm_metal.attention.nax_split import (
     nax_split_hint,
     nax_split_kwargs,

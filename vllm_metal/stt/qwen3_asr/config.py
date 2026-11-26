@@ -8,11 +8,10 @@ shape helpers during planning/registration without pulling in the model stack.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 
-from vllm.transformers_utils.configs.qwen3_asr import (
-    Qwen3ASRConfig as VllmQwen3ASRConfig,
-)
+from transformers import PreTrainedConfig
+from transformers import Qwen3ASRConfig as HFQwen3ASRConfig
 
 # Maximum decode tokens for Qwen3-ASR decode loop.
 QWEN3_ASR_MAX_DECODE_TOKENS = 1024
@@ -84,11 +83,11 @@ class Qwen3ASRConfig:
     n_audio_ctx: int = 1500
 
     @classmethod
-    def _from_vllm_config(cls, config: VllmQwen3ASRConfig) -> Qwen3ASRConfig:
-        """Adapt the upstream vLLM/HF config into the local MLX model config."""
-        thinker = config.thinker_config
-        audio = thinker.audio_config
-        text = thinker.text_config
+    def _from_hf_config(cls, config: HFQwen3ASRConfig) -> Qwen3ASRConfig:
+        """Adapt the Transformers config into the local MLX model config."""
+        audio = cast(PreTrainedConfig, config.audio_config)
+        text = cast(PreTrainedConfig, config.text_config)
+        rope_parameters = text.rope_parameters
 
         audio_cfg = Qwen3ASRAudioConfig(
             num_mel_bins=audio.num_mel_bins,
@@ -112,14 +111,14 @@ class Qwen3ASRConfig:
             intermediate_size=text.intermediate_size,
             vocab_size=text.vocab_size,
             rms_norm_eps=text.rms_norm_eps,
-            rope_theta=text.rope_theta,
-            rope_scaling=getattr(text, "rope_scaling", None),
+            rope_theta=rope_parameters["rope_theta"],
+            rope_scaling=rope_parameters,
             tie_word_embeddings=text.tie_word_embeddings,
         )
         config_kwargs = {
             "audio_config": audio_cfg,
             "text_config": text_cfg,
-            "audio_token_id": thinker.audio_token_id,
+            "audio_token_id": config.audio_token_id,
             "n_mels": audio_cfg.num_mel_bins,
             "n_audio_ctx": audio_cfg.max_source_positions,
         }
@@ -134,4 +133,16 @@ class Qwen3ASRConfig:
     @classmethod
     def from_dict(cls, d: dict) -> Qwen3ASRConfig:
         """Create config from config.json using the upstream schema owner."""
-        return cls._from_vllm_config(VllmQwen3ASRConfig.from_dict(d))
+        if "thinker_config" not in d:
+            raise ValueError(
+                "vllm-metal does not support Transformers-format Qwen3-ASR "
+                "checkpoints such as Qwen/Qwen3-ASR-0.6B-hf: the MLX model loads the "
+                "original checkpoint layout. Use an original checkpoint such as "
+                "Qwen/Qwen3-ASR-0.6B."
+            )
+        # Original checkpoints nest their fields; flatten them as vLLM does.
+        top = dict(d)
+        thinker = top.pop("thinker_config")
+        audio = {**thinker["audio_config"], "model_type": "qwen3_asr_encoder"}
+        flat = {**thinker, "audio_config": audio, **top}
+        return cls._from_hf_config(HFQwen3ASRConfig.from_dict(flat))
