@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -371,19 +372,25 @@ class MLXLoRAModelManager:
                     (lora_a, lora_b, int(weights.lora_a.shape[0])),
                 )
             )
-        # Upstream applies LoRA to these embedding modules; Metal cannot, so
-        # refuse rather than serve the adapter without them. Modules excluded
-        # by the deployment target_modules are dropped, as upstream does.
-        unsupported = sorted(
+        # Upstream applies LoRA to embedding modules and to MoE experts (the
+        # ".experts" names its check_unexpected_modules accepts). Metal does
+        # not wrap mlx_lm's SwitchLinear experts, so refuse rather than serve
+        # the adapter without them. Modules excluded by the deployment
+        # target_modules are dropped, as upstream does.
+        unsupported = {
             name
             for name in adapter.weights.keys() - consumed
-            if name.rsplit(".", 1)[-1] in _EMBEDDING_MODULES
+            if (name.rsplit(".", 1)[-1] in _EMBEDDING_MODULES or ".experts" in name)
             and is_in_target_modules(name, self.lora_config.target_modules)
-        )
+        }
         if unsupported:
+            # An MoE adapter has one module per expert per layer.
+            patterns = sorted(
+                {re.sub(r"(?<=\.)\d+(?=\.)", "*", n) for n in unsupported}
+            )
             raise ValueError(
                 f"LoRA adapter {adapter.lora_id} contains weights for "
-                f"{unsupported} that this model cannot apply on Metal. "
+                f"{patterns} that this model cannot apply on Metal. "
                 "Use an adapter trained for supported target modules."
             )
         if loaded == 0:
