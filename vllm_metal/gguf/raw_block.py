@@ -32,8 +32,9 @@ Element ``e`` of half ``c`` decodes as
 
 An IQ3_XXS superblock is 98 bytes for 256 weights: an fp16 ``d``, 64 grid
 index bytes ``qs``, and eight little-endian uint32 words ``aux``, one per
-32-element group. Its grid magnitudes are not evenly spaced, so it cannot
-repack into MLX affine codes. Element ``e`` of group ``g = e/32`` decodes as
+32-element group. Its grid magnitudes are not evenly spaced, so an exact MLX
+affine repack, with at least 6-bit codes, takes more than twice the memory of
+these blocks. Element ``e`` of group ``g = e/32`` decodes as
 ``db * grid[qs[e/4]][e%4] * sign`` with
 ``db = d * (0.5 + (aux[g] >> 28)) * 0.5``; ``sign`` is bit ``e%8`` of
 ``ksigns[(aux[g] >> (7*((e%32)/8))) & 0x7F]``, set meaning negative.
