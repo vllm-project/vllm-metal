@@ -651,6 +651,11 @@ constant int v_bits [[function_constant(70)]];  // V quantization bit width (def
 // 80/81/90 in turboquant.metal, 100 in reshape_and_cache.metal, 110 below).
 constant bool use_mm_prefix [[function_constant(120)]];
 constant bool use_compact_scratch [[function_constant(130)]];
+// Reduce only: set by the windowed GQA launcher, which also binds the window.
+// Other launchers leave it unset and keep partitions over the whole context.
+constant bool use_visible_window_fc [[function_constant(150)]];
+constant bool use_visible_window = is_function_constant_defined(use_visible_window_fc)
+    ? use_visible_window_fc : false;
 // Window mode: 0 = per-token (grid.y is a query token; today's decode path).
 // > 0 = the number of PA_WINDOW_ROWS-row sub-windows per segment: grid.y is
 // a (segment, sub-window) pair and the threadgroup owns up to
@@ -1862,6 +1867,9 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
     const constant int &num_seqs [[buffer(8)]],
     const device int64_t *partition_offsets
     [[buffer(9), function_constant(use_compact_scratch)]],
+    // Partitions tile only the last visible_window tokens (windowed GQA).
+    const constant int &visible_window
+    [[buffer(10), function_constant(use_visible_window)]],
     threadgroup char *shared_mem [[threadgroup(0)]],
     uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],
     uint3 threadgroups_per_grid [[threadgroups_per_grid]],
@@ -1879,7 +1887,9 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
   const int q_pos_in_seq = q_token_idx - q_seq_start;
   const uint32_t context_len = context_lens[seq_idx];
   const int effective_context_len = (int)context_len - q_len + q_pos_in_seq + 1;
-  const int num_partitions = DIVIDE_ROUND_UP(effective_context_len, PARTITION_SIZE);
+  const int partitioned_len = use_visible_window
+      ? MIN(effective_context_len, visible_window) : effective_context_len;
+  const int num_partitions = DIVIDE_ROUND_UP(partitioned_len, PARTITION_SIZE);
   const int64_t out_offset = paged_attention_reduce_offset(
       q_token_idx, head_idx, num_heads, 1, HEAD_SIZE);
   const int64_t stats_offset = use_compact_scratch
@@ -2108,8 +2118,13 @@ inline uint32_t gqa_broadcast_page_id(device const uint32_t *bt, int page,
 // consumes: log2-space running (max, exp-sum) stats plus the
 // epsilon-normalised partial at tmp_out[token, head, partition, :], so the
 // existing reduce pass merges them unchanged.  Engaged only for pure-decode
-// batches without TurboQuant/FP8/sinks/softcap/sliding-window (dispatch gate
-// in paged_attention.cpp); everything else keeps the established paths.
+// batches without FP8/sinks/softcap (dispatch gate in paged_attention.cpp);
+// everything else keeps the established paths.
+//
+// With sliding_window > 0, partitions tile only the visible span
+// [context_len - sliding_window, context_len), so keys left of the window are
+// never read; the first partition may start inside a page. The reduce is
+// passed the same window, so it counts the same partitions.
 template <typename T, int HEAD_SIZE, int BLOCK_SIZE, int PARTITION_SIZE>
 [[kernel]] void paged_attention_gqa_decode(
     device float *exp_sums [[buffer(0)]], device float *max_logits [[buffer(1)]],
@@ -2125,6 +2140,7 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE, int PARTITION_SIZE>
     const constant int &kv_head_stride [[buffer(17)]],
     const device int64_t *partition_offsets
     [[buffer(18), function_constant(use_compact_scratch)]],
+    const constant int &sliding_window [[buffer(19)]],  // -1 = disabled
     uint3 tg_pos [[threadgroup_position_in_grid]],
     uint3 tg_per_grid [[threadgroups_per_grid]],
     uint3 tptg [[threads_per_threadgroup]],
@@ -2132,17 +2148,19 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE, int PARTITION_SIZE>
     uint lane [[thread_index_in_simdgroup]]) {
   static_assert(HEAD_SIZE % 32 == 0, "one lane-strided slice per lane");
   static_assert(PARTITION_SIZE % BLOCK_SIZE == 0,
-                "partition start is page-aligned");
+                "unwindowed partitions start on a page boundary");
   constexpr int SLICE = HEAD_SIZE / 32;  // elements per lane
   const int partition_idx = tg_pos.x;
   const int kv_head_idx = tg_pos.y;
   const int seq_idx = tg_pos.z;
   const int context_len = static_cast<int>(context_lens[seq_idx]);
-  const int t0 = partition_idx * PARTITION_SIZE;
+  const int window_start =
+      sliding_window > 0 ? max(context_len - sliding_window, 0) : 0;
+  const int t0 = window_start + partition_idx * PARTITION_SIZE;
   if (t0 >= context_len) {
-    // The reduce reads only ceil(context_len / PARTITION_SIZE) partitions,
-    // so stats for later partitions are never consumed (same early-out as
-    // the partitioned per-token kernel).
+    // The reduce reads only the partitions that cover the visible span, so
+    // stats for later partitions are never consumed (same early-out as the
+    // partitioned per-token kernel).
     return;
   }
   const int t_end = min(t0 + PARTITION_SIZE, context_len);
@@ -2191,7 +2209,7 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE, int PARTITION_SIZE>
                             kv_head_idx * kv_head_stride;
     const int64_t page_base =
         page_kv + static_cast<int64_t>(lane) * SLICE;
-    int t = tok0;
+    int t = max(tok0, t0);  // a windowed span can start inside its first page
     for (; t + 4 <= tok1; t += 4) {
       const int64_t r0 = page_base + (t - tok0) * kv_token_stride;
       const int64_t r1 = r0 + kv_token_stride;
@@ -2614,6 +2632,8 @@ template <typename T, typename K_CACHE_T, int HEAD_SIZE, int BLOCK_SIZE,
       const constant int &num_seqs [[buffer(8)]],                              \
       const device int64_t *partition_offsets                                 \
       [[buffer(9), function_constant(use_compact_scratch)]],                   \
+      const constant int &visible_window                                       \
+      [[buffer(10), function_constant(use_visible_window)]],                   \
       threadgroup char *shared_mem [[threadgroup(0)]],                         \
       uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],     \
       uint3 threadgroups_per_grid [[threadgroups_per_grid]],                   \
@@ -2759,6 +2779,7 @@ instantiate_paged_attention_v2(half, char, uchar, 32);
       const constant int &kv_head_stride [[buffer(17)]],                     \
       const device int64_t *partition_offsets                               \
       [[buffer(18), function_constant(use_compact_scratch)]],                 \
+      const constant int &sliding_window [[buffer(19)]],                     \
       uint3 tg_pos [[threadgroup_position_in_grid]],                         \
       uint3 tg_per_grid [[threadgroups_per_grid]],                           \
       uint3 tptg [[threads_per_threadgroup]],                                \
@@ -2770,10 +2791,7 @@ instantiate_paged_attention_v2(half, char, uchar, 32);
   instantiate_gqa_decode_inner(type, 256, 16, partition_size);               \
   instantiate_gqa_decode_inner(type, 256, 32, partition_size);
 
-instantiate_gqa_decode(bfloat16_t, VLLM_METAL_PARTITION_SIZE);
-instantiate_gqa_decode(half, VLLM_METAL_PARTITION_SIZE);
-
-// Smaller GQA partitions and matching reducers for the default selector.
+// One GQA partition size with matching reducers (kGqaPartitionSize).
 // Established per-token and split-KV kernels remain at their original size.
 instantiate_gqa_decode(bfloat16_t, 256);
 instantiate_gqa_decode(half, 256);
@@ -2827,8 +2845,6 @@ instantiate_gqa_decode(half, 256);
   instantiate_gqa_decode_tq_cache(type, char, partition_size);                 \
   instantiate_gqa_decode_tq_cache(type, uchar, partition_size);
 
-instantiate_gqa_decode_tq(bfloat16_t, VLLM_METAL_PARTITION_SIZE);
-instantiate_gqa_decode_tq(half, VLLM_METAL_PARTITION_SIZE);
 instantiate_gqa_decode_tq(bfloat16_t, 256);
 instantiate_gqa_decode_tq(half, 256);
 

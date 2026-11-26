@@ -429,12 +429,6 @@ class DraftModelProposer(NoOwnKVProposer):
         for plan in plans:
             self._draft_seq_lens[plan.req_id] = plan.committed_len
 
-        # If K=0 reaches this point, lazy ingest is disabled (currently because
-        # prefix caching is enabled). Keep physical draft KV synchronized with the
-        # scheduler, but do not return draft tokens.
-        if num_speculative_tokens <= 0:
-            return None
-
         drafting_plans = [plan for plan in plans if plan.is_drafting]
         if not drafting_plans:
             return None
@@ -901,8 +895,7 @@ def resolve_draft_dims(
     Delegates to ``ModelConfig``'s own accessors rather than re-deriving GQA
     head-count and head-size fallbacks from raw ``hf_config`` fields --
     ``get_head_size()``/``get_num_kv_heads()`` already handle those (and the
-    MLA-becomes-MQA case), the same way upstream's own
-    ``SpecDecodeBaseProposer`` reads them off its ``draft_model_config``.
+    MLA-becomes-MQA case).
 
     Raises :class:`NotImplementedError` if the draft model uses sliding-window
     or hybrid attention.  ``_draft_layer_specs`` unconditionally emits

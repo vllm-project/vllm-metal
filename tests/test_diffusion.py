@@ -384,9 +384,7 @@ def _scheduler_output(
         scheduled_new_reqs=list(new_reqs),
         scheduled_cached_reqs=CachedRequestData(
             req_ids=list(cached),
-            resumed_req_ids=set(),
             new_token_ids=[],
-            all_token_ids={},
             new_block_ids=[None] * len(cached),
             num_computed_tokens=list(cached.values()),
             num_output_tokens=[0] * len(cached),
@@ -404,7 +402,7 @@ def _new_req(
     req_id: str,
     params: SamplingParams | None = None,
     prompt=(7, 8),
-    prefill_token_ids: list[int] | None = None,
+    generated=(),
 ) -> NewRequestData:
     return NewRequestData(
         req_id=req_id,
@@ -415,7 +413,7 @@ def _new_req(
         block_ids=([0],),
         num_computed_tokens=0,
         lora_request=None,
-        prefill_token_ids=prefill_token_ids,
+        prefill_token_ids=[*prompt, *generated],
     )
 
 
@@ -788,7 +786,7 @@ class TestRuntimeStepProtocol:
 
         assert "r" not in rt._requests
         assert forwards == []
-        new_req = _new_req("r", prompt=[1, 2], prefill_token_ids=[1, 2, 3, 1])
+        new_req = _new_req("r", prompt=[1, 2], generated=[3, 1])
         new_req.num_computed_tokens = num_computed_tokens
         new_req.block_ids = ([5],)
 
@@ -948,12 +946,11 @@ class TestPlatformDiffusionConfig:
     @pytest.mark.parametrize(
         ("params", "parameter"),
         [
-            ({"logprobs": -1}, "logprobs"),
             ({"prompt_logprobs": 1}, "prompt_logprobs"),
             ({"prompt_logprob_token_ids": [1]}, "prompt_logprob_token_ids"),
         ],
     )
-    def test_rejects_prompt_and_full_vocab_logprobs_while_serving_diffusion(
+    def test_rejects_prompt_logprobs_while_serving_diffusion(
         self, monkeypatch, params, parameter
     ) -> None:
         from vllm.exceptions import VLLMValidationError

@@ -364,8 +364,11 @@ def build_metallibs() -> list[Path]:
         with tempfile.TemporaryDirectory(prefix="vllm-metal-mlx-build-") as tmp:
             _build_extension(pending_sources, Path(tmp))
     else:
+        # CMake caches the interpreter's include dir, so keep one tree per Python ABI.
+        python_abi = _EXT_SUFFIX.removeprefix(".")
         _build_extension(
-            pending_sources, _THIS_DIR / "build" / toolchain / config / expected_hash
+            pending_sources,
+            _THIS_DIR / "build" / toolchain / config / expected_hash / python_abi,
         )
     _HASH.write_text(expected_hash)
     _MLX_VERSION.write_text(_package_version("mlx") + "\n")

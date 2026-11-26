@@ -11,14 +11,17 @@ def register_kernel_overrides():
     from vllm_metal.pytorch_backend import input_ops, sampling, speculative_ops
 
     module = "vllm.v1.worker.gpu.spec_decode.rejection_sampler"
+    draft_module = "vllm.v1.worker.gpu.spec_decode.target_dependent_ar.speculator"
     sample_module = "vllm.v1.worker.gpu.sample"
     register_kernels(
         {
-            f"{sample_module}.gumbel._gumbel_sample_kernel": sampling.gumbel_sample,
             f"{sample_module}.gumbel._temperature_kernel": sampling.temperature,
             f"{sample_module}.min_p._min_p_kernel": sampling.min_p,
             f"{module}._gather_draft_sampled_kernel": speculative_ops.gather_draft_sampled,
             f"{module}._flatten_sampled_kernel": speculative_ops.flatten_sampled,
+            f"{draft_module}._prepare_decode_inputs_kernel": (
+                speculative_ops.prepare_decode_inputs
+            ),
             f"{sample_module}.prompt_logprob._prompt_logprobs_token_ids_kernel": (
                 input_ops.prompt_logprobs_token_ids
             ),
@@ -64,7 +67,6 @@ def _install_speculative_ops():
 
     rejection_sampler.compute_topk_scores = runtime.compute_topk_scores
     speculator.prepare_prefill_inputs = speculative_ops.prepare_prefill_inputs
-    speculator.prepare_decode_inputs = speculative_ops.prepare_decode_inputs
     speculator.update_draft_inputs = speculative_ops.update_draft_inputs
     rejection_sampler.rejection_sample = speculative_ops.rejection_sample
     rejection_sampler.get_num_sampled_and_rejected = (
@@ -91,7 +93,7 @@ def install():
     from vllm.v1.worker.gpu import buffer_utils, model_runner
     from vllm.v1.worker.gpu.sample import prompt_logprob, sampler
 
-    from vllm_metal.pytorch_backend import runtime
+    from vllm_metal.pytorch_backend import runtime, sampling
     from vllm_metal.pytorch_backend.models.qwen3_5 import install as install_qwen3_5
 
     if getattr(buffer_utils, "_metal_installed", False):
@@ -110,13 +112,13 @@ def install():
         vit_attn_wrappers.torch_sdpa_wrapper
     )
 
-    # MRV2 0.32 uses these CUDA names even with an MPS device. Use native
+    # MRV2 uses these CUDA names even with an MPS device. Use native
     # PyTorch objects; partial avoids duplicate Dynamo handler registration.
     torch.cuda.Stream = torch.Stream
     torch.cuda.Event = partial(torch.Event, device="mps")
     torch.cuda.current_stream = partial(torch.accelerator.current_stream)
     torch.cuda.set_stream = partial(torch.accelerator.set_stream)
-    # Explicit vLLM 0.32 bindings for the supported single-device path.
+    # Explicit vLLM bindings for the supported single-device path.
     buffer_utils.NonUvaBuffer = runtime.MPSStagingBuffer
     model_runner.async_tensor_h2d = runtime.copy_to_device
     buffer_utils.StagedWriteTensor.apply_write = runtime.staged_write
@@ -124,6 +126,7 @@ def install():
 
     _install_input_ops()
     _install_speculative_ops()
+    sampler.gumbel_sample = sampling.gumbel_sample
     sampler.compute_topk_scores = runtime.compute_topk_scores
     prompt_logprob.compute_topk_scores = runtime.compute_topk_scores
     # Unlike upstream's Triton kernels, this scorer materializes fp32 logprobs:

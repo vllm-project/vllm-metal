@@ -3,18 +3,19 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
+import re
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, cast
 from unittest.mock import MagicMock
 
 import mlx.core as mx
 import numpy as np
 import pytest
 from transformers import WhisperFeatureExtractor
-from vllm.v1.sample.sampler import Sampler
+from vllm.sampling_params import SamplingParams
 
 from vllm_metal.stt.audio import load_audio
 from vllm_metal.stt.detection import is_stt_model
@@ -33,56 +34,111 @@ from vllm_metal.stt.qwen3_asr.model import (
 )
 from vllm_metal.stt.qwen3_asr.transcriber import Qwen3ASRTranscriber
 from vllm_metal.stt.sampling import STTSampling
+from vllm_metal.v1.sampling import Sampler
+
+# Qwen/Qwen3-ASR-1.7B's config.json, reduced to what the config parsers read.
+# Its sizes differ from the MLX config defaults, which follow the 0.6B checkpoint.
+_QWEN3_ASR_17B = {
+    "model_type": "qwen3_asr",
+    "thinker_config": {
+        "model_type": "qwen3_asr",
+        "audio_token_id": 151676,
+        "audio_config": {
+            "model_type": "qwen3_asr_audio_encoder",
+            "num_mel_bins": 128,
+            "d_model": 1024,
+            "encoder_layers": 24,
+            "encoder_attention_heads": 16,
+            "encoder_ffn_dim": 4096,
+            "downsample_hidden_size": 480,
+            "output_dim": 2048,
+            "max_source_positions": 1500,
+            "n_window": 50,
+            "n_window_infer": 800,
+            "activation_function": "gelu",
+        },
+        "text_config": {
+            "model_type": "qwen3",
+            "hidden_size": 2048,
+            "num_hidden_layers": 28,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 8,
+            "head_dim": 128,
+            "intermediate_size": 6144,
+            "vocab_size": 151936,
+            "rms_norm_eps": 1e-06,
+            "rope_scaling": {
+                "interleaved": True,
+                "mrope_interleaved": True,
+                "mrope_section": [24, 20, 20],
+                "rope_type": "default",
+                "type": "default",
+            },
+            "rope_theta": 1000000,
+            "tie_word_embeddings": True,
+            "eos_token_id": None,
+        },
+    },
+}
 
 
-class TestQwen3ASRConfigAdaptation:
-    """Tests for adapting the upstream config into the local MLX config."""
+class TestQwen3ASRConfigFromDict:
+    """Tests for building the local MLX config from config.json."""
 
-    def test_from_vllm_config_keeps_local_eos_default_when_upstream_omits_it(
-        self,
-    ) -> None:
-        upstream_config = SimpleNamespace(
-            thinker_config=SimpleNamespace(
-                audio_config=SimpleNamespace(
-                    d_model=896,
-                    num_mel_bins=128,
-                    encoder_layers=18,
-                    encoder_attention_heads=14,
-                    encoder_ffn_dim=3584,
-                    downsample_hidden_size=480,
-                    output_dim=1024,
-                    max_source_positions=1500,
-                    n_window=50,
-                    n_window_infer=800,
-                    activation_function="gelu",
-                ),
-                text_config=SimpleNamespace(
-                    hidden_size=1024,
-                    num_hidden_layers=28,
-                    num_attention_heads=16,
-                    num_key_value_heads=8,
-                    head_dim=128,
-                    intermediate_size=3072,
-                    vocab_size=151936,
-                    rms_norm_eps=1e-6,
-                    rope_theta=1000000.0,
-                    rope_scaling={
-                        "mrope_section": [24, 20, 20],
-                        "mrope_interleaved": True,
-                    },
-                    tie_word_embeddings=True,
-                ),
-                audio_token_id=151676,
-            )
+    def test_original_checkpoint_values_reach_the_mlx_config(self) -> None:
+        config = Qwen3ASRConfig.from_dict(_QWEN3_ASR_17B)
+
+        text_config = dataclasses.replace(config.text_config, rope_scaling=None)
+        assert config.audio_config == Qwen3ASRAudioConfig(
+            num_mel_bins=128,
+            d_model=1024,
+            encoder_layers=24,
+            encoder_attention_heads=16,
+            encoder_ffn_dim=4096,
+            downsample_hidden_size=480,
+            output_dim=2048,
+            max_source_positions=1500,
+            n_window=50,
+            n_window_infer=800,
+            activation_function="gelu",
         )
-        config = Qwen3ASRConfig._from_vllm_config(cast(Any, upstream_config))
+        assert text_config == Qwen3ASRTextConfig(
+            hidden_size=2048,
+            num_hidden_layers=28,
+            num_attention_heads=16,
+            num_key_value_heads=8,
+            head_dim=128,
+            intermediate_size=6144,
+            vocab_size=151936,
+            rms_norm_eps=1e-06,
+            rope_theta=1000000,
+            tie_word_embeddings=True,
+        )
+        assert config.text_config.rope_scaling["mrope_section"] == [24, 20, 20]
 
-        assert config.audio_token_id == 151676
-        assert config.eos_token_id == 151643
-        assert config.text_config.rope_scaling == {
-            "mrope_section": [24, 20, 20],
-            "mrope_interleaved": True,
+    def test_null_text_eos_keeps_the_local_eos_default(self) -> None:
+        config = Qwen3ASRConfig.from_dict(_QWEN3_ASR_17B)
+
+        assert config.eos_token_id == Qwen3ASRConfig.eos_token_id
+
+    def test_transformers_format_checkpoint_is_rejected(self) -> None:
+        # Qwen/Qwen3-ASR-0.6B-hf keeps its configs at the top level.
+        transformers_format = {
+            "model_type": "qwen3_asr",
+            "audio_config": {"model_type": "qwen3_asr_encoder"},
+            "text_config": {"model_type": "qwen3"},
         }
+
+        with pytest.raises(
+            ValueError,
+            match=re.escape(
+                "vllm-metal does not support Transformers-format Qwen3-ASR "
+                "checkpoints such as Qwen/Qwen3-ASR-0.6B-hf: the MLX model loads the "
+                "original checkpoint layout. Use an original checkpoint such as "
+                "Qwen/Qwen3-ASR-0.6B."
+            ),
+        ):
+            Qwen3ASRConfig.from_dict(transformers_format)
 
 
 class TestCNNOutputLengths:
@@ -496,6 +552,66 @@ class TestGreedyDecodeStopping:
 
         assert tokens == prefix
         assert model.decode_step.call_count == len(prefix)
+
+    def test_forced_language_prompt_starts_transcript_budget(self) -> None:
+        """An <asr_text> already in the prompt must start the transcript count.
+
+        Upstream Qwen3-ASR appends ``language {lang}<asr_text>`` to the prompt
+        when a language is forced, so the tag is never generated in the decode
+        loop. The transcript budget must still apply from the first generated
+        token, otherwise the loop decodes past the request's max_tokens.
+        """
+        model = MagicMock()
+        model.config.eos_token_id = 2
+        logits = [mx.eye(10)[None, token : token + 1] for token in [7, 9, 2]]
+        model.prefill.return_value = (logits[0], None)
+        model.decode_step.side_effect = [(row, None) for row in logits[1:]]
+        transcriber = Qwen3ASRTranscriber(
+            model,
+            tokenizer=SimpleNamespace(
+                eos_token_id=3, encode=lambda *_args, **_kwargs: [8]
+            ),
+        )
+        sampling = STTSampling.from_request(
+            SamplingParams(temperature=0, max_tokens=1), Sampler()
+        )
+
+        # Token 8 is <asr_text>; it is already in the forced-language prompt.
+        tokens = transcriber.decode_tokens(mx.zeros((1, 4)), [1, 8], sampling)
+
+        assert tokens == [7]
+        assert model.decode_step.call_count == 0
+
+    def test_earlier_asr_text_tag_does_not_start_transcript_budget(self) -> None:
+        """Only a trailing <asr_text> starts the budget, not one in context.
+
+        Automatic-language prompts may contain the tag earlier without ending
+        in it; those requests still generate a language prefix before the tag,
+        and that prefix must stay outside the transcript budget.
+        """
+        model = MagicMock()
+        model.config.eos_token_id = 2
+        # Generated sequence: language prefix (5), <asr_text> (8), transcript
+        # (7, 9), EOS (2). Budget is 1, so counting must begin at the generated
+        # tag rather than at the first token.
+        logits = [mx.eye(10)[None, token : token + 1] for token in [5, 8, 7, 9, 2]]
+        model.prefill.return_value = (logits[0], None)
+        model.decode_step.side_effect = [(row, None) for row in logits[1:]]
+        transcriber = Qwen3ASRTranscriber(
+            model,
+            tokenizer=SimpleNamespace(
+                eos_token_id=3, encode=lambda *_args, **_kwargs: [8]
+            ),
+        )
+        sampling = STTSampling.from_request(
+            SamplingParams(temperature=0, max_tokens=1), Sampler()
+        )
+
+        # Tag 8 is present but not the last prompt token.
+        tokens = transcriber.decode_tokens(mx.zeros((1, 4)), [1, 8, 9], sampling)
+
+        assert tokens == [5, 8, 7]
+        assert model.decode_step.call_count == 2
 
 
 class TestPostProcessOutput:

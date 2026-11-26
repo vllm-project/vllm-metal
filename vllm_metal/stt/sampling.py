@@ -8,8 +8,8 @@ from dataclasses import dataclass
 import mlx.core as mx
 import torch
 from vllm.sampling_params import SamplingParams
-from vllm.v1.sample.sampler import Sampler
 
+from vllm_metal.v1.sampling import Sampler
 from vllm_metal.v1.sampling_batch import (
     SamplingBatch,
     create_request_generator,

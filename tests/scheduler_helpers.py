@@ -2,12 +2,6 @@
 """Shared scheduler instrumentation for serving lifecycle tests."""
 
 
-def assert_v2_model_runner(llm):
-    assert llm.llm_engine.vllm_config.use_v2_model_runner, (
-        "This test requires Model Runner V2; check VLLM_USE_V2_MODEL_RUNNER"
-    )
-
-
 def track_preemptions_and_resumptions(
     scheduler, stats, *, resumption_key="resumptions"
 ):

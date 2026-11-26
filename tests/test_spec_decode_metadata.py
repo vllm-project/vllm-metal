@@ -56,7 +56,6 @@ def _scheduler_output(
         total_num_scheduled_tokens=sum(num_scheduled.values()),
         scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
         scheduled_encoder_inputs={},
-        num_common_prefix_blocks=[],
         finished_req_ids=set(),
         free_encoder_mm_hashes=[],
         num_invalid_spec_tokens=num_invalid_spec_tokens,

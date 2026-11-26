@@ -76,13 +76,24 @@ ensure_uv() {
 
 # Ensure virtual environment exists and is activated
 ensure_venv() {
+  local python_version="${VLLM_METAL_PYTHON:-3.12}"
+  case "$python_version" in
+    3.12|3.13) ;;
+    *) error "Unsupported Python version: ${python_version}; expected 3.12 or 3.13."; return 1 ;;
+  esac
   if [ ! -d "$1" ]; then
     section "Creating virtual environment"
-    uv venv "$1" --clear --python 3.12 --seed
+    uv venv "$1" --python "$python_version" --seed
   fi
 
   # shellcheck source=/dev/null
   source "$1/bin/activate"
+  local actual_version
+  actual_version=$(python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+  if [ "$actual_version" != "$python_version" ]; then
+    error "Environment $1 uses Python ${actual_version}, requested ${python_version}. Set VLLM_METAL_PYTHON to match or choose a different VLLM_METAL_VENV."
+    return 1
+  fi
 }
 
 # Install dev dependencies
@@ -98,9 +109,10 @@ setup_dev_env() {
   install_dev_deps
 }
 
-# Get version from pyproject.toml
+# Get version from pyproject.toml. This runs before the per-version venvs
+# exist, so use a fixed interpreter and skip project environment resolution.
 get_version() {
-  uv run python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])"
+  uv run --no-project --python 3.12 python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])"
 }
 
 # Ensure `xcrun metal` can actually compile a .metallib.
@@ -223,13 +235,14 @@ from pathlib import Path
 
 sys.path.insert(0, sys.argv[1])
 sys.modules["torch.utils.cpp_extension"] = None
+from vllm_metal.metal import get_ops
 from vllm_metal.pytorch_backend.mps_ops import _load_mps_module
 
-module = _load_mps_module()
-assert Path(module.__file__).resolve().is_relative_to(Path(sys.argv[1]).resolve())
+for module in (get_ops(), _load_mps_module()):
+    assert Path(module.__file__).resolve().is_relative_to(Path(sys.argv[1]).resolve())
 PYTHON
   then
-    error "The wheel's prebuilt MPS launcher could not be imported."
+    error "The wheel's prebuilt launchers could not be imported."
     rm -rf "${unpack_dir}"
     return 1
   fi

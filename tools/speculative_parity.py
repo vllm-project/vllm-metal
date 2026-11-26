@@ -96,7 +96,7 @@ def run_engine(args):
             request_ids[output_state.external_req_id] = new.req_id
             records[new.req_id] = []
             decisions[new.req_id] = []
-            prompts[new.req_id] = new.prompt_token_ids
+            prompts[new.req_id] = list(new.prompt_token_ids)
         lengths = {req_id: len(req.token_ids) for req_id, req in state.decode_reqs}
         result = sample(*positional, **keywords)
         for (req_id, req), segment in zip(

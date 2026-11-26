@@ -345,6 +345,7 @@ def _new_req(
     return NewRequestData(
         req_id=req_id,
         prompt_token_ids=token_ids,
+        prefill_token_ids=token_ids,
         mm_features=[],
         sampling_params=None,
         pooling_params=pooling_params or _pooling_params(task),
@@ -358,9 +359,7 @@ def _new_req(
 def _cached_req_data(req_ids: list[str], num_computed_tokens: list[int]):
     return SimpleNamespace(
         req_ids=req_ids,
-        resumed_req_ids=set(),
         new_token_ids=[],
-        all_token_ids={},
         new_block_ids=[None] * len(req_ids),
         num_computed_tokens=num_computed_tokens,
         num_output_tokens=[0] * len(req_ids),
@@ -396,7 +395,6 @@ def _scheduler_output(
         kv_cache_block_copies=None,
         new_block_ids_to_zero=None,
         scheduled_encoder_inputs={},
-        num_common_prefix_blocks=[],
         finished_req_ids=set(),
         free_encoder_mm_hashes=[],
         preempted_req_ids=set(),

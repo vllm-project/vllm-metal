@@ -6,13 +6,14 @@ import numpy as np
 import pytest
 
 from tests.gqa_test_utils import (
+    GQA_PARTITION_SIZE,
     _assert_close,
     _assert_fallback,
     _dispatch_family,
     _primitive,
     _run_primitive,
 )
-from tests.test_gqa_paged_decode import GQA_GEOMETRIES, GQA_PARTITIONS
+from tests.test_gqa_paged_decode import GQA_GEOMETRIES
 from vllm_metal.metal import get_ops
 
 
@@ -34,22 +35,15 @@ def _diagnostics_and_cores():
     [
         ([5375, 5375], 0),
         ([5376, 5376], 256),
-        ([10751, 10751], 256),
-        ([10752, 10752], 512),
         ([5375, 5631], 0),  # Summing tokens before flooring overcounts tails.
         ([5375, 5632], 256),
-        ([1, 10751], 0),
-        ([1, 10752], 256),  # max(length) * batch would wrongly promote to 512.
-        ([1, 21504], 512),
-        ([65536] * 9, 512),
-        ([65536] * 10, 512),  # Batch size alone must not veto long GQA decode.
+        ([1, 10751], 0),  # A short row adds no complete partition.
+        ([1, 10752], 256),
+        ([65536] * 10, 256),  # Batch size alone must not veto long GQA decode.
         ([1279] * 10, 0),
         ([1280] * 10, 256),
-        ([2559] * 10, 256),
-        ([2560] * 10, 512),
         ([255] * 128, 0),  # Partial tails do not become complete partitions.
         ([256] * 64, 256),
-        ([512] * 64, 512),
         ([], 0),
         ([0, 21504], 0),
         ([-1, 21504], 0),
@@ -70,31 +64,24 @@ def test_batch_planner_requires_known_cores(cores):
 
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
 @pytest.mark.parametrize(
-    "partition,length,maximum,expected",
+    "maximum,expected",
     [
-        (256, 1536, 1046527, 256),
-        (256, 1536, 1046528, 256),
-        (256, 1536, 1046529, 0),
-        (256, 1536, 1048576, 0),
-        (256, 1536, 1048577, 0),
-        (512, 4096, 2093055, 512),
-        (512, 4096, 2093056, 512),
-        (512, 4096, 2093057, 0),
-        (512, 4096, 2097152, 0),
-        (512, 4096, 2097153, 0),
+        (1046527, 256),
+        (1046528, 256),
+        (1046529, 0),
+        (1048576, 0),
+        (1048577, 0),
     ],
 )
-def test_generic_admission_counts_static_reducer_memory(
-    dtype, partition, length, maximum, expected
-):
+def test_generic_admission_counts_static_reducer_memory(dtype, maximum, expected):
     ops = get_ops()
-    batch, q, kv, head, block = 10, 32, 8, 128, 16
+    batch, q, kv, head, block, length = 10, 32, 8, 128, 16, 1536
     # Apple GPUs allow 32 KiB per threadgroup. 4,088 partitions consume
     # 32,704 aligned dynamic bytes plus the ordinary reducer's 64 static bytes.
     # Also cover the former dynamic-only limit and its successor.
     # These are allocation bounds, not the actual KV lengths used for planning.
     lengths = [length] * batch
-    assert ops.gqa_decode_batch_partition_size(q, kv, head, lengths, 40) == partition
+    assert ops.gqa_decode_batch_partition_size(q, kv, head, lengths, 40) == 256
     query = mx.zeros((batch, q, head), dtype)
     keys = mx.zeros((batch, block, kv, head), dtype)
     values = mx.stack(
@@ -135,25 +122,20 @@ def test_generic_admission_counts_static_reducer_memory(
 
 
 @pytest.mark.parametrize(
-    "cores,q,kv,head,batch,entry,promotion",
+    "cores,q,kv,head,batch,entry",
     [
-        (10, 32, 8, 128, 3, 1024, 2048),
-        (10, 24, 4, 256, 4, 1024, 2048),
-        (10, 16, 2, 128, 5, 1280, 2560),
-        (20, 32, 8, 128, 5, 1280, 2560),
-        (20, 24, 4, 256, 7, 1024, 2048),
-        (20, 16, 2, 256, 10, 1280, 2560),
+        (10, 32, 8, 128, 3, 1024),
+        (10, 24, 4, 256, 4, 1024),
+        (10, 16, 2, 128, 5, 1280),
+        (20, 32, 8, 128, 5, 1280),
+        (20, 24, 4, 256, 7, 1024),
+        (20, 16, 2, 256, 10, 1280),
     ],
 )
-def test_cross_device_batch_boundaries(cores, q, kv, head, batch, entry, promotion):
+def test_cross_device_batch_boundaries(cores, q, kv, head, batch, entry):
     # Fixed expectations independent of the planner, including integer rounding
     # at the first batch admitted above the former unsplit-grid veto.
-    for length, expected in (
-        (entry - 1, 0),
-        (entry, 256),
-        (promotion - 1, 256),
-        (promotion, 512),
-    ):
+    for length, expected in ((entry - 1, 0), (entry, 256)):
         assert (
             get_ops().gqa_decode_batch_partition_size(
                 q, kv, head, [length] * batch, cores
@@ -210,7 +192,7 @@ def test_forward_context_reorder_and_membership_survive_deferred_evaluation(
 
     import mlx.nn as nn
 
-    from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
+    from tests.stub_runner import make_kv_cache
     from vllm_metal.attention.context import clear_context, get_context, prepare_grouped
     from vllm_metal.attention.impls.sdpa import sdpa_forward
 
@@ -223,7 +205,7 @@ def test_forward_context_reorder_and_membership_survive_deferred_evaluation(
     for count in counts:
         pages.append(list(range(cursor, cursor + count)))
         cursor += count
-    cache = MetalPagedKVCache(
+    cache = make_kv_cache(
         num_layers=1,
         num_kv_heads=kv,
         head_dim=head,
@@ -233,15 +215,25 @@ def test_forward_context_reorder_and_membership_survive_deferred_evaluation(
     )
     # Zero Q/K makes the oracle a plain mean. Distinct per-request histories
     # and large new values expose row mixups, stale lengths and missing writes.
-    cache.key_caches[0] = mx.zeros_like(cache.key_caches[0])
-    values = np.zeros((cursor, block, kv, head), np.float16)
-    histories = []
+    histories, slots = [], []
     for rid, length in enumerate(past):
-        history = [float(rid + 1 + (i % 5)) for i in range(length)]
-        histories.append(history)
-        for pos, value in enumerate(history):
-            values[pages[rid][pos // block], pos % block] = value
-    cache.value_caches[0] = mx.array(values)
+        histories.append([float(rid + 1 + (i % 5)) for i in range(length)])
+        slots += [
+            pages[rid][pos // block] * block + pos % block for pos in range(length)
+        ]
+    values = np.zeros((len(slots), kv, head), np.float16)
+    values[:] = np.array(sum(histories, []), np.float16)[:, None, None]
+    values = mx.array(values)
+    cache.replace_layer_cache(
+        0,
+        *get_ops().reshape_and_cache(
+            mx.zeros_like(values),
+            values,
+            cache.key_caches[0],
+            cache.value_caches[0],
+            mx.array(slots, mx.int64),
+        ),
+    )
     mx.eval(cache.key_caches[0], cache.value_caches[0])
     inner = SimpleNamespace(
         n_heads=q,
@@ -276,7 +268,7 @@ def test_forward_context_reorder_and_membership_survive_deferred_evaluation(
                 histories[rid].append(value)
                 expected.append(np.mean(histories[rid], dtype=np.float64))
                 past[rid] += 1
-            pending.append((output, expected, 256 if step == 0 else 512))
+            pending.append((output, expected, 256))
         clear_context()
         # Building the second graph/context must not change the first. Resolve
         # in reverse order, as allowed by the scatter dependency graph.
@@ -312,11 +304,10 @@ def test_batch_planner_rejects_unshipped_geometry(geometry):
 
 
 @pytest.mark.parametrize("q,kv,head,block", GQA_GEOMETRIES)
-@pytest.mark.parametrize("partition", GQA_PARTITIONS)
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
-def test_forced_batched_kernels_with_ragged_tails(q, kv, head, block, partition, dtype):
+def test_forced_batched_kernels_with_ragged_tails(q, kv, head, block, dtype):
     # Disjoint shuffled pages and different tail widths expose row/stride errors.
-    lengths = [1, partition - 1, partition + 1, 3 * partition + 3]
+    lengths = [1, 255, 257, 771]
     kwargs = {
         "interleaved": True,
         "seed": 1004,
@@ -324,12 +315,12 @@ def test_forced_batched_kernels_with_ragged_tails(q, kv, head, block, partition,
         "num_kv_heads": kv,
         "head_size": head,
         "block_size": block,
-        "test_partition": partition,
+        "force_gqa": True,
     }
     rectangular, _ = _run_primitive(lengths, dtype, **kwargs)
     out, ref = _run_primitive(lengths, dtype, gqa_lengths=lengths, **kwargs)
     assert _dispatch_family() == "gqa_decode"
-    assert get_ops().last_gqa_partition_size() == partition
+    assert get_ops().last_gqa_partition_size() == GQA_PARTITION_SIZE
     assert get_ops().last_gqa_num_requests() == 4
     _assert_close(out, ref, dtype)
     np.testing.assert_array_equal(
@@ -339,11 +330,11 @@ def test_forced_batched_kernels_with_ragged_tails(q, kv, head, block, partition,
 
 
 @pytest.mark.parametrize("q,kv,head,block", GQA_GEOMETRIES)
-@pytest.mark.parametrize("partition", GQA_PARTITIONS)
-def test_automatic_batch_route_matches_reference(q, kv, head, block, partition):
+def test_automatic_batch_route_matches_reference(q, kv, head, block):
     # 40 cores, two rows: 21 / 28 / 42 full partitions per row for Q32/24/16.
     per_row = {32: 21, 24: 28, 16: 42}[q]
-    lengths = [partition * per_row + 1, partition * per_row + 3]
+    full_tokens = GQA_PARTITION_SIZE * per_row
+    lengths = [full_tokens + 1, full_tokens + 3]
     out, ref = _run_primitive(
         lengths,
         mx.bfloat16,
@@ -358,7 +349,7 @@ def test_automatic_batch_route_matches_reference(q, kv, head, block, partition):
         gqa_lengths=lengths,
     )
     assert _dispatch_family() == "gqa_decode"
-    assert get_ops().last_gqa_partition_size() == partition
+    assert get_ops().last_gqa_partition_size() == GQA_PARTITION_SIZE
     assert get_ops().last_gqa_num_requests() == 2
     _assert_close(out, ref, mx.bfloat16)
 
@@ -391,7 +382,7 @@ def test_batch_gate_keeps_excluded_routes(kwargs):
     _assert_close(out, ref, mx.float16)
 
 
-@pytest.mark.parametrize("cores,expected_partition", [(0, 0), (4, 512)])
+@pytest.mark.parametrize("cores,expected_partition", [(0, 0), (4, 256)])
 def test_batch_uses_known_core_budget_without_unsplit_grid_veto(
     cores, expected_partition
 ):
@@ -431,7 +422,7 @@ def test_production_dispatch_above_legacy_split_budget(dtype):
         gqa_lengths=lengths,
     )
     assert _dispatch_family() == "gqa_decode"
-    assert get_ops().last_gqa_partition_size() == 512
+    assert get_ops().last_gqa_partition_size() == 256
     assert get_ops().last_gqa_num_requests() == len(lengths)
     _assert_close(out, ref, dtype)
 
@@ -500,18 +491,17 @@ def test_host_lengths_are_captured_by_each_lazy_primitive():
     _assert_fallback()
     mx.eval(selected)
     assert _dispatch_family() == "gqa_decode"
-    assert ops.last_gqa_partition_size() == 512
+    assert ops.last_gqa_partition_size() == 256
     np.testing.assert_allclose(np.array(selected), np.array(fallback), atol=2e-3)
 
 
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
-@pytest.mark.parametrize("partition", GQA_PARTITIONS)
 @pytest.mark.parametrize(
     "q,kv,head,cache_block",
     [(24, 4, 256, 784), (24, 4, 256, 800), (16, 2, 256, 1056)],
 )
 def test_batched_shared_prefix_and_strided_scheduler_pages(
-    dtype, partition, q, kv, head, cache_block
+    dtype, q, kv, head, cache_block
 ):
     from tests.test_gqa_paged_decode import _grouped_paged_reference
     from vllm_metal.attention.block_tables import build_block_tables
@@ -560,7 +550,6 @@ def test_batched_shared_prefix_and_strided_scheduler_pages(
         mx.array([length - 1, length], mx.int32),
         block,
         length,
-        partition,
     )
     mx.eval(out)  # No evaluation boundary between scatter and attention.
     ref = _grouped_paged_reference(
@@ -577,9 +566,7 @@ def test_batched_shared_prefix_and_strided_scheduler_pages(
 
 
 def test_recorded_batch_size_clears_with_diagnostics():
-    _run_primitive(
-        [513, 1025], mx.float16, interleaved=True, seed=1010, test_partition=256
-    )
+    _run_primitive([513, 1025], mx.float16, interleaved=True, seed=1010, force_gqa=True)
     ops = get_ops()
     assert ops.last_gqa_num_requests() == 2
     ops._set_paged_dispatch_diagnostics(False)
@@ -628,10 +615,10 @@ def test_compact_scratch_admits_ragged_batch_within_budget(dtype):
     ops = get_ops()
     batch, q, kv, head, block = 256, 24, 4, 256, 16
     lengths = [131072] + [1] * (batch - 1)
-    padded_bytes = batch * q * 256 * (2 * head + 8)
-    assert padded_bytes == 780 * 1024**2
+    padded_bytes = batch * q * (131072 // 256) * (2 * head + 8)
+    assert padded_bytes == 1560 * 1024**2
     assert ops._gqa_decode_config_for_test()["max_scratch_bytes"] == 512 * 1024**2
-    assert ops.gqa_decode_batch_partition_size(q, kv, head, lengths, 40) == 512
+    assert ops.gqa_decode_batch_partition_size(q, kv, head, lengths, 40) == 256
     # A uniform batch still exceeds the budget: compaction cannot save its slots.
     assert ops.gqa_decode_batch_partition_size(q, kv, head, [131072] * batch, 40) == 0
     assert (
@@ -658,7 +645,7 @@ def test_compact_scratch_admits_ragged_batch_within_budget(dtype):
     )
     mx.eval(out)
     assert ops.last_paged_dispatch() == "gqa_decode"
-    assert ops.last_gqa_partition_size() == 512
+    assert ops.last_gqa_partition_size() == 256
     assert mx.get_peak_memory() - before < 16 * 1024**2
     np.testing.assert_allclose(np.array(out.astype(mx.float32)), 2, atol=2e-3)
 

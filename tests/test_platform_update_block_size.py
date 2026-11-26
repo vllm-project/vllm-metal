@@ -28,9 +28,8 @@ class TestFindNonSsmBackends:
         """Test: MetalBackend returns MultipleOf(16) for kernel block sizes.
 
         16 is the Metal paged-attention kernel sweet spot: bs=8 gives no
-        speedup, bs=32 is ~46% slower TPOT. Advertising MultipleOf(16) makes
-        vLLM's selector default to 16 for non-hybrid models and lets hybrid
-        alignment compute multiples-of-16 for SSM/Mamba page sizes.
+        speedup, bs=32 is ~46% slower TPOT. Advertising MultipleOf(16) lets
+        hybrid alignment compute multiples-of-16 for SSM/Mamba page sizes.
         """
         from vllm.v1.attention.backend import MultipleOf
 
@@ -40,6 +39,27 @@ class TestFindNonSsmBackends:
         assert len(sizes) == 1
         assert isinstance(sizes[0], MultipleOf)
         assert sizes[0].base == 16
+
+
+class TestMetalPreferredBlockSize:
+    """Dense models keep the kernels' block size unless the user sets one."""
+
+    @pytest.mark.parametrize(
+        ("requested", "expected"), [(None, 16), (64, 64)], ids=["default", "explicit"]
+    )
+    def test_dense_model_block_size_through_the_upstream_selector(
+        self, requested: int | None, expected: int
+    ) -> None:
+        cache_config = CacheConfig(block_size=requested)
+        model_config = MagicMock(spec=ModelConfig)
+        model_config.is_hybrid = False
+        vllm_config = MagicMock(spec=VllmConfig)
+        vllm_config.model_config = model_config
+        vllm_config.cache_config = cache_config
+
+        MetalPlatform.update_block_size_for_backend(vllm_config)
+
+        assert cache_config.block_size == expected
 
 
 class TestUpdateBlockSizeForBackend:

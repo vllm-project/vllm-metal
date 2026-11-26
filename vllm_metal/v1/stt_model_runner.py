@@ -28,7 +28,6 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
 )
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
-from vllm.v1.sample.sampler import Sampler
 
 from vllm_metal.stt.loader import resolve_model_path
 from vllm_metal.stt.policy import STT_SCHED_BLOCK_BYTES, STT_SCHED_NOMINAL_HEAD_SIZE
@@ -36,6 +35,7 @@ from vllm_metal.stt.runtime import STTRuntimeAdapter
 from vllm_metal.stt.sampling import STTSampling
 from vllm_metal.stt.serve import VLLMSTTRequestAdapter
 from vllm_metal.v1.model_lifecycle import load_stt_model
+from vllm_metal.v1.sampling import Sampler
 
 logger = init_logger(__name__)
 
@@ -177,7 +177,6 @@ class STTModelRunner:
         assert self._stt_runtime_adapter is not None
 
         req_ids: list[str] = []
-        req_id_to_index: dict[str, int] = {}
         sampled_tokens: list[list[int]] = []
 
         eot_token = self._stt_runtime_adapter.eot_token
@@ -195,7 +194,6 @@ class STTModelRunner:
             )
 
             req_ids.append(stt_request.req_id)
-            req_id_to_index[stt_request.req_id] = len(req_ids) - 1
             sampled_tokens.append(tokens)
 
         # Handle cached requests: STT processes everything in one shot,
@@ -203,13 +201,11 @@ class STTModelRunner:
         cached_req_ids = list(scheduler_output.scheduled_cached_reqs.req_ids)
         for req_id in cached_req_ids:
             req_ids.append(req_id)
-            req_id_to_index[req_id] = len(req_ids) - 1
             sampled_tokens.append([eot_token])
 
         if not req_ids:
             return ModelRunnerOutput(
                 req_ids=[],
-                req_id_to_index={},
                 sampled_token_ids=[],
                 logprobs=None,
                 prompt_logprobs_dict={},
@@ -218,7 +214,6 @@ class STTModelRunner:
 
         self._pending_output = ModelRunnerOutput(
             req_ids=req_ids,
-            req_id_to_index=req_id_to_index,
             sampled_token_ids=sampled_tokens,
             logprobs=None,
             prompt_logprobs_dict={},

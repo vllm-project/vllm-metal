@@ -13,20 +13,21 @@ import mlx.core as mx
 import numpy as np
 import torch
 from vllm.sampling_params import SamplingParams
-from vllm.utils.torch_utils import make_tensor_with_pad
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors, SamplerOutput
-from vllm.v1.sample.logits_processor import (
-    BatchUpdate,
-    LogitBiasLogitsProcessor,
-    LogitsProcessor,
-    LogitsProcessors,
-    MinTokensLogitsProcessor,
-)
-from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.sampler import Sampler
 
 from vllm_metal.tensor_bridge import mlx_to_torch
-from vllm_metal.v1.logits_processors import BatchMinPLogitsProcessor
+from vllm_metal.v1.logits_processors import (
+    BatchMinPLogitsProcessor,
+    BatchUpdate,
+    LogitsProcessor,
+    LogitsProcessors,
+)
+from vllm_metal.v1.sampling import Sampler, SamplingMetadata
+from vllm_metal.v1.sampling.builtin_logits_processors import (
+    LogitBiasLogitsProcessor,
+    MinTokensLogitsProcessor,
+)
+from vllm_metal.v1.sampling.torch_utils import make_tensor_with_pad
 
 GREEDY_TEMPERATURE_EPS = 1e-5
 _EMPTY_LOGITSPROCS = LogitsProcessors()
@@ -667,7 +668,7 @@ class SamplingBatch:
                     )
                 )
             )
-        upstream_processors = [
+        builtin_processor_classes = [
             processor_cls
             for processor_cls, needed in (
                 (
@@ -683,8 +684,8 @@ class SamplingBatch:
             )
             if needed
         ]
-        if upstream_processors:
-            # These vLLM processors track rows of a persistent batch; adding
+        if builtin_processor_classes:
+            # These vendored vLLM processors track rows of a persistent batch; adding
             # every row rebuilds that state for this step's batch.
             batch_update = BatchUpdate(
                 batch_size=len(self.sampling_params_list),
@@ -700,7 +701,7 @@ class SamplingBatch:
                 ),
                 moved=(),
             )
-            for processor_cls in upstream_processors:
+            for processor_cls in builtin_processor_classes:
                 processor = processor_cls(None, self.SAMPLER_DEVICE, False)
                 processor.update_state(batch_update)
                 processors.append(processor)

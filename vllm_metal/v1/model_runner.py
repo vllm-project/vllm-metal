@@ -45,13 +45,12 @@ from vllm.v1.outputs import (
     LogprobsTensors,
     ModelRunnerOutput,
 )
-from vllm.v1.sample.logits_processor import LOGITSPROCS_GROUP
-from vllm.v1.sample.sampler import Sampler
 from vllm.v1.worker.gpu.kv_connector import (
     NO_OP_KV_CONNECTOR,
     ActiveKVConnector,
     KVConnector,
 )
+from vllm.v1.worker.gpu.sample.logits_processor.loader import LOGITSPROCS_GROUP
 
 from vllm_metal import envs
 from vllm_metal.attention.context import (
@@ -125,6 +124,7 @@ from vllm_metal.v1.proposer import (
     MetalProposer,
     ProposeContext,
 )
+from vllm_metal.v1.sampling import Sampler
 from vllm_metal.v1.sampling_batch import (
     SamplingBatch,
     create_request_generator,
@@ -278,7 +278,6 @@ class _ExecutionBatch:
         """Build ``ModelRunnerOutput`` from this completed batch."""
         return ModelRunnerOutput(
             req_ids=self.req_ids,
-            req_id_to_index=self.req_id_to_index,
             sampled_token_ids=self.sampled_tokens,
             logprobs=self.merged_logprobs(),
             prompt_logprobs_dict=dict(self.prompt_logprobs_dict),
@@ -1017,8 +1016,7 @@ class MetalModelRunner:
 
         Called by the worker after ``initialize_kv_cache`` when a KV connector
         is configured. Only the SDPA and MLA runtimes' ``KVCacheStorage`` is
-        registered. Hybrid and count-based (draft model) caches have no layout
-        the connector can address.
+        registered. Hybrid caches have no layout the connector can address.
         """
         from vllm_metal.attention.runtime.mla import MLAPagedAttentionRuntime
         from vllm_metal.attention.runtime.sdpa import SDPAPagedAttentionRuntime
@@ -1579,7 +1577,11 @@ class MetalModelRunner:
             self._paged_group_block_sizes,
             merge_verify_windows=self.merge_verify_windows,
             tq_prefill_workspace_bytes=self.tq_prefill_workspace_bytes,
-            all_rows_consumed=needs_prompt_logprob_rows,
+            # LoRA routing covers every packed row, so pruning rows (Gemma 4
+            # YOCO) would leave the adapter layers with fewer rows than routes.
+            all_rows_consumed=(
+                needs_prompt_logprob_rows or self._lora.step_uses_adapter
+            ),
         )
         try:
             ctx = get_context()
@@ -1626,7 +1628,7 @@ class MetalModelRunner:
                 )
 
             # ---- forward (lazy graph + async submit) ----
-            offset_caches = [OffsetCache(0) for _ in range(self.num_layers)]
+            offset_caches = [OffsetCache(0, index=i) for i in range(self.num_layers)]
             # On a pipeline-eligible step with a pending deferred sample, the
             # decode inputs are the previous step's lazy tokens (device
             # gather) — the host list still ends in placeholders there.
@@ -1994,11 +1996,11 @@ class MetalModelRunner:
 
         # ---- sample tokens ----
         vocab_size = self._vocab_size
+        # Draft rows use the greedy verifier below. Only plain decode rows
+        # and completed prefills can use the native sampling key.
         next_native_rng_key = (
             self._next_native_sample_key
             if self._native_sampling_enabled
-            and self.vllm_config.speculative_config is None
-            and self._drafter is None
             and grammar_output is None
             and not scheduler_output.has_structured_output_requests
             else None
@@ -2792,10 +2794,6 @@ class MetalModelRunner:
 
         mrope_position_delta = None
         if req_id in self._awaiting_readmission:
-            if new_req.prefill_token_ids is None:
-                raise RuntimeError(
-                    f"Readmitted request {req_id!r} is missing prefill_token_ids."
-                )
             # Preemption retains the old state for in-flight sampling. Only
             # readmission replaces its history with the scheduler's snapshot.
             preempted = self._request_states[req_id]
@@ -2807,11 +2805,8 @@ class MetalModelRunner:
         else:
             generator = create_request_generator(sampling_params)
 
-        token_ids = new_req.prefill_token_ids
-        if token_ids is None:
-            token_ids = new_req.prompt_token_ids or []
         state = RequestState(
-            token_ids=list(token_ids),
+            token_ids=list(new_req.prefill_token_ids),
             prompt_len=new_req.prompt_len,
             sampling_params=sampling_params,
             pooling_params=new_req.pooling_params,

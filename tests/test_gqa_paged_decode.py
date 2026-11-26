@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Numerical and cache-layout coverage for the private P256/P512 GQA kernels.
+"""Numerical and cache-layout coverage for the private GQA kernels.
 
 Tests force each specialization without GPU core detection. Production
 selection and fallback are covered separately in test_gqa_decode_routing.py.
@@ -15,6 +15,7 @@ import numpy as np
 import pytest
 
 from tests.gqa_test_utils import (
+    GQA_PARTITION_SIZE,
     _assert_close,
     _assert_fallback,
     _dispatch_family,
@@ -30,9 +31,8 @@ from vllm_metal.metal import get_ops
 # rejection expectations. A missing table must fail rather than skip coverage.
 GQA_CONFIG = get_ops()._gqa_decode_config_for_test()
 GQA_GEOMETRIES = tuple(tuple(row) for row in GQA_CONFIG["geometries"])
-GQA_PARTITIONS = tuple(sorted(GQA_CONFIG["partitions"]))
 GQA_SIMD_GROUPS_PER_CORE = GQA_CONFIG["simd_groups_per_core"]
-assert GQA_GEOMETRIES and GQA_PARTITIONS
+assert GQA_GEOMETRIES
 assert len(GQA_GEOMETRIES) == len(set(GQA_GEOMETRIES))
 
 NUM_QUERY_HEADS = 32
@@ -102,8 +102,8 @@ def test_dispatch_diagnostics_are_disabled_in_a_fresh_process() -> None:
     )
 
 
-@pytest.mark.parametrize("test_partition", [None, *GQA_PARTITIONS])
-def test_dispatch_diagnostics_require_opt_in(test_partition) -> None:
+@pytest.mark.parametrize("force_gqa", [False, True])
+def test_dispatch_diagnostics_require_opt_in(force_gqa) -> None:
     ops = get_ops()
     mx.synchronize()
     previous = ops._set_paged_dispatch_diagnostics(False)
@@ -112,7 +112,7 @@ def test_dispatch_diagnostics_require_opt_in(test_partition) -> None:
         "dtype": mx.bfloat16,
         "interleaved": True,
         "seed": 715,
-        "test_partition": test_partition,
+        "force_gqa": force_gqa,
     }
     try:
         unrecorded, reference = _run_primitive(**kwargs)
@@ -120,12 +120,12 @@ def test_dispatch_diagnostics_require_opt_in(test_partition) -> None:
         assert ops.last_gqa_partition_size() == 0
         assert ops._set_paged_dispatch_diagnostics(True) is False
         recorded, _ = _run_primitive(**kwargs)
-        if test_partition is None:
+        if force_gqa:
+            assert ops.last_paged_dispatch() == "gqa_decode"
+            assert ops.last_gqa_partition_size() == GQA_PARTITION_SIZE
+        else:
             _assert_fallback()
             assert ops.last_gqa_partition_size() == 0
-        else:
-            assert ops.last_paged_dispatch() == "gqa_decode"
-            assert ops.last_gqa_partition_size() == test_partition
         _assert_close(unrecorded, reference, mx.bfloat16)
         np.testing.assert_array_equal(
             np.array(unrecorded.astype(mx.float32)),
@@ -142,24 +142,13 @@ def test_dispatch_diagnostics_require_opt_in(test_partition) -> None:
         ops._set_paged_dispatch_diagnostics(previous)
 
 
-def test_gqa_decode_kernel_is_in_default_library() -> None:
-    ops = get_ops()
-    assert ops._has_gqa_decode_kernel(), (
-        "default shader library is missing paged_attention_gqa_decode; "
-        "rebuild with `python -m vllm_metal.metal.build`"
-    )
-
-
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
-@pytest.mark.parametrize("part", GQA_PARTITIONS)
-@pytest.mark.parametrize("tail", [False, True])
+@pytest.mark.parametrize("length", [GQA_PARTITION_SIZE, 2 * GQA_PARTITION_SIZE + 17])
 @pytest.mark.parametrize("q,kv,head,block", GQA_GEOMETRIES)
-def test_gqa_kernel_numerics_without_core_detection(
-    dtype, part, tail, q, kv, head, block
-):
+def test_gqa_kernel_numerics_without_core_detection(dtype, length, q, kv, head, block):
     """CI executes every specialization, including single and partial partitions."""
     out, ref = _run_primitive(
-        [2 * part + 17 if tail else part],
+        [length],
         dtype,
         interleaved=True,
         seed=42,
@@ -167,24 +156,23 @@ def test_gqa_kernel_numerics_without_core_detection(
         num_kv_heads=kv,
         head_size=head,
         block_size=block,
-        test_partition=part,
+        force_gqa=True,
     )
     assert _dispatch_family() == "gqa_decode"
-    assert get_ops().last_gqa_partition_size() == part
+    assert get_ops().last_gqa_partition_size() == GQA_PARTITION_SIZE
     _assert_close(out, ref, dtype)
 
 
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
-@pytest.mark.parametrize("part", GQA_PARTITIONS)
 @pytest.mark.parametrize("n_tok", [1, 5, 6, 7, 13, 15])
 @pytest.mark.parametrize("q,kv,head,block", GQA_GEOMETRIES)
-def test_gqa_partial_page_tails(dtype, part, n_tok, q, kv, head, block):
+def test_gqa_partial_page_tails(dtype, n_tok, q, kv, head, block):
     """Partition remainder pages, including n_tok % 4 != 0."""
     # One full partition plus a last page of n_tok tokens; the tail falls
     # through the 4-way groups into the per-token loop.
     extra = block if block > 16 else 0
     out, ref = _run_primitive(
-        [part + extra + n_tok],
+        [GQA_PARTITION_SIZE + extra + n_tok],
         dtype,
         interleaved=True,
         seed=64 + n_tok,
@@ -192,17 +180,57 @@ def test_gqa_partial_page_tails(dtype, part, n_tok, q, kv, head, block):
         num_kv_heads=kv,
         head_size=head,
         block_size=block,
-        test_partition=part,
+        force_gqa=True,
     )
     assert _dispatch_family() == "gqa_decode"
-    assert get_ops().last_gqa_partition_size() == part
+    assert get_ops().last_gqa_partition_size() == GQA_PARTITION_SIZE
     _assert_close(out, ref, dtype)
 
 
-@pytest.mark.parametrize("part", [0, 32, 64, 128, 1024])
-def test_private_gqa_entry_rejects_unshipped_partitions(part):
-    with pytest.raises(ValueError, match="GQA test partition"):
-        _run_primitive([65], mx.float16, interleaved=False, seed=0, test_partition=part)
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize(
+    "lengths,window",
+    [
+        pytest.param((2, 37), (1, 5), id="window-not-block-aligned"),
+        pytest.param((1, 17), (4, 0), id="window-covers-context"),
+        pytest.param((3, 9), (0, 7), id="window-inside-one-block"),
+        pytest.param(((3, 41), (0, 33), (1, 1), (2, 0)), (1, 23), id="ragged-batch"),
+    ],
+)
+@pytest.mark.parametrize("q,kv,head,block", GQA_GEOMETRIES)
+def test_windowed_gqa_matches_full_softmax_reference(
+    dtype, lengths, window, q, kv, head, block
+):
+    """Keys left of the window never contribute, wherever the window starts."""
+    rows = lengths if isinstance(lengths[0], tuple) else (lengths,)
+    out, ref = _run_primitive(
+        [n * GQA_PARTITION_SIZE + extra for n, extra in rows],
+        dtype,
+        interleaved=True,
+        seed=1272,
+        num_query_heads=q,
+        num_kv_heads=kv,
+        head_size=head,
+        block_size=block,
+        sliding_window=window[0] * GQA_PARTITION_SIZE + window[1],
+        force_gqa=True,
+    )
+    assert _dispatch_family() == "gqa_decode"
+    assert get_ops().last_gqa_partition_size() == GQA_PARTITION_SIZE
+    _assert_close(out, ref, dtype)
+
+
+@pytest.mark.parametrize("window", [0, -2])
+def test_private_gqa_entry_rejects_invalid_window(window):
+    with pytest.raises(ValueError, match="sliding_window"):
+        _run_primitive(
+            [65],
+            mx.float16,
+            interleaved=False,
+            seed=0,
+            sliding_window=window,
+            force_gqa=True,
+        )
 
 
 @pytest.mark.parametrize("cache", ["key", "value"])
@@ -231,11 +259,10 @@ def test_private_gqa_entry_rejects_mismatched_cache_dtype(
             mx.array([17], dtype=mx.int32),
             16,
             17,
-            256,
         )
 
 
-def test_private_gqa_partition_is_local_to_lazy_primitive():
+def test_force_gqa_is_local_to_lazy_primitive():
     """Building another node must not change a pending node or production routing."""
     ops = get_ops()
     q = mx.ones((1, 32, 128), dtype=mx.float16)
@@ -244,12 +271,7 @@ def test_private_gqa_partition_is_local_to_lazy_primitive():
     tables = mx.arange(40, dtype=mx.int32)[None]
     lengths = mx.array([513], dtype=mx.int32)
     outputs = [
-        ops._gqa_paged_attention_for_test(
-            q, k, v, 128**-0.5, tables, lengths, 16, 513, part
-        )
-        for part in (256, 512)
-    ]
-    outputs.append(
+        ops._gqa_paged_attention_for_test(q, k, v, 128**-0.5, tables, lengths, 16, 513),
         ops.paged_attention_primitive(
             q,
             k,
@@ -263,17 +285,19 @@ def test_private_gqa_partition_is_local_to_lazy_primitive():
             16,
             513,
             -1,
-        )
-    )
-    for part, out in zip([256, 512, 0], outputs, strict=True):
+            num_decode_requests=1,
+            num_decode_tokens=1,
+            max_decode_context_len=513,
+        ),
+    ]
+    for part, out in zip([256, 0], outputs, strict=True):
         mx.eval(out)
         assert ops.last_gqa_partition_size() == part
         assert np.allclose(np.array(out), 2, atol=2e-3)
     _assert_fallback()
 
 
-@pytest.mark.parametrize("partition", [256])
-def test_forced_partition_rejects_oversized_reducer(partition):
+def test_forced_gqa_rejects_oversized_reducer():
     """A small cache can represent a long logical history without a huge allocation."""
     ops = get_ops()
     n = 1048577
@@ -284,19 +308,29 @@ def test_forced_partition_rejects_oversized_reducer(partition):
     lengths = mx.array([n], mx.int32)
     with pytest.raises(ValueError, match="threadgroup memory limit"):
         ops._gqa_paged_attention_for_test(
-            query, key, value, 128**-0.5, table, lengths, 16, n, partition
+            query, key, value, 128**-0.5, table, lengths, 16, n
         )
-    # A larger partition fits the same history and still computes every token.
+
+
+def test_windowed_partitions_cover_only_the_window():
+    """A window bounds the partition count, so the reducer fits any history."""
+    ops = get_ops()
+    n = 1048577
+    query = mx.ones((1, 16, 128), mx.float16)
+    key = mx.ones((1, 16, 2, 128), mx.float16)
+    value = mx.full(key.shape, 2, mx.float16)
+    table = mx.zeros((1, (n + 15) // 16), mx.int32)
+    lengths = mx.array([n], mx.int32)
+    # The same history overflows the P256 reducer without a window.
     out = ops._gqa_paged_attention_for_test(
-        query, key, value, 128**-0.5, table, lengths, 16, n, 512
+        query, key, value, 128**-0.5, table, lengths, 16, n, sliding_window=1000
     )
     mx.eval(out)
-    assert ops.last_gqa_partition_size() == 512
+    assert ops.last_gqa_partition_size() == 256
     np.testing.assert_allclose(np.array(out), 2, atol=2e-3)
 
 
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
-@pytest.mark.parametrize("test_partition", GQA_PARTITIONS)
 @pytest.mark.parametrize(
     "q_heads,kv_heads,head,block_size",
     GQA_GEOMETRIES
@@ -307,7 +341,7 @@ def test_forced_partition_rejects_oversized_reducer(partition):
     + ((24, 4, 256, 800),),
 )
 def test_gqa_reads_upstream_views_after_writes_and_block_copy(
-    dtype, test_partition, q_heads, kv_heads, head, block_size
+    dtype, q_heads, kv_heads, head, block_size
 ):
     """Exercise every shipped GQA specialization on shared K/V storage.
 
@@ -327,7 +361,7 @@ def test_gqa_reads_upstream_views_after_writes_and_block_copy(
     from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
     from vllm_metal.attention.caches.storage import KVCacheStorage
 
-    n = 2 * max(block_size, test_partition) + 1
+    n = 2 * max(block_size, GQA_PARTITION_SIZE) + 1
     pages = _interleaved_table((n + 1 + block_size - 1) // block_size)
     num_blocks = max(pages) + 2
     spec = FullAttentionSpec(
@@ -414,11 +448,10 @@ def test_gqa_reads_upstream_views_after_writes_and_block_copy(
             mx.array([length], dtype=mx.int32),
             kernel_block_size,
             length,
-            test_partition,
         )
         mx.eval(out)
         assert _dispatch_family() == "gqa_decode"
-        assert ops.last_gqa_partition_size() == test_partition
+        assert ops.last_gqa_partition_size() == GQA_PARTITION_SIZE
         # Independent logical history; never gather the cache under test.
         ref = _grouped_paged_reference(
             query=query,
@@ -435,9 +468,8 @@ def test_gqa_reads_upstream_views_after_writes_and_block_copy(
 @pytest.mark.parametrize("q,kv,head,block_size", GQA_GEOMETRIES)
 @pytest.mark.parametrize("n", [131071, 131072, 131073, 196608, 262144, 262145])
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
-@pytest.mark.parametrize("part", GQA_PARTITIONS)
 @pytest.mark.slow
-def test_each_geometry_at_long_context(q, kv, head, block_size, n, dtype, part):
+def test_each_geometry_at_long_context(q, kv, head, block_size, n, dtype):
     """Opt-in long-context matrix; regular CI covers every specialization above."""
     out, ref = _run_primitive(
         [n],
@@ -448,23 +480,8 @@ def test_each_geometry_at_long_context(q, kv, head, block_size, n, dtype, part):
         num_kv_heads=kv,
         head_size=head,
         block_size=block_size,
-        test_partition=part,
+        force_gqa=True,
     )
     assert _dispatch_family() == "gqa_decode"
-    assert get_ops().last_gqa_partition_size() == part
+    assert get_ops().last_gqa_partition_size() == GQA_PARTITION_SIZE
     _assert_close(out, ref, dtype)
-
-
-@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
-@pytest.mark.parametrize("n", [1024, 32769])
-def test_private_kernels_do_not_change_production_routing(dtype, n):
-    ops = get_ops()
-    out, ref = _run_primitive([n], dtype, interleaved=True, seed=715)
-    expected = (ops.last_paged_dispatch(), ops.last_gqa_partition_size())
-    _run_primitive([n], dtype, interleaved=True, seed=715, test_partition=256)
-    repeated, _ = _run_primitive([n], dtype, interleaved=True, seed=715)
-    assert (ops.last_paged_dispatch(), ops.last_gqa_partition_size()) == expected
-    _assert_close(out, ref, dtype)
-    np.testing.assert_array_equal(
-        np.array(out.astype(mx.float32)), np.array(repeated.astype(mx.float32))
-    )

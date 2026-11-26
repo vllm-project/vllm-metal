@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the Metal n-gram speculative-decode proposer.
 
-The proposer wraps vLLM's pure-Python/Numba n-gram kernel, so these tests need no
-model or engine: a ``SimpleNamespace`` ``vllm_config`` exercises the upstream
-constructor (which reads only scalar config) and a hand-built ``ProposeContext``
-drives ``propose``. They lock in the request filtering (greedy-only, skip
-intermediate prefills) and the array marshalling into the upstream kernel.
+The proposer wraps a Numba n-gram matcher, so these tests need no model or
+engine: a ``SimpleNamespace`` ``vllm_config`` supplies the scalar config both
+read and a hand-built ``ProposeContext`` drives ``propose``. They lock in the
+request filtering (greedy-only, skip intermediate prefills), the array
+marshalling into the matcher and the matcher's lookup.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
 import pytest
 from vllm.sampling_params import SamplingParams
 
@@ -106,6 +107,39 @@ def _verified_segment(req_id: str, *, has_draft: bool = True) -> PagedDecodeSegm
         cache_start_pos=0,
         block_ids=(0,),
     )
+
+
+class TestNgramMatcher:
+    @pytest.mark.parametrize(
+        ("history", "k", "max_model_len", "expected"),
+        [
+            pytest.param(
+                [1, 2, 3, 9, 5, 2, 3, 7, 1, 2, 3], 3, 64, [9, 5, 2], id="longest-match"
+            ),
+            pytest.param(
+                [1, 2, 7, 1, 2, 8, 1, 2], 3, 64, [7, 1, 2], id="earliest-equal-match"
+            ),
+            pytest.param([1, 2, 3, 1, 2], 5, 64, [3, 1, 2], id="history-end"),
+            pytest.param([1, 2, 3, 1, 2], 3, 6, [3], id="max-model-len"),
+            pytest.param([1, 2, 3, 2], 3, 64, [], id="match-below-min-n"),
+            pytest.param([1], 3, 64, [], id="history-below-min-n"),
+        ],
+    )
+    def test_drafts_tokens_after_longest_suffix_match(
+        self, history, k, max_model_len, expected
+    ) -> None:
+        matcher = _proposer(max_model_len=max_model_len)._ngram
+        token_ids = np.array([history], dtype=np.int32)
+        lengths = np.array([len(history)], dtype=np.int32)
+
+        assert matcher.propose(k, lengths, token_ids) == [expected]
+
+    def test_reads_each_row_up_to_its_own_length(self) -> None:
+        matcher = _proposer()._ngram
+        token_ids = np.array([[1, 2, 3, 1, 2, 0], [5, 6, 7, 8, 5, 6]], dtype=np.int32)
+        lengths = np.array([5, 4], dtype=np.int32)
+
+        assert matcher.propose(3, lengths, token_ids) == [[3, 1, 2], []]
 
 
 class TestNgramProposerProtocol:
@@ -327,9 +361,8 @@ class TestNgramMissThrottle:
     """The kernel scans a request's whole history every step whether or not
     it finds anything, so a request that never matches should stop being
     handed to the kernel after enough consecutive misses -- these tests
-    mock the wrapped upstream call directly so they exercise only the
-    throttle bookkeeping, independent of the installed vLLM's kernel
-    signature."""
+    mock the wrapped matcher call directly so they exercise only the
+    throttle bookkeeping."""
 
     def test_throttles_after_max_consecutive_misses(self) -> None:
         proposer = _proposer()
