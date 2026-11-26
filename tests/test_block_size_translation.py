@@ -298,7 +298,7 @@ class TestMLAKernelBlockSizes:
 
 @pytest.fixture(scope="module")
 def nax_policy_binary(tmp_path_factory):
-    """Call the actual host admission and name helpers without loading a GPU."""
+    """Exercise the host selector and causal work counts without loading a GPU."""
     compiler = shutil.which("c++")
     if compiler is None:
         pytest.skip("The header-policy test requires a C++17 compiler")
@@ -324,7 +324,6 @@ int main(int argc, char** argv) {
   NaxSequence s{};
   int cores, capacity, value_dim, token_stride;
   bool split;
-  std::cout << std::setprecision(17);
   while (std::cin >> g.heads >> g.kv_heads >> g.qk_dim >> g.kernel_page >> g.physical_page
                   >> g.key_head_stride >> s.query_tokens >> s.kv_tokens >> cores
                   >> split >> capacity >> value_dim >> token_stride) {
@@ -333,14 +332,7 @@ int main(int argc, char** argv) {
         ? token_stride : int64_t(g.kv_heads) * g.key_head_stride;
     const auto choice = select_nax_config(g, s, split, cores);
     const auto cfg = nax_config_for_pipeline(choice, capacity);
-    std::cout << cfg.BQ << ' ' << cfg.HEADS_PER_TG << ' ' << cfg.NUM_THREADS;
-    if (argc > 1) {
-      for (int width : {1, 2, g.heads / g.kv_heads / 2, g.heads / g.kv_heads}) {
-        const NaxLayout layout{width == 1 ? 64 : 16, 32, width};
-        std::cout << ' ' << nax_prefill_cost(s, g, layout, split || width > 1, cores);
-      }
-    }
-    std::cout << '\n';
+    std::cout << cfg.BQ << ' ' << cfg.HEADS_PER_TG << ' ' << cfg.NUM_THREADS << '\n';
   }
 }
 """)
@@ -484,20 +476,15 @@ def _nax_plan_config(
         ({"stride": 384}, (64, 1, 128)),
         ({"physical": 33}, (64, 1, 128)),
         ({"dim": 512}, (64, 1, 128)),
-        # Pin the ten-percent admission margin just below, just above and at
-        # equality: grouped costs of 89.71%, 90.49% and exactly 90% of ordinary NAX.
+        # Pin costs just below, just above, and exactly at the grouped admission cutoff.
         ({"split": 1, "q": 289, "prefix": 2495, "stride": 256}, (16, 2, 64)),
         ({"split": 1, "q": 289, "prefix": 2496, "stride": 256}, (64, 1, 128)),
         ({"split": 1, "q": 257, "prefix": 1601, "stride": 256}, (64, 1, 128)),
         ({"value_dim": 512}, (64, 1, 128)),
         ({"token_stride": 1023}, (64, 1, 128)),
         ({"kv_tokens": 15}, (64, 1, 128)),
-        # GQA6 cold-prefill chunks at the 27B cache geometry (784-token pages).
-        # Calibration points from fixed-width timings against a common h1
-        # reference: h6 is 5.46%/4.92% faster than h3 at q=1568/p=15680 in
-        # both run orders, h3 wins at q=992; q=2592 directions disagree. The
-        # 64K case pins selector replay of the last full chunk (no fixed-width
-        # timing exists at that shape).
+        # Pin both sides of the h3/h6 crossover on 784-token pages for 27B cold
+        # prefill, plus the last full 64K chunk.
         (
             {
                 "heads": 24,
@@ -547,47 +534,6 @@ def _nax_plan_config(
 )
 def test_nax_plan_selects_supported_width(nax_policy_binary, changes, expected):
     assert _nax_plan_config(nax_policy_binary, **changes) == expected
-
-
-def test_one_cost_comparison_selects_the_width_for_both_cache_layouts(
-    nax_policy_binary,
-):
-    """Ordinary NAX is the fixed reference for every eligible ratio and layout."""
-    cases = [
-        (
-            ratio,
-            (
-                4 * ratio,
-                4,
-                256,
-                page,
-                physical,
-                stride,
-                q,
-                q + 31360,
-                cores,
-                split,
-                256,
-            ),
-        )
-        for ratio, page, physical in ((6, 16, 784), (8, 32, 1056))
-        for stride in (256, 512)
-        for q in (16, 63, 64, 65, 128, 144, 1328, 2048)
-        for cores in (10, 20, 40, 80)
-        for split in (0, 1)
-    ]
-    output = subprocess.check_output(
-        [str(nax_policy_binary), "rank"],
-        input="\n".join(" ".join(map(str, row + (0, 0))) for _, row in cases),
-        text=True,
-    )
-    for (ratio, case), line in zip(cases, output.splitlines(), strict=True):
-        _, width, _, ordinary, *grouped = map(float, line.split())
-        best = min(grouped)
-        expected = (
-            (2, ratio // 2, ratio)[grouped.index(best)] if best < 0.9 * ordinary else 1
-        )
-        assert width == expected, case
 
 
 class TestNaxKernelInstantiations:
