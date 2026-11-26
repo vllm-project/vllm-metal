@@ -23,7 +23,7 @@ _APPLIED = False
 _HEADLESS_LOAD_SCOPE: ContextVar[bool] = ContextVar(
     "vllm_metal_headless_load_scope", default=False
 )
-_QWEN_FP8_BLOCK_SIZE = 128
+_QWEN35_FP8_BLOCK_SIZE = 128
 _QWEN3_BACKBONE_ROOTS = frozenset({"embed_tokens", "layers", "norm", "lm_head"})
 _EXAONE4_LAYER_TYPE = {"L": "sliding_attention", "G": "full_attention"}
 
@@ -78,7 +78,7 @@ def apply_compat_patches() -> None:
     _APPLIED = True
     _patch_torch_mps_empty_host_cache()
     _apply_bytelevel_patch_during_registration()
-    _patch_mlx_lm_qwen_fp8_sanitize()
+    _patch_mlx_lm_qwen35_fp8_sanitize()
     _patch_mlx_lm_qwen3_flat_weight_prefix()
     _patch_mlx_lm_d3_weight_layout()
     _patch_mlx_lm_minicpm4_model_type()
@@ -570,11 +570,11 @@ def _shape_tuple(value: Any) -> tuple[int, ...]:
     return tuple(int(dim) for dim in getattr(value, "shape", ()))
 
 
-def _validate_qwen_fp8_block_scale_shape(
+def _validate_qwen35_fp8_block_scale_shape(
     weight: Any,
     scale_inv: Any,
     *,
-    block_size: int = _QWEN_FP8_BLOCK_SIZE,
+    block_size: int = _QWEN35_FP8_BLOCK_SIZE,
 ) -> None:
     """Validate the FP8 scale shape before applying the fixed block layout."""
     weight_shape = _shape_tuple(weight)
@@ -593,21 +593,21 @@ def _validate_qwen_fp8_block_scale_shape(
         return
 
     raise ValueError(
-        "Unsupported Qwen3 FP8 block scale shape: "
+        "Unsupported Qwen FP8 block scale shape: "
         f"weight shape={weight_shape}, weight_scale_inv shape={scale_shape}, "
         f"expected {expected_scale_shape} for {block_size}x{block_size} FP8 "
         "blocks."
     )
 
 
-def _dequantize_qwen_fp8_weight(
+def _dequantize_qwen35_fp8_weight(
     weight: Any,
     scale_inv: Any,
     mx: Any,
     *,
-    block_size: int = _QWEN_FP8_BLOCK_SIZE,
+    block_size: int = _QWEN35_FP8_BLOCK_SIZE,
 ) -> Any:
-    _validate_qwen_fp8_block_scale_shape(
+    _validate_qwen35_fp8_block_scale_shape(
         weight,
         scale_inv,
         block_size=block_size,
@@ -637,7 +637,7 @@ def _dequantize_qwen_fp8_weight(
     return weight[..., :rows, :cols].astype(mx.bfloat16)
 
 
-def _dequantize_qwen_fp8_weights(
+def _dequantize_qwen35_fp8_weights(
     weights: Mapping[str, Any], mx: Any
 ) -> Mapping[str, Any]:
     if not any("weight_scale_inv" in key for key in weights):
@@ -649,11 +649,11 @@ def _dequantize_qwen_fp8_weights(
             weight_key = key.replace("_scale_inv", "")
             if weight_key not in weights:
                 raise ValueError(
-                    "Qwen3 FP8 checkpoint has "
+                    "Qwen FP8 checkpoint has "
                     f"{key!r} but is missing matching weight {weight_key!r}."
                 )
             weight = weights[weight_key]
-            new_weights[weight_key] = _dequantize_qwen_fp8_weight(
+            new_weights[weight_key] = _dequantize_qwen35_fp8_weight(
                 weight,
                 value,
                 mx,
@@ -760,18 +760,11 @@ def _stack_qwen36_moe_per_expert_weights(
     return new_weights
 
 
-def _patch_mlx_lm_qwen_fp8_sanitize() -> None:
-    """Teach mlx_lm's Qwen3 loaders to consume local FP8 ``weight_scale_inv``.
+def _patch_mlx_lm_qwen35_fp8_sanitize() -> None:
+    """Consume block-FP8 scales before mlx_lm remaps Qwen checkpoint weights.
 
-    Qwen ships block-FP8 builds of the Qwen3 line (dense, MoE, 3.5/3.6) that
-    store FP8 weights plus ``*_weight_scale_inv`` tensors in HuggingFace-style
-    shards. The installed mlx_lm ``qwen3`` and ``qwen3_5`` loaders do not
-    dequantize those tensors during ``sanitize()``, so ``model.load_weights()``
-    aborts with hundreds of unexpected ``weight_scale_inv`` parameters.
-
-    Patch the top-level model ``sanitize()`` methods to dequantize those FP8
-    tensors before the upstream remapping logic runs. This keeps the workaround
-    narrow to the affected architectures and leaves upstream control flow intact.
+    Dense Qwen3 uses the same 128x128 block layout as Qwen3.5/3.6. Without
+    this step, strict loading rejects the unused ``weight_scale_inv`` tensors.
     """
     from importlib import import_module
     from importlib.util import find_spec
@@ -780,72 +773,82 @@ def _patch_mlx_lm_qwen_fp8_sanitize() -> None:
         import mlx.core as mx
     except ImportError as exc:
         logger.warning(
-            "Could not install mlx_lm Qwen3 FP8 sanitize "
+            "Could not install mlx_lm Qwen FP8 sanitize "
             "compatibility patch because mlx.core is unavailable: %s",
             exc,
         )
         return
 
-    # Dense checkpoints only need FP8 dequant — they have no expert tensors to
-    # stack.
+    model_modules = []
+    for module_name in (
+        "mlx_lm.models.qwen3_5",
+        "mlx_lm.models.qwen3_5_moe",
+        "mlx_lm.models.qwen3",
+    ):
+        if find_spec(module_name) is None:
+            continue
+        try:
+            model_modules.append(import_module(module_name))
+        except ImportError as exc:
+            logger.warning(
+                "Could not import %s while installing mlx_lm Qwen "
+                "FP8 sanitize compatibility patch: %s",
+                module_name,
+                exc,
+            )
+    if not model_modules:
+        logger.warning(
+            "Could not install mlx_lm Qwen FP8 sanitize "
+            "compatibility patch: no supported model modules found."
+        )
+        return
+
+    # Dense qwen3 and qwen3_5 checkpoints only need FP8 dequant — they have no expert
+    # tensors to stack. Keep the dense patch narrow.
     def _transform_dense(_self, weights):
-        return _dequantize_qwen_fp8_weights(weights, mx)
+        return _dequantize_qwen35_fp8_weights(weights, mx)
 
     # qwen3_5_moe (Qwen-org Qwen3.6-MoE FP8) needs FP8 dequant followed by
     # per-expert stacking. The stacking step is the temporary downstream
     # complement to ml-explore/mlx-lm#1224 and short-circuits when no
     # per-expert keys are present.
     def _transform_moe(_self, weights):
-        weights = _dequantize_qwen_fp8_weights(weights, mx)
+        weights = _dequantize_qwen35_fp8_weights(weights, mx)
         weights = _stack_qwen36_moe_per_expert_weights(weights, mx)
         return weights
 
-    transforms_by_module = {
+    transforms_by_module: dict[str, Any] = {
         "mlx_lm.models.qwen3": _transform_dense,
         "mlx_lm.models.qwen3_5": _transform_dense,
         "mlx_lm.models.qwen3_5_moe": _transform_moe,
     }
+
     patched_modules = []
     unpatchable_modules = []
-    found_module = False
-    for module_name, transform in transforms_by_module.items():
-        if find_spec(module_name) is None:
-            continue
-        try:
-            module = import_module(module_name)
-        except ImportError as exc:
-            logger.warning(
-                "Could not import %s while installing mlx_lm Qwen3 "
-                "FP8 sanitize compatibility patch: %s",
-                module_name,
-                exc,
-            )
-            continue
-        found_module = True
-        short_name = module_name.rsplit(".", maxsplit=1)[-1]
+    for module in model_modules:
+        short_name = module.__name__.rsplit(".", maxsplit=1)[-1]
         model_cls = getattr(module, "Model", None)
         if model_cls is None:
             unpatchable_modules.append(short_name)
             continue
+        transform = transforms_by_module.get(module.__name__)
+        if transform is None:
+            unpatchable_modules.append(short_name)
+            continue
         if _wrap_model_sanitize(
             model_cls,
-            "_vllm_metal_qwen_fp8_patch",
+            "_vllm_metal_qwen35_fp8_patch",
             transform,
         ):
             patched_modules.append(short_name)
-    if not found_module:
-        logger.warning(
-            "Could not install mlx_lm Qwen3 FP8 sanitize "
-            "compatibility patch: no Qwen3 FP8 model modules found."
-        )
     if patched_modules:
         logger.debug(
             "Patched mlx_lm %s FP8 sanitize compatibility",
             ", ".join(sorted(patched_modules)),
         )
-    if unpatchable_modules:
+    elif unpatchable_modules:
         logger.warning(
-            "Could not install mlx_lm Qwen3 FP8 sanitize "
+            "Could not install mlx_lm Qwen FP8 sanitize "
             "compatibility patch for modules without Model classes: %s",
             ", ".join(sorted(unpatchable_modules)),
         )

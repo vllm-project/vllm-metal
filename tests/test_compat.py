@@ -251,8 +251,8 @@ class TestApplyCompatPatches:
         )
         monkeypatch.setattr(
             compat,
-            "_patch_mlx_lm_qwen_fp8_sanitize",
-            lambda: calls.append("qwen_fp8"),
+            "_patch_mlx_lm_qwen35_fp8_sanitize",
+            lambda: calls.append("qwen35_fp8"),
         )
         monkeypatch.setattr(
             compat,
@@ -269,7 +269,7 @@ class TestApplyCompatPatches:
 
         assert calls == [
             "bytelevel",
-            "qwen_fp8",
+            "qwen35_fp8",
             "qwen3_flat_prefix",
             "minicpm4_model_type",
         ]
@@ -428,7 +428,7 @@ class TestNanbeigeCompat:
         assert configuration_auto.CONFIG_MAPPING["nanbeige"] is existing
 
 
-def _install_fake_qwen_fp8_modules(
+def _install_fake_qwen35_modules(
     monkeypatch, *, include_moe: bool, dense_name: str = "mlx_lm.models.qwen3_5"
 ):
     mlx_pkg = ModuleType("mlx")
@@ -498,7 +498,7 @@ class TestMiniCPM4ModelTypeCompatPatch:
         assert model_cls.__module__ == "mlx_lm.models.minicpm"
 
 
-class TestQwenFp8CompatPatch:
+class TestQwen35Fp8CompatPatch:
     def test_logs_when_mlx_core_is_unavailable(self, monkeypatch) -> None:
         original_import = builtins.__import__
         warnings = []
@@ -514,7 +514,7 @@ class TestQwenFp8CompatPatch:
         monkeypatch.setattr(builtins, "__import__", _fake_import)
         monkeypatch.setattr(compat.logger, "warning", _record_warning)
 
-        compat._patch_mlx_lm_qwen_fp8_sanitize()
+        compat._patch_mlx_lm_qwen35_fp8_sanitize()
 
         assert any("mlx.core is unavailable" in warning for warning in warnings)
 
@@ -522,11 +522,10 @@ class TestQwenFp8CompatPatch:
         "dense_name", ["mlx_lm.models.qwen3", "mlx_lm.models.qwen3_5"]
     )
     def test_dense_fp8_sanitize_without_moe(self, monkeypatch, dense_name) -> None:
-        dense_module, _ = _install_fake_qwen_fp8_modules(
+        dense_module, _ = _install_fake_qwen35_modules(
             monkeypatch, include_moe=False, dense_name=dense_name
         )
-
-        compat._patch_mlx_lm_qwen_fp8_sanitize()
+        compat._patch_mlx_lm_qwen35_fp8_sanitize()
 
         key = "model.layers.0.mlp.down_proj.weight"
         sanitized = dense_module.Model().sanitize(
@@ -537,14 +536,14 @@ class TestQwenFp8CompatPatch:
         np.testing.assert_array_equal(sanitized[key], [[3.0, -6.0]])
 
     def test_dequant_applies_scale_values_by_fp8_block(self, monkeypatch) -> None:
-        _install_fake_qwen_fp8_modules(monkeypatch, include_moe=False)
+        _install_fake_qwen35_modules(monkeypatch, include_moe=False)
 
         weight = np.arange(129 * 130, dtype=np.float32).reshape(129, 130)
         scale_inv = np.array(
             [[2.0, 3.0], [5.0, 7.0]],
             dtype=np.float32,
         )
-        dequantized = compat._dequantize_qwen_fp8_weight(
+        dequantized = compat._dequantize_qwen35_fp8_weight(
             weight,
             scale_inv,
             sys.modules["mlx.core"],
@@ -564,7 +563,7 @@ class TestQwenFp8CompatPatch:
         weight = mx.to_fp8(mx.array([[1.0, -2.0], [0.5, 4.0]]))
         scale_inv = mx.array([[2.0]])
 
-        dequantized = compat._dequantize_qwen_fp8_weight(weight, scale_inv, mx)
+        dequantized = compat._dequantize_qwen35_fp8_weight(weight, scale_inv, mx)
 
         np.testing.assert_allclose(
             np.array(dequantized.astype(mx.float32)),
@@ -572,9 +571,9 @@ class TestQwenFp8CompatPatch:
         )
 
     def test_rejects_unexpected_fp8_block_scale_shape(self, monkeypatch) -> None:
-        dense_module, _ = _install_fake_qwen_fp8_modules(monkeypatch, include_moe=False)
+        dense_module, _ = _install_fake_qwen35_modules(monkeypatch, include_moe=False)
 
-        compat._patch_mlx_lm_qwen_fp8_sanitize()
+        compat._patch_mlx_lm_qwen35_fp8_sanitize()
 
         with pytest.raises(ValueError, match="128x128 FP8 blocks"):
             dense_module.Model().sanitize(
@@ -585,10 +584,10 @@ class TestQwenFp8CompatPatch:
             )
 
     def test_patches_higher_rank_weights_for_moe(self, monkeypatch) -> None:
-        _, moe_module = _install_fake_qwen_fp8_modules(monkeypatch, include_moe=True)
+        _, moe_module = _install_fake_qwen35_modules(monkeypatch, include_moe=True)
         gate_up_proj_prefix = "language_model.layers.0.mlp.experts.gate_up_proj"
 
-        compat._patch_mlx_lm_qwen_fp8_sanitize()
+        compat._patch_mlx_lm_qwen35_fp8_sanitize()
 
         sanitized = moe_module.Model().sanitize(
             {
@@ -607,10 +606,10 @@ class TestQwenFp8CompatPatch:
         # sanitize wrapper must stack them along axis 0 and concatenate
         # gate+up along the intermediate-dim axis, producing the combined
         # form upstream sanitize already handles.
-        _, moe_module = _install_fake_qwen_fp8_modules(monkeypatch, include_moe=True)
+        _, moe_module = _install_fake_qwen35_modules(monkeypatch, include_moe=True)
         prefix = "model.language_model.layers.0.mlp.experts"
 
-        compat._patch_mlx_lm_qwen_fp8_sanitize()
+        compat._patch_mlx_lm_qwen35_fp8_sanitize()
 
         per_expert = {
             f"{prefix}.0.gate_proj.weight": np.full((6, 4), 1.0),
@@ -650,10 +649,10 @@ class TestQwenFp8CompatPatch:
         # combined. The per-expert helper must short-circuit and pass them
         # through unchanged, leaving the combined-format branch in upstream
         # sanitize free to do its split.
-        _, moe_module = _install_fake_qwen_fp8_modules(monkeypatch, include_moe=True)
+        _, moe_module = _install_fake_qwen35_modules(monkeypatch, include_moe=True)
         prefix = "model.language_model.layers.0.mlp.experts"
 
-        compat._patch_mlx_lm_qwen_fp8_sanitize()
+        compat._patch_mlx_lm_qwen35_fp8_sanitize()
 
         gate_up = np.arange(2 * 12 * 4, dtype=np.float32).reshape(2, 12, 4)
         down = np.arange(2 * 4 * 6, dtype=np.float32).reshape(2, 4, 6)
@@ -674,10 +673,10 @@ class TestQwenFp8CompatPatch:
         # 2) would silently drop expert 3 if the stacker walked indices in
         # order. Helper must raise loudly so the user diagnoses the missing
         # tensor instead of getting subtly wrong output.
-        _, moe_module = _install_fake_qwen_fp8_modules(monkeypatch, include_moe=True)
+        _, moe_module = _install_fake_qwen35_modules(monkeypatch, include_moe=True)
         prefix = "model.language_model.layers.0.mlp.experts"
 
-        compat._patch_mlx_lm_qwen_fp8_sanitize()
+        compat._patch_mlx_lm_qwen35_fp8_sanitize()
 
         gapped = {
             f"{prefix}.0.gate_proj.weight": np.zeros((6, 4)),
@@ -701,10 +700,10 @@ class TestQwenFp8CompatPatch:
         # leaking from the walk step. The same path also covers the case
         # where only some experts have a given projection (mismatched index
         # sets across families).
-        _, moe_module = _install_fake_qwen_fp8_modules(monkeypatch, include_moe=True)
+        _, moe_module = _install_fake_qwen35_modules(monkeypatch, include_moe=True)
         prefix = "model.language_model.layers.0.mlp.experts"
 
-        compat._patch_mlx_lm_qwen_fp8_sanitize()
+        compat._patch_mlx_lm_qwen35_fp8_sanitize()
 
         # 1) Entire down_proj family absent.
         no_down = {
@@ -728,15 +727,15 @@ class TestQwenFp8CompatPatch:
         with pytest.raises(ValueError, match="mismatched down_proj"):
             moe_module.Model().sanitize(partial_down)
 
-    def test_per_expert_helper_does_not_run_on_dense_qwen3_5(self, monkeypatch) -> None:
+    def test_per_expert_helper_does_not_run_on_dense_qwen35(self, monkeypatch) -> None:
         # The dense qwen3_5 patch wraps sanitize with FP8 dequant only — the
         # per-expert stacking helper must NOT run on dense Qwen3.5/3.6
         # checkpoints (no expert tensors exist in dense models, so even an
         # accidental call would be a no-op, but the patch architecture
         # makes the MoE-only nature explicit).
-        dense_module, _ = _install_fake_qwen_fp8_modules(monkeypatch, include_moe=True)
+        dense_module, _ = _install_fake_qwen35_modules(monkeypatch, include_moe=True)
 
-        compat._patch_mlx_lm_qwen_fp8_sanitize()
+        compat._patch_mlx_lm_qwen35_fp8_sanitize()
 
         # Dense weights with FP8 quant; no expert tensors anywhere.
         sanitized = dense_module.Model().sanitize(
@@ -969,13 +968,12 @@ class TestInstallMetalOverride:
                 delattr(RayWorkerProc, "_metal_patched")
 
 
-def _unwrap_qwen3_sanitize(model_cls) -> bool:
-    """Restore upstream sanitize if this session already wrapped it."""
-    original = getattr(model_cls.sanitize, "_vllm_metal_original_sanitize", None)
-    if original is None:
-        return False
-    model_cls.sanitize = original
-    return True
+def _unwrap_qwen3_sanitize(model_cls) -> None:
+    """Restore upstream sanitize beneath both the FP8 and flat-prefix wrappers."""
+    while original := getattr(
+        model_cls.sanitize, "_vllm_metal_original_sanitize", None
+    ):
+        model_cls.sanitize = original
 
 
 def _tiny_qwen3_args(tie_word_embeddings: bool):
