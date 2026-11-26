@@ -134,16 +134,17 @@ def test_unsupported_reason_covers_each_gate() -> None:
     ],
 )
 def test_prefill_quantization_formats(
-    recorded_ops, prefill_backend, dtype, k_quant, v_quant
+    recorded_ops, prefill_backend, monkeypatch, dtype, k_quant, v_quant
 ):
+    # Test the host hint on CI machines with or without a NAX library.
+    monkeypatch.setattr(get_ops(), "nax_ready", lambda: True)
     case = build_case(dtype=dtype, k_quant=k_quant, v_quant=v_quant)
     assert_parity(case)
     assert len(recorded_ops) == 1
     args, kwargs = recorded_ops[0]
     assert not kwargs.get("use_turboquant", False)
     assert kwargs["window_seqlen_q"] == case.ctx.verify_window_q == 1
-    # With NAX, two full Q blocks retain the original loop.
-    assert kwargs.get("nax_split_hint") == (0 if get_ops().nax_ready() else None)
+    assert kwargs["nax_split_hint"] == 0  # Two full Q blocks retain the original loop.
     assert args[1].dtype == dtype
     assert args[1].shape == (17, 16, 2, 128)
 
@@ -152,8 +153,10 @@ def test_prefill_quantization_formats(
     ("head_dim", "block_size"), [(64, 8), (128, 32), (256, 544), (512, 64)]
 )
 def test_prefill_strided_translated_pages(
-    recorded_ops, prefill_backend, head_dim, block_size
+    recorded_ops, prefill_backend, monkeypatch, head_dim, block_size
 ):
+    # Test the host hint on CI machines with or without a NAX library.
+    monkeypatch.setattr(get_ops(), "nax_ready", lambda: True)
     case = build_case(
         head_dim=head_dim,
         block_size=block_size,
@@ -167,7 +170,7 @@ def test_prefill_strided_translated_pages(
     assert_parity(case)
     args, kwargs = recorded_ops[0]
     assert not kwargs.get("use_turboquant", False)
-    assert kwargs.get("nax_split_hint") == (1 if get_ops().nax_ready() else None)
+    assert kwargs["nax_split_hint"] == 1
     kb = args[9]
     # Only ceil(valid KV / kernel block) pages, even if the scheduler page
     # contains many unused sub-blocks and the input table has spare capacity.

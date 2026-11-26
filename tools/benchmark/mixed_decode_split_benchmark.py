@@ -181,15 +181,9 @@ class Arms:
         cu = _cumsum(shape.query_lens)
         self.decode_lens = shape.kv_lens[:d]
         # Whole-batch and prefill-only NAX hints, as sdpa_forward computes them.
-        self.work_all = self.work_prefill = None
-        if (
-            capabilities["nax_split_hint"]
-            and self.ops.nax_ready()
-            and self.ops.tile_config(shape.head_size) is not None
-        ):
-            self.work_all, self.work_prefill = nax_tile_work_views(
-                cu, shape.kv_lens, prefill_start=d or None
-            )
+        self.work_all, self.work_prefill = nax_tile_work_views(
+            cu, shape.kv_lens, prefill_start=d or None
+        )
         prefill_cu = [c - cu[d] for c in cu[d:]]
         x = inputs
         self.decode_x = Inputs(
@@ -266,7 +260,8 @@ class Arms:
 
     def _prefill_only(self) -> mx.array:
         kwargs = {"num_decode_requests": 0, "num_decode_tokens": 0}
-        kwargs.update(self._nax(self.work_prefill or self.work_all))
+        work = self.work_all if self.work_prefill is None else self.work_prefill
+        kwargs.update(self._nax(work))
         return self._call(self.prefill_x, self.shape.prefill_len, **kwargs)
 
     def split_emulated(self) -> list[mx.array]:

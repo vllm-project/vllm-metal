@@ -1069,9 +1069,10 @@ def sdpa_forward(
             if ctx.paged_native_capabilities is None:
                 ctx.paged_native_capabilities = paged_attention_capabilities(ops)
             capabilities = ctx.paged_native_capabilities
+            # The dequantized lane only admits full-attention layers.
             nax_kwargs = (
                 nax_split_kwargs(capabilities, batch.nax_work, q_3d.shape[2])
-                if capabilities["nax_split_hint"] and ops.nax_ready()
+                if ops.nax_ready()
                 else {}
             )
             out = ops.paged_attention_primitive(
@@ -1114,14 +1115,10 @@ def sdpa_forward(
         paged_kwargs: dict[str, Any] = dict(mm_kwargs)
         paged_kwargs.update(_whole_batch_decode_routing_kwargs(ctx, q_3d.shape[0], ops))
         capabilities = ctx.paged_native_capabilities
-        if (
-            q_3d.shape[0] > len(ctx.context_lens)
-            and capabilities["nax_split_hint"]
-            and ctx.verify_window_q == 1
-            and mm_prefix_ranges is None
-            and q_3d.dtype in (mx.float16, mx.bfloat16)
-            and q_3d.dtype == kernel_k_cache.dtype
-        ):
+        if capabilities["nax_split_hint"] and q_3d.shape[0] > len(ctx.context_lens):
+            # Prefill batch: pick the NAX pipeline from per-sequence lengths
+            # the kernel dispatcher could only read back from the GPU.
+            # Native alone decides whether to split off ordinary decode rows.
             work = prefill_work = None
             cache = ctx.nax_tile_work
             if cache is not None and layer_sliding_window in cache:
@@ -1130,9 +1127,8 @@ def sdpa_forward(
                 ctx.cu_seqlens is not None
                 and len(ctx.cu_seqlens) == len(ctx.context_lens) + 1
                 and ctx.cu_seqlens[-1] == q_3d.shape[0]
+                # Skip counting when native NAX cannot consume the hint.
                 and ops.nax_ready()
-                # NAX and tiled prefill support the same kernel head sizes.
-                and ops.tile_config(head_dim) is not None
             ):
                 num_decode = ctx.num_decode_requests
                 prefill_start = (
@@ -1140,6 +1136,7 @@ def sdpa_forward(
                     if capabilities["nax_prefill_split_hint"]
                     and 0 < num_decode < len(ctx.context_lens)
                     and num_decode == ctx.num_decode_tokens
+                    and ctx.verify_window_q == 1
                     else None
                 )
                 work, prefill_work = nax_tile_work_views(
@@ -1153,7 +1150,7 @@ def sdpa_forward(
                 cache[layer_sliding_window] = work, prefill_work
             paged_kwargs.update(
                 nax_split_kwargs(
-                    capabilities, work, head_dim, prefill_work=prefill_work
+                    capabilities, work, q_3d.shape[2], prefill_work=prefill_work
                 )
             )
         out = ops.paged_attention_primitive(
