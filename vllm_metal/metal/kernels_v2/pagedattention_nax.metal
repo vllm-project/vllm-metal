@@ -753,7 +753,6 @@ void paged_attention_nax_grouped_full(
     device const int *cu_seqlens_q [[buffer(19)]],
     const constant int &num_seqs [[buffer(20)]],
     const constant int &sliding_window [[buffer(21)]],
-    const constant int &q_block_offset [[buffer(30)]],
     uint3 tgp [[threadgroup_position_in_grid]],
     uint3 tgpg [[threadgroups_per_grid]],
     uint sg_idx [[simdgroup_index_in_threadgroup]])
@@ -775,7 +774,7 @@ void paged_attention_nax_grouped_full(
   // changing the per-head attention calculation or the buffer ABI.
   const int kv_head_idx = int(tgp.x) / (GROUP_SIZE / HEADS_PER_TG);
   const int head_idx = int(tgp.x) * HEADS_PER_TG + int(sg_idx);
-  const int q_block_global_idx = int(tgp.y) + q_block_offset;
+  const int q_block_global_idx = int(tgp.y);
   const long kv_token_stride = long(num_kv_heads) * kv_head_stride;
 
   // Varlen: map global q-block -> (sequence, block-within-sequence).
@@ -924,7 +923,6 @@ void paged_attention_nax_grouped_full(
       device const int *cu_seqlens_q [[buffer(19)]],                         \
       const constant int &num_seqs [[buffer(20)]],                           \
       const constant int &sliding_window [[buffer(21)]],                     \
-      const constant int &q_block_offset [[buffer(30)]],                     \
       uint3 tgp [[threadgroup_position_in_grid]],                            \
       uint3 tgpg [[threadgroups_per_grid]],                                  \
       uint sg_idx [[simdgroup_index_in_threadgroup]]);
