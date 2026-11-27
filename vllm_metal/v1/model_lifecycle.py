@@ -31,6 +31,7 @@ from vllm_metal.multimodal.gemma4 import Gemma4VisionSidecar
 from vllm_metal.quant.awq_loader import AWQQuantLoader
 from vllm_metal.tensor_bridge import TORCH_TO_MLX_DTYPE
 from vllm_metal.utils import get_model_download_path, resolve_mlx_lm_model_path
+from vllm_metal.v1.cache_policy import uses_metal_offloading
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPAssistantLoader
 from vllm_metal.v1.mlx_lm_paths import (
     mlx_lm_compatible_model_path as _mlx_lm_compatible_model_path,
@@ -211,6 +212,17 @@ class ModelLifecycle:
             )
         ):
             loaded_model = self._load_generation(request)
+
+        # The uni executor loads the weights before constructing its disk tiers.
+        # A Hub GGUF selector has resolved to the exact file used by the loader.
+        config = self._runner.vllm_config
+        if uses_metal_offloading(config):
+            assert config.kv_transfer_config is not None
+            extra = config.kv_transfer_config.kv_connector_extra_config
+            for tier in extra.get("secondary_tiers") or ():
+                tier["gguf_weights_path"] = (
+                    request.gguf_source.weights_path if request.gguf_source else None
+                )
 
         self._install_generation_model(loaded_model, request)
 
