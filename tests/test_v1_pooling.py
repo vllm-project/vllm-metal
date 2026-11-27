@@ -855,6 +855,25 @@ class TestMetalPoolingCapabilities:
         with pytest.raises(NotImplementedError, match="does not support quantization"):
             load_embedding_gemma2_backend(config)
 
+    def test_encoder_download_falls_back_to_pytorch_at_same_commit(self, tmp_path):
+        from vllm_metal.v1.pooling.backends.encoder.models import loading
+
+        snapshot = tmp_path / ("a" * 40)
+        snapshot.mkdir()
+
+        def download(*, repo_id, revision, allow_patterns):
+            if "pytorch_model*.bin" in allow_patterns:
+                assert revision == snapshot.name
+                torch.save({"probe": torch.tensor([2])}, snapshot / "pytorch_model.bin")
+            else:
+                assert revision == "main"
+            return str(snapshot)
+
+        config = _encoder_model_config(model="org/encoder", revision="main")
+        with patch.object(loading, "snapshot_download", side_effect=download):
+            weights = loading.load_encoder_weights(loading.encoder_model_path(config))
+        assert weights["probe"].tolist() == [2]
+
     @pytest.mark.parametrize("model_type", ["xlm-roberta", "roberta"])
     @pytest.mark.parametrize("pooling_type", ["CLS", "LAST", "MEAN"])
     @pytest.mark.parametrize("dimensions", [None, 4])
@@ -951,6 +970,7 @@ class TestMetalPoolingCapabilities:
             atol=1e-5,
             rtol=1e-5,
         )
+        assert "pytorch_model*.bin" not in download.call_args.kwargs["allow_patterns"]
         assert download.call_count == 1
         assert download.call_args.kwargs["repo_id"] == "encoder-checkpoint"
         assert download.call_args.kwargs["revision"] == "model-revision"
