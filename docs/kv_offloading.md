@@ -69,11 +69,13 @@ The pool takes memory only as chunks are stored. Level 1 sleep frees it (see
 
 ## Limits
 
-Only uniform full-attention models are supported (GQA, MHA, MQA, and MLA),
-for example Qwen3 dense models or MiniCPM3. Refused at startup:
+Supported layouts are uniform full attention (GQA, MHA, MQA, and MLA),
+and full attention with aligned Gated DeltaNet (GDN) state. Hybrid GDN
+offloading requires prefix caching. The longest reusable prefix ends at a
+boundary where the attention pages and all recurrent checkpoints are present.
+Refused at startup:
 
-- Sliding-window models, and models whose KV cache splits into more than one
-  group (hybrid models).
+- Sliding-window models and other hybrid layouts.
 - Draft-model speculative decoding.
 - Pooling and speech-to-text models.
 - Pipeline and data parallelism, and any executor other than `uni`.
@@ -104,7 +106,8 @@ the tier would publish nothing.
 ## Operational notes
 
 - **Disk cap.** When a store would cross the cap, the least recently stored or
-  restored blocks are deleted first. Files with a load or store in flight are
+  restored blocks are deleted first. Files from prior hybrid layouts count
+  toward the cap. Files with a load or store in flight are
   never deleted. The cap is per process, so give each server its own
   `root_dir`. A Time Machine local snapshot can hold deleted block files until
   macOS reclaims the space, which it does when the disk runs low.

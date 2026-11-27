@@ -319,11 +319,15 @@ def test_lmcache_backend_rejected() -> None:
 
 
 def test_validate_metal_support_guards() -> None:
-    """Only a single full-attention group reaches the offload path."""
+    """Dense attention and full attention with aligned GDN reach offload."""
     import torch
+    from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
     from vllm.v1.kv_cache_interface import (
         FullAttentionSpec,
         HiddenStateCacheSpec,
+        KVCacheConfig,
+        KVCacheGroupSpec,
+        MambaSpec,
         MLAAttentionSpec,
         SlidingWindowSpec,
     )
@@ -342,9 +346,26 @@ def test_validate_metal_support_guards() -> None:
         group = SimpleNamespace(kv_cache_spec=spec, layer_names=layer_names)
         validate_metal_support(SimpleNamespace(kv_cache_groups=[group]))
 
-    with pytest.raises(NotImplementedError, match="2 groups"):
-        group = SimpleNamespace(kv_cache_spec=full, layer_names=("layer0",))
-        validate_metal_support(SimpleNamespace(kv_cache_groups=[group, group]))
+    attention = KVCacheGroupSpec(["attention"], full)
+    gdn = MambaSpec(
+        block_size=16,
+        shapes=((2, 16), (4, 16, 16)),
+        dtypes=(torch.bfloat16, torch.float32),
+        mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
+        mamba_cache_mode="align",
+    )
+    state = KVCacheGroupSpec(["state"], gdn)
+    validate_metal_support(KVCacheConfig(2, [], [attention, state]))
+    with pytest.raises(NotImplementedError, match="aligned GDN"):
+        validate_metal_support(KVCacheConfig(2, [], [attention, attention]))
+    with pytest.raises(NotImplementedError, match="aligned GDN"):
+        validate_metal_support(
+            KVCacheConfig(
+                2,
+                [],
+                [attention, KVCacheGroupSpec(["state"], gdn, enable_kv_transfer=False)],
+            )
+        )
     with pytest.raises(NotImplementedError, match="SlidingWindowSpec"):
         check(SlidingWindowSpec(**dims, sliding_window=128))
     # MLA keeps one latent head per token and offloads like full attention.
@@ -429,14 +450,11 @@ def test_pooling_rejected_at_config_time() -> None:
         MetalPlatform.check_and_update_config(vllm_config)
 
 
-@pytest.mark.parametrize("use_mla", [False, True])
-def test_hybrid_rejected_at_config_time(use_mla: bool) -> None:
-    """Hybrids fail before the weights load: Qwen3.5 (use_mla=False), and Ling
-    and Kimi Linear (use_mla=True), which the old use_mla check refused here."""
+def test_hybrid_offloading_requires_prefix_caching() -> None:
     vllm_config = _base_config(kv_offloading_size=1.0)
-    vllm_config.model_config.use_mla = use_mla
     vllm_config.model_config.is_hybrid = True
-    with pytest.raises(NotImplementedError, match="single full-attention KV cache"):
+    vllm_config.cache_config.enable_prefix_caching = False
+    with pytest.raises(NotImplementedError, match="--enable-prefix-caching"):
         configure_kv_offloading(vllm_config)
 
 
@@ -445,6 +463,16 @@ def test_mla_accepted_at_config_time() -> None:
     vllm_config.model_config.use_mla = True
     MetalPlatform.check_and_update_config(vllm_config)
     assert vllm_config.kv_transfer_config.kv_connector == "MetalOffloadingConnector"
+
+
+@pytest.mark.parametrize(("use_mla", "kv_lora_rank"), [(True, None), (False, 512)])
+def test_hybrid_mla_rejected_at_config_time(use_mla, kv_lora_rank) -> None:
+    vllm_config = _base_config(kv_offloading_size=1.0, enable_prefix_caching=True)
+    vllm_config.model_config.is_hybrid = True
+    vllm_config.model_config.use_mla = use_mla
+    vllm_config.model_config.hf_text_config.kv_lora_rank = kv_lora_rank
+    with pytest.raises(NotImplementedError, match="hybrid MLA"):
+        configure_kv_offloading(vllm_config)
 
 
 def _tiered(kv_offloading_size: float = 1.0) -> SimpleNamespace:
