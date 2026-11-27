@@ -721,15 +721,15 @@ def _qwen3moe_reference(gguf_path: str, cfg_dir: str) -> nn.Module:
         pytest.param(QT.Q2_K, QT.Q3_K, id="q2_k"),
     ],
 )
-# 2 tokens x top-2 stays under the 4-expert gather-QMV cap (8 assignments); 40
-# tokens also crosses SwitchGLU's sort threshold (64 assignments).
-@pytest.mark.parametrize("num_tokens", [2, 40])
+# Raw experts use gather at 2 and 16 tokens, and dense at 40, which is sorted.
+@pytest.mark.parametrize("num_tokens", [2, 16, 40])
 def test_qwen3moe_blocks_match_dequantized_source_model(
-    tmp_path, expert_type, down_type, num_tokens
+    tmp_path, monkeypatch, expert_type, down_type, num_tokens
 ):
     # Feed each MoE block the same input so routing is identical; whole-model
     # logits would compound the quantized attention's fp32 differences into
     # router near-ties.
+    monkeypatch.setenv("VLLM_METAL_GGUF_FAST_QMV", "1")
     gguf_path, cfg_dir = _build_qwen3moe_fixture(
         tmp_path, expert_type=expert_type, down_type=down_type
     )

@@ -108,10 +108,11 @@ def test_matmul_qmv_path_matches_dense_oracle_f32(monkeypatch, batch, qtype):
 
 
 @pytest.mark.parametrize("qtype", _RAW_QTYPES)
-def test_matmul_gemm_path_matches_dense_oracle_f32(monkeypatch, qtype):
+@pytest.mark.parametrize("batch", [9, 32])
+def test_matmul_gemm_path_matches_dense_oracle_f32(monkeypatch, batch, qtype):
     qt, oracle = _make_raw_tensor(qtype=qtype)
     calls = _spy_matmul_paths(monkeypatch)
-    x = mx.random.normal((32, qt.in_features)).astype(mx.float32)
+    x = mx.random.normal((batch, qt.in_features)).astype(mx.float32)
 
     out = qt.matmul(x)
     expected = mx.matmul(x, mx.array(oracle).T, stream=mx.cpu)
@@ -294,10 +295,12 @@ def test_matmul_rejects_wrong_last_dim():
 _NUM_EXPERTS = 4
 
 
-def _make_expert_tensor(qtype: gguf.GGMLQuantizationType) -> tuple:
-    """Four 8-row experts stacked in one tensor, plus their (E, rows, in) oracle."""
-    qt, oracle = _make_raw_tensor(rows=_NUM_EXPERTS * 8, qtype=qtype)
-    return qt, oracle.reshape(_NUM_EXPERTS, 8, qt.in_features)
+def _make_expert_tensor(
+    qtype: gguf.GGMLQuantizationType, num_experts: int = _NUM_EXPERTS
+) -> tuple:
+    """Stack 8-row experts in one tensor, plus their (E, rows, in) oracle."""
+    qt, oracle = _make_raw_tensor(rows=num_experts * 8, qtype=qtype)
+    return qt, oracle.reshape(num_experts, 8, qt.in_features)
 
 
 def _gather_oracle(x: mx.array, indices: mx.array, experts: np.ndarray) -> mx.array:
@@ -314,11 +317,22 @@ def _assert_close_to(out: mx.array, expected: mx.array) -> None:
 
 
 @pytest.mark.parametrize("qtype", _RAW_QTYPES)
-@pytest.mark.parametrize(("tokens", "dequantizes"), [(1, False), (4, False), (5, True)])
-def test_gather_matmul_matches_expert_oracle(monkeypatch, qtype, tokens, dequantizes):
+@pytest.mark.parametrize(
+    ("fast_flag", "tokens", "dequantizes"),
+    [
+        ("0", 4, False),
+        ("0", 5, True),
+        ("1", 1, False),
+        ("1", 5, False),
+        ("1", 16, False),
+        ("1", 17, True),
+    ],
+)
+def test_gather_matmul_matches_expert_oracle(
+    monkeypatch, qtype, fast_flag, tokens, dequantizes
+):
     # SwitchGLU's unsorted call: x (B, L, 1, 1, in) routed by indices (B, L, k).
-    # Four experts cap gather QMV at 8 (token, expert) assignments; 5 x top-2
-    # is 10.
+    monkeypatch.setenv("VLLM_METAL_GGUF_FAST_QMV", fast_flag)
     qt, experts = _make_expert_tensor(qtype)
     calls = _spy_matmul_paths(monkeypatch)
     x = mx.random.normal((1, tokens, 1, 1, qt.in_features))
@@ -331,15 +345,16 @@ def test_gather_matmul_matches_expert_oracle(monkeypatch, qtype, tokens, dequant
     _assert_close_to(out, _gather_oracle(x, indices, experts))
 
 
-# 4 tokens x top-2 runs gather QMV and 5 the dense arm; tolerances as for matmul.
-@pytest.mark.parametrize("tokens", [4, 5])
+# 16 tokens x top-2 runs gather QMV and 17 the dense arm; tolerances as for matmul.
+@pytest.mark.parametrize("tokens", [16, 17])
 @pytest.mark.parametrize(
     ("dtype", "rel_tol"), [(mx.float16, 4e-3), (mx.bfloat16, 8e-3)]
 )
 @pytest.mark.parametrize("qtype", _RAW_QTYPES)
 def test_gather_matmul_low_precision_matches_expert_oracle(
-    dtype, rel_tol, tokens, qtype
+    monkeypatch, dtype, rel_tol, tokens, qtype
 ):
+    monkeypatch.setenv("VLLM_METAL_GGUF_FAST_QMV", "1")
     qt, experts = _make_expert_tensor(qtype)
     x = mx.random.normal((1, tokens, 1, 1, qt.in_features)).astype(dtype)
     indices = mx.random.randint(0, _NUM_EXPERTS, (1, tokens, 2))
@@ -358,15 +373,141 @@ def test_gather_matmul_low_precision_matches_expert_oracle(
     )
 
 
-# 8 assignments run gather QMV and 80 the dense arm.
-@pytest.mark.parametrize("assignments", [8, 80])
+@pytest.mark.parametrize(
+    ("assignments", "dequantizes"), [(8, False), (64, False), (65, True)]
+)
 @pytest.mark.parametrize("qtype", _RAW_QTYPES)
-def test_gather_matmul_sorted_matches_expert_oracle(qtype, assignments):
+def test_gather_matmul_sorted_matches_expert_oracle(
+    monkeypatch, qtype, assignments, dequantizes
+):
     # SwitchGLU sorts 64+ assignments into x (N, 1, in) with ascending indices.
-    qt, experts = _make_expert_tensor(qtype)
+    monkeypatch.setenv("VLLM_METAL_GGUF_FAST_QMV", "1")
+    num_experts = 8
+    qt, experts = _make_expert_tensor(qtype, num_experts)
+    calls = _spy_matmul_paths(monkeypatch)
     x = mx.random.normal((assignments, 1, qt.in_features))
-    indices = mx.sort(mx.random.randint(0, _NUM_EXPERTS, (assignments,)))
+    indices = mx.sort(mx.random.randint(0, num_experts, (assignments,)))
 
-    out = qt.gather_matmul(x, indices, num_experts=_NUM_EXPERTS, sorted_indices=True)
+    out = qt.gather_matmul(x, indices, num_experts=num_experts, sorted_indices=True)
 
+    assert calls["gemm"] == int(dequantizes)
     _assert_close_to(out, _gather_oracle(x, indices, experts))
+
+
+@pytest.mark.parametrize("fast_flag", ["0", "1"])
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("qtype", _RAW_QTYPES)
+def test_dequantize_fast_and_ref_match_oracle_exact(
+    monkeypatch, fast_flag, dtype, qtype
+):
+    monkeypatch.setenv("VLLM_METAL_GGUF_FAST_QMV", fast_flag)
+    qt, oracle = _make_raw_tensor(rows=7, cols=3 * 256, qtype=qtype)
+
+    out = qt._dequantize_rows(qt.qweight, dtype)
+    expected = mx.array(oracle).astype(dtype)
+    mx.eval(out, expected)
+
+    assert out.dtype == dtype
+    assert out.shape == (7, 3 * 256)
+    assert mx.array_equal(out, expected).item()
+
+
+@pytest.mark.parametrize("qtype", _RAW_QTYPES)
+@pytest.mark.parametrize(
+    ("dtype", "atol", "rtol"),
+    [
+        (mx.float16, 1e-3, 2e-3),
+        (mx.bfloat16, 1e-2, 1e-2),
+        (mx.float32, 1e-4, 1e-4),
+    ],
+)
+@pytest.mark.parametrize("rows", [1, 3, 5, 7, 13])
+@pytest.mark.parametrize("cols", [256, 3 * 256, 5 * 256])
+@pytest.mark.parametrize("batch", [1, 2, 4, 5, 8])
+def test_simd_qmv_matches_reference_path_and_oracle_edge_shapes(
+    monkeypatch, qtype, dtype, atol, rtol, rows, cols, batch
+):
+    qt, oracle = _make_raw_tensor(rows=rows, cols=cols, qtype=qtype)
+    mx.random.seed(17 + rows + batch)
+    x = mx.random.normal((batch, cols)).astype(dtype)
+
+    monkeypatch.setenv("VLLM_METAL_GGUF_FAST_QMV", "1")
+    fast_out = qt.matmul(x)
+    monkeypatch.setenv("VLLM_METAL_GGUF_FAST_QMV", "0")
+    ref_out = qt.matmul(x)
+    oracle_out = mx.matmul(x.astype(mx.float32), mx.array(oracle).T, stream=mx.cpu)
+    mx.eval(fast_out, ref_out, oracle_out)
+
+    assert fast_out.dtype == dtype
+    assert fast_out.shape == (batch, rows)
+    np.testing.assert_allclose(
+        np.array(fast_out.astype(mx.float32)),
+        np.array(ref_out.astype(mx.float32)),
+        atol=atol,
+        rtol=rtol,
+    )
+    ref_max = max(float(mx.max(mx.abs(oracle_out))), 1.0)
+    oracle_rel = {mx.float32: 4e-5, mx.float16: 4e-3, mx.bfloat16: 8e-3}[dtype]
+    np.testing.assert_allclose(
+        np.array(fast_out.astype(mx.float32)),
+        np.array(oracle_out),
+        rtol=0,
+        atol=ref_max * oracle_rel,
+    )
+
+
+@pytest.mark.parametrize("qtype", _RAW_QTYPES)
+@pytest.mark.parametrize(
+    ("dtype", "atol", "rtol"),
+    [
+        (mx.float16, 1e-3, 2e-3),
+        (mx.bfloat16, 1e-2, 1e-2),
+        (mx.float32, 1e-4, 1e-4),
+    ],
+)
+@pytest.mark.parametrize("rows_per_expert", [5, 7])
+def test_simd_gather_qmv_edge_expert_rows_and_broadcasts(
+    monkeypatch, qtype, dtype, atol, rtol, rows_per_expert
+):
+    """Exercise partial expert row tails and both shared-x and general broadcast shapes."""
+    num_experts = 4
+    cols = 3 * 256
+    qt, oracle = _make_raw_tensor(
+        rows=num_experts * rows_per_expert, cols=cols, qtype=qtype
+    )
+    experts = oracle.reshape(num_experts, rows_per_expert, cols)
+    mx.random.seed(91 + rows_per_expert)
+
+    # Case 1: SwitchGLU shared-token broadcast (1, 3, 1, 1, D) x (1, 3, 2) -> x_repeat=2
+    # Case 2: Multi-axis broadcast (2, 1, 1, D) x (1, 2, 2) -> fallback broadcast path
+    shapes = [
+        ((1, 3, 1, 1, cols), (1, 3, 2)),
+        ((2, 1, 1, cols), (1, 2, 2)),
+    ]
+    for x_shape, idx_shape in shapes:
+        x = mx.random.normal(x_shape).astype(dtype)
+        indices = mx.random.randint(0, num_experts, idx_shape)
+
+        monkeypatch.setenv("VLLM_METAL_GGUF_FAST_QMV", "1")
+        fast_out = qt.gather_matmul(x, indices, num_experts=num_experts)
+        monkeypatch.setenv("VLLM_METAL_GGUF_FAST_QMV", "0")
+        ref_out = qt.gather_matmul(x, indices, num_experts=num_experts)
+        oracle_out = _gather_oracle(x.astype(mx.float32), indices, experts)
+        mx.eval(fast_out, ref_out, oracle_out)
+
+        assert fast_out.dtype == dtype
+        assert fast_out.shape == ref_out.shape
+        np.testing.assert_allclose(
+            np.array(fast_out.astype(mx.float32)),
+            np.array(ref_out.astype(mx.float32)),
+            atol=atol,
+            rtol=rtol,
+        )
+        ref_max = max(float(mx.max(mx.abs(oracle_out))), 1.0)
+        oracle_rel = {mx.float32: 4e-5, mx.float16: 4e-3, mx.bfloat16: 8e-3}[dtype]
+        np.testing.assert_allclose(
+            np.array(fast_out.astype(mx.float32)),
+            np.array(oracle_out),
+            rtol=0,
+            atol=ref_max * oracle_rel,
+        )

@@ -6,10 +6,10 @@
   dequant  dequantize every expert once, then ``mx.gather_mm`` (the baseline).
   kernel   gather QMV: each (token, expert) pair decodes only its expert's rows.
 
-It picks the kernel while ``pairs <= _GATHER_QMV_MAX_ASSIGNMENTS_PER_EXPERT *
-num_experts``. This script forces each arm in turn through a full mlx-lm
-``SwitchGLU`` (gate, up, down; sorting at >= 64 pairs as in serving) and
-derives the per-call time every candidate constant would give.
+It picks the kernel while ``pairs <= limit * num_experts``, with separate
+limits for the SIMD and legacy kernels. This script forces each arm in turn
+through a full mlx-lm ``SwitchGLU`` (gate, up, down; sorting at >= 64 pairs as
+in serving) and derives the per-call time every candidate constant would give.
 
 Each timed evaluation queues ``--layers`` SwitchGLU calls, as a forward pass
 does, and reports milliseconds per layer. Arms alternate in random order each
@@ -17,7 +17,7 @@ rep. Both arms' outputs are checked against each other before timing.
 
 Run from the repository root:
 
-    python tools/benchmark/gguf_gather_qmv_crossover.py
+    python -m tools.benchmark.gguf_gather_qmv_crossover
 """
 
 from __future__ import annotations
@@ -68,6 +68,7 @@ def _routing(tokens: int, num_experts: int, top_k: int) -> mx.array:
 
 def _run(glu, x, idx, arm: str, layers: int) -> list[mx.array]:
     rb._GATHER_QMV_MAX_ASSIGNMENTS_PER_EXPERT = _ARMS[arm]
+    rb._GATHER_QMV_LEGACY_MAX_ASSIGNMENTS_PER_EXPERT = _ARMS[arm]
     outs = [glu(x, idx) for _ in range(layers)]
     mx.eval(outs)
     return outs

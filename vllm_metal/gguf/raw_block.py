@@ -34,11 +34,15 @@ Element ``e`` of half ``c`` decodes as
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any
 
 import mlx.core as mx
 import numpy as np
 from gguf import GGML_QUANT_SIZES, GGMLQuantizationType
+
+import vllm_metal.envs as envs
+from vllm_metal.metal import _read_v2_metal_source
 
 # qtypes executed from raw GGUF block bytes by the kernels below (#761).
 _RAW_KERNEL_BITS: dict[GGMLQuantizationType, int] = {
@@ -48,8 +52,7 @@ _RAW_KERNEL_BITS: dict[GGMLQuantizationType, int] = {
 }
 RAW_KERNEL_GGUF_TYPES = frozenset(_RAW_KERNEL_BITS)
 
-# Above this flattened batch the per-row qmv kernel loses to a transient
-# dequantize + dense GEMM (measured; numbers in the PR).
+# SIMD QMV slows sharply above this batch size versus dequantize + GEMM.
 _QMV_MAX_BATCH = 8
 
 _Q2K_DEQUANT_SOURCE = """
@@ -303,9 +306,36 @@ _GATHER_QMV_KERNELS: dict[GGMLQuantizationType, Any] = {
     for qtype, body in _QMV_BODIES.items()
 }
 
-# Threshold for when it's likely faster to make a transient dequantized copy
-# of the expert tensor in memory first (measured; results in PR)
-_GATHER_QMV_MAX_ASSIGNMENTS_PER_EXPERT = 2
+# The SIMD gather kernel handles more assignments before dequantization wins.
+_GATHER_QMV_MAX_ASSIGNMENTS_PER_EXPERT = 8
+_GATHER_QMV_LEGACY_MAX_ASSIGNMENTS_PER_EXPERT = 2
+
+_SIMD_LANES = 32
+_SIMDGROUPS_PER_TG = 2
+
+
+@lru_cache(maxsize=1)
+def _fast_kernels() -> tuple[Any, Any, Any]:
+    raw = _read_v2_metal_source("gguf_raw_block.metal")
+    dequant = mx.fast.metal_kernel(
+        name="gguf_raw_simd_dequant",
+        input_names=["blocks"],
+        output_names=["out"],
+        source=f"#define GGUF_KERNEL_MODE 0\n{raw}\n#undef GGUF_KERNEL_MODE\n",
+    )
+    qmv = mx.fast.metal_kernel(
+        name="gguf_raw_simd_qmv",
+        input_names=["blocks", "x"],
+        output_names=["y"],
+        source=f"#define GGUF_KERNEL_MODE 1\n{raw}\n#undef GGUF_KERNEL_MODE\n",
+    )
+    gather_qmv = mx.fast.metal_kernel(
+        name="gguf_raw_simd_gather_qmv",
+        input_names=["blocks", "x", "idx"],
+        output_names=["y"],
+        source=f"#define GGUF_KERNEL_MODE 2\n{raw}\n#undef GGUF_KERNEL_MODE\n",
+    )
+    return dequant, qmv, gather_qmv
 
 
 @dataclass(frozen=True, eq=False)
@@ -452,7 +482,7 @@ class GGUFRawBlockTensor:
         if rows == 0:
             return mx.zeros((*lead, self.out_features), dtype=x.dtype)
         if rows <= _QMV_MAX_BATCH:
-            out = self._qmv(flat.astype(mx.float32))
+            out = self._qmv(flat)
         else:
             # Dequantizing straight into x's dtype keeps the GEMM there; a
             # float16 copy would promote bfloat16 activations to float32.
@@ -501,8 +531,28 @@ class GGUFRawBlockTensor:
         """Materialize the packed bytes backing this quantized tensor."""
         mx.eval(self.qweight)
 
-    def _qmv(self, x_f32: mx.array) -> mx.array:
-        batch = x_f32.shape[0]
+    def _qmv(self, x: mx.array) -> mx.array:
+        batch = x.shape[0]
+        if envs.VLLM_METAL_GGUF_FAST_QMV:
+            _, qmv_kernel, _ = _fast_kernels()
+            nr = 4 if batch <= 4 else 2
+            row_groups = (self.out_features + nr - 1) // nr
+            tg_y = min(_SIMDGROUPS_PER_TG, row_groups)
+            (y,) = qmv_kernel(
+                inputs=[self.qweight, x],
+                template=[
+                    ("T", x.dtype),
+                    ("QTYPE", self.bits),
+                    ("NB", batch),
+                    ("NR", nr),
+                ],
+                output_shapes=[(batch, self.out_features)],
+                output_dtypes=[x.dtype],
+                grid=(_SIMD_LANES, row_groups, 1),
+                threadgroup=(_SIMD_LANES, tg_y, 1),
+            )
+            return y
+        x_f32 = x if x.dtype == mx.float32 else x.astype(mx.float32)
         dims = mx.array([self.in_features // 256, self.out_features], dtype=mx.uint32)
         (y,) = _QMV_KERNELS[self.qweight_type](
             inputs=[self.qweight, x_f32, dims],
@@ -520,6 +570,19 @@ class GGUFRawBlockTensor:
         """Dequantize packed byte rows into an ``(rows, in)`` array."""
         n_rows = packed_rows.shape[0]
         n_elements = n_rows * self.in_features
+        if envs.VLLM_METAL_GGUF_FAST_QMV:
+            dequant_kernel, _, _ = _fast_kernels()
+            total_chunks = n_elements // 8
+            tg_x = min(_KERNEL_THREADGROUP, max(1, total_chunks))
+            (out,) = dequant_kernel(
+                inputs=[packed_rows],
+                template=[("T", output_dtype), ("QTYPE", self.bits)],
+                output_shapes=[(n_rows, self.in_features)],
+                output_dtypes=[output_dtype],
+                grid=(total_chunks, 1, 1),
+                threadgroup=(tg_x, 1, 1),
+            )
+            return out
         n = mx.array([n_elements], dtype=mx.uint32)
         (out,) = _DEQUANT_KERNELS[self.qweight_type](
             inputs=[packed_rows, n],
@@ -562,10 +625,31 @@ class GGUFRawBlockTensor:
             )
         assignment_shape = mx.broadcast_shapes(tuple(batch_dims), indices.shape)
         idx = mx.broadcast_to(indices, assignment_shape).flatten()
-        max_assignments = _GATHER_QMV_MAX_ASSIGNMENTS_PER_EXPERT * num_experts
+        use_fast_qmv = envs.VLLM_METAL_GGUF_FAST_QMV
+        assignments_per_expert = (
+            _GATHER_QMV_MAX_ASSIGNMENTS_PER_EXPERT
+            if use_fast_qmv
+            else _GATHER_QMV_LEGACY_MAX_ASSIGNMENTS_PER_EXPERT
+        )
+        max_assignments = assignments_per_expert * num_experts
         if m == 1 and 0 < idx.size <= max_assignments:
             # This arm runs when it's likely more efficient to dequantize each
             # row as it's needed within a custom kernel
+            if use_fast_qmv:
+                batch_tuple = tuple(batch_dims)
+                can_share_x = batch_tuple == assignment_shape or (
+                    len(batch_tuple) == len(assignment_shape)
+                    and batch_tuple[:-1] == assignment_shape[:-1]
+                    and batch_tuple[-1] == 1
+                )
+                if can_share_x:
+                    x_2d = x.reshape(-1, self.in_features)
+                else:
+                    x_2d = mx.broadcast_to(
+                        x, (*assignment_shape, 1, self.in_features)
+                    ).reshape(-1, self.in_features)
+                out = self._gather_qmv_fast(x_2d, idx, rows_per_expert, num_experts)
+                return out.reshape(*assignment_shape, 1, rows_per_expert)
             xs = mx.broadcast_to(x, (*assignment_shape, 1, self.in_features))
             out = self._gather_qmv(
                 xs.reshape(-1, self.in_features).astype(mx.float32),
@@ -588,6 +672,35 @@ class GGUFRawBlockTensor:
             # memory longer than necessary
             mx.eval(out)
             return out
+
+    def _gather_qmv_fast(
+        self,
+        x_2d: mx.array,
+        idx: mx.array,
+        rows_per_expert: int,
+        num_experts: int,
+    ) -> mx.array:
+        _, _, gather_kernel = _fast_kernels()
+        assignments = idx.shape[0]
+        nr = 4
+        row_groups = (rows_per_expert + nr - 1) // nr
+        tg_y = min(_SIMDGROUPS_PER_TG, row_groups)
+        (y,) = gather_kernel(
+            inputs=[self.qweight, x_2d, idx],
+            template=[
+                ("T", x_2d.dtype),
+                ("IdxT", idx.dtype),
+                ("QTYPE", self.bits),
+                ("NB", 1),
+                ("NR", nr),
+                ("NUM_EXPERTS", num_experts),
+            ],
+            output_shapes=[(assignments, rows_per_expert)],
+            output_dtypes=[x_2d.dtype],
+            grid=(_SIMD_LANES, row_groups, assignments),
+            threadgroup=(_SIMD_LANES, tg_y, 1),
+        )
+        return y
 
     def _gather_qmv(
         self, xs_f32: mx.array, idx: mx.array, rows_per_expert: int
