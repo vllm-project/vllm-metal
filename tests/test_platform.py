@@ -2584,6 +2584,218 @@ class TestMetalPlatform:
         MetalPlatform.check_and_update_config(vllm_config)
         assert vllm_config.scheduler_config.disable_chunked_mm_input is False
 
+    def test_check_and_update_config_rejects_unsupported_block_fp8_target(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from vllm_metal.quant.awq_config import UnsupportedQuantizationConfigError
+
+        self._patch_stt_resolution(monkeypatch, is_stt=False)
+        vllm_config = self._platform_config(
+            model_config=SimpleNamespace(
+                quantization=None,
+                enable_sleep_mode=False,
+                model="Qwen/Qwen3-0.6B-FP8",
+                disable_cascade_attn=False,
+                tokenizer=None,
+                max_model_len=128,
+                multimodal_config=None,
+                hf_config=SimpleNamespace(
+                    model_type="qwen3",
+                    architectures=["Qwen3ForCausalLM"],
+                    quantization_config={
+                        "quant_method": "fp8",
+                        "weight_block_size": [128, 128],
+                    },
+                ),
+                is_hybrid=False,
+            )
+        )
+
+        with pytest.raises(UnsupportedQuantizationConfigError) as excinfo:
+            MetalPlatform.check_and_update_config(vllm_config)
+
+        msg = str(excinfo.value)
+        assert "qwen3" in msg
+        assert "bf16" in msg
+
+    def test_check_and_update_config_rejects_unsupported_block_fp8_engine_config(
+        self, tmp_path
+    ) -> None:
+        import json
+
+        from pydantic import ValidationError
+
+        (tmp_path / "config.json").write_text(
+            json.dumps(
+                {
+                    "architectures": ["Qwen3ForCausalLM"],
+                    "model_type": "qwen3",
+                    "hidden_size": 1024,
+                    "intermediate_size": 3072,
+                    "num_attention_heads": 16,
+                    "num_hidden_layers": 2,
+                    "num_key_value_heads": 8,
+                    "vocab_size": 1000,
+                    "quantization_config": {
+                        "activation_scheme": "dynamic",
+                        "fmt": "e4m3",
+                        "quant_method": "fp8",
+                        "weight_block_size": [128, 128],
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        # Pydantic wraps ValueError subclasses raised inside VllmConfig validation.
+        with pytest.raises(ValidationError) as excinfo:
+            EngineArgs(
+                model=str(tmp_path),
+                skip_tokenizer_init=True,
+                max_model_len=128,
+            ).create_engine_config()
+
+        msg = str(excinfo.value)
+        assert "qwen3" in msg
+        assert "weight_block_size=[128, 128]" in msg
+        assert "bf16" in msg
+
+    def test_check_and_update_config_allows_qwen35_moe_block_fp8_override(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._patch_stt_resolution(monkeypatch, is_stt=False)
+        reset_config()
+        try:
+            model_config = SimpleNamespace(
+                quantization=None,
+                enable_sleep_mode=False,
+                model="Qwen/Qwen3.6-35B-A3B-FP8",
+                disable_cascade_attn=False,
+                tokenizer=None,
+                max_model_len=128,
+                multimodal_config=MultiModalConfig(),
+                hf_config=SimpleNamespace(
+                    model_type="qwen3_5_moe",
+                    architectures=["Qwen3_5MoeForConditionalGeneration"],
+                    quantization_config={
+                        "quant_method": "fp8",
+                        "weight_block_size": [128, 128],
+                    },
+                ),
+                is_hybrid=False,
+            )
+            vllm_config = self._platform_config(
+                model_config=model_config,
+                cache_config=SimpleNamespace(enable_prefix_caching=False),
+            )
+
+            MetalPlatform.check_and_update_config(vllm_config)
+            assert model_config.multimodal_config is None
+        finally:
+            reset_config()
+
+    @pytest.mark.parametrize(
+        ("backend", "quantization", "mode", "multimodal"),
+        [
+            ("mlx", "gguf", None, False),
+            ("mlx", None, "multimodal-native", True),
+            ("mps", None, None, False),
+        ],
+        ids=["gguf", "mlx-vlm-native", "mps-backend"],
+    )
+    def test_check_and_update_config_skips_block_fp8_outside_mlx_lm(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        backend: str,
+        quantization: str | None,
+        mode: str | None,
+        multimodal: bool,
+    ) -> None:
+        self._patch_stt_resolution(monkeypatch, is_stt=False)
+        monkeypatch.setattr("vllm_metal.envs.VLLM_METAL_BACKEND", backend)
+        if backend == "mps":
+            monkeypatch.setattr(
+                "vllm_metal.pytorch_backend.worker.configure_mps",
+                lambda *_args, **_kwargs: None,
+            )
+        if mode is not None:
+            monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", mode)
+        reset_config()
+        try:
+            model_config = SimpleNamespace(
+                quantization=quantization,
+                enable_sleep_mode=False,
+                model="test-model",
+                disable_cascade_attn=False,
+                tokenizer=None,
+                max_model_len=128,
+                multimodal_config=MultiModalConfig() if multimodal else None,
+                hf_config=SimpleNamespace(
+                    model_type="qwen3_vl" if multimodal else "qwen3",
+                    architectures=(
+                        ["Qwen3VLForConditionalGeneration"]
+                        if multimodal
+                        else ["Qwen3ForCausalLM"]
+                    ),
+                    quantization_config={
+                        "quant_method": "fp8",
+                        "weight_block_size": [128, 128],
+                    },
+                ),
+                hf_text_config=None,
+                is_hybrid=False,
+            )
+            vllm_config = self._platform_config(
+                model_config=model_config,
+                cache_config=SimpleNamespace(enable_prefix_caching=False),
+            )
+
+            MetalPlatform.check_and_update_config(vllm_config)
+        finally:
+            reset_config()
+
+    def test_check_and_update_config_rejects_block_fp8_draft_model(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from vllm_metal.quant.awq_config import UnsupportedQuantizationConfigError
+
+        self._patch_stt_resolution(monkeypatch, is_stt=False)
+        spec_config = SimpleNamespace(
+            method="draft_model",
+            custom_method=None,
+            num_speculative_tokens=3,
+            dspark_draft_topk=None,
+            draft_model_config=SimpleNamespace(
+                model="Qwen/Qwen3-0.6B-FP8",
+                quantization=None,
+                hf_config=SimpleNamespace(
+                    model_type="qwen3",
+                    architectures=["Qwen3ForCausalLM"],
+                    quantization_config={
+                        "quant_method": "fp8",
+                        "weight_block_size": [128, 128],
+                    },
+                ),
+            ),
+        )
+        vllm_config = self._platform_config(
+            model_config=SimpleNamespace(
+                quantization=None,
+                enable_sleep_mode=False,
+                model="Qwen/Qwen3-8B",
+                disable_cascade_attn=False,
+                tokenizer=None,
+                max_model_len=128,
+                multimodal_config=None,
+                hf_config=SimpleNamespace(model_type="qwen3"),
+                is_hybrid=False,
+            ),
+            speculative_config=spec_config,
+        )
+
+        with pytest.raises(UnsupportedQuantizationConfigError, match="draft model"):
+            MetalPlatform.check_and_update_config(vllm_config)
+
 
 class TestKvBudgetBytes:
     """Tests for paged-attention base KV budget calculation.

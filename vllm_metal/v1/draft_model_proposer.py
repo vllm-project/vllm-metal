@@ -70,6 +70,7 @@ from vllm_metal.attention.context import (
 )
 from vllm_metal.attention.runtime.sdpa import SDPAPagedAttentionRuntime
 from vllm_metal.metal.constants import PA_WINDOW_MAX_HEAD_SIZE
+from vllm_metal.quant.fp8_config import validate_mlx_lm_block_fp8_support
 from vllm_metal.utils import get_model_download_path, resolve_mlx_lm_model_path
 from vllm_metal.v1.mlx_lm_paths import mlx_lm_compatible_model_path
 from vllm_metal.v1.proposer import (
@@ -961,6 +962,11 @@ def _load_draft_model(
     # (canonical loader: ModelLifecycle._load_generation_model).
     model_path = get_model_download_path(
         draft_model_config.model, revision=draft_model_config.revision
+    )
+    validate_mlx_lm_block_fp8_support(
+        getattr(draft_model_config, "hf_config", None),
+        model_path=model_path,
+        is_draft=True,
     )
     with mlx_lm_compatible_model_path(model_path) as compatible_path:
         resolved_path = resolve_mlx_lm_model_path(

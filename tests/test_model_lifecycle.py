@@ -1235,6 +1235,74 @@ class TestModelLifecycle:
         assert runner._is_vlm is False
         assert runner.model_args["vocab_size"] == 32000
 
+    def test_load_rejects_unsupported_block_fp8_before_resolve_or_load(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from unittest.mock import Mock
+
+        from vllm_metal.quant.awq_config import UnsupportedQuantizationConfigError
+
+        class _StubAWQLoader:
+            @classmethod
+            def for_model(cls, _model_name: str, *, revision: str | None) -> None:
+                return None
+
+        resolve_mock = Mock()
+        load_mock = Mock()
+        monkeypatch.setattr(model_lifecycle, "AWQQuantLoader", _StubAWQLoader)
+        monkeypatch.setattr(model_lifecycle, "resolve_mlx_lm_model_path", resolve_mock)
+        monkeypatch.setattr(model_lifecycle, "mlx_lm_load_model", load_mock)
+        lifecycle, _ = _make_lifecycle(
+            model_config=_runner_model_config(
+                hf_config=SimpleNamespace(
+                    model_type="qwen3",
+                    architectures=["Qwen3ForCausalLM"],
+                    quantization_config={
+                        "quant_method": "fp8",
+                        "weight_block_size": [128, 128],
+                    },
+                )
+            )
+        )
+
+        with pytest.raises(UnsupportedQuantizationConfigError, match="qwen3"):
+            lifecycle.load()
+
+        resolve_mock.assert_not_called()
+        load_mock.assert_not_called()
+
+    def test_load_mlx_lm_text_model_rejects_local_block_fp8_dir(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import json
+        from unittest.mock import Mock
+
+        from vllm_metal.quant.awq_config import UnsupportedQuantizationConfigError
+
+        (tmp_path / "config.json").write_text(
+            json.dumps(
+                {
+                    "model_type": "qwen3_moe",
+                    "architectures": ["Qwen3MoeForCausalLM"],
+                    "quantization_config": {
+                        "quant_method": "fp8",
+                        "weight_block_size": [128, 128],
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        load_mock = Mock()
+        monkeypatch.setattr(model_lifecycle, "mlx_lm_load_model", load_mock)
+        lifecycle, _ = _make_lifecycle(
+            model_config=_runner_model_config(hf_config=None)
+        )
+
+        with pytest.raises(UnsupportedQuantizationConfigError, match="qwen3_moe"):
+            lifecycle._load_mlx_lm_text_model(str(tmp_path))
+
+        load_mock.assert_not_called()
+
 
 class TestResolveModelDims:
     def _resolve(self, args: dict[str, object], *, is_hybrid: bool = False) -> object:

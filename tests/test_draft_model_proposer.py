@@ -997,3 +997,42 @@ def test_scheduler_adoption_uses_target_limit_after_auto_fit() -> None:
         is None
     )
     assert model.input_lens == [31]
+
+
+def test_load_draft_model_rejects_unsupported_block_fp8_before_download(
+    tmp_path, monkeypatch
+):
+    import json
+
+    from vllm_metal.quant.awq_config import UnsupportedQuantizationConfigError
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen3",
+                "architectures": ["Qwen3ForCausalLM"],
+                "quantization_config": {
+                    "quant_method": "fp8",
+                    "weight_block_size": [128, 128],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = SimpleNamespace(
+        draft_model_config=SimpleNamespace(model=str(tmp_path), revision=None)
+    )
+    monkeypatch.setattr(draft_model_proposer, "resolve_draft_dims", lambda *_: object())
+    monkeypatch.setattr(
+        draft_model_proposer, "get_model_download_path", lambda m, revision=None: m
+    )
+    download = Mock()
+    load = Mock()
+    monkeypatch.setattr(draft_model_proposer, "resolve_mlx_lm_model_path", download)
+    monkeypatch.setattr(draft_model_proposer, "mlx_lm_load_model", load)
+
+    with pytest.raises(UnsupportedQuantizationConfigError, match="draft model"):
+        draft_model_proposer._load_draft_model(config, None)
+
+    download.assert_not_called()
+    load.assert_not_called()
