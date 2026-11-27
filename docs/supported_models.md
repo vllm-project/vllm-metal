@@ -57,6 +57,7 @@ unsupported; leave `--video-pruning-rate` unset.
 | --- | --- | --- | --- | --- | --- |
 | Qwen3-VL | 🔵 | | native multimodal paged generation | image and video input | `mlx-community/Qwen3-VL-4B-Instruct-4bit` |
 | Qwen3.5 / 3.6 (dense and MoE) | 🔵 | | native multimodal paged generation | image and video input; FP8 and GGUF checkpoints stay text-only | `mlx-community/Qwen3.5-4B-MLX-4bit` |
+| Ternary-Bonsai 2 / 2.5 (PrismML) | 🔵 | | native multimodal paged generation | image input; `--language-model-only` supported; MLX packs only | `prism-ml/Ternary-Bonsai-2-2B-mlx-2bit` |
 | PaddleOCR-VL | 🔵 | | native multimodal paged generation | image input, no video | `PaddlePaddle/PaddleOCR-VL-1.6` |
 | LFM2-VL / LFM2.5-VL | 🔵 | 🔵 | native multimodal paged generation on the ShortConv text tower | image input, no video; one tile grid plus thumbnail per image; needs a checkpoint packaged for Transformers, which the MLX conversions are not | `LiquidAI/LFM2.5-VL-1.6B` |
 | LFM3-VL | 🔵 | | native multimodal paged generation on the LFM3 text tower | image input, no video; the image processor comes from mlx-vlm | `LiquidAI/LFM3-VL-2B-MLX-4bit` |
@@ -196,6 +197,7 @@ and TurboQuant are not validated.
 | OLMoE | ✅ | | MHA + full-projection QK norm (paged) | ✅ | `mlx-community/OLMoE-1B-7B-0125-Instruct-4bit` |
 | OLMo 3 | 🔵 | | MHA + per-layer sliding window (paged) | ✅ | `mlx-community/Olmo-3-7B-Instruct-4bit` |
 | Muse Glimmer | 🔵 | | GQA + per-layer sliding window, gated attention with QK norm (paged) | ✅ | `mlx-community/Muse-Glimmer-30B-4bit` |
+| Nanbeige 4.2 | 🔵 | | GQA, weight-tied looped decoder (paged) | ✅ | `mlx-community/Nanbeige4.2-3B-OptiQ-4bit` |
 
 **Hunyuan on MPS:** use `--generation-config vllm` to override the checkpoint’s unsupported `repetition_penalty=1.05` default.
 

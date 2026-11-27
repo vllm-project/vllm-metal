@@ -360,6 +360,162 @@ class TestModelMetadataCompat:
         assert registered == _VLLM_LFM3
 
 
+def _write_nanbeige_config(path) -> None:
+    (path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["NanbeigeForCausalLM"],
+                "model_type": "nanbeige",
+                "hidden_size": 3072,
+                "num_hidden_layers": 22,
+                "num_attention_heads": 48,
+                "num_key_value_heads": 8,
+                "head_dim": 128,
+                "num_loops": 2,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+class TestNanbeigeCompat:
+    @pytest.fixture(autouse=True)
+    def metal_mlx(self, monkeypatch):
+        import vllm.platforms as platforms
+
+        from vllm_metal.platform import MetalPlatform
+
+        monkeypatch.delenv("VLLM_METAL_BACKEND", raising=False)
+        monkeypatch.setattr(platforms, "current_platform", MetalPlatform())
+
+    @pytest.fixture(autouse=True)
+    def without_nanbeige(self, monkeypatch):
+        """Hide any Nanbeige config registration in Transformers."""
+        from transformers.models.auto import configuration_auto
+
+        config_mapping = configuration_auto.CONFIG_MAPPING
+        monkeypatch.setattr(config_mapping, "_mapping", dict(config_mapping._mapping))
+        monkeypatch.setattr(
+            config_mapping, "_extra_content", dict(config_mapping._extra_content)
+        )
+        config_mapping._mapping.pop("nanbeige", None)
+        config_mapping._extra_content.pop("nanbeige", None)
+
+    def test_checkpoint_config_loads_and_pickles(self, tmp_path) -> None:
+        """vllm.LLM sends the config to spawned EngineCore workers by pickle."""
+        import pickle
+
+        from transformers import AutoConfig
+
+        _write_nanbeige_config(tmp_path)
+        compat.register_model_compat()
+        config = pickle.loads(pickle.dumps(AutoConfig.from_pretrained(tmp_path)))
+
+        assert config.model_type == "nanbeige"
+        assert config.num_hidden_layers == 22
+        assert config.num_loops == 2
+
+    def test_existing_registration_is_kept(self) -> None:
+        """Once Transformers knows nanbeige, the hook must leave it alone."""
+        from transformers import AutoConfig
+        from transformers.models.auto import configuration_auto
+
+        existing = type("ExistingConfig", (), {"model_type": "nanbeige"})
+        AutoConfig.register("nanbeige", existing, exist_ok=True)
+
+        compat.register_model_compat()
+
+        assert configuration_auto.CONFIG_MAPPING["nanbeige"] is existing
+
+
+def _write_prism_hadamard_config(
+    path,
+    *,
+    with_vision: bool = True,
+    architectures: list[str] | None = None,
+) -> None:
+    payload: dict[str, object] = {
+        "schema_version": 2 if with_vision else 1,
+        "model_type": "prism_hadamard_qwen35",
+        "text_config": {"model_type": "qwen3_5_text"},
+    }
+    if with_vision:
+        payload["vision_config"] = {"model_type": "qwen3_5"}
+    if architectures is not None:
+        payload["architectures"] = architectures
+    (path / "config.json").write_text(json.dumps(payload), encoding="utf-8")
+
+
+class TestPrismHadamardQwen35Compat:
+    @pytest.fixture(autouse=True)
+    def metal_mlx(self, monkeypatch):
+        import vllm.platforms as platforms
+
+        from vllm_metal.platform import MetalPlatform
+
+        monkeypatch.delenv("VLLM_METAL_BACKEND", raising=False)
+        monkeypatch.setattr(platforms, "current_platform", MetalPlatform())
+
+    @pytest.fixture(autouse=True)
+    def without_prism_hadamard(self, monkeypatch):
+        """Hide any prism_hadamard_qwen35 config registration in Transformers."""
+        from transformers.models.auto import configuration_auto
+
+        config_mapping = configuration_auto.CONFIG_MAPPING
+        monkeypatch.setattr(config_mapping, "_mapping", dict(config_mapping._mapping))
+        monkeypatch.setattr(
+            config_mapping, "_extra_content", dict(config_mapping._extra_content)
+        )
+        config_mapping._mapping.pop("prism_hadamard_qwen35", None)
+        config_mapping._extra_content.pop("prism_hadamard_qwen35", None)
+
+    def test_vlm_config_loads_defaults_and_pickles(self, tmp_path) -> None:
+        """vllm.LLM sends the config to spawned EngineCore workers by pickle."""
+        import pickle
+
+        from transformers import AutoConfig
+
+        _write_prism_hadamard_config(tmp_path, with_vision=True)
+        compat.register_model_compat()
+        config = pickle.loads(pickle.dumps(AutoConfig.from_pretrained(tmp_path)))
+
+        assert config.model_type == "prism_hadamard_qwen35"
+        assert config.architectures == ["Qwen3_5ForConditionalGeneration"]
+        assert config.text_config.model_type == "qwen3_5_text"
+
+    def test_text_only_config_defaults_to_causal_lm(self, tmp_path) -> None:
+        from transformers import AutoConfig
+
+        _write_prism_hadamard_config(tmp_path, with_vision=False)
+        compat.register_model_compat()
+
+        assert AutoConfig.from_pretrained(tmp_path).architectures == [
+            "Qwen3_5ForCausalLM"
+        ]
+
+    def test_explicit_architectures_are_preserved(self, tmp_path) -> None:
+        from transformers import AutoConfig
+
+        _write_prism_hadamard_config(tmp_path, architectures=["CustomQwen3_5Arch"])
+        compat.register_model_compat()
+
+        assert AutoConfig.from_pretrained(tmp_path).architectures == [
+            "CustomQwen3_5Arch"
+        ]
+
+    def test_existing_registration_is_kept(self) -> None:
+        """Once Transformers knows prism_hadamard_qwen35, leave it alone."""
+        from transformers import AutoConfig
+        from transformers.models.auto import configuration_auto
+
+        existing = type("ExistingConfig", (), {"model_type": "prism_hadamard_qwen35"})
+        AutoConfig.register("prism_hadamard_qwen35", existing, exist_ok=True)
+
+        compat.register_model_compat()
+
+        assert configuration_auto.CONFIG_MAPPING["prism_hadamard_qwen35"] is existing
+
+
 def _install_fake_qwen35_modules(monkeypatch, *, include_moe: bool):
     mlx_pkg = ModuleType("mlx")
     mlx_core = ModuleType("mlx.core")

@@ -332,6 +332,7 @@ def _run_primitive(
             block_size,
             max_kv_len,
             gqa_length_plan=length_plan,
+            sliding_window=sliding_window,
         )
     else:
         out = get_ops().paged_attention_primitive(

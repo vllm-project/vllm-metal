@@ -14,6 +14,7 @@ vLLM Metal is a plugin that enables vLLM to run on Apple Silicon Macs using MLX 
 ---
 *Latest News* 🔥
 
+- [2026/11] Looped transformers now run on Metal! [Nanbeige 4.2](https://huggingface.co/Nanbeige/Nanbeige4.2-3B) passes every token through its layer stack twice.
 - [2026/11] [MiniCPM-o 4.5](https://docs.vllm.ai/projects/vllm-metal/en/latest/omni/#minicpm-o-45) now supports concurrent duplex audio/video conversations on Apple Silicon through vLLM-Omni.
 - [2026/11] D3 (Decision 3.0) support is now available on MLX for text-only choice, yes/no, and score requests. See the [structured decisions guide](https://docs.vllm.ai/projects/vllm-metal/en/latest/structured_decisions/).
 - [2026/11] [Text-to-image generation](https://docs.vllm.ai/projects/vllm-metal/en/latest/omni/#text-to-image) is now supported through vLLM-Omni, starting with SDXL.

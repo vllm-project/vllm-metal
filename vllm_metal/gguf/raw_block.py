@@ -29,6 +29,15 @@ Element ``e`` of half ``c`` decodes as
 ``d * sc[(c*128+e)/16] * (int(low4 | high2 << 4) - 32)`` with
 ``low4 = e < 64 ? ql[c*64+e] & 0xF : ql[c*64+e-64] >> 4`` and
 ``high2 = (qh[c*32 + e%32] >> (2*(e/32))) & 3``.
+
+An IQ3_XXS superblock is 98 bytes for 256 weights: an fp16 ``d``, 64 grid
+index bytes ``qs``, and eight little-endian uint32 words ``aux``, one per
+32-element group. Its grid magnitudes are not evenly spaced, so an exact MLX
+affine repack, with at least 6-bit codes, takes more than twice the memory of
+these blocks. Element ``e`` of group ``g = e/32`` decodes as
+``db * grid[qs[e/4]][e%4] * sign`` with
+``db = d * (0.5 + (aux[g] >> 28)) * 0.5``; ``sign`` is bit ``e%8`` of
+``ksigns[(aux[g] >> (7*((e%32)/8))) & 0x7F]``, set meaning negative.
 """
 
 from __future__ import annotations
@@ -39,14 +48,32 @@ from typing import Any
 import mlx.core as mx
 import numpy as np
 from gguf import GGML_QUANT_SIZES, GGMLQuantizationType
+from gguf.quants import IQ2_XXS, IQ3_XXS
 
 # qtypes executed from raw GGUF block bytes by the kernels below (#761).
 _RAW_KERNEL_BITS: dict[GGMLQuantizationType, int] = {
     GGMLQuantizationType.Q2_K: 2,
     GGMLQuantizationType.Q3_K: 3,
     GGMLQuantizationType.Q6_K: 6,
+    GGMLQuantizationType.IQ3_XXS: 3,
 }
 RAW_KERNEL_GGUF_TYPES = frozenset(_RAW_KERNEL_BITS)
+
+
+def _metal_uint8_table(name: str, values: np.ndarray) -> str:
+    body = ", ".join(str(int(v)) for v in values)
+    return f"constant uint8_t {name}[{values.size}] = {{{body}}};\n"
+
+
+# IQ3_XXS lookup tables, taken from gguf-py so they match the oracle: 256 grid
+# rows of four magnitudes, and 128 sign bytes (bit i set = element i negative).
+IQ3_XXS.init_grid()
+_IQ3XXS_HEADER = _metal_uint8_table(
+    "kIq3xxsGrid", np.asarray(IQ3_XXS.grid, dtype=np.uint8).reshape(-1)
+) + _metal_uint8_table("kIqSigns", np.frombuffer(IQ2_XXS.ksigns, dtype=np.uint8))
+_KERNEL_HEADERS: dict[GGMLQuantizationType, str] = {
+    GGMLQuantizationType.IQ3_XXS: _IQ3XXS_HEADER,
+}
 
 # Above this flattened batch the per-row qmv kernel loses to a transient
 # dequantize + dense GEMM (measured; numbers in the PR).
@@ -100,6 +127,24 @@ _Q6K_DEQUANT_SOURCE = """
     uint high2 = (qh[e & 31] >> (2 * (e / 32))) & 3;
     int q = int(low4 | (high2 << 4)) - 32;
     out[elem] = static_cast<T>(d * float(sc[within / 16]) * float(q));
+"""
+
+_IQ3XXS_DEQUANT_SOURCE = """
+    uint elem = thread_position_in_grid.x;
+    if (elem >= n[0]) return;
+    uint block = elem / 256;
+    uint e = elem % 256;
+    device const uint8_t* b = blocks + (size_t)block * 98;
+    float d = float(as_type<half>(((device const uint16_t*)b)[0]));
+    // 98-byte blocks leave aux unaligned for a uint32 load, so assemble it.
+    device const uint8_t* w = b + 66 + 4 * (e / 32);
+    uint aux = uint(w[0]) | (uint(w[1]) << 8) | (uint(w[2]) << 16)
+        | (uint(w[3]) << 24);
+    float db = d * (0.5f + float(aux >> 28)) * 0.5f;
+    float mag = float(kIq3xxsGrid[uint(b[2 + e / 4]) * 4 + e % 4]);
+    uint signs = kIqSigns[(aux >> (7 * ((e % 32) / 8))) & 0x7F];
+    float v = db * mag;
+    out[elem] = static_cast<T>(((signs >> (e % 8)) & 1) ? -v : v);
 """
 
 # Shared QMV skeleton: one 256-thread threadgroup per row. Thread t strides
@@ -225,17 +270,51 @@ _Q6K_QMV_BODY = """
         }
 """
 
+_IQ3XXS_QMV_BODY = """
+        device const uint8_t* b =
+            blocks + ((size_t)row * blocks_per_row + blk) * 98;
+        float d = float(as_type<half>(((device const uint16_t*)b)[0]));
+        device const uint8_t* wa = b + 66 + 4 * (grp / 2);
+        uint aux = uint(wa[0]) | (uint(wa[1]) << 8) | (uint(wa[2]) << 16)
+            | (uint(wa[3]) << 24);
+        float db = d * (0.5f + float(aux >> 28)) * 0.5f;
+        // This 16-element half of the 32-element group uses sign chunks
+        // 2*(grp%2) and 2*(grp%2)+1, 7 bits each.
+        uint sh = 14 * (grp % 2);
+        uint s0 = kIqSigns[(aux >> sh) & 0x7F];
+        uint s1 = kIqSigns[(aux >> (sh + 7)) & 0x7F];
+        device const uint8_t* qs = b + 2 + grp * 4;
+        float w[16];
+        #pragma unroll
+        for (uint i = 0; i < 16; ++i) {
+            float mag = float(kIq3xxsGrid[uint(qs[i / 4]) * 4 + i % 4]);
+            uint s = (i < 8) ? s0 : s1;
+            w[i] = ((s >> (i % 8)) & 1) ? -mag : mag;
+        }
+        uint x_offset = blk * 256 + grp * 16;
+        for (uint batch = 0; batch < NB; ++batch) {
+            device const float* xg =
+                x + (size_t)batch * blocks_per_row * 256 + x_offset;
+            float part = 0.0f;
+            #pragma unroll
+            for (uint i = 0; i < 16; ++i) part += xg[i] * w[i];
+            acc[batch] += db * part;
+        }
+"""
+
 # mlx types metal_kernel's return as a plain object; the callable contract
 # lives in its docs, so the constants carry Any.
 _DEQUANT_SOURCES: dict[GGMLQuantizationType, str] = {
     GGMLQuantizationType.Q2_K: _Q2K_DEQUANT_SOURCE,
     GGMLQuantizationType.Q3_K: _Q3K_DEQUANT_SOURCE,
     GGMLQuantizationType.Q6_K: _Q6K_DEQUANT_SOURCE,
+    GGMLQuantizationType.IQ3_XXS: _IQ3XXS_DEQUANT_SOURCE,
 }
 _QMV_BODIES: dict[GGMLQuantizationType, str] = {
     GGMLQuantizationType.Q2_K: _Q2K_QMV_BODY,
     GGMLQuantizationType.Q3_K: _Q3K_QMV_BODY,
     GGMLQuantizationType.Q6_K: _Q6K_QMV_BODY,
+    GGMLQuantizationType.IQ3_XXS: _IQ3XXS_QMV_BODY,
 }
 
 # Kernel names stay unique per qtype so Metal caches them separately.
@@ -245,6 +324,7 @@ _DEQUANT_KERNELS: dict[GGMLQuantizationType, Any] = {
         input_names=["blocks", "n"],
         output_names=["out"],
         source=source,
+        header=_KERNEL_HEADERS.get(qtype, ""),
     )
     for qtype, source in _DEQUANT_SOURCES.items()
 }
@@ -254,6 +334,7 @@ _QMV_KERNELS: dict[GGMLQuantizationType, Any] = {
         input_names=["blocks", "x", "dims"],
         output_names=["y"],
         source=_QMV_PROLOGUE + body + _QMV_EPILOGUE,
+        header=_KERNEL_HEADERS.get(qtype, ""),
     )
     for qtype, body in _QMV_BODIES.items()
 }
@@ -299,6 +380,7 @@ _GATHER_QMV_KERNELS: dict[GGMLQuantizationType, Any] = {
         input_names=["blocks", "xs", "idx", "dims"],
         output_names=["y"],
         source=_GATHER_QMV_PROLOGUE + body + _GATHER_QMV_EPILOGUE,
+        header=_KERNEL_HEADERS.get(qtype, ""),
     )
     for qtype, body in _QMV_BODIES.items()
 }

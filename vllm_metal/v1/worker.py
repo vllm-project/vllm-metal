@@ -388,8 +388,11 @@ class MetalWorker(WorkerBase):
         level 1 keeps them in place instead of copying them to the CPU.
         """
         if level != 1:
+            # vLLM pauses the scheduler before it calls the worker, and a
+            # refused sleep leaves it paused until wake_up().
             raise NotImplementedError(
-                f"Metal supports sleep level 1 only, got {level}."
+                f"Metal supports sleep level 1 only, got {level}. The engine "
+                "is paused; call wake_up() (POST /wake_up) to resume it."
             )
         self.discard(("kv_cache",))
 
