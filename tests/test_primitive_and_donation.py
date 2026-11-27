@@ -555,19 +555,26 @@ def test_sliding_window_bounds_tiled_prefill_work(force_tiled_prefill) -> None:
 # ── 1b. Tiled-kernel head-size coverage ─────────────────────────────────────
 
 
-@pytest.mark.parametrize("head_size", [64, 96, 128])
-def test_tiled_kernel_head_size_parity(head_size: int, force_tiled_prefill) -> None:
+@pytest.mark.parametrize(
+    ("head_size", "sliding_window"),
+    [(64, -1), (96, -1), (128, -1), (512, -1), (512, 100)],
+)
+def test_tiled_kernel_head_size_parity(
+    head_size: int, sliding_window: int, force_tiled_prefill
+) -> None:
     """Tiled prefill kernel matches reference for every routed head size.
 
     can_use_tiled_kernel() routes head sizes {64, 96, 128} to the BQ=32
     flash kernel; each is a separately compiled template specialization
     (TD = HEAD_SIZE / 8 differs).  The varlen test only exercises 128, so
     this adds one prefill shape per head size to keep CI parity 1:1 with
-    can_use_tiled_kernel().
+    can_use_tiled_kernel().  512 splits each 8-row group across four
+    simdgroups (D_SPLIT=4), so it also runs with a sliding window.
     """
     mx.random.seed(0)
     # Prefill-only (q_len > 1 for every seq) guarantees tiled dispatch.
-    seq_lens = [(32, 512), (64, 1024)]
+    # Query lengths that are not multiples of 8 leave padded rows.
+    seq_lens = [(37, 512), (90, 1024)]
     d = _make_cache_and_inputs(256, 2, 8, seq_lens, head_size=head_size)
 
     ops = get_ops()
@@ -583,7 +590,7 @@ def test_tiled_kernel_head_size_parity(head_size: int, force_tiled_prefill) -> N
         d["cu_seqlens_q"],
         BLOCK_SIZE,
         d["max_kv_len"],
-        -1,  # sliding_window
+        sliding_window,
     )
     mx.eval(out)
 
@@ -595,7 +602,7 @@ def test_tiled_kernel_head_size_parity(head_size: int, force_tiled_prefill) -> N
         kv_lens=d["kv_lens"],
         block_tables=np.array(d["block_tables"]),
         scale=d["scale"],
-        sliding_window=None,
+        sliding_window=sliding_window if sliding_window >= 0 else None,
     )
     mx.eval(ref)
 

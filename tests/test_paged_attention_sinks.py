@@ -242,6 +242,11 @@ class TestSinkPrefillMode:
         )
         _assert_close(got, ref, mx.bfloat16)
 
+    def test_head512_prefill_matches_mlx_oracle(self, force_tiled_prefill) -> None:
+        """512 splits each 8-row group across four simdgroups (D_SPLIT=4)."""
+        got, ref = _run_prefill(64, 37, 4, 2, 512, mx.bfloat16, _sinks(4))
+        _assert_close(got, ref, mx.bfloat16)
+
 
 def _run_window(
     ctx: int,

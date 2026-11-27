@@ -111,12 +111,13 @@ template <int NBYTES> struct LoadUnit;
 template <> struct LoadUnit<8>  { using type = uint2; };
 template <> struct LoadUnit<16> { using type = uint4; };
 
-// D_SPLIT: simdgroups per 8-row group.  With D_SPLIT > 1 the simdgroups of
-// one row group all compute the same S = Q K^T (redundantly) and each owns
-// HEAD_SIZE / D_SPLIT columns of O.  Q is then read from threadgroup memory
-// per tile instead of being register-resident, so per-thread state shrinks to
-// TD / D_SPLIT O fragments: the way HEAD_SIZE=512 fits registers and the
-// 32 KB threadgroup budget with more than one simdgroup per threadgroup.
+// D_SPLIT: simdgroups per 8-row group.  Each simdgroup owns one column slice
+// [d_base, d_base + TD_O) of the head dimension: it keeps that slice of Q
+// and O in registers, computes S = Q K^T over the slice only, and the
+// partial S fragments of a row group are summed through threadgroup memory.
+// Per-thread state is TD / D_SPLIT Q and O fragments, so HEAD_SIZE=512 with
+// D_SPLIT 4 holds the same 16 + 16 the HEAD_SIZE=128 instantiation holds.
+// D_SPLIT == 1 is the same code with one slice covering the whole head.
 template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
           int BQ = 32, int TILE_KV = 32, int NUM_THREADS = 128,
           int D_SPLIT = 1>
@@ -238,8 +239,9 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
   // ─ Load Q into register fragments (once, reused across all KV tiles) ──
-  // Each simdgroup owns 8 contiguous rows: [sg_idx*8, sg_idx*8 + 8).
-  // For each fragment, we load Q_smem[sg_idx*8..sg_idx*8+8, d*8..d*8+8].
+  // Each simdgroup owns 8 contiguous rows [row_sg*8, row_sg*8 + 8) and the
+  // column slice [d_base, d_base + TD_O); it loads only the Q fragments of
+  // that slice, Q_smem[row_sg*8..+8, (d_base+dd)*8..+8].
   //
   // We use vec<T,2> arrays (MLX MFAMMAFrag pattern) for register storage.
   // simdgroup_matrix instances are materialized only at the MMA call site —
@@ -247,18 +249,12 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
   // per-thread registers, not in some implicit threadgroup memory.
   using vec2T = vec<T, 2>;
   using vec2F = vec<float, 2>;
-  // With D_SPLIT > 1 the Q fragments are re-read from Q_smem on every tile
-  // (Q_smem stays intact until the output staging after the loop); the
-  // register array is then unused and elided.
-  constexpr int QREG_N = (D_SPLIT == 1) ? TD : 1;
-  vec2T Qreg[QREG_N];
-  if (D_SPLIT == 1) {
-    #pragma unroll
-    for (int d = 0; d < TD; d++) {
-      simdgroup_matrix<T, 8, 8> tmp;
-      simdgroup_load(tmp, Q_smem + row_sg * 8 * LD + d * 8, LD);
-      Qreg[d] = reinterpret_cast<thread vec2T &>(tmp.thread_elements());
-    }
+  vec2T Qreg[TD_O];
+  #pragma unroll
+  for (int dd = 0; dd < TD_O; dd++) {
+    simdgroup_matrix<T, 8, 8> tmp;
+    simdgroup_load(tmp, Q_smem + row_sg * 8 * LD + (d_base + dd) * 8, LD);
+    Qreg[dd] = reinterpret_cast<thread vec2T &>(tmp.thread_elements());
   }
 
   // ─ Initialize per-simdgroup-row online softmax state ──────────────────
@@ -402,20 +398,14 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
       Sreg[k] = vec2F(0.0f);
     }
 
-    // Each simdgroup covers only its own column part of the head dimension
-    // (all of it when D_SPLIT == 1); the parts are summed below.
+    // Each simdgroup covers only its own column slice of the head dimension
+    // (all of it when D_SPLIT == 1); the slices are summed below.
     #pragma unroll
     for (int dd = 0; dd < TD_O; dd++) {
       const int d = d_base + dd;
-      // Materialize Q fragment: from registers (D_SPLIT == 1) or from
-      // threadgroup memory (D_SPLIT > 1, one 8×8 load per fragment).
+      // Materialize Q fragment from register vec → simdgroup_matrix.
       simdgroup_matrix<T, 8, 8> q_frag;
-      if (D_SPLIT == 1) {
-        reinterpret_cast<thread vec2T &>(q_frag.thread_elements()) =
-            Qreg[(D_SPLIT == 1) ? d : 0];
-      } else {
-        simdgroup_load(q_frag, Q_smem + row_sg * 8 * LD + d * 8, LD);
-      }
+      reinterpret_cast<thread vec2T &>(q_frag.thread_elements()) = Qreg[dd];
 
       #pragma unroll
       for (int k = 0; k < TK; k++) {
@@ -626,8 +616,8 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
   // Reuse Q_smem as the output staging buffer (it's no longer needed).
   // Each simdgroup stores its 8 rows × HEAD_SIZE into Q_smem (as float).
   // With D_SPLIT > 1 the row group's simdgroups each store their own
-  // column part; every simdgroup passed the loop's final barrier, so no
-  // Q_smem read is still in flight.
+  // column slice.  Q_smem was last read before the KV loop, and every
+  // simdgroup passed the loop's barriers since, so no read is in flight.
   threadgroup float *O_smem = reinterpret_cast<threadgroup float *>(Q_smem);
   #pragma unroll
   for (int d = 0; d < TD_O; d++) {
