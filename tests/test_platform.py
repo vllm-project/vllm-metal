@@ -14,6 +14,7 @@ import torch
 from vllm.config import (
     AuxOutputConfig,
     CacheConfig,
+    LoRAConfig,
     ParallelConfig,
     SchedulerConfig,
     VllmConfig,
@@ -220,6 +221,19 @@ class TestMetalPlatform:
                 enable_chunked_prefill=False,
             ),
         )
+
+    def test_moe_offload_budget_is_scoped_to_its_engine(self, monkeypatch) -> None:
+        self._patch_stt_resolution(monkeypatch, is_stt=False)
+        first, second = (
+            self._detection_platform_config(model="llama", model_type="llama")
+            for _ in range(2)
+        )
+        first.model_config.runner_type = second.model_config.runner_type = "generate"
+        second.model_config.quantization = None
+        first.additional_config = {"moe_expert_offload": {"cache_gb": 0.125}}
+        second.lora_config = LoRAConfig()
+        MetalPlatform.check_and_update_config(first)
+        MetalPlatform.check_and_update_config(second)
 
     def test_device_name(self) -> None:
         """Test device name retrieval."""

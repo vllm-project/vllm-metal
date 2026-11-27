@@ -545,10 +545,6 @@ def test_moe_expert_reserve_stays_out_of_the_room(monkeypatch) -> None:
     """Streamed experts arrive after profiling, so the room excludes the
     expert reserve just as the probe does."""
     reserved = 200_000_000
-    monkeypatch.setattr(
-        "vllm_metal.v1.cache_policy.get_config",
-        lambda: MetalConfig(mlx_device="gpu", moe_expert_cache_bytes=reserved),
-    )
     kv_transfer_config = _auto_pool(4 * _GB)
     planner = _planner(kv_transfer_config, max_model_len=_MML)
     planner._worker.model_runner.moe_expert_reserved_bytes = reserved

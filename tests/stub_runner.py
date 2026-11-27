@@ -184,6 +184,7 @@ def make_stub_runner(
 
     defaults: dict[str, Any] = {
         "vllm_config": SimpleNamespace(
+            additional_config={},
             speculative_config=None,
             lora_config=None,
             load_config=SimpleNamespace(download_dir=None, ignore_patterns=[]),
