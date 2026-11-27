@@ -29,6 +29,7 @@ from vllm_metal.gguf.source import GGUFLoadSource
 from vllm_metal.moe_offload import ExpertStore
 from vllm_metal.multimodal.gemma4 import Gemma4VisionSidecar
 from vllm_metal.quant.awq_loader import AWQQuantLoader
+from vllm_metal.quant.fp8_config import validate_mlx_lm_block_fp8_support
 from vllm_metal.tensor_bridge import TORCH_TO_MLX_DTYPE
 from vllm_metal.utils import get_model_download_path, resolve_mlx_lm_model_path
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPAssistantLoader
@@ -419,6 +420,10 @@ class ModelLifecycle:
             model = self._load_awq_text_model(model_name, awq_loader, revision=revision)
 
         else:
+            validate_mlx_lm_block_fp8_support(
+                getattr(model_config, "hf_config", None),
+                model_path=model_name,
+            )
             load_label = "MLX-LM model"
             model = self._load_mlx_lm_text_model(
                 model_name,
@@ -473,6 +478,10 @@ class ModelLifecycle:
         lazy: bool = False,
         revision: str | None = None,
     ) -> Any:
+        validate_mlx_lm_block_fp8_support(
+            getattr(self._runner.model_config, "hf_config", None),
+            model_path=model_name,
+        )
         model_path = resolve_mlx_lm_model_path(model_name, revision=revision)
         # Pooling backends read checkpoint files next to the weights
         # (d3's readout), so remember the directory the loader actually used:

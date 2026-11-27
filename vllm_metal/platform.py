@@ -1047,6 +1047,7 @@ class MetalPlatform(Platform):
         # Let the adapter apply any model-specific normalisations (e.g. clearing
         # ``multimodal_config`` for model types served on the text-only
         # backbone — see ``DefaultModelAdapter.normalize_model_config``).
+        backbone_mode = "text_only"
         if model_config is not None:
             from vllm_metal.v1.model_adapter import DefaultModelAdapter
 
@@ -1076,10 +1077,10 @@ class MetalPlatform(Platform):
                 # MLX vision towers take the processor's normalized pixels;
                 # vLLM's device-side normalization only runs in its own models.
                 model_config.multimodal_config.mm_device_do_normalize = False
-                mode = DefaultModelAdapter().multimodal_backbone_mode(
+                backbone_mode = DefaultModelAdapter().multimodal_backbone_mode(
                     model_config, speculative_config=vllm_config.speculative_config
                 )
-                if mode == "text_sidecar":
+                if backbone_mode == "text_sidecar":
                     _apply_vision_sidecar_scheduler_policy(vllm_config, model_config)
 
             # DP + multimodal: the multimodal tensor-IPC queue only supports DP=1
@@ -1094,6 +1095,9 @@ class MetalPlatform(Platform):
                     "Metal does not support data parallelism for multimodal models "
                     "(the multimodal tensor-IPC path is DP=1 only)."
                 )
+
+        if backend == "mlx" and not serves_stt_model:
+            cls._check_block_fp8_config(vllm_config, backbone_mode=backbone_mode)
 
         if serves_stt_model:
             # STT checkpoints use a dedicated STTModelRunner with no pipeline-
@@ -1188,6 +1192,55 @@ class MetalPlatform(Platform):
         if unsupported is not None:
             raise NotImplementedError(
                 f"MoE expert offloading does not support {unsupported} on Metal."
+            )
+
+    @classmethod
+    def _check_block_fp8_config(
+        cls, vllm_config: "VllmConfig", *, backbone_mode: str
+    ) -> None:
+        """Reject unsupported block-FP8 checkpoints on mlx-lm paths before loading."""
+        from vllm_metal.quant.fp8_config import validate_mlx_lm_block_fp8_support
+        from vllm_metal.v1.model_adapter import DefaultModelAdapter
+
+        model_config = vllm_config.model_config
+        if (
+            model_config is not None
+            and getattr(model_config, "quantization", None) != "gguf"
+        ):
+            hf_config = getattr(model_config, "hf_config", None)
+            is_multimodal = (
+                getattr(model_config, "multimodal_config", None) is not None
+                and backbone_mode != "text_sidecar"
+            )
+            if (
+                DefaultModelAdapter().generation_model_provider(
+                    hf_config, is_multimodal=is_multimodal
+                )
+                == "mlx-lm"
+            ):
+                validate_mlx_lm_block_fp8_support(
+                    hf_config,
+                    model_path=getattr(model_config, "model", None),
+                )
+
+        speculative_config = vllm_config.speculative_config
+        if speculative_config is None:
+            return
+        uses_draft = (
+            speculative_config.uses_draft_model()
+            if callable(getattr(speculative_config, "uses_draft_model", None))
+            else getattr(speculative_config, "method", None) == "draft_model"
+        )
+        draft_model_config = getattr(speculative_config, "draft_model_config", None)
+        if (
+            uses_draft
+            and draft_model_config is not None
+            and getattr(draft_model_config, "quantization", None) != "gguf"
+        ):
+            validate_mlx_lm_block_fp8_support(
+                getattr(draft_model_config, "hf_config", None),
+                model_path=getattr(draft_model_config, "model", None),
+                is_draft=True,
             )
 
     @classmethod
