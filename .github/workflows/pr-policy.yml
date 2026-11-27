@@ -36,7 +36,8 @@ jobs:
       group: pr-policy-${{ github.event.pull_request.user.id }}
       queue: max
     permissions:
-      contents: read
+      # Required by the convertPullRequestToDraft GraphQL mutation.
+      contents: write
       pull-requests: write
     steps:
       - uses: actions/checkout@v4
