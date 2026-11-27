@@ -66,7 +66,7 @@ class MetalWorkerLoRAManager:
         return self._add_and_activate(adapter)
 
     def _add_and_activate(self, adapter: LoadedLoRA) -> bool:
-        if not self._mm.add_adapter(adapter):
+        if not self._mm.add_adapter(adapter, require_activation_slot=True):
             return False
         try:
             self._mm.activate_adapter(adapter.lora_id)
