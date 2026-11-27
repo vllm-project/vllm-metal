@@ -51,9 +51,10 @@ substituted for serving results.
 
 ## Measure short requests during a long prefill
 
-Measure each request alone, then send the same short request at a fixed
-offset during a multi-chunk long prefill. Verify overlap and report the
-first-token latency of both requests.
+Set `--max-num-seqs` to at least 2 and allow two in-flight requests in the
+client. Measure each request alone, then send the same short request at a
+fixed offset during a multi-chunk long prefill. Record the actual send
+offset relative to the long request and report both first-token latencies.
 
 Compare `--long-prefill-token-threshold` values at a fixed batch capacity
 and scheduling budget. vLLM can waive the cap for a lone prefill. To
@@ -61,11 +62,13 @@ test shorter solo chunks, vary `--max-num-scheduled-tokens` separately
 and keep `--max-num-batched-tokens` fixed. Report the cost to cold solo
 prefill alongside any improvement in late-peer latency.
 
-Keep sampling and async scheduling fixed across arms. Use cold prefixes for
-the timed mix and record the cached-token count when measuring a warm repeat.
-For a separate diagnostic run, `--enable-logging-iteration-details` reports
-planned context and generation work for each iteration. Use a scoped Metal
-trace when attributing that time to GPU execution.
+Keep sampling and async scheduling fixed across arms. Compare cold runs
+separately from warmed runs, and match cached and fresh input token counts
+between arms. Use client timestamps to check whether the short stream
+started before the long stream's first token. In a separate diagnostic run,
+`--enable-logging-iteration-details` reports aggregate scheduled context
+and generation work. Use a scoped Metal trace when attributing that time
+to GPU execution.
 
 ## Control warmup and machine state
 
