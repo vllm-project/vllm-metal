@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import socket
 import subprocess
 import sys
@@ -32,6 +33,7 @@ import urllib.request
 import uuid
 import wave
 from pathlib import Path
+from typing import Any
 
 _HEALTH_TIMEOUT_S = 300
 _MAX_PORT_ATTEMPTS = 3
@@ -91,8 +93,10 @@ def _write_silence(path: Path) -> None:
         handle.writeframes(b"\x00\x00" * (_SAMPLE_RATE * _NON_SPEECH_SECONDS))
 
 
-def _transcribe(base_url: str, audio: Path, **form: str) -> tuple[int, str]:
-    """POST one transcription request; returns the status and the text or error."""
+def _transcribe(
+    base_url: str, audio: Path, **form: str
+) -> tuple[int, dict[str, Any] | str]:
+    """POST one transcription request; returns the status and the JSON body or error."""
     boundary = uuid.uuid4().hex
     parts: list[bytes] = []
     for name, value in form.items():
@@ -113,9 +117,33 @@ def _transcribe(base_url: str, audio: Path, **form: str) -> tuple[int, str]:
     )
     try:
         with urllib.request.urlopen(request, timeout=300) as resp:
-            return resp.status, json.load(resp).get("text", "")
+            return resp.status, json.load(resp)
     except urllib.error.HTTPError as exc:
         return exc.code, exc.read().decode(errors="replace")
+
+
+def _check_verbose_json(base_url: str, speech: Path, served_model: str) -> bool:
+    status, body = _transcribe(
+        base_url,
+        speech,
+        model=served_model,
+        language="en",
+        response_format="verbose_json",
+    )
+    if status != 200 or not isinstance(body, dict):
+        print(f"[FAIL] verbose_json returned HTTP {status}: {body}")
+        return False
+    segments = body.get("segments")
+    if not isinstance(segments, list) or not segments:
+        print("[FAIL] expected transcription segments for the speech clip")
+        return False
+    for segment in segments:
+        score = segment.get("avg_logprob") if isinstance(segment, dict) else None
+        if type(score) not in (float, int) or not math.isfinite(score):
+            print(f"[FAIL] segment has invalid avg_logprob: {score!r}")
+            return False
+    print(f"[PASS] {len(segments)} segments with finite avg_logprob")
+    return True
 
 
 def _run_checks(base_url: str, speech: Path, silence: Path, served_model: str) -> bool:
@@ -123,9 +151,9 @@ def _run_checks(base_url: str, speech: Path, silence: Path, served_model: str) -
 
     def timed_transcribe(label: str, audio: Path, **form: str) -> tuple[int, str]:
         started = time.monotonic()
-        result = _transcribe(base_url, audio, model=served_model, **form)
+        status, body = _transcribe(base_url, audio, model=served_model, **form)
         timed[label] = time.monotonic() - started
-        return result
+        return status, body.get("text", "") if isinstance(body, dict) else body
 
     greedy_first = timed_transcribe("greedy", speech)
     greedy_again = timed_transcribe("greedy (repeat)", speech)
@@ -189,6 +217,11 @@ def main() -> int:
         help="Server port (default: choose an available port)",
     )
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.5)
+    parser.add_argument(
+        "--check-verbose-json",
+        action="store_true",
+        help="Check verbose transcription segments using an English speech clip",
+    )
     args = parser.parse_args()
 
     attempts = _MAX_PORT_ATTEMPTS if args.port == 0 else 1
@@ -235,6 +268,12 @@ def main() -> int:
                 )
                 print(f"FAIL: {message}", file=sys.stderr)
                 return 1
+            if args.check_verbose_json:
+                return (
+                    0
+                    if _check_verbose_json(base_url, Path(args.audio), served_model)
+                    else 1
+                )
             with tempfile.TemporaryDirectory() as workdir:
                 silence = Path(workdir) / "silence.wav"
                 _write_silence(silence)

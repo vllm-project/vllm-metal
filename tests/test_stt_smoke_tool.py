@@ -120,7 +120,7 @@ def test_transcriptions_use_the_served_model(monkeypatch):
 
     def transcribe(_base_url, _audio, **form):
         requested_models.append(form["model"])
-        return (200, "same transcript")
+        return (200, {"text": "same transcript"})
 
     monkeypatch.setattr(smoke, "_transcribe", transcribe)
     assert smoke._run_checks(
@@ -189,3 +189,31 @@ def test_auto_port_retries_claimed_port(monkeypatch, capsys):
     assert starts == [8100, 8200]
     assert checked_urls == ["http://127.0.0.1:8200"]
     assert "retrying on a new port" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("status", "body", "expected"),
+    [
+        (500, "server error", False),
+        (200, {"segments": []}, False),
+        (200, {"segments": [{"text": "hi"}]}, False),
+        (200, {"segments": [{"avg_logprob": float("nan")}]}, False),
+        (200, {"segments": [{"text": "hi", "avg_logprob": -0.5}]}, True),
+    ],
+)
+def test_verbose_transcription_requires_segment_scores(
+    monkeypatch, status, body, expected
+):
+    def transcribe(_url, _audio, **form):
+        assert form == {
+            "model": "whisper",
+            "language": "en",
+            "response_format": "verbose_json",
+        }
+        return status, body
+
+    monkeypatch.setattr(smoke, "_transcribe", transcribe)
+    assert (
+        smoke._check_verbose_json("http://localhost", "speech.wav", "whisper")
+        is expected
+    )
