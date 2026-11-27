@@ -9,14 +9,9 @@ from typing import Any, cast
 import mlx.core as mx
 import torch
 from huggingface_hub import snapshot_download
+from vllm.model_executor.model_loader.weight_utils import download_weights_from_hf
 
 from vllm_metal.tensor_bridge import TORCH_TO_MLX_DTYPE, torch_to_mlx
-
-_ENCODER_DOWNLOAD_PATTERNS = (
-    "config.json",
-    "*.safetensors",
-    "sparse_linear.pt",
-)
 
 
 def load_encoder_checkpoint(model: Any, model_config: Any) -> None:
@@ -41,17 +36,16 @@ def encoder_model_path(model_config: Any) -> Path:
         snapshot_download(
             repo_id=str(model_config.model),
             revision=model_config.revision,
-            allow_patterns=list(_ENCODER_DOWNLOAD_PATTERNS),
+            allow_patterns=["config.json", "sparse_linear.pt"],
         )
     )
-    if any(snapshot.glob("*.safetensors")):
-        return snapshot
     # Hub snapshot directories are named for their resolved commit.
     return Path(
-        snapshot_download(
-            repo_id=str(model_config.model),
+        download_weights_from_hf(
+            str(model_config.model),
+            cache_dir=None,
+            allow_patterns=["*.safetensors", "pytorch_model*.bin"],
             revision=snapshot.name,
-            allow_patterns=["pytorch_model*.bin"],
         )
     )
 

@@ -49,11 +49,9 @@ from vllm_metal.v1.pooling.backends.encoder.factory import (  # noqa: E402
     load_encoder_pooling_backend,
     supports_encoder_pooling_backend,
 )
+from vllm_metal.v1.pooling.backends.encoder.models import loading  # noqa: E402
 from vllm_metal.v1.pooling.backends.encoder.models.embedding_gemma2 import (  # noqa: E402
     load_embedding_gemma2_backend,
-)
-from vllm_metal.v1.pooling.backends.encoder.models.loading import (  # noqa: E402
-    load_encoder_weight_file,
 )
 from vllm_metal.v1.pooling.backends.encoder.models.xlm_roberta import (  # noqa: E402
     load_xlm_roberta_backend,
@@ -855,23 +853,33 @@ class TestMetalPoolingCapabilities:
         with pytest.raises(NotImplementedError, match="does not support quantization"):
             load_embedding_gemma2_backend(config)
 
-    def test_encoder_download_falls_back_to_pytorch_at_same_commit(self, tmp_path):
-        from vllm_metal.v1.pooling.backends.encoder.models import loading
-
+    def test_encoder_download_pins_weights_to_config_commit(self, tmp_path):
         snapshot = tmp_path / ("a" * 40)
         snapshot.mkdir()
-
-        def download(*, repo_id, revision, allow_patterns):
-            if "pytorch_model*.bin" in allow_patterns:
-                assert revision == snapshot.name
-                torch.save({"probe": torch.tensor([2])}, snapshot / "pytorch_model.bin")
-            else:
-                assert revision == "main"
-            return str(snapshot)
-
+        torch.save({"probe": torch.tensor([2])}, snapshot / "pytorch_model.bin")
         config = _encoder_model_config(model="org/encoder", revision="main")
-        with patch.object(loading, "snapshot_download", side_effect=download):
+
+        with (
+            patch.object(
+                loading, "snapshot_download", return_value=str(snapshot)
+            ) as metadata,
+            patch.object(
+                loading, "download_weights_from_hf", return_value=str(snapshot)
+            ) as download,
+        ):
             weights = loading.load_encoder_weights(loading.encoder_model_path(config))
+
+        metadata.assert_called_once_with(
+            repo_id="org/encoder",
+            revision="main",
+            allow_patterns=["config.json", "sparse_linear.pt"],
+        )
+        download.assert_called_once_with(
+            "org/encoder",
+            cache_dir=None,
+            revision=snapshot.name,
+            allow_patterns=["*.safetensors", "pytorch_model*.bin"],
+        )
         assert weights["probe"].tolist() == [2]
 
     @pytest.mark.parametrize("model_type", ["xlm-roberta", "roberta"])
@@ -890,8 +898,7 @@ class TestMetalPoolingCapabilities:
         )
 
         model_config = _encoder_model_config(
-            model="encoder-checkpoint",
-            revision="model-revision",
+            model=str(tmp_path),
             trust_remote_code=True,
             tokenizer="custom-tokenizer",
             tokenizer_revision="tokenizer-revision",
@@ -905,16 +912,7 @@ class TestMetalPoolingCapabilities:
             embedding_size=torch_config.hidden_size,
         )
 
-        with (
-            patch(
-                "vllm_metal.v1.pooling.backends.encoder.models.loading.snapshot_download",
-                return_value=str(tmp_path),
-            ) as download,
-            patch(
-                "transformers.AutoTokenizer.from_pretrained",
-                return_value=object(),
-            ) as load_tokenizer,
-        ):
+        with patch("transformers.AutoTokenizer.from_pretrained") as load_tokenizer:
             loaded_backend = load_xlm_roberta_backend(model_config)
 
         input_ids = torch.tensor(
@@ -970,10 +968,6 @@ class TestMetalPoolingCapabilities:
             atol=1e-5,
             rtol=1e-5,
         )
-        assert "pytorch_model*.bin" not in download.call_args.kwargs["allow_patterns"]
-        assert download.call_count == 1
-        assert download.call_args.kwargs["repo_id"] == "encoder-checkpoint"
-        assert download.call_args.kwargs["revision"] == "model-revision"
         load_tokenizer.assert_not_called()
 
     @pytest.mark.parametrize("model_type", ["xlm-roberta", "roberta"])
@@ -1071,7 +1065,7 @@ class TestMetalPoolingCapabilities:
             weight_path,
         )
 
-        weights = load_encoder_weight_file(weight_path)
+        weights = loading.load_encoder_weight_file(weight_path)
 
         assert weights["encoder.layer.weight"].dtype == mx.bfloat16
         assert weights["encoder.layer.weight"].shape == (2, 2)
