@@ -237,16 +237,6 @@ class MetalWorker(WorkerBase):
         """
         return self.model_runner.get_kv_cache_spec()
 
-    def initialize_cache(self, num_gpu_blocks: int, num_cpu_blocks: int) -> None:
-        """Initialize the KV cache.
-
-        Args:
-            num_gpu_blocks: Number of GPU cache blocks
-            num_cpu_blocks: Number of CPU cache blocks (unused on Metal)
-        """
-        self.cache_config.num_gpu_blocks = num_gpu_blocks
-        self.cache_config.num_cpu_blocks = num_cpu_blocks
-
     def get_supported_kv_cache_layouts(self) -> list[str]:
         """Report Metal's own page order instead of the CPU backend's LBHNC."""
         return [KV_CACHE_LAYOUT]
@@ -398,8 +388,11 @@ class MetalWorker(WorkerBase):
         level 1 keeps them in place instead of copying them to the CPU.
         """
         if level != 1:
+            # vLLM pauses the scheduler before it calls the worker, and a
+            # refused sleep leaves it paused until wake_up().
             raise NotImplementedError(
-                f"Metal supports sleep level 1 only, got {level}."
+                f"Metal supports sleep level 1 only, got {level}. The engine "
+                "is paused; call wake_up() (POST /wake_up) to resume it."
             )
         self.discard(("kv_cache",))
 

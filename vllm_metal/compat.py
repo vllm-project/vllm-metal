@@ -29,12 +29,12 @@ _EXAONE4_LAYER_TYPE = {"L": "sliding_attention", "G": "full_attention"}
 
 
 def register_model_compat() -> None:
-    """Register Metal's LFM3-VL and LFM3-Audio classes for the MLX runner.
+    """Register Metal's LFM3 overrides and missing HF config metadata.
 
     MLX executes the model, while vLLM still queries registered model classes
-    for hybrid capabilities, state-cache metadata and multimodal processing.
-    The general-plugin hook runs before ModelConfig inspection, after
-    vllm.config is importable; registering in apply_compat_patches would
+    and HF configs for hybrid capabilities, state-cache metadata and multimodal
+    processing. The general-plugin hook runs before ModelConfig inspection,
+    after vllm.config is importable; registering in apply_compat_patches would
     create an import cycle.
     """
     if os.environ.get("VLLM_METAL_BACKEND", "mlx") != "mlx":
@@ -46,7 +46,22 @@ def register_model_compat() -> None:
     if not isinstance(current_platform, MetalPlatform):
         return
 
+    from transformers import AutoConfig
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
     from vllm.model_executor.models import ModelRegistry
+
+    from vllm_metal.patches.nanbeige_config import NanbeigeConfig
+    from vllm_metal.patches.prism_hadamard_config import PrismHadamardQwen35Config
+
+    # SCAFFOLDING: remove once the pinned Transformers registers nanbeige.
+    # Without it, Nanbeige 4.2 checkpoints load only with --trust-remote-code.
+    if "nanbeige" not in CONFIG_MAPPING:
+        AutoConfig.register("nanbeige", NanbeigeConfig)
+
+    # SCAFFOLDING: remove once Transformers registers prism_hadamard_qwen35 and
+    # the packs declare architectures.
+    if "prism_hadamard_qwen35" not in CONFIG_MAPPING:
+        AutoConfig.register("prism_hadamard_qwen35", PrismHadamardQwen35Config)
 
     # SCAFFOLDING: remove when the MLX LFM3 adapters accept the placeholders and
     # processor outputs of vLLM's native LFM3-VL and LFM3-Audio classes; until

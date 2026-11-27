@@ -298,7 +298,11 @@ NB_MODULE(_paged_ops, m) {
         [](const array& q, const array& k, const array& v,
            float scale, const array& tables, const array& lengths,
            int block_size, int max_seq_len,
-           const std::optional<GqaDecodeLengthPlan>& gqa_length_plan) {
+           const std::optional<GqaDecodeLengthPlan>& gqa_length_plan,
+           int sliding_window) {
+          if (sliding_window == 0 || sliding_window < -1) {
+            throw std::invalid_argument("GQA test sliding_window must be -1 or positive");
+          }
           if (q.ndim() != 3 || q.shape(0) < 1 || k.ndim() != 4 ||
               k.shape() != v.shape() || k.strides() != v.strides() ||
               (q.dtype() != float16 && q.dtype() != bfloat16) ||
@@ -314,18 +318,22 @@ NB_MODULE(_paged_ops, m) {
               max_seq_len > static_cast<int64_t>(tables.shape(1)) * block_size) {
             throw std::invalid_argument("GQA test entry requires supported one-token decode rows");
           }
-          check_gqa_test_reducer_size(max_seq_len);
+          // A window bounds the partitions to the visible span.
+          check_gqa_test_reducer_size(
+              sliding_window > 0 ? std::min(max_seq_len, sliding_window) : max_seq_len);
           auto cu = arange(q.shape(0) + 1, int32);
           return paged_attention_primitive_fn(
               q, k, v, k.shape(2), scale, 0.f, tables, lengths, cu,
-              block_size, max_seq_len, -1, false, "", nullptr, nullptr,
+              block_size, max_seq_len, sliding_window, false, "", nullptr, nullptr,
               nullptr, nullptr, 3, 1, nullptr, nullptr, q.shape(0), q.shape(0),
               max_seq_len, /*gqa_disabled=*/false, /*force_gqa=*/true, gqa_length_plan);
         }, nb::arg("query"), nb::arg("key_cache"), nb::arg("value_cache"),
         nb::arg("scale"), nb::arg("block_tables"), nb::arg("seq_lens"),
         nb::arg("block_size"), nb::arg("max_seq_len"),
-        nb::arg("gqa_length_plan") = nb::none(),
-        "Force the GQA producer for one decode token per request.");
+        nb::arg("gqa_length_plan") = nb::none(), nb::arg("sliding_window") = -1,
+        "Force the GQA producer for one decode token per request. A positive "
+        "sliding_window runs the windowed producer, which default routing does "
+        "not select yet.");
 
   m.def("_gqa_turboquant_paged_attention_for_test",
         [](const array& q, const array& k, const array& v,

@@ -123,7 +123,7 @@ include = ["vllm_metal*"]
 [tool.ruff]
 line-length = 88
 target-version = "py312"
-exclude = ["extern", ".venv*", "test_vllm.py", "target"]
+exclude = [".venv*"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "N", "UP", "B", "C4"]

@@ -13,6 +13,7 @@ from tools.benchmark.tq_e2e_arm import prefix_probe_layout, validate_prefix_reus
 from vllm_metal.attention.impls import turboquant_prefill as tq_prefill
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize(
     ("kv_heads", "query_len", "context_len"),
     [(2, 32, 257), (8, 32, 257), pytest.param(8, 16, 16, id="single-page")],

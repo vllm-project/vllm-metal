@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
+import gguf
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
@@ -22,23 +23,21 @@ from huggingface_hub import constants as hf_constants
 from mlx.utils import tree_flatten
 from mlx_lm import utils as mlx_lm_utils
 
-gguf = pytest.importorskip("gguf")
-
-import vllm_metal.gguf.loader as gguf_loader  # noqa: E402
-from tests.gguf_kquant_fixtures import (  # noqa: E402
+import vllm_metal.gguf.loader as gguf_loader
+from tests.gguf_kquant_fixtures import (
     build_iq3s_blocks,
     build_iq4_blocks,
     build_kquant_blocks,
 )
-from vllm_metal.gguf.adapter import GGUFModelAdapter  # noqa: E402
-from vllm_metal.gguf.loader import GGUFLoadError, GGUFModelLoader  # noqa: E402
-from vllm_metal.gguf.mlx_native import GGUFMLXQuantizedTensor  # noqa: E402
-from vllm_metal.gguf.raw_block import (  # noqa: E402
+from vllm_metal.gguf.adapter import GGUFModelAdapter
+from vllm_metal.gguf.loader import GGUFLoadError, GGUFModelLoader
+from vllm_metal.gguf.mlx_native import GGUFMLXQuantizedTensor
+from vllm_metal.gguf.raw_block import (
     RAW_KERNEL_GGUF_TYPES,
     GGUFRawBlockTensor,
 )
-from vllm_metal.gguf.source import GGUFLoadSource  # noqa: E402
-from vllm_metal.gguf.wrappers import GGUFLinear  # noqa: E402
+from vllm_metal.gguf.source import GGUFLoadSource
+from vllm_metal.gguf.wrappers import GGUFLinear
 
 QT = gguf.GGMLQuantizationType
 
@@ -2040,3 +2039,20 @@ def test_vocab_overrides_follow_the_file_and_config_shape(config, arch, expected
         GGUFModelAdapter.vocab_overrides(config, arch=arch, embedding_rows=256)
         == expected
     )
+
+
+@pytest.mark.parametrize("cut", [4, 109, 200])
+def test_truncated_header_raises_gguf_load_error(tmp_path, cut):
+    """A file cut inside the header must fail as GGUFLoadError, not IndexError.
+
+    gguf-py indexes an empty array when the tensor-info section is short; the
+    loader contract promises GGUFLoadError for every unreadable file.
+    """
+    gguf_path, cfg_dir = _build_dense_fixture(tmp_path, "qwen3", has_qk_norm=True)
+    data = Path(gguf_path).read_bytes()
+    assert cut < len(data)
+    truncated = tmp_path / "truncated.gguf"
+    truncated.write_bytes(data[:cut])
+
+    with pytest.raises(GGUFLoadError, match="Could not read GGUF file"):
+        GGUFModelLoader(truncated, config_dir=cfg_dir, target_dtype=mx.float32).load()
