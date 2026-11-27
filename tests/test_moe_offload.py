@@ -151,6 +151,25 @@ def test_dense_model_is_rejected(tmp_path) -> None:
         ExpertStore.install(nn.Linear(4, 4), str(tmp_path), None, 1 << 20)
 
 
+def test_shutdown_closes_expert_checkpoint(tmp_path) -> None:
+    import psutil
+
+    from vllm_metal.v1.worker import MetalWorker
+
+    reference = _tiny_olmoe(seed=1)
+    directory = tmp_path / "checkpoint"
+    _save_checkpoint(reference, directory, per_expert=False)
+    model, store = _offloaded_twin(reference, directory, 4096)
+    mx.eval(model(mx.array([[1, 2]])))
+    shard = str((directory / "model.safetensors").resolve())
+    worker = object.__new__(MetalWorker)
+    worker.model_runner = SimpleNamespace(model=model, _expert_store=store)
+    worker._metal_profiler = None
+    assert shard in {file.path for file in psutil.Process().open_files()}
+    worker.shutdown()
+    assert shard not in {file.path for file in psutil.Process().open_files()}
+
+
 class TestConfig:
     def test_cache_gb_sets_the_byte_budget(self) -> None:
         config = MetalConfig(mlx_device="gpu")
