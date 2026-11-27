@@ -25,6 +25,7 @@ def _planner(
     kv_transfer_config: object, max_model_len: int = 4096
 ) -> WorkerCachePlanner:
     runner = SimpleNamespace(
+        moe_expert_reserved_bytes=0,
         scheduler_memory_reporting_mode=lambda: "paged_attention_layout_budget",
         profile_run=lambda: _GB,
     )

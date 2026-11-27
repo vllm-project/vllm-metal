@@ -981,9 +981,7 @@ class WorkerCachePlanner:
                 )
         # Experts stream in after profiling: the cache plus one layer of
         # experts stacked for a forward.
-        expert_bytes = getattr(
-            self._worker.model_runner, "moe_expert_reserved_bytes", 0
-        )
+        expert_bytes = self._worker.model_runner.moe_expert_reserved_bytes
         overhead += expert_bytes
         future_reserved_bytes += expert_bytes
         usable_metal = int(metal_limit * fraction)
