@@ -596,7 +596,7 @@ def test_resolve_arch_rejects_unsupported_gguf_archs(gguf_arch, config_model_typ
 
     assert str(unsupported.value) == (
         f"Architecture {gguf_arch!r} is not supported; the GGUF loader supports "
-        "['gemma3', 'llama', 'qwen2', 'qwen3', 'qwen35', 'qwen3moe']."
+        "['gemma3', 'gemma4', 'llama', 'qwen2', 'qwen3', 'qwen35', 'qwen3moe']."
     )
 
 
@@ -2032,6 +2032,18 @@ def test_gemma3_quantized_file_loads_source_norms(tmp_path):
             {"vocab_size": 256, "text_config": {"vocab_size": 256}},
             id="gemma3-multimodal",
         ),
+        pytest.param(
+            {"model_type": "gemma4_text"},
+            "gemma4",
+            {"vocab_size": 256},
+            id="gemma4-text",
+        ),
+        pytest.param(
+            {"model_type": "gemma4", "text_config": {"vocab_size": 262144}},
+            "gemma4",
+            {"vocab_size": 256, "text_config": {"vocab_size": 256}},
+            id="gemma4-multimodal",
+        ),
         pytest.param({"model_type": "qwen3"}, "qwen3", {}, id="untrimmed"),
     ],
 )
@@ -2042,6 +2054,438 @@ def test_vocab_overrides_follow_the_file_and_config_shape(config, arch, expected
         GGUFModelAdapter.vocab_overrides(config, arch=arch, embedding_rows=256)
         == expected
     )
+
+
+# --- gemma4 -----------------------------------------------------------------
+
+# E2B/E4B-like dense: 4 layers (0,2 sliding; 1,3 full), 2 KV-shared YOCO layers,
+# double-wide MLP on KV-shared layers, and per-layer embeddings (PLE).
+# hidden_size_per_layer_input=32 keeps blk.{i}.proj.weight a multiple of 32
+# for Q4_0/Q8_0 block quantization.
+_GEMMA4_E2B_TEXT_CONFIG = {
+    "model_type": "gemma4_text",
+    "hidden_size": 64,
+    "intermediate_size": 128,
+    "num_hidden_layers": 4,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 1,
+    "head_dim": 16,
+    "global_head_dim": 32,
+    "vocab_size": 256,
+    "vocab_size_per_layer_input": 256,
+    "rms_norm_eps": 1e-6,
+    "hidden_size_per_layer_input": 32,
+    "num_kv_shared_layers": 2,
+    "use_double_wide_mlp": True,
+    "sliding_window": 4,
+    "sliding_window_pattern": 2,
+    "layer_types": [
+        "sliding_attention",
+        "full_attention",
+        "sliding_attention",
+        "full_attention",
+    ],
+    "attention_k_eq_v": False,
+    "final_logit_softcapping": 30.0,
+    "tie_word_embeddings": True,
+    "max_position_embeddings": 512,
+}
+
+# 31B-like dense: no KV sharing, no PLE, K-eq-V on full attention layers, and
+# separate num_global_key_value_heads.
+_GEMMA4_31B_TEXT_CONFIG = {
+    "model_type": "gemma4_text",
+    "hidden_size": 64,
+    "intermediate_size": 128,
+    "num_hidden_layers": 2,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "num_global_key_value_heads": 1,
+    "head_dim": 16,
+    "global_head_dim": 32,
+    "vocab_size": 256,
+    "rms_norm_eps": 1e-6,
+    "hidden_size_per_layer_input": 0,
+    "num_kv_shared_layers": 0,
+    "use_double_wide_mlp": False,
+    "sliding_window": 4,
+    "sliding_window_pattern": 2,
+    "layer_types": ["sliding_attention", "full_attention"],
+    "attention_k_eq_v": True,
+    "final_logit_softcapping": 30.0,
+    "tie_word_embeddings": True,
+    "max_position_embeddings": 512,
+}
+
+# GGUF tensor (after ``blk.N.``) -> mlx-lm parameter (after ``layers.N.``).
+_GEMMA4_LAYER_TENSORS = {
+    "attn_norm.weight": "input_layernorm.weight",
+    "attn_q.weight": "self_attn.q_proj.weight",
+    "attn_k.weight": "self_attn.k_proj.weight",
+    "attn_v.weight": "self_attn.v_proj.weight",
+    "attn_output.weight": "self_attn.o_proj.weight",
+    "attn_q_norm.weight": "self_attn.q_norm.weight",
+    "attn_k_norm.weight": "self_attn.k_norm.weight",
+    "post_attention_norm.weight": "post_attention_layernorm.weight",
+    "ffn_norm.weight": "pre_feedforward_layernorm.weight",
+    "ffn_gate.weight": "mlp.gate_proj.weight",
+    "ffn_up.weight": "mlp.up_proj.weight",
+    "ffn_down.weight": "mlp.down_proj.weight",
+    "post_ffw_norm.weight": "post_feedforward_layernorm.weight",
+    "inp_gate.weight": "per_layer_input_gate.weight",
+    "proj.weight": "per_layer_projection.weight",
+    "post_norm.weight": "post_per_layer_input_norm.weight",
+    "layer_output_scale.weight": "layer_scalar",
+}
+_GEMMA4_GLOBAL_TENSORS = {
+    "token_embd.weight": "model.embed_tokens.weight",
+    "output_norm.weight": "model.norm.weight",
+    "per_layer_token_embd.weight": "model.embed_tokens_per_layer.weight",
+    "per_layer_model_proj.weight": "model.per_layer_model_projection.weight",
+    "per_layer_proj_norm.weight": "model.per_layer_projection_norm.weight",
+    "output.weight": "lm_head.weight",
+}
+_GEMMA4_LIVE_TO_GGUF_LAYER = {
+    live: kind for kind, live in _GEMMA4_LAYER_TENSORS.items()
+}
+_GEMMA4_LIVE_TO_GGUF_GLOBAL = {
+    live: name for name, live in _GEMMA4_GLOBAL_TENSORS.items()
+}
+
+
+def _gemma4_gguf_name(param_path: str) -> str:
+    """Live mlx-lm parameter path -> the GGUF tensor llama.cpp writes for it."""
+    path = param_path.removeprefix("language_model.")
+    if not path.startswith("model.layers."):
+        return _GEMMA4_LIVE_TO_GGUF_GLOBAL[path]
+    _, _, layer, leaf = path.split(".", 3)
+    return f"blk.{layer}.{_GEMMA4_LIVE_TO_GGUF_LAYER[leaf]}"
+
+
+def _is_gemma4_plain(gguf_name: str) -> bool:
+    return gguf_name.endswith(("norm.weight", "layer_output_scale.weight"))
+
+
+def _gemma4_hf_value(
+    rng: np.random.Generator, gguf_name: str, shape: tuple[int, ...]
+) -> np.ndarray:
+    if gguf_name.endswith("layer_output_scale.weight"):
+        # Distinct non-unit scalars prove layer_scalar loads instead of staying 1.0.
+        value = rng.uniform(0.4, 1.6, shape)
+    elif gguf_name.endswith("norm.weight"):
+        # Unshifted around 1.0 (Gemma 4 has norm_shift=0.0, unlike Gemma 3).
+        value = 1.0 + 0.1 * rng.standard_normal(shape)
+    elif len(shape) > 1 and "token_embd" not in gguf_name:
+        value = rng.standard_normal(shape) / np.sqrt(shape[1])
+    else:
+        value = rng.standard_normal(shape)
+    return value.astype(np.float32)
+
+
+def _build_gemma4_fixture(
+    tmp_path: Path,
+    text_config: dict | None = None,
+    *,
+    quant_type=QT.Q8_0,
+    tie: bool | None = None,
+    include_dead_kv_shared: bool = False,
+    include_rope_freqs: bool = False,
+    inject: dict | None = None,
+) -> tuple[str, str, dict[str, np.ndarray]]:
+    """Write a tiny Gemma 4 dense config and the GGUF llama.cpp converts it to."""
+    config = dict(text_config or _GEMMA4_E2B_TEXT_CONFIG)
+    if tie is not None:
+        config["tie_word_embeddings"] = tie
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    skeleton, _ = mlx_lm_utils.load_model(tmp_path, lazy=True, strict=False)
+    rng = np.random.default_rng(0)
+    hf: dict[str, np.ndarray] = {}
+    for path, param in tree_flatten(skeleton.parameters()):
+        name = _gemma4_gguf_name(path)
+        hf[name] = _gemma4_hf_value(rng, name, tuple(param.shape))
+    specs: dict[str, tuple[str, tuple[int, ...]]] = {
+        name: ("f" if _is_gemma4_plain(name) else "q", value.shape)
+        for name, value in hf.items()
+    }
+    extra_inject = dict(inject or {})
+    if include_dead_kv_shared:
+        # Mirror ggml-org Q8_0 / unsloth Q4_K_M exports that retain K/V/K-norm
+        # tensors on YOCO KV-shared layers (has_kv=False).
+        for i, layer in enumerate(skeleton.model.layers):
+            if getattr(layer.self_attn, "has_kv", True):
+                continue
+            head_dim = layer.self_attn.head_dim
+            kv_dim = layer.self_attn.n_kv_heads * head_dim
+            hidden = config["hidden_size"]
+            extra_inject[f"blk.{i}.attn_k.weight"] = ("q", (kv_dim, hidden))
+            extra_inject[f"blk.{i}.attn_v.weight"] = ("q", (kv_dim, hidden))
+            extra_inject[f"blk.{i}.attn_k_norm.weight"] = ("f", (head_dim,))
+    if include_rope_freqs:
+        extra_inject["rope_freqs.weight"] = ("f", (config["global_head_dim"] // 2,))
+    gguf_path = tmp_path / "gemma4.gguf"
+    _write_gguf(
+        gguf_path,
+        "gemma4",
+        specs,
+        quant_type=quant_type,
+        inject=extra_inject,
+        values=hf,
+    )
+    return str(gguf_path), str(tmp_path), hf
+
+
+def _gemma4_source_model(cfg_dir: str, hf: dict[str, np.ndarray]) -> nn.Module:
+    """The dense mlx-lm Gemma 4 model the fixture's GGUF was converted from."""
+    model, _ = mlx_lm_utils.load_model(Path(cfg_dir), lazy=True, strict=False)
+    params = [path for path, _ in tree_flatten(model.parameters())]
+    model.load_weights(
+        [(path, mx.array(hf[_gemma4_gguf_name(path)])) for path in params]
+    )
+    model.eval()
+    return model
+
+
+@pytest.mark.parametrize(
+    "include_dead_kv_shared", [False, True], ids=["clean", "dead-kv"]
+)
+def test_gemma4_e2b_loads_the_model_it_was_converted_from(
+    tmp_path, include_dead_kv_shared
+):
+    # Proves zero norm shift (norm_shift=0.0), exact layer_scalar scaling, PLE
+    # projections/norms, YOCO KV sharing, double-wide MLP, and dead KV-shared
+    # + rope_freqs skipping match the reference mlx-lm Gemma 4 model.
+    gguf_path, cfg_dir, hf = _build_gemma4_fixture(
+        tmp_path,
+        _GEMMA4_E2B_TEXT_CONFIG,
+        quant_type=QT.F32,
+        include_dead_kv_shared=include_dead_kv_shared,
+        include_rope_freqs=True,
+    )
+    tokens = mx.array([[1, 2, 3, 4, 5, 6, 7, 8]])
+    expected = np.array(_gemma4_source_model(cfg_dir, hf)(tokens))
+
+    model = GGUFModelLoader(
+        gguf_path, config_dir=cfg_dir, target_dtype=mx.float32
+    ).load()
+    logits = np.array(model(tokens))
+
+    np.testing.assert_allclose(
+        logits, expected, rtol=0, atol=float(np.abs(expected).max()) * 1e-6
+    )
+
+
+@pytest.mark.parametrize(
+    ("quant_type", "include_dead_kv_shared"),
+    [
+        pytest.param(QT.Q4_0, False, id="q4_0-clean"),
+        pytest.param(QT.Q8_0, True, id="q8_0-dead-kv"),
+    ],
+)
+def test_gemma4_e2b_quantized_loads_wrappers_norms_and_scalars(
+    tmp_path, quant_type, include_dead_kv_shared
+):
+    gguf_path, cfg_dir, hf = _build_gemma4_fixture(
+        tmp_path,
+        _GEMMA4_E2B_TEXT_CONFIG,
+        quant_type=quant_type,
+        include_dead_kv_shared=include_dead_kv_shared,
+        include_rope_freqs=True,
+    )
+
+    model = GGUFModelLoader(
+        gguf_path, config_dir=cfg_dir, target_dtype=mx.float32
+    ).load()
+
+    hist = _gguf_module_histogram(model)
+    assert hist.get("GGUFEmbedding") == 2  # embed_tokens + embed_tokens_per_layer
+    assert hist.get("GGUFLinear") == 33
+    assert model.model.layers[0].mlp.up_proj.tensor.out_features == 128
+    assert model.model.layers[2].mlp.up_proj.tensor.out_features == 256
+
+    for path, value in tree_flatten(model.parameters()):
+        if path.endswith(("norm.weight", "layer_scalar")):
+            np.testing.assert_allclose(
+                np.array(value), hf[_gemma4_gguf_name(path)], rtol=0, atol=1e-6
+            )
+
+    _assert_forward_vocab_shape(model)
+
+
+@pytest.mark.parametrize("quant_type", [QT.F32, QT.Q4_0], ids=["f32", "q4_0"])
+def test_gemma4_31b_k_eq_v_loads_without_attn_v(tmp_path, quant_type):
+    # 31B-like dense: hidden_size_per_layer_input=0, num_kv_shared_layers=0,
+    # attention_k_eq_v=True, and num_global_key_value_heads. Full-attention layer
+    # 1 has no v_proj / attn_v.
+    gguf_path, cfg_dir, hf = _build_gemma4_fixture(
+        tmp_path,
+        _GEMMA4_31B_TEXT_CONFIG,
+        quant_type=quant_type,
+        include_rope_freqs=True,
+    )
+
+    model = GGUFModelLoader(
+        gguf_path, config_dir=cfg_dir, target_dtype=mx.float32
+    ).load()
+
+    assert "v_proj" in model.model.layers[0].self_attn
+    assert "v_proj" not in model.model.layers[1].self_attn
+    assert model.model.embed_tokens_per_layer is None
+
+    if quant_type == QT.F32:
+        tokens = mx.array([[1, 2, 3, 4, 5, 6, 7, 8]])
+        expected = np.array(_gemma4_source_model(cfg_dir, hf)(tokens))
+        logits = np.array(model(tokens))
+        np.testing.assert_allclose(
+            logits, expected, rtol=0, atol=float(np.abs(expected).max()) * 1e-6
+        )
+    else:
+        hist = _gguf_module_histogram(model)
+        assert hist.get("GGUFEmbedding") == 1
+        assert hist.get("GGUFLinear") == 13
+        _assert_forward_vocab_shape(model)
+
+
+def test_gemma4_multimodal_config_loads_trimmed_vocab(tmp_path):
+    # Multimodal Gemma 4 configs have no top-level vocab_size, so mlx-lm's
+    # ModelArgs defaults vocab_size=262144 and overwrites text_config unless
+    # skeleton_config supplies the file's embedding rows on both levels.
+    gguf_path, cfg_dir, hf = _build_gemma4_fixture(
+        tmp_path, _GEMMA4_E2B_TEXT_CONFIG, quant_type=QT.F32
+    )
+    tokens = mx.array([[1, 2, 3, 4, 5, 6, 7, 8]])
+    expected = np.array(_gemma4_source_model(cfg_dir, hf)(tokens))
+    padded_vocab = _GEMMA4_E2B_TEXT_CONFIG["vocab_size"] + 64
+    multimodal = {
+        "model_type": "gemma4",
+        "architectures": ["Gemma4ForConditionalGeneration"],
+        "text_config": {**_GEMMA4_E2B_TEXT_CONFIG, "vocab_size": padded_vocab},
+    }
+    (tmp_path / "config.json").write_text(json.dumps(multimodal))
+
+    model = GGUFModelLoader(
+        gguf_path, config_dir=cfg_dir, target_dtype=mx.float32
+    ).load()
+    logits = np.array(model(tokens))
+
+    np.testing.assert_allclose(
+        logits, expected, rtol=0, atol=float(np.abs(expected).max()) * 1e-6
+    )
+
+
+def test_gemma4_untied_output_weight_matches_reference(tmp_path):
+    gguf_path, cfg_dir, hf = _build_gemma4_fixture(
+        tmp_path, _GEMMA4_31B_TEXT_CONFIG, quant_type=QT.F32, tie=False
+    )
+    tokens = mx.array([[1, 2, 3, 4, 5, 6, 7, 8]])
+    expected = np.array(_gemma4_source_model(cfg_dir, hf)(tokens))
+
+    model = GGUFModelLoader(
+        gguf_path, config_dir=cfg_dir, target_dtype=mx.float32
+    ).load()
+    logits = np.array(model(tokens))
+
+    assert hasattr(model, "lm_head")
+    np.testing.assert_allclose(
+        logits, expected, rtol=0, atol=float(np.abs(expected).max()) * 1e-6
+    )
+
+
+def test_gemma4_tied_config_reads_output_weight_when_present(tmp_path):
+    cfg = _GEMMA4_31B_TEXT_CONFIG
+    gguf_path, cfg_dir, _ = _build_gemma4_fixture(
+        tmp_path,
+        cfg,
+        quant_type=QT.Q8_0,
+        tie=True,
+        inject={"output.weight": ("q", (cfg["vocab_size"], cfg["hidden_size"]))},
+    )
+    untied_dir = tmp_path / "untied"
+    untied_dir.mkdir()
+    (untied_dir / "config.json").write_text(
+        json.dumps({**cfg, "tie_word_embeddings": False})
+    )
+
+    model = GGUFModelLoader(
+        gguf_path, config_dir=cfg_dir, target_dtype=mx.float32
+    ).load()
+    untied = GGUFModelLoader(
+        gguf_path, config_dir=untied_dir, target_dtype=mx.float32
+    ).load()
+
+    assert isinstance(model.lm_head, GGUFLinear)
+    tokens = mx.array([[1, 2, 3]])
+    np.testing.assert_array_equal(np.array(model(tokens)), np.array(untied(tokens)))
+
+
+@pytest.mark.parametrize("nested", [False, True], ids=["top-level", "text_config"])
+def test_gemma4_loader_rejects_moe_config_before_skeleton(
+    tmp_path, monkeypatch, nested
+):
+    gguf_path, cfg_dir, _ = _build_gemma4_fixture(
+        tmp_path, _GEMMA4_31B_TEXT_CONFIG, quant_type=QT.Q8_0
+    )
+    moe_text = {**_GEMMA4_31B_TEXT_CONFIG, "enable_moe_block": True}
+    moe_config = (
+        {
+            "model_type": "gemma4",
+            "architectures": ["Gemma4ForConditionalGeneration"],
+            "text_config": moe_text,
+        }
+        if nested
+        else moe_text
+    )
+    (Path(cfg_dir) / "config.json").write_text(json.dumps(moe_config))
+
+    def fail_load_model(*args, **kwargs):
+        raise AssertionError("MoE rejection must fire before skeleton allocation")
+
+    monkeypatch.setattr(gguf_loader, "load_model", fail_load_model)
+    with pytest.raises(GGUFLoadError, match="enable_moe_block=True"):
+        GGUFModelLoader(gguf_path, config_dir=cfg_dir, target_dtype=mx.float32).load()
+
+
+@pytest.mark.parametrize(
+    "moe_tensor",
+    [
+        "blk.0.ffn_gate_inp.weight",
+        "blk.0.ffn_gate_up_exps.weight",
+        "blk.0.ffn_down_exps.weight",
+    ],
+)
+def test_gemma4_rejects_out_of_scope_moe_tensors_at_preflight(tmp_path, moe_tensor):
+    h = _GEMMA4_31B_TEXT_CONFIG["hidden_size"]
+    gguf_path, cfg_dir, _ = _build_gemma4_fixture(
+        tmp_path,
+        _GEMMA4_31B_TEXT_CONFIG,
+        quant_type=QT.Q8_0,
+        inject={moe_tensor: ("f", (2, h))},
+    )
+
+    with pytest.raises(GGUFLoadError, match=f"Out-of-scope GGUF tensor '{moe_tensor}'"):
+        GGUFModelLoader(gguf_path, config_dir=cfg_dir, target_dtype=mx.float32).load()
+
+
+def test_gemma4_plain_scalars_and_norms_follow_bfloat16_dtype(tmp_path):
+    # F32 layer_output_scale.weight and norms must cast to target_dtype so
+    # layer_scalar * h does not promote activations back to float32.
+    gguf_path, cfg_dir, _ = _build_gemma4_fixture(
+        tmp_path, _GEMMA4_E2B_TEXT_CONFIG, quant_type=QT.Q4_0
+    )
+
+    model = GGUFModelLoader(
+        gguf_path, config_dir=cfg_dir, target_dtype=mx.bfloat16
+    ).load()
+
+    plain = {
+        name: leaf.dtype
+        for name, leaf in tree_flatten(model.parameters())
+        if isinstance(leaf, mx.array) and mx.issubdtype(leaf.dtype, mx.floating)
+    }
+    assert any(name.endswith("layer_scalar") for name in plain)
+    assert {str(dtype) for dtype in plain.values()} == {str(mx.bfloat16)}
+    out = model(mx.array([[1, 2, 3]]))
+    mx.eval(out)
+    assert out.dtype == mx.bfloat16
 
 
 @pytest.mark.parametrize("cut", [4, 109, 200])

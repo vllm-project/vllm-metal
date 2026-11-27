@@ -93,6 +93,8 @@ class GGUFArchSpec:
     appended_mtp_blocks: bool = False
     # token_embd cut to the tokenizer's tokens, so config vocab_size can exceed it.
     trimmed_vocab: bool = False
+    # KV-shared (YOCO) layers reuse earlier KV; some exports still carry dead K/V tensors.
+    skip_kv_shared_projections: bool = False
 
 
 class GGUFModelAdapter:
@@ -134,6 +136,12 @@ class GGUFModelAdapter:
             global_transforms={"output_norm.weight": _ShiftedByOne()},
             trimmed_vocab=True,
         ),
+        "gemma4": GGUFArchSpec(
+            config_model_types=frozenset({"gemma4_text"}),
+            param_aliases={"layer_scalar": "layer_scalar.weight"},
+            trimmed_vocab=True,
+            skip_kv_shared_projections=True,
+        ),
         "qwen3moe": GGUFArchSpec(
             config_model_types=frozenset({"qwen3_moe"}),
             admitted_substrings=frozenset({"_exps", "ffn_gate_inp"}),
@@ -171,6 +179,14 @@ class GGUFModelAdapter:
 
     # GGUF tensors with no MLX-LM counterpart (precomputed buffers MLX recreates).
     _KNOWN_SKIP = frozenset({"rope_freqs.weight"})
+
+    # Dead K/V tensors some GGUF exports keep on YOCO KV-shared layers whose
+    # mlx-lm attention has ``has_kv=False``.
+    _KV_SHARED_SKIP_TENSORS = (
+        "attn_k.weight",
+        "attn_v.weight",
+        "attn_k_norm.weight",
+    )
 
     def __init__(
         self,
@@ -233,12 +249,36 @@ class GGUFModelAdapter:
     @classmethod
     def validate_config_model_type(cls, config_model_type: str) -> None:
         """Reject a config family that :meth:`resolve_arch` rejects for every .gguf."""
+        cls._validate_config_model_type(config_model_type)
+
+    @classmethod
+    def validate_config(cls, config: Mapping[str, Any]) -> None:
+        """Reject configs whose model family or variant the GGUF loader does not support."""
+        config_arch = cls._validate_config_model_type(str(config.get("model_type", "")))
+        if config_arch == "gemma4" and cls._is_moe_enabled(config):
+            raise GGUFLoadError(
+                "Gemma 4 MoE checkpoints (enable_moe_block=True) are not "
+                "supported by the GGUF loader; only dense Gemma 4 checkpoints "
+                "are supported."
+            )
+
+    @classmethod
+    def _validate_config_model_type(cls, config_model_type: str) -> str:
         config_arch = cls._config_model_type_to_gguf_arch(config_model_type)
         if config_arch not in cls.SUPPORTED_ARCHS:
             raise GGUFLoadError(
                 f"Config model_type {config_model_type!r} is not supported; the "
                 f"GGUF loader supports {sorted(cls.SUPPORTED_ARCHS)}."
             )
+        return config_arch
+
+    @staticmethod
+    def _is_moe_enabled(config: Mapping[str, Any]) -> bool:
+        text_config = config.get("text_config")
+        return bool(config.get("enable_moe_block")) or (
+            isinstance(text_config, Mapping)
+            and bool(text_config.get("enable_moe_block"))
+        )
 
     @classmethod
     def is_out_of_scope_tensor(cls, gguf_name: str, arch: str) -> bool:
@@ -338,6 +378,9 @@ class GGUFModelAdapter:
                 gguf, arch_enum, num_hidden_layers, nextn_predict_layers
             ):
                 translation_map[name] = None
+        if spec.skip_kv_shared_projections:
+            for name in cls._kv_shared_skip_names(model):
+                translation_map.setdefault(name, None)
         v_head_rows, v_head_columns = (
             cls._build_v_head_index(model) if spec.tiled_v_heads else ({}, {})
         )
@@ -423,6 +466,16 @@ class GGUFModelAdapter:
                 rows[f"blk.{i}.{tensor}"] = index
             columns[f"blk.{i}.ssm_out.weight"] = values
         return rows, columns
+
+    @classmethod
+    def _kv_shared_skip_names(cls, model: nn.Module) -> list[str]:
+        """Dead K/V GGUF tensor names on YOCO layers that share earlier KV."""
+        return [
+            f"blk.{i}.{tensor}"
+            for i, layer in enumerate(model.model.layers)
+            if not getattr(getattr(layer, "self_attn", None), "has_kv", True)
+            for tensor in cls._KV_SHARED_SKIP_TENSORS
+        ]
 
     @staticmethod
     def _nextn_block_names(

@@ -116,6 +116,7 @@ class GGUFModelLoader:
             gguf_arch=self._gguf_arch(reader),
             config_model_type=str(config.get("model_type", "")),
         )
+        GGUFModelAdapter.validate_config(config)
         self._preflight(reader, arch)
 
         # llama.cpp computes logits from output.weight whenever the file has one,
