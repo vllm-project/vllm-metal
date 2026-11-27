@@ -153,7 +153,11 @@ def get_model_download_path(
 
 
 def resolve_mlx_lm_model_path(
-    model_name: str | Path, *, revision: str | None = None
+    model_name: str | Path,
+    *,
+    revision: str | None = None,
+    token: str | bool | None = None,
+    cache_dir: str | None = None,
 ) -> Path:
     """Resolve a local checkpoint using mlx-lm's file filters and Hub selection.
 
@@ -168,16 +172,26 @@ def resolve_mlx_lm_model_path(
 
     from mlx_lm.utils import DEFAULT_ALLOW_PATTERNS
 
+    allow_patterns = [*DEFAULT_ALLOW_PATTERNS, "readout.safetensors"]
     if os.getenv("MLXLM_USE_MODELSCOPE", "False").lower() == "true":
         from modelscope import snapshot_download
-    else:
-        from huggingface_hub import snapshot_download
+
+        return Path(
+            snapshot_download(
+                str(model_name),
+                revision=revision,
+                allow_patterns=allow_patterns,
+            )
+        )
+    from huggingface_hub import snapshot_download
 
     return Path(
         snapshot_download(
             str(model_name),
             revision=revision,
-            allow_patterns=[*DEFAULT_ALLOW_PATTERNS, "readout.safetensors"],
+            token=token,
+            cache_dir=cache_dir,
+            allow_patterns=allow_patterns,
         )
     )
 

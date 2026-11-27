@@ -389,7 +389,12 @@ class ModelLifecycle:
         awq_loader = (
             None
             if is_gguf or use_mlx_vlm
-            else AWQQuantLoader.for_model(model_name, revision=revision)
+            else AWQQuantLoader.for_model(
+                model_name,
+                revision=revision,
+                token=model_config.hf_token,
+                cache_dir=self._runner.vllm_config.load_config.download_dir,
+            )
         )
 
         expert_cache_bytes = get_config().moe_expert_cache_bytes
@@ -416,18 +421,26 @@ class ModelLifecycle:
 
         elif awq_loader is not None:
             load_label = "AWQ model"
-            model = self._load_awq_text_model(model_name, awq_loader, revision=revision)
+            model = self._load_awq_text_model(
+                model_name,
+                awq_loader,
+                revision=revision,
+                token=model_config.hf_token,
+                cache_dir=self._runner.vllm_config.load_config.download_dir,
+            )
 
         else:
             load_label = "MLX-LM model"
             model = self._load_mlx_lm_text_model(
                 model_name,
                 lazy=lazy_weights or bool(expert_cache_bytes),
+                token=model_config.hf_token,
+                cache_dir=self._runner.vllm_config.load_config.download_dir,
                 revision=revision,
             )
             if expert_cache_bytes:
                 self._runner._expert_store = ExpertStore.install(
-                    model, model_name, revision, expert_cache_bytes
+                    model, str(self._resolved_model_path), revision, expert_cache_bytes
                 )
 
         loaded_from = (
@@ -462,9 +475,16 @@ class ModelLifecycle:
         awq_loader: AWQQuantLoader,
         *,
         revision: str | None = None,
+        token: str | bool | None = None,
+        cache_dir: str | None = None,
     ) -> Any:
         with _mlx_lm_compatible_model_path(model_name) as compatible_model_name:
-            return awq_loader.load(str(compatible_model_name), revision=revision)
+            return awq_loader.load(
+                str(compatible_model_name),
+                revision=revision,
+                token=token,
+                cache_dir=cache_dir,
+            )
 
     def _load_mlx_lm_text_model(
         self,
@@ -472,8 +492,12 @@ class ModelLifecycle:
         *,
         lazy: bool = False,
         revision: str | None = None,
+        token: str | bool | None = None,
+        cache_dir: str | None = None,
     ) -> Any:
-        model_path = resolve_mlx_lm_model_path(model_name, revision=revision)
+        model_path = resolve_mlx_lm_model_path(
+            model_name, revision=revision, token=token, cache_dir=cache_dir
+        )
         # Pooling backends read checkpoint files next to the weights
         # (d3's readout), so remember the directory the loader actually used:
         # re-resolving it from the config string needs the Hub and rejects any

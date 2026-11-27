@@ -91,13 +91,15 @@ def test_mlx_lm_snapshot_preserves_provider_revision_and_filters(
         else (hf_download, ms_download)
     )
 
-    assert resolve_mlx_lm_model_path("org/model", revision="release-tag") == Path(
-        expected.return_value
-    )
+    hub = {"token": "test-token", "cache_dir": "/model-cache"}
+    assert resolve_mlx_lm_model_path(
+        "org/model", revision="release-tag", **hub
+    ) == Path(expected.return_value)
     expected.assert_called_once_with(
         "org/model",
         revision="release-tag",
         allow_patterns=[*DEFAULT_ALLOW_PATTERNS, "readout.safetensors"],
+        **({} if modelscope_flag == "TrUe" else hub),
     )
     unused.assert_not_called()
 
