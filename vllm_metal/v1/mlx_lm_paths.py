@@ -33,10 +33,6 @@ def mlx_lm_compatible_model_path(model_name: str | Path) -> Iterator[Path]:
         yield model_path
         return
 
-    if any(model_path.glob("model*.safetensors")):
-        yield model_path
-        return
-
     index_path = model_path / "model.safetensors.index.json"
     if not index_path.is_file():
         yield model_path
@@ -52,10 +48,12 @@ def mlx_lm_compatible_model_path(model_name: str | Path) -> Iterator[Path]:
             if isinstance(shard_name, str) and shard_name.endswith(".safetensors")
         }
     )
-    if not shard_names:
+    discovered = {p.name for p in model_path.glob("model*.safetensors")}
+    if discovered.issuperset(shard_names):
         yield model_path
         return
 
+    model_path = model_path.absolute()
     with TemporaryDirectory(prefix="vllm-metal-mlx-lm-") as tmpdir:
         compat_path = Path(tmpdir)
 
