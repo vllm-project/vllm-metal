@@ -342,12 +342,13 @@ def test_mixed_decode_prefix_uses_gqa(mixed_family, lengths, dtype):
         )
 
 
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
 def test_tiled_key_ranges_preserve_packed_rows_with_translated_pages(
-    force_tiled_prefill,
+    force_tiled_prefill, dtype
 ):
     ops = get_ops()
     inputs = _mixed_inputs(
-        [131], prefill_kv=1057, geometry=(24, 4, 256, 16), cache_block=784
+        [131], dtype=dtype, prefill_kv=1057, geometry=(24, 4, 256, 16), cache_block=784
     )
     assert ops._tiled_prefill_range_plan(
         inputs["query"],
@@ -401,10 +402,15 @@ def test_tiled_key_ranges_preserve_packed_rows_with_translated_pages(
         assert mx.array_equal(bounded, plain).item()
 
 
-def test_bounded_tiled_plan_keeps_native_split_decode(force_tiled_prefill):
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+def test_bounded_tiled_plan_keeps_native_split_decode(force_tiled_prefill, dtype):
     ops = get_ops()
     inputs = _mixed_inputs(
-        [256, 300], geometry=(24, 4, 256, 16), prefill_kv=1057, cache_block=784
+        [256, 300],
+        dtype=dtype,
+        geometry=(24, 4, 256, 16),
+        prefill_kv=1057,
+        cache_block=784,
     )
     prefix_plan = ops.gqa_decode_length_plan([256, 300])
     mixed = _mixed_call(inputs, gqa_length_plan=prefix_plan)
