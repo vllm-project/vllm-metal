@@ -72,9 +72,7 @@ Open a pull request against `main` in `vllm-project/vllm-metal`.
 
 ### Pull request limit
 
-Contributors without write access may have up to **7 open PRs**, including
-drafts, under [GitHub's pull request limit](https://docs.github.com/en/communities/moderating-comments-and-conversations/limiting-interactions-in-your-repository#limiting-concurrent-open-pull-requests-for-users-without-write-access).
-All authors may have at most **2 PRs ready for review**.
+All authors may have at most **2 PRs ready for review**. Drafts are not limited.
 
 Drafts remain available for discussion outside the review queue. To reprioritize,
 convert a ready PR to draft before marking another ready.
