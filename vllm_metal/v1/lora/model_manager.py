@@ -186,13 +186,16 @@ class MLXLoRAModelManager:
             )
         self.encoder_punica_wrapper.set_slot(slot)
 
-    def add_adapter(self, adapter: LoadedLoRA) -> bool:
+    def add_adapter(
+        self, adapter: LoadedLoRA, *, require_activation_slot: bool = False
+    ) -> bool:
         if adapter.lora_id in self._registered:
             self._registered.touch(adapter.lora_id)
             return False
 
-        # Validate before eviction so a malformed new adapter cannot destroy a
-        # working cache entry.
+        # Check capacity and weights before evicting a cached adapter.
+        if require_activation_slot:
+            self._next_activation_slot()
         self._prepare_adapter_update(adapter, 0)
 
         if len(self._registered) >= self.capacity:
