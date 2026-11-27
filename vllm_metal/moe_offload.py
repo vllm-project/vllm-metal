@@ -72,7 +72,7 @@ class ExpertStore:
         "BF16": (np.uint16, mx.bfloat16),
     }
     PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
-    COMPONENTS = ("weight", "scales", "biases")
+    COMPONENTS = ("weight", "scales", "biases", "bias")
     # Parallel preads per batch of cache misses; SSD reads are latency bound.
     READ_THREADS = 8
 

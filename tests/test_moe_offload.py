@@ -33,10 +33,16 @@ def _tiny_olmoe(seed: int) -> nn.Module:
             "vocab_size": 128,
             "num_experts": NUM_EXPERTS,
             "num_experts_per_tok": TOP_K,
+            "mlp_bias": True,
             "tie_word_embeddings": False,
         }
     )
     model = olmoe.Model(args)
+    for layer in model.model.layers:
+        projection = layer.mlp.switch_mlp.down_proj
+        projection.bias = mx.broadcast_to(
+            mx.arange(NUM_EXPERTS, dtype=mx.float32)[:, None], projection.bias.shape
+        )
     nn.quantize(model, group_size=32, bits=4)
     mx.eval(model.parameters())
     return model
