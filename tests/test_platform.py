@@ -2052,6 +2052,13 @@ class TestMetalPlatform:
         MetalPlatform.check_and_update_config(vllm_config)
         assert cache_config.mamba_ssm_cache_dtype == dtype
 
+    def test_sleep_mode_rejected_for_stt_before_startup(self, monkeypatch) -> None:
+        self._patch_stt_resolution(monkeypatch, is_stt=True)
+        config = self._detection_platform_config()
+        config.model_config.enable_sleep_mode = True
+        with pytest.raises(NotImplementedError, match="Sleep mode.*speech-to-text"):
+            MetalPlatform.check_and_update_config(config)
+
     def test_check_and_update_config_applies_stt_scheduler_policy(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

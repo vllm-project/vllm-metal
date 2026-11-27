@@ -1096,6 +1096,10 @@ class MetalPlatform(Platform):
                 )
 
         if serves_stt_model:
+            if model_config.enable_sleep_mode:
+                raise NotImplementedError(
+                    "Sleep mode is not supported for speech-to-text models on Metal."
+                )
             # STT checkpoints use a dedicated STTModelRunner with no pipeline-
             # split path. Reject PP here, with the other config-time PP guards,
             # before any worker spawns.
