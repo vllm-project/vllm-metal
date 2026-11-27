@@ -106,7 +106,8 @@ the tier would publish nothing.
 ## Operational notes
 
 - **Disk cap.** When a store would cross the cap, the least recently stored or
-  restored blocks are deleted first. Files with a load or store in flight are
+  restored blocks are deleted first. Files from prior hybrid layouts count
+  toward the cap. Files with a load or store in flight are
   never deleted. The cap is per process, so give each server its own
   `root_dir`. A Time Machine local snapshot can hold deleted block files until
   macOS reclaims the space, which it does when the disk runs low.

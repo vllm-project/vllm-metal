@@ -165,10 +165,19 @@ def configure_kv_offloading(vllm_config: VllmConfig) -> None:
         raise NotImplementedError(
             "KV offloading on Metal does not support pooling models."
         )
-    if model_config.is_hybrid and not cache_config.enable_prefix_caching:
-        raise NotImplementedError(
-            "Hybrid KV offloading on Metal requires --enable-prefix-caching."
-        )
+    if model_config.is_hybrid:
+        # Metal also detects MLA from the checkpoint's latent rank.
+        if (
+            model_config.use_mla
+            or getattr(model_config.hf_text_config, "kv_lora_rank", None) is not None
+        ):
+            raise NotImplementedError(
+                "KV offloading on Metal does not support hybrid MLA models."
+            )
+        if not cache_config.enable_prefix_caching:
+            raise NotImplementedError(
+                "Hybrid KV offloading on Metal requires --enable-prefix-caching."
+            )
     speculative_config = vllm_config.speculative_config
     if speculative_config is not None and speculative_config.method in (
         "dflash",

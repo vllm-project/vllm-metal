@@ -120,12 +120,18 @@ class MetalFileSystemTierManager(FileSystemTierManager):
         tier_type = "fs"
         store_dir = prepare_root_dir(root_dir)
         signature = layout_signature()
-        store_dir = os.path.join(store_dir, *filter(None, (signature, hybrid_layout)))
-        _make_private_dir(store_dir)
-        if store_dir != root_dir:
-            logger.info("KV store blocks live under %s (Spotlight-excluded)", store_dir)
+        if signature:
+            store_dir = os.path.join(store_dir, signature)
+        layout_dir = (
+            os.path.join(store_dir, hybrid_layout) if hybrid_layout else store_dir
+        )
+        _make_private_dir(layout_dir)
+        if layout_dir != root_dir:
+            logger.info(
+                "KV store blocks live under %s (Spotlight-excluded)", layout_dir
+            )
         super().__init__(
-            offloading_spec, primary_kv_view, tier_type, store_dir, **kwargs
+            offloading_spec, primary_kv_view, tier_type, layout_dir, **kwargs
         )
         # Scheduler-thread bookkeeping. Paths of in-flight jobs pin their files.
         # path -> (size, key); key is None if the path does not map back to one.

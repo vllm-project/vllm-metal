@@ -409,6 +409,26 @@ def test_store_cap_seeds_from_a_previous_run(tmp_path: Path) -> None:
         second.shutdown()
 
 
+def test_hybrid_layout_keeps_previous_files_under_the_cap(tmp_path: Path) -> None:
+    cap = BLOCK / (1 << 30)
+    key = _key(b"same prompt")
+    first = _tier(tmp_path, max_size_gib=cap, hybrid_layout="old-layout")
+    try:
+        _store_keys(first, [key])
+        old_path = Path(first.file_mapper.get_file_name(key))
+    finally:
+        first.shutdown()
+
+    second = _tier(tmp_path, max_size_gib=cap, hybrid_layout="new-layout")
+    try:
+        assert _lookup(second, key, ReqContext(req_id="old")) is LookupResult.MISS
+        _store_keys(second, [key])
+        assert _lookup(second, key, ReqContext(req_id="new")) is LookupResult.HIT
+        assert not old_path.exists()
+    finally:
+        second.shutdown()
+
+
 @pytest.fixture(autouse=True)
 def _roomy_disk(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep the default cap's free-space check off the host's real disk."""

@@ -465,6 +465,16 @@ def test_mla_accepted_at_config_time() -> None:
     assert vllm_config.kv_transfer_config.kv_connector == "MetalOffloadingConnector"
 
 
+@pytest.mark.parametrize(("use_mla", "kv_lora_rank"), [(True, None), (False, 512)])
+def test_hybrid_mla_rejected_at_config_time(use_mla, kv_lora_rank) -> None:
+    vllm_config = _base_config(kv_offloading_size=1.0, enable_prefix_caching=True)
+    vllm_config.model_config.is_hybrid = True
+    vllm_config.model_config.use_mla = use_mla
+    vllm_config.model_config.hf_text_config.kv_lora_rank = kv_lora_rank
+    with pytest.raises(NotImplementedError, match="hybrid MLA"):
+        configure_kv_offloading(vllm_config)
+
+
 def _tiered(kv_offloading_size: float = 1.0) -> SimpleNamespace:
     vllm_config = _base_config(kv_offloading_size=kv_offloading_size)
     vllm_config.kv_transfer_config = SimpleNamespace(
