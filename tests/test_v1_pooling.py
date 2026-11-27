@@ -1715,7 +1715,10 @@ class TestD3ReadoutPooler:
     ) -> None:
         """/v1/systemone sends False and softmaxes over one question's codes;
         True is upstream PoolerClassify over the whole code space."""
-        pooler = D3ReadoutPooler(self._model_config(tmp_path))
+        config = self._model_config(tmp_path)
+        config.pooler_config.logit_mean = 1.0
+        config.pooler_config.logit_sigma = 2.0
+        pooler = D3ReadoutPooler(config)
         span = DecoderPoolingSpan(
             start_row=0,
             num_tokens=2,
@@ -1732,11 +1735,11 @@ class TestD3ReadoutPooler:
 
         if use_activation:
             assert logits.tolist() == pytest.approx(
-                mx.softmax(mx.array([1.0, 4.0, 1.5])).tolist()
+                mx.softmax(mx.array([0.0, 1.5, 0.25])).tolist()
             )
             assert float(logits.sum()) == pytest.approx(1.0, abs=1e-6)
         else:
-            assert logits.tolist() == pytest.approx([1.0, 4.0, 1.5])
+            assert logits.tolist() == pytest.approx([0.0, 1.5, 0.25])
 
     def test_pooler_config_activation_applies_when_params_are_silent(
         self, tmp_path
