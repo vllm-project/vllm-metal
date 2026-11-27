@@ -70,6 +70,10 @@ from vllm_metal.metal import get_ops, paged_attention_capabilities
 
 logger = init_logger(__name__)
 
+# Bound large, full-causal hybrid tiles without changing scheduler chunking.
+_TILED_PREFILL_KEY_RANGE = 32_768
+_TILED_PREFILL_MIN_QK_PAIRS = 32 * 1024 * 1024
+
 
 def _has_packed_qkv_sdpa_contract(module: nn.Module) -> bool:
     """Return True when *module* exposes the packed Phi-style SDPA contract."""
@@ -1148,23 +1152,117 @@ def sdpa_forward(
                     capabilities, work, q_3d.shape[2], prefill_work=prefill_work
                 )
             )
-        out = ops.paged_attention_primitive(
-            q_3d,
-            kernel_k_cache,
-            kernel_v_cache,
-            cache_kv_heads,
-            attn_scale,
-            attn_softcap,
-            block_tables,
-            seq_lens,
-            cu_seqlens_q,
-            kernel_block_size,
-            max_seq_len,
-            layer_sliding_window,
-            window_seqlen_q=ctx.verify_window_q,
-            sinks=sinks,
-            **paged_kwargs,
-        )
+        range_plan = None
+        if (
+            ctx.state_group_slot_mappings is not None
+            and 0 <= num_decode == ctx.num_decode_tokens
+            and len(ctx.context_lens) - num_decode == 1
+            and ctx.verify_window_q == 1
+            and layer_sliding_window < 0
+            and not ctx.segment_bidi_ranges
+            and q_3d.shape[2] == 256
+            and ctx.context_lens[-1] > _TILED_PREFILL_KEY_RANGE
+            and (q_3d.shape[0] - num_decode) * ctx.context_lens[-1]
+            >= _TILED_PREFILL_MIN_QK_PAIRS
+            and not mm_kwargs
+            and not attn_softcap
+            and sinks is None
+        ):
+            range_plan = ops._tiled_prefill_range_plan(
+                q_3d,
+                kernel_k_cache,
+                kernel_v_cache,
+                len(ctx.context_lens),
+                kernel_block_size,
+                max_seq_len,
+                paged_kwargs.get("num_decode_requests", -1),
+                paged_kwargs.get("num_decode_tokens", 0),
+                paged_kwargs.get("max_decode_context_len", 0),
+                paged_kwargs.get("gqa_length_plan"),
+            )
+        split_decode = range_plan is not None and range_plan[1]
+        key_limit = ctx.context_lens[-1] if split_decode else max_seq_len
+        if (
+            range_plan is not None
+            and key_limit > _TILED_PREFILL_KEY_RANGE
+            and _TILED_PREFILL_KEY_RANGE % range_plan[0] == 0
+        ):
+            key_alignment, _ = range_plan
+            logger.info_once(
+                "Metal: bounding tiled prefill to %d keys per dispatch with %d active decode rows (split decode: %s).",
+                _TILED_PREFILL_KEY_RANGE,
+                num_decode,
+                split_decode,
+            )
+            decode_output = None
+            range_query, range_tables = q_3d, block_tables
+            range_lengths, range_offsets = seq_lens, cu_seqlens_q
+            if split_decode:
+                # Preserve the native one-token decode route. Only prefill
+                # spans the long keys and needs separate command buffers.
+                decode_output = ops.paged_attention_primitive(
+                    q_3d[:num_decode],
+                    kernel_k_cache,
+                    kernel_v_cache,
+                    cache_kv_heads,
+                    attn_scale,
+                    attn_softcap,
+                    block_tables[:num_decode],
+                    seq_lens[:num_decode],
+                    cu_seqlens_q[: num_decode + 1],
+                    kernel_block_size,
+                    ctx.max_decode_context_len,
+                    layer_sliding_window,
+                    **paged_kwargs,
+                )
+                range_query = q_3d[num_decode:]
+                range_tables = block_tables[num_decode:]
+                range_lengths = seq_lens[num_decode:]
+                range_offsets = cu_seqlens_q[num_decode:] - num_decode
+            state = None
+            for start in range(0, key_limit, _TILED_PREFILL_KEY_RANGE):
+                end = min(start + _TILED_PREFILL_KEY_RANGE, key_limit)
+                state = ops._tiled_prefill_key_range(
+                    range_query,
+                    kernel_k_cache,
+                    kernel_v_cache,
+                    range_tables,
+                    range_lengths,
+                    range_offsets,
+                    attn_scale,
+                    kernel_block_size,
+                    start,
+                    (end + key_alignment - 1) // key_alignment * key_alignment,
+                    end == key_limit,
+                    state,
+                )
+                # End the range outside native eval_gpu, where MLX owns the buffer.
+                mx.eval(state)
+                mx.synchronize(mx.default_stream(mx.gpu))
+            assert state is not None
+            out = (
+                state
+                if decode_output is None
+                else mx.concatenate((decode_output, state))
+            )
+        else:
+            out = ops.paged_attention_primitive(
+                q_3d,
+                kernel_k_cache,
+                kernel_v_cache,
+                cache_kv_heads,
+                attn_scale,
+                attn_softcap,
+                block_tables,
+                seq_lens,
+                cu_seqlens_q,
+                kernel_block_size,
+                max_seq_len,
+                layer_sliding_window,
+                window_seqlen_q=ctx.verify_window_q,
+                sinks=sinks,
+                **paged_kwargs,
+            )
 
     if recompute_after_kernel:
         assert ctx.cu_seqlens is not None

@@ -342,6 +342,125 @@ def test_mixed_decode_prefix_uses_gqa(mixed_family, lengths, dtype):
         )
 
 
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+def test_tiled_key_ranges_preserve_packed_rows_with_translated_pages(
+    force_tiled_prefill, dtype
+):
+    ops = get_ops()
+    inputs = _mixed_inputs(
+        [131], dtype=dtype, prefill_kv=1057, geometry=(24, 4, 256, 16), cache_block=784
+    )
+    assert ops._tiled_prefill_range_plan(
+        inputs["query"],
+        inputs["key_cache"],
+        inputs["value_cache"],
+        2,
+        inputs["block_size"],
+        inputs["max_seq_len"],
+        1,
+        1,
+        inputs["max_decode_context_len"],
+        ops.gqa_decode_length_plan([131]),
+    ) == (16, False)
+    plain = bounded = inputs["query"]
+    range_inputs = tuple(
+        inputs[name]
+        for name in (
+            "key_cache",
+            "value_cache",
+            "block_tables",
+            "seq_lens",
+            "cu_seqlens_q",
+            "scale",
+            "block_size",
+        )
+    )
+    with pytest.raises(ValueError, match="invalid tiled-attention FP32 state shape"):
+        ops._tiled_prefill_key_range(
+            bounded,
+            *range_inputs,
+            512,
+            1024,
+            False,
+            mx.zeros(bounded.shape, mx.float32),
+        )
+    for _ in range(2):
+        plain = _mixed_call(
+            inputs, query=plain, num_decode_requests=0, num_decode_tokens=0
+        )
+        assert _dispatch_family() == "tiled_prefill"
+        # The decode row exhausts its keys in the first range; the prefill
+        # still reaches a partial final key tile through translated pages.
+        previous = None
+        for begin, end in ((0, 512), (512, 1024), (1024, 1072)):
+            previous = ops._tiled_prefill_key_range(
+                bounded, *range_inputs, begin, end, end == 1072, previous
+            )
+            mx.eval(previous)
+            mx.synchronize()
+        bounded = previous
+        assert mx.array_equal(bounded, plain).item()
+
+
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+def test_bounded_tiled_plan_keeps_native_split_decode(force_tiled_prefill, dtype):
+    ops = get_ops()
+    inputs = _mixed_inputs(
+        [256, 300],
+        dtype=dtype,
+        geometry=(24, 4, 256, 16),
+        prefill_kv=1057,
+        cache_block=784,
+    )
+    prefix_plan = ops.gqa_decode_length_plan([256, 300])
+    mixed = _mixed_call(inputs, gqa_length_plan=prefix_plan)
+    assert _dispatch_family() == "mixed_prefill_decode"
+    assert ops._tiled_prefill_range_plan(
+        inputs["query"],
+        inputs["key_cache"],
+        inputs["value_cache"],
+        3,
+        inputs["block_size"],
+        inputs["max_seq_len"],
+        inputs["num_decode_requests"],
+        inputs["num_decode_tokens"],
+        inputs["max_decode_context_len"],
+        prefix_plan,
+    ) == (16, True)
+    query = inputs["query"]
+    tables = inputs["block_tables"]
+    lengths = inputs["seq_lens"]
+    offsets = inputs["cu_seqlens_q"]
+    decode = _mixed_call(
+        inputs,
+        query=query[:2],
+        block_tables=tables[:2],
+        seq_lens=lengths[:2],
+        cu_seqlens_q=offsets[:3],
+        max_seq_len=300,
+        gqa_length_plan=prefix_plan,
+    )
+    prefill = None
+    for begin, end in ((0, 512), (512, 1024), (1024, 1072)):
+        prefill = ops._tiled_prefill_key_range(
+            query[2:],
+            inputs["key_cache"],
+            inputs["value_cache"],
+            tables[2:],
+            lengths[2:],
+            offsets[2:] - 2,
+            inputs["scale"],
+            inputs["block_size"],
+            begin,
+            end,
+            end == 1072,
+            prefill,
+        )
+        mx.eval(prefill)
+        mx.synchronize()
+    assert mx.array_equal(mixed, mx.concatenate((decode, prefill))).item()
+
+
 @pytest.mark.parametrize(
     "geometry,cache_block,dtype",
     [

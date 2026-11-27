@@ -734,6 +734,7 @@ class _PagedRoutingOpsSpy:
         nax_prefill_split_hint: int = -1,
     ) -> mx.array:
         del window_seqlen_q, sinks
+        self.calls[-1].query_rows = _query.shape[0]
         self.calls[-1].block_tables = block_tables.tolist()
         self.calls[-1].block_size = block_size
         self.calls[-1].num_decode_requests = num_decode_requests
@@ -796,6 +797,79 @@ class _PreMmPrefixOps(_PagedOpsCapsOff):
 
 class TestSDPAForward:
     """Tests for ``sdpa_forward`` runtime argument propagation."""
+
+    @pytest.mark.parametrize("native_plan", [(16, False), (16, True), None])
+    def test_bounded_long_prefill_respects_native_attention_route(
+        self, monkeypatch, native_plan
+    ) -> None:
+        inner = _make_inner(head_dim=256, dtype=mx.bfloat16)
+        inner.o_proj = nn.Identity()
+        ctx = _make_ctx(257)
+        split_decode = native_plan == (16, True)
+        decode_context = 1_176 if split_decode else 131
+        ctx.context_lens = [decode_context, 131_073]
+        ctx.block_tables = [[0], [1]]
+        ctx.cu_seqlens = [0, 1, 257]
+        ctx.num_decode_requests = ctx.num_decode_tokens = 1
+        ctx.max_decode_context_len = decode_context
+        ctx.state_group_slot_mappings = ([0, 1],)
+        cache = make_kv_cache(
+            num_layers=1,
+            num_kv_heads=_N_KV_HEADS,
+            head_dim=256,
+            num_blocks=2,
+            block_size=16,
+            dtype=mx.bfloat16,
+        )
+        ops = _PagedRoutingOpsSpy()
+        ranges = []
+
+        def key_range(
+            query,
+            _key,
+            _value,
+            _tables,
+            lengths,
+            boundaries,
+            _scale,
+            _block,
+            begin,
+            end,
+            final,
+            _previous,
+        ):
+            assert lengths.tolist() == ([131_073] if split_decode else [131, 131_073])
+            assert boundaries.tolist() == ([0, 256] if split_decode else [0, 1, 257])
+            assert query.shape[0] == (256 if split_decode else 257)
+            ranges.append((begin, end, final))
+            return mx.zeros_like(query)
+
+        monkeypatch.setattr(ops, "_tiled_prefill_key_range", key_range, raising=False)
+        monkeypatch.setattr(
+            ops,
+            "_tiled_prefill_range_plan",
+            lambda *_args: native_plan,
+            raising=False,
+        )
+        monkeypatch.setattr(sdpa_mod, "get_ops", lambda: ops)
+        x = mx.ones((_BATCH, 257, _HIDDEN), dtype=mx.bfloat16)
+
+        output, _ = sdpa_forward(inner, x, ctx, cache, layer_idx=0)
+
+        assert output.shape == (_BATCH, 257, _N_HEADS * 256)
+        expected = [
+            (0, 32_768, False),
+            (32_768, 65_536, False),
+            (65_536, 98_304, False),
+            (98_304, 131_072, False),
+            (131_072, 131_088, True),
+        ]
+        assert ranges == (expected if native_plan else [])
+        if native_plan is None or split_decode:
+            assert ops.calls[-1].num_decode_requests == 1
+            assert ops.calls[-1].num_decode_tokens == 1
+            assert ops.calls[-1].max_decode_context_len == decode_context
+            assert ops.calls[-1].query_rows == (1 if split_decode else 257)
 
     @pytest.mark.parametrize("cache_dtype", [mx.bfloat16, mx.float16])
     def test_output_projection_receives_the_query_dtype(
