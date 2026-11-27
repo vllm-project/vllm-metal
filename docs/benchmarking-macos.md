@@ -52,9 +52,13 @@ substituted for serving results.
 ## Measure short requests during a long prefill
 
 Set `--max-num-seqs` to at least 2 and allow two in-flight requests in the
-client. Measure each request alone, then send the same short request at a
-fixed offset during a multi-chunk long prefill. Record the actual send
-offset relative to the long request and report both first-token latencies.
+client. If you set `--max-num-active-seqs`, keep it at least 2 as well. In an
+otherwise idle server, sample `vllm:num_requests_running` on `/metrics` to
+check that both requests were admitted concurrently.
+
+Measure each request alone, then send the same short request at a fixed
+offset during a multi-chunk long prefill. Record the actual send offset
+relative to the long request and report both first-token latencies.
 
 Compare `--long-prefill-token-threshold` values at a fixed batch capacity
 and scheduling budget. vLLM can waive the cap for a lone prefill. To
