@@ -132,15 +132,16 @@ vllm-metal's GGUF engine integration sets `quantization=gguf` from the file
 (vLLM 0.24 moved its in-tree GGUF support to the CUDA/ROCm-only
 [vllm-gguf-plugin](https://github.com/vllm-project/vllm-gguf-plugin)). Dense
 `qwen2`/`qwen3`/`llama`/`mistral`, Qwen3 MoE (`qwen3moe`), and text-only
-Qwen3.5 (`qwen35`) and Gemma 3 (`gemma3`) checkpoints load from a local `.gguf`
-(including llama.cpp's Q4_K_M and Q5_K_M exports) or a remote `repo_id:quant`
-reference and stay quantized in memory. See
-[GGUF](gguf.md) for the supported qtypes, exclusions, and serve examples.
+Qwen3.5 (`qwen35`), Gemma 3 (`gemma3`), and Gemma 4 dense (`gemma4`)
+checkpoints load from a local `.gguf` (including llama.cpp's Q4_K_M and Q5_K_M
+exports) or a remote `repo_id:quant` reference and stay quantized in memory.
+See [GGUF](gguf.md) for the supported qtypes, exclusions, and serve examples.
 Verified end-to-end on Qwen3-0.6B, Llama-3.2-1B-Instruct, and
 Mistral-7B-Instruct-v0.3 in Q8_0 and Q4_K_M, on Qwen3.5-0.8B Q8_0, 4B
-Q5_K_M, and 9B Q4_K_M, and on Gemma 3 4B Q4_K_M
+Q5_K_M, and 9B Q4_K_M, on Gemma 3 4B Q4_K_M, and on Gemma 4 E2B Q4_0 and Q8_0
 ([#415](https://github.com/vllm-project/vllm-metal/issues/415),
-[#761](https://github.com/vllm-project/vllm-metal/issues/761)).
+[#761](https://github.com/vllm-project/vllm-metal/issues/761),
+[#1259](https://github.com/vllm-project/vllm-metal/issues/1259)).
 
 Mistral Small 3.1 (`mlx-community/Mistral-Small-3.1-24B-Instruct-2503-4bit`) is
 a vision-language model. By default vllm-metal serves its text backbone through

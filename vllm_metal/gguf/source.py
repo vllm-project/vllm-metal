@@ -243,10 +243,8 @@ class GGUFLoadSource:
         if remote_ref is None:
             weights_path = weights_ref
         else:
-            # The loader rejects the same families, but only after the download.
-            GGUFModelAdapter.validate_config_model_type(
-                cls._read_config_model_type(config_dir)
-            )
+            # The loader rejects the same configs, but only after the download.
+            GGUFModelAdapter.validate_config(cls._read_config(config_dir))
             weights_path = remote_ref.resolve(
                 cache_dir=cache_dir,
                 revision=model_config.revision,
@@ -334,7 +332,3 @@ class GGUFLoadSource:
         if not config_file.is_file():
             raise GGUFLoadError(f"No config.json in config_dir {config_dir!r}")
         return json.loads(config_file.read_text())
-
-    @classmethod
-    def _read_config_model_type(cls, config_dir: str) -> str:
-        return str(cls._read_config(config_dir).get("model_type", ""))

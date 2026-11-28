@@ -424,6 +424,97 @@ def test_gemma3_gguf_keeps_the_users_hf_overrides(tmp_path, gemma3_gguf) -> None
     assert model_config.hf_text_config.rms_norm_eps == 1e-5
 
 
+@pytest.fixture()
+def gemma4_gguf(tmp_path):
+    """A real tiny Gemma 4 E2B .gguf with 256 embedding rows, and its text config."""
+    loader_tests = pytest.importorskip("tests.test_gguf_loader")
+    gguf_path, _, _ = loader_tests._build_gemma4_fixture(
+        tmp_path, loader_tests._GEMMA4_E2B_TEXT_CONFIG, quant_type=loader_tests.QT.F32
+    )
+    return gguf_path, loader_tests._GEMMA4_E2B_TEXT_CONFIG
+
+
+def _gemma4_config_dir(
+    tmp_path: Path, text_config: dict, *, multimodal: bool, vocab_size: int = 320
+) -> str:
+    """A gemma4_text or gemma4 config whose vocab_size exceeds the file's rows."""
+    text_config = {**text_config, "vocab_size": vocab_size}
+    if multimodal:
+        config = {
+            "model_type": "gemma4",
+            "architectures": ["Gemma4ForConditionalGeneration"],
+            "text_config": text_config,
+        }
+    else:
+        config = {**text_config, "architectures": ["Gemma4ForCausalLM"]}
+    directory = tmp_path / "gemma4-config"
+    directory.mkdir()
+    (directory / "config.json").write_text(json.dumps(config))
+    return str(directory)
+
+
+@pytest.mark.parametrize("multimodal", [False, True], ids=["text", "multimodal"])
+def test_create_engine_config_routes_gemma4_gguf(
+    tmp_path, gemma4_gguf, multimodal
+) -> None:
+    gguf_path, text_config = gemma4_gguf
+    config_dir = _gemma4_config_dir(tmp_path, text_config, multimodal=multimodal)
+
+    vllm_config = _engine_args(
+        model=gguf_path, tokenizer=config_dir
+    ).create_engine_config()
+    model_config = vllm_config.model_config
+    source = gguf_source.GGUFLoadSource.from_model_config(model_config)
+
+    assert model_config.quantization == "gguf"
+    assert isinstance(vllm_config.quant_config, MetalGGUFConfig)
+    assert model_config.hf_config.model_type == (
+        "gemma4" if multimodal else "gemma4_text"
+    )
+    assert model_config.get_vocab_size() == 256
+    assert source is not None
+    assert source.weights_path == gguf_path
+    assert source.config_dir == config_dir
+
+
+@pytest.mark.parametrize("multimodal", [False, True], ids=["text", "multimodal"])
+@pytest.mark.parametrize(
+    ("params", "message"),
+    [
+        ({"logit_bias": {256: 1.0}}, r"\[256\] in logit_bias .* Vocabulary size: 256"),
+        ({"allowed_token_ids": [1, 256]}, "allowed_token_ids contains out-of-vocab"),
+    ],
+    ids=["logit_bias", "allowed_token_ids"],
+)
+def test_gemma4_gguf_rejects_token_ids_past_the_file_vocab(
+    tmp_path, gemma4_gguf, multimodal, params, message
+) -> None:
+    gguf_path, text_config = gemma4_gguf
+    config_dir = _gemma4_config_dir(tmp_path, text_config, multimodal=multimodal)
+
+    model_config = _engine_args(
+        model=gguf_path, tokenizer=config_dir
+    ).create_model_config()
+
+    assert model_config.get_vocab_size() == 256
+    with pytest.raises(VLLMValidationError, match=message):
+        SamplingParams(**params).verify(model_config, None, None, None)
+
+
+def test_gemma4_gguf_keeps_the_users_hf_overrides(tmp_path, gemma4_gguf) -> None:
+    gguf_path, text_config = gemma4_gguf
+    config_dir = _gemma4_config_dir(tmp_path, text_config, multimodal=True)
+
+    model_config = _engine_args(
+        model=gguf_path,
+        tokenizer=config_dir,
+        hf_overrides={"text_config": {"rms_norm_eps": 1e-5}},
+    ).create_model_config()
+
+    assert model_config.get_vocab_size() == 256
+    assert model_config.hf_text_config.rms_norm_eps == 1e-5
+
+
 @pytest.mark.parametrize("offline", [False, True])
 def test_create_model_config_routes_remote_gguf_reference(
     config_dir, monkeypatch, offline
@@ -874,6 +965,41 @@ def test_remote_load_source_rejects_unsupported_family_before_download(
         f"Config model_type {model_type!r} is not supported; the GGUF loader "
         f"supports {supported}."
     )
+
+
+@pytest.mark.parametrize("nested", [False, True], ids=["top-level", "text_config"])
+def test_remote_load_source_rejects_gemma4_moe_before_download(
+    tmp_path, monkeypatch, nested: bool
+) -> None:
+    def fail_hub(*_: object, **__: object) -> None:
+        raise AssertionError("Gemma 4 MoE must be rejected before weights download")
+
+    monkeypatch.setattr(gguf_source, "HfApi", fail_hub)
+    monkeypatch.setattr(gguf_source, "snapshot_download", fail_hub)
+    loader_tests = pytest.importorskip("tests.test_gguf_loader")
+    moe_text = {
+        **loader_tests._GEMMA4_31B_TEXT_CONFIG,
+        "enable_moe_block": True,
+        "num_experts": 4,
+        "top_k_experts": 2,
+        "moe_intermediate_size": 64,
+    }
+    config = (
+        {
+            "model_type": "gemma4",
+            "architectures": ["Gemma4ForConditionalGeneration"],
+            "text_config": moe_text,
+        }
+        if nested
+        else {**moe_text, "architectures": ["Gemma4ForCausalLM"]}
+    )
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    model_config = _engine_args(
+        model="org/gemma4-moe-GGUF:Q4_K_M", tokenizer=str(tmp_path)
+    ).create_model_config()
+
+    with pytest.raises(GGUFLoadError, match="enable_moe_block=True"):
+        gguf_source.GGUFLoadSource.from_model_config(model_config)
 
 
 def test_remote_load_source_rejects_missing_config_before_download(
