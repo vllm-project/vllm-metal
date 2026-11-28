@@ -25,6 +25,7 @@ from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from dataclasses import dataclass
+from itertools import batched, chain
 from pathlib import Path
 
 import mlx.core as mx
@@ -34,6 +35,7 @@ from huggingface_hub import snapshot_download
 from mlx.utils import tree_unflatten
 from mlx_lm.models.switch_layers import SwitchGLU
 from vllm.logger import init_logger
+from vllm.utils.math_utils import cdiv
 
 logger = init_logger(__name__)
 
@@ -167,10 +169,17 @@ class ExpertStore:
             )
             is not None
         ]
-        # Reads run in parallel; arrays are created on the calling thread.
-        raws = self._pool.map(lambda job: self._read(job[3]), jobs)
+        # Let each I/O worker read a batch of components. A wide prefill
+        # otherwise schedules hundreds of futures for one layer.
+        batch_size = max(1, cdiv(len(jobs), self.READ_THREADS))
+        reads = self._pool.map(
+            lambda pieces: [self._read(piece) for piece in pieces],
+            batched((job[3] for job in jobs), batch_size),
+        )
         bytes_read = 0
-        for (expert, projection, component, piece), raw in zip(jobs, raws, strict=True):
+        for (expert, projection, component, piece), raw in zip(
+            jobs, chain.from_iterable(reads), strict=True
+        ):
             missing[expert][projection][component] = self._to_array(piece, raw)
             bytes_read += len(raw)
         # Publish only complete reads so a failed batch can be retried.
