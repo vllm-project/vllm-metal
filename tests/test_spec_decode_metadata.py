@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for paged speculative decode metadata helpers."""
+"""Tests for paged speculative decode metadata and verification."""
 
 from __future__ import annotations
 
@@ -12,6 +12,8 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPDraftSeed
+from vllm_metal.v1.model_runner import RequestState
+from vllm_metal.v1.sampling import Sampler
 from vllm_metal.v1.spec_decode import (
     PagedDecodeSegment,
     SpeculativeDecodeController,
@@ -557,6 +559,54 @@ class TestVerifyGreedySpecDecode:
                 [("r0", _request_state(temperature=0.7))],
                 (segment,),
             )
+
+
+@pytest.mark.parametrize("use_native_sampling", [True, False], ids=["mlx", "torch"])
+@pytest.mark.parametrize(
+    ("second_draft", "expected"),
+    [
+        pytest.param(0, [1, 2], id="first-rejection"),
+        pytest.param(2, [1, 2, 0, 1], id="full-acceptance"),
+    ],
+)
+def test_rejection_verification_emits_accepted_prefix_and_correction_or_bonus(
+    use_native_sampling: bool, second_draft: int, expected: list[int]
+) -> None:
+    controller = SpeculativeDecodeController()
+    state = RequestState(
+        token_ids=[0, 2],
+        prompt_len=1,
+        sampling_params=SamplingParams(temperature=1.0, seed=42),
+        generated_tokens=1,
+        block_ids=[[0]],
+    )
+    decode_reqs = [("r0", state)]
+    segments = controller.build_decode_segments(
+        decode_reqs, {"r0": [1, second_draft, 0]}, {"r0": 1}
+    )
+
+    # At the second position, token 0 is always rejected and token 2 is
+    # always accepted. The residual supports only token 2, even though
+    # token 1 is the target argmax there. The third draft is always acceptable.
+    target_logits = mx.log(
+        mx.array([[[0.0, 1.0, 0.0], [0.0, 0.625, 0.375], [1, 0, 0], [0, 1, 0]]])
+    )
+    draft_probs = mx.array([[0.0, 1.0, 0.0], [0.125, 0.75, 0.125], [1, 0, 0]])
+    drafter = SimpleNamespace(
+        draft_probs_for=lambda segment, *, temperature: draft_probs
+    )
+
+    output = controller.verify_rejection(
+        target_logits,
+        decode_reqs,
+        segments,
+        drafter=drafter,
+        sampler=Sampler(),
+        vocab_size=3,
+        use_native_sampling=use_native_sampling,
+    )
+
+    assert output == [expected]
 
 
 class TestSchedulerPaddedDrafts:
