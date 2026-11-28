@@ -622,10 +622,32 @@ def _gqa_disabled_kwargs(ctx: PagedAttentionContext, ops: Any) -> dict[str, Any]
     return {}
 
 
+def _gqa_length_plan(
+    ctx: PagedAttentionContext, ops: Any, lengths: list[int], sliding_window: int
+) -> Any:
+    """The forward's length plan for full layers, or for one window size."""
+    if sliding_window <= 0:
+        if ctx.gqa_length_plan is None:
+            ctx.gqa_length_plan = ops.gqa_decode_length_plan(lengths)
+        return ctx.gqa_length_plan
+    plan = ctx.gqa_window_length_plans.get(sliding_window)
+    if plan is None:
+        plan = ops.gqa_decode_length_plan(lengths, sliding_window=sliding_window)
+        ctx.gqa_window_length_plans[sliding_window] = plan
+    return plan
+
+
 def _whole_batch_decode_routing_kwargs(
-    ctx: PagedAttentionContext, num_query_rows: int, ops: Any
+    ctx: PagedAttentionContext,
+    num_query_rows: int,
+    ops: Any,
+    sliding_window: int = -1,
 ) -> dict[str, Any]:
-    """Decode routing keywords for a call over every query row of the batch."""
+    """Decode routing keywords for a call over every query row of the batch.
+
+    A sliding layer gets a plan for its window only from a build that admits
+    windowed GQA decode; older builds keep sliding layers on their kernels.
+    """
     kwargs = _gqa_disabled_kwargs(ctx, ops)
     capabilities = ctx.paged_native_capabilities
     assert capabilities is not None
@@ -641,15 +663,17 @@ def _whole_batch_decode_routing_kwargs(
         and num_decode == ctx.num_decode_tokens
         and ctx.verify_window_q == 1
     )
+    if sliding_window > 0 and not capabilities["gqa_windowed_decode"]:
+        sliding_window = -1
     if (
         capabilities["gqa_length_plan"]
         and ordinary_decode_rows
         and num_decode > 1
         and num_decode == num_query_rows == len(ctx.context_lens)
     ):
-        if ctx.gqa_length_plan is None:
-            ctx.gqa_length_plan = ops.gqa_decode_length_plan(ctx.context_lens)
-        kwargs["gqa_length_plan"] = ctx.gqa_length_plan
+        kwargs["gqa_length_plan"] = _gqa_length_plan(
+            ctx, ops, ctx.context_lens, sliding_window
+        )
     elif (
         capabilities["gqa_mixed_decode_plan"]
         and ordinary_decode_rows
@@ -658,11 +682,9 @@ def _whole_batch_decode_routing_kwargs(
     ):
         # Mixed batch: describe only the leading decode rows. Native code
         # uses it when it splits those rows from the prefill kernel.
-        if ctx.gqa_length_plan is None:
-            ctx.gqa_length_plan = ops.gqa_decode_length_plan(
-                ctx.context_lens[:num_decode]
-            )
-        kwargs["gqa_length_plan"] = ctx.gqa_length_plan
+        kwargs["gqa_length_plan"] = _gqa_length_plan(
+            ctx, ops, ctx.context_lens[:num_decode], sliding_window
+        )
     return kwargs
 
 
@@ -1032,7 +1054,9 @@ def sdpa_forward(
             out = quantized_attention(
                 q_3d,
                 meta,
-                **_whole_batch_decode_routing_kwargs(ctx, q_3d.shape[0], ops),
+                **_whole_batch_decode_routing_kwargs(
+                    ctx, q_3d.shape[0], ops, layer_sliding_window
+                ),
             )
         elif plan is None:
             out = quantized_attention(q_3d, meta)
@@ -1109,7 +1133,11 @@ def sdpa_forward(
             del k16, v16
     else:
         paged_kwargs: dict[str, Any] = dict(mm_kwargs)
-        paged_kwargs.update(_whole_batch_decode_routing_kwargs(ctx, q_3d.shape[0], ops))
+        paged_kwargs.update(
+            _whole_batch_decode_routing_kwargs(
+                ctx, q_3d.shape[0], ops, layer_sliding_window
+            )
+        )
         capabilities = ctx.paged_native_capabilities
         num_decode = ctx.num_decode_requests
         if capabilities["nax_split_hint"] and q_3d.shape[0] > len(ctx.context_lens):

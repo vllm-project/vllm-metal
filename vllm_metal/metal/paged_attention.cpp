@@ -140,14 +140,16 @@ constexpr int kWindowMaxHeadSize = VLLM_METAL_PA_WINDOW_MAX_HEAD;
 
 
 bool gqa_decode_geometry_supported(int num_heads, int num_kv_heads,
-                                           int head_size, int block_size) {
-  return std::any_of(
-      kGqaDecodeGeometries.begin(), kGqaDecodeGeometries.end(),
-      [=](const auto& geometry) {
-        return geometry.num_heads == num_heads &&
-            geometry.num_kv_heads == num_kv_heads &&
-            geometry.head_size == head_size && geometry.block_size == block_size;
-      });
+                                   int head_size, int block_size, bool windowed) {
+  const auto matches = [=](const auto& geometry) {
+    return geometry.num_heads == num_heads &&
+        geometry.num_kv_heads == num_kv_heads &&
+        geometry.head_size == head_size && geometry.block_size == block_size;
+  };
+  return std::any_of(kGqaDecodeGeometries.begin(), kGqaDecodeGeometries.end(),
+                     matches) ||
+      (windowed && std::any_of(kGqaWindowedDecodeGeometries.begin(),
+                               kGqaWindowedDecodeGeometries.end(), matches));
 }
 
 std::string gqa_decode_kernel_name(
@@ -196,12 +198,23 @@ static const std::vector<int64_t>* gqa_compact_offsets(
 
 int gqa_decode_plan_for_lengths(
     int num_heads, int num_kv_heads, int head_size,
-    const GqaDecodeLengthPlan& plan, int gpu_cores, int block_size,
-    int max_seq_len) {
+    const GqaDecodeLengthPlan& lengths, int gpu_cores, int block_size,
+    int max_seq_len, int sliding_window) {
+  // A sliding layer needs a plan for its own window, and a full-attention
+  // layer an unwindowed one.
+  const int window = sliding_window > 0 ? sliding_window : 0;
+  if (lengths.window != window) return 0;
   // This table is the calibrated default scope, not a claim that every
   // unlisted geometry is mathematically unsupported by the kernel.
   if (!gqa_decode_geometry_supported(
-          num_heads, num_kv_heads, head_size, block_size)) return 0;
+          num_heads, num_kv_heads, head_size, block_size, window > 0)) return 0;
+  // Plan a windowed layer over its visible span: the producer, scratch and
+  // reducer never cover tokens left of the window.
+  GqaDecodeLengthPlan plan = lengths;
+  if (window > 0) {
+    plan.max_length = std::min(plan.max_length, window);
+    max_seq_len = std::min(max_seq_len, window);
+  }
   // Performance admission: a work budget of complete partitions per GPU core.
   if (gpu_cores <= 0 || plan.num_requests == 0 ||
       plan.full_partitions * num_heads < kGqaSimdGroupsPerCore * gpu_cores) return 0;
@@ -662,10 +675,10 @@ static bool gqa_decode_metadata_eligible(
   const bool gqa_cache_dtypes = m.use_turboquant
       ? gqa_turboquant
       : m.query_dtype == m.key_dtype && m.query_dtype == m.value_dtype;
-  // The windowed producer is reachable only through the forced test hook
-  // until default routing admits sliding layers (#1272).
+  // The windowed producer has no TurboQuant variant. Default admission of
+  // a sliding layer also needs a plan for its window (see the planner).
   const bool gqa_window = m.sliding_window < 0
-      || (m.sliding_window > 0 && m.force_gqa && !m.use_turboquant);
+      || (m.sliding_window > 0 && !m.use_turboquant);
   return !has_prefill && m.window_seqlen_q <= 1 && gqa_decode_rows
       && (m.query_dtype == float16 || m.query_dtype == bfloat16)
       && gqa_cache_dtypes && m.softcap <= 0.f && !m.use_sinks && gqa_window;
@@ -848,16 +861,18 @@ static PagedAttentionPlan select_paged_attention_route(
   const bool gqa_supported = !m.gqa_disabled
       && gqa_decode_metadata_eligible(m, total_q_tokens, num_seqs, has_prefill)
       && gqa_decode_geometry_supported(
-          m.num_heads, m.num_kv_heads, m.head_size, m.block_size);
+          m.num_heads, m.num_kv_heads, m.head_size, m.block_size,
+          m.sliding_window > 0);
 
   const int gqa_partition_size = !gqa_supported ? 0
       : m.force_gqa ? kGqaPartitionSize
       : gqa_decode_plan_for_lengths(
             m.num_heads, m.num_kv_heads, m.head_size,
             num_seqs == 1 && m.decode_only_rows == 0
-                ? gqa_decode_length_plan(std::array<int, 1>{m.max_seq_len})
+                ? gqa_decode_length_plan(std::array<int, 1>{m.max_seq_len},
+                                         m.sliding_window)
                 : m.gqa_length_plan,
-            get_detected_gpu_cores(), m.block_size, m.max_seq_len);
+            get_detected_gpu_cores(), m.block_size, m.max_seq_len, m.sliding_window);
 
   // A windowed producer partitions only the visible span. Its rows hold at
   // most ceil(window / partition) partitions, so it keeps the dense layout

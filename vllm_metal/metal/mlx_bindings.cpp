@@ -39,9 +39,17 @@ static int gqa_decode_plan_for_shape(int num_heads, int num_kv_heads,
 static int gqa_decode_batch_plan_for_shape(
     int num_heads, int num_kv_heads, int head_size,
     const std::vector<int>& context_lens, int gpu_cores, int block_size,
-    int max_seq_len = 0) {
+    int max_seq_len = 0, int sliding_window = -1) {
   return gqa_decode_plan_for_lengths(num_heads, num_kv_heads, head_size,
-      gqa_decode_length_plan(context_lens), gpu_cores, block_size, max_seq_len);
+      gqa_decode_length_plan(context_lens, sliding_window), gpu_cores, block_size,
+      max_seq_len, sliding_window);
+}
+
+static GqaDecodeLengthPlan gqa_decode_length_plan_for_python(
+    const std::vector<int>& context_lens, int sliding_window) {
+  if (sliding_window == 0 || sliding_window < -1)
+    throw std::invalid_argument("sliding_window must be -1 or positive");
+  return gqa_decode_length_plan(context_lens, sliding_window);
 }
 
 static void check_gqa_test_reducer_size(int max_seq_len) {
@@ -144,11 +152,14 @@ NB_MODULE(_paged_ops, m) {
         "not GPU execution order.");
   nb::class_<GqaDecodeLengthPlan>(m, "GqaDecodeLengthPlan")
       .def_ro("num_requests", &GqaDecodeLengthPlan::num_requests)
-      .def_ro("max_length", &GqaDecodeLengthPlan::max_length);
-  m.def("gqa_decode_length_plan", &gqa_decode_length_plan<std::vector<int>>,
-        nb::arg("context_lens"),
+      .def_ro("max_length", &GqaDecodeLengthPlan::max_length)
+      .def_ro("window", &GqaDecodeLengthPlan::window);
+  m.def("gqa_decode_length_plan", &gqa_decode_length_plan_for_python,
+        nb::arg("context_lens"), nb::arg("sliding_window") = -1,
         "Immutable CPU length statistics and partition offsets shared across layers. "
-        "Does not select a partition or read GPU arrays.");
+        "A positive sliding_window plans the layers of that window: work counts "
+        "only each row's last sliding_window tokens. Does not select a partition "
+        "or read GPU arrays.");
   m.def("gqa_decode_partition_size", &gqa_decode_plan_for_shape,
         nb::arg("num_heads"), nb::arg("num_kv_heads"), nb::arg("head_size"),
         nb::arg("max_seq_len"), nb::arg("gpu_cores"), nb::arg("block_size") = 16,
@@ -158,8 +169,9 @@ NB_MODULE(_paged_ops, m) {
   m.def("gqa_decode_batch_partition_size", &gqa_decode_batch_plan_for_shape,
         nb::arg("num_heads"), nb::arg("num_kv_heads"), nb::arg("head_size"),
         nb::arg("context_lens"), nb::arg("gpu_cores"), nb::arg("block_size") = 16,
-        nb::arg("max_seq_len") = 0,
-        "GQA partition from per-request KV lengths, or zero. max_seq_len "
+        nb::arg("max_seq_len") = 0, nb::arg("sliding_window") = -1,
+        "GQA partition from per-request KV lengths, or zero. A positive "
+        "sliding_window plans a sliding layer over its visible span. max_seq_len "
         "optionally supplies the dispatch bound; compact scratch uses actual "
         "lengths. Dispatch separately checks features and compiled reducer "
         "resources.");
@@ -183,6 +195,12 @@ NB_MODULE(_paged_ops, m) {
                                        geometry.head_size, geometry.block_size));
     }
     config["geometries"] = geometries;
+    nb::list windowed_geometries;
+    for (const auto& geometry : kGqaWindowedDecodeGeometries) {
+      windowed_geometries.append(nb::make_tuple(geometry.num_heads,
+          geometry.num_kv_heads, geometry.head_size, geometry.block_size));
+    }
+    config["windowed_geometries"] = windowed_geometries;
     config["simd_groups_per_core"] = kGqaSimdGroupsPerCore;
     config["max_scratch_bytes"] = kGqaMaxScratchBytes;
     return config;
@@ -195,6 +213,7 @@ NB_MODULE(_paged_ops, m) {
     caps["decode_routing_metadata"] = true;
     caps["gqa_length_plan"] = true;
     caps["gqa_mixed_decode_plan"] = true;
+    caps["gqa_windowed_decode"] = true;
     caps["nax_split_hint"] = true;
     caps["nax_prefill_split_hint"] = true;
     return caps;
@@ -303,7 +322,8 @@ NB_MODULE(_paged_ops, m) {
               k.dtype() != q.dtype() || v.dtype() != q.dtype() ||
               k.shape(3) != q.shape(2) ||
               !gqa_decode_geometry_supported(q.shape(1), k.shape(2),
-                                             q.shape(2), block_size) ||
+                                             q.shape(2), block_size,
+                                             sliding_window > 0) ||
               k.shape(1) % block_size != 0 ||
               tables.ndim() != 2 || tables.shape(0) != q.shape(0) ||
               tables.dtype() != int32 || lengths.ndim() != 1 ||

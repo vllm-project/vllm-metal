@@ -687,8 +687,10 @@ class _PagedRoutingOpsSpy:
             "gqa_length_plan": True,
         }
 
-    def gqa_decode_length_plan(self, lengths):
+    def gqa_decode_length_plan(self, lengths, sliding_window=-1):
         plan = tuple(lengths)
+        if sliding_window != -1:
+            plan = ("window", sliding_window, plan)
         self.length_plans.append(plan)
         return plan
 
@@ -1037,6 +1039,61 @@ class TestSDPAForward:
                     assert spy.length_plans == expected
                     assert spy.calls[-1].gqa_length_plan == next_plan
                     assert spy.calls[-1].num_decode_requests == len(next_plan)
+
+    @pytest.mark.parametrize("windowed_build", [False, True])
+    def test_sliding_layers_get_a_plan_for_their_window(
+        self, monkeypatch, windowed_build
+    ) -> None:
+        monkeypatch.delenv("VLLM_METAL_DISABLE_GQA_DECODE", raising=False)
+        prepare_grouped([([[0]], 1), ([[1]], 3)], [], (8,))
+        ctx = get_context()
+        spy = _PagedRoutingOpsSpy()
+        capabilities = {
+            "gqa_decode": True,
+            "gqa_disable": True,
+            "decode_routing_metadata": True,
+            "gqa_length_plan": True,
+            "gqa_windowed_decode": windowed_build,
+        }
+        monkeypatch.setattr(spy, "paged_attention_capabilities", lambda: capabilities)
+        inner = _make_inner()
+        inner.o_proj = lambda out: out
+        caches = {
+            window: make_kv_cache(
+                num_layers=1,
+                num_kv_heads=_N_KV_HEADS,
+                head_dim=_HEAD_DIM,
+                num_blocks=3,
+                block_size=8,
+                dtype=mx.float16,
+                sliding_window_per_layer=[window],
+            )
+            for window in (-1, 2, 3)
+        }
+        x = mx.ones((1, 2, _HIDDEN), mx.float16)
+        zeros = mx.zeros((1, 2, _N_HEADS * _HEAD_DIM), mx.float16)
+        with (
+            patch.object(sdpa_mod, "get_ops", return_value=spy),
+            patch.object(sdpa_mod, "truncate_padded_output", return_value=zeros),
+        ):
+            received = {}
+            for window in (2, -1, 3, 2, -1, 3):
+                sdpa_forward(inner, x, ctx, caches[window], layer_idx=0)
+                received.setdefault(window, set()).add(spy.calls[-1].gqa_length_plan)
+
+        if windowed_build:
+            # One plan per window size per forward, shared by its layers.
+            assert received == {
+                -1: {(2, 4)},
+                2: {("window", 2, (2, 4))},
+                3: {("window", 3, (2, 4))},
+            }
+            assert len(spy.length_plans) == 3
+        else:
+            # Older builds receive the plan they already understand; native
+            # code keeps their sliding layers on the established kernels.
+            assert received == {-1: {(2, 4)}, 2: {(2, 4)}, 3: {(2, 4)}}
+            assert spy.length_plans == [(2, 4)]
 
     @pytest.mark.parametrize(
         ("disabled", "expected_plan"), [(False, (2, 4)), (True, None)]

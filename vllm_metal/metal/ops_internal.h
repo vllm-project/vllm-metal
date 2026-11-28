@@ -54,6 +54,15 @@ constexpr std::array<GqaDecodeGeometry, 7> kGqaDecodeGeometries = {{
     {16, 2, 256, 16},
     {16, 2, 256, 32},
 }};
+// Admitted only for sliding-window layers, whose producer reads the visible
+// span. Measured over the last window on M5 (#1272); full-attention layers
+// of these geometries keep the established kernels.
+constexpr std::array<GqaDecodeGeometry, 4> kGqaWindowedDecodeGeometries = {{
+    {8, 4, 256, 16},
+    {8, 2, 256, 16},
+    {16, 8, 256, 16},
+    {32, 16, 128, 16},
+}};
 
 // One size: a query head walks its partition serially, so partitions are the
 // producer's only parallelism over context length, and 256 fills the GPU
@@ -66,16 +75,20 @@ constexpr int64_t kGqaSimdGroupsPerCore = 33;
 constexpr size_t kGqaMaxScratchBytes = 512 * 1024 * 1024;
 // Immutable CPU metadata shared by every attention layer of one forward.
 // No device reads or geometry-dependent policy are captured here.
+// A windowed plan (window > 0) serves the sliding layers of one window size.
+// Its lengths and total stay whole contexts; full_partitions counts only each
+// row's visible span, min(length, window), and it carries no offsets.
 struct GqaDecodeLengthPlan {
   int num_requests = 0;
   int max_length = 0;
   int64_t total_length = 0;
   int64_t full_partitions = 0;
   std::shared_ptr<const std::vector<int64_t>> partition_offsets;
+  int window = 0;
 
   bool operator==(const GqaDecodeLengthPlan& other) const {
     return num_requests == other.num_requests && max_length == other.max_length &&
-        total_length == other.total_length &&
+        total_length == other.total_length && window == other.window &&
         full_partitions == other.full_partitions &&
         (partition_offsets == other.partition_offsets ||
          (partition_offsets && other.partition_offsets &&
@@ -92,9 +105,11 @@ extern std::atomic<int> g_last_nax_heads_per_tg;
 extern bool nax_lib_ready_;
 extern bool nax_enabled_;
 template <typename Lengths>
-static GqaDecodeLengthPlan gqa_decode_length_plan(const Lengths& context_lens) {
+static GqaDecodeLengthPlan gqa_decode_length_plan(
+    const Lengths& context_lens, int window = 0) {
   GqaDecodeLengthPlan plan;
-  auto offsets = context_lens.size() > 1
+  plan.window = std::max(window, 0);
+  auto offsets = context_lens.size() > 1 && plan.window == 0
       ? std::make_shared<std::vector<int64_t>>() : nullptr;
   if (offsets) {
     offsets->reserve(context_lens.size() + 1);
@@ -105,7 +120,8 @@ static GqaDecodeLengthPlan gqa_decode_length_plan(const Lengths& context_lens) {
     ++plan.num_requests;
     plan.max_length = std::max(plan.max_length, length);
     plan.total_length += length;
-    plan.full_partitions += length / kGqaPartitionSize;
+    const int visible = plan.window > 0 ? std::min(length, plan.window) : length;
+    plan.full_partitions += visible / kGqaPartitionSize;
     if (offsets) {
       offsets->push_back(offsets->back() +
           (int64_t(length) + kGqaPartitionSize - 1) / kGqaPartitionSize);
@@ -116,7 +132,8 @@ static GqaDecodeLengthPlan gqa_decode_length_plan(const Lengths& context_lens) {
 }
 
 bool gqa_decode_geometry_supported(int num_heads, int num_kv_heads,
-                                   int head_size, int block_size);
+                                   int head_size, int block_size,
+                                   bool windowed = false);
 std::string gqa_decode_kernel_name(
     const std::string& dtype, int head_size, int block_size, int partition_size);
 std::string gqa_decode_tq_kernel_name(
@@ -125,7 +142,7 @@ std::string gqa_decode_tq_kernel_name(
 int gqa_decode_plan_for_lengths(
     int num_heads, int num_kv_heads, int head_size,
     const GqaDecodeLengthPlan& plan, int gpu_cores, int block_size,
-    int max_seq_len = 0);
+    int max_seq_len = 0, int sliding_window = -1);
 void init_library_path(const std::string& name, const std::string& path);
 void init_nax_library_path(const std::string& path);
 std::string dtype_to_metal(Dtype dt);
