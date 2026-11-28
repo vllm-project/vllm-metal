@@ -247,11 +247,12 @@ def _load_native_module() -> ModuleType:
                 f"VLLM_METAL_BUILD_FROM_SOURCE=1 to compile it from source "
                 f"(requires CMake and the Xcode Metal toolchain)."
             )
-        # Locally-built artifacts (the .so and the .metallib shaders) drift if a
-        # developer edits the Metal ops C++ sources or a .metal file without rebuilding. Fail
-        # loudly rather than run stale kernels — but do NOT auto-build, which
-        # would reintroduce the silent compile this design removed. No-op for
-        # wheel installs (no stamps), so end users are never affected.
+        # Locally-built artifacts (the .so and the .metallib shaders) drift when
+        # what they were built from changes without a rebuild: a Metal ops C++
+        # or .metal edit, a branch switch or pull, or an MLX/nanobind upgrade.
+        # Fail loudly rather than run stale kernels — but do NOT auto-build,
+        # which would reintroduce the silent compile this design removed. No-op
+        # for wheel installs (no stamps), so end users are never affected.
         stale = stale_artifacts()
         if stale:
             raise RuntimeError(

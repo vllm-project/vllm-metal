@@ -433,10 +433,11 @@ def needs_rebuild() -> bool:
 def is_stale(artifact: Path, expected_digest: str) -> bool:
     """One staleness primitive for every prebuilt artifact (the ``.so`` and each
     ``.metallib``). True only if ``artifact`` and its ``.sha256`` stamp both
-    exist but the stamp no longer matches ``expected_digest`` — i.e. a source
-    was edited without rebuilding. A missing stamp (every wheel install, which
-    ships artifacts but no stamps) returns False, so end users never see a
-    staleness warning. Never raises."""
+    exist but the stamp no longer matches ``expected_digest`` — i.e. its inputs
+    changed after the last build (an edit, a checkout of other sources, or for
+    the ``.so`` a new MLX/nanobind version). A missing stamp (every wheel
+    install, which ships artifacts but no stamps) returns False, so end users
+    never see a staleness warning. Never raises."""
     stamp = _stamp_path(artifact)
     if not artifact.exists() or not stamp.exists():
         return False
