@@ -11,7 +11,7 @@ import mlx.core as mx
 from vllm.v1.core.sched.output import SchedulerOutput
 
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPDraftSeed
-from vllm_metal.v1.sampling_batch import GREEDY_TEMPERATURE_EPS
+from vllm_metal.v1.sampling_policy import params_allow_native_greedy
 
 if TYPE_CHECKING:
     from vllm.config.speculative import SpeculativeConfig
@@ -442,28 +442,20 @@ class SpeculativeDecodeController:
         self,
         decode_reqs: Sequence[tuple[str, _SpecDecodeRequestStateLike]],
     ) -> None:
-        for _, request_state in decode_reqs:
-            sampling_params = request_state.sampling_params
-            unsupported = (
-                sampling_params.temperature >= GREEDY_TEMPERATURE_EPS
-                or sampling_params.top_k > 0
-                or sampling_params.top_p != 1.0
-                or sampling_params.frequency_penalty != 0.0
-                or sampling_params.presence_penalty != 0.0
-                or sampling_params.repetition_penalty != 1.0
-                or sampling_params.num_logprobs is not None
-                or bool(sampling_params.allowed_token_ids)
-                or bool(sampling_params.bad_words_token_ids)
-                or bool(sampling_params.logit_bias)
-                or request_state.generated_tokens < sampling_params.min_tokens
+        # Same greedy-only contract as the native greedy gate: verification
+        # must reproduce plain argmax sampling exactly. The verifier keeps
+        # this strict profile even if the native gates later admit more
+        # features for ordinary synchronous sampling.
+        if not params_allow_native_greedy(
+            [state.sampling_params for _, state in decode_reqs],
+            [state.generated_tokens for _, state in decode_reqs],
+        ):
+            raise NotImplementedError(
+                "Speculative decode verification on Metal currently "
+                "supports greedy sampling only (temperature=0, no "
+                "penalties, constraints, logprobs, or logit_bias, and "
+                "not before a request reaches min_tokens)."
             )
-            if unsupported:
-                raise NotImplementedError(
-                    "Speculative decode verification on Metal currently "
-                    "supports greedy sampling only (temperature=0, no "
-                    "penalties, constraints, logprobs, or logit_bias, and "
-                    "not before a request reaches min_tokens)."
-                )
 
 
 __all__ = [

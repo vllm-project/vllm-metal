@@ -133,6 +133,10 @@ from vllm_metal.v1.sampling_batch import (
     sample_from_logits,
     sample_prefill_tokens,
 )
+from vllm_metal.v1.sampling_policy import (
+    params_allow_native_greedy,
+    params_allow_native_random,
+)
 from vllm_metal.v1.spec_decode import (
     PagedDecodeSegment,
     SpeculativeDecodeController,
@@ -1857,14 +1861,12 @@ class MetalModelRunner:
         sampling = SamplingShape(
             native_greedy=(
                 not states_missing
-                and SamplingBatch.params_allow_native_greedy(
-                    decode_params, decode_output_lengths
-                )
+                and params_allow_native_greedy(decode_params, decode_output_lengths)
             ),
             native_random=(
                 self._native_sampling_enabled
                 and not states_missing
-                and SamplingBatch.params_allow_native_random(
+                and params_allow_native_random(
                     decode_params, decode_output_lengths, allow_seed=True
                 )
             ),

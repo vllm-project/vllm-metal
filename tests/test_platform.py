@@ -568,6 +568,25 @@ class TestMetalPlatform:
             {}, SamplingParams(temperature=0, prompt_logprobs=5)
         )
 
+    @pytest.mark.parametrize(
+        ("backend", "accepted"),
+        [("mlx", True), ("mps", False)],
+        ids=["mlx-accepts", "mps-rejects"],
+    )
+    def test_api_bad_words_rejected_on_mps_before_tokenization(
+        self, monkeypatch, backend, accepted
+    ):
+        """Request validation reads the API field; tokenization runs later."""
+        monkeypatch.setattr("vllm_metal.envs.VLLM_METAL_BACKEND", backend)
+        params = SamplingParams(temperature=0, bad_words=["foo"])
+        assert params.bad_words_token_ids is None
+        if accepted:
+            MetalPlatform.validate_request({}, params)
+        else:
+            with pytest.raises(VLLMValidationError, match="bad_words") as exc_info:
+                MetalPlatform.validate_request({}, params)
+            assert exc_info.value.parameter == "bad_words"
+
     def test_check_and_update_config_rejects_pipeline_with_tensor_parallel(
         self,
     ) -> None:

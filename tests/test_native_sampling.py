@@ -9,6 +9,7 @@ from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 
 from tests.stub_runner import make_stub_runner
 from vllm_metal.v1.sampling_batch import SamplingBatch, native_sampling_key
+from vllm_metal.v1.sampling_policy import params_allow_native_random
 
 VOCAB_SIZE = 512
 BATCH_SIZE = 4
@@ -49,12 +50,10 @@ class TestNativeRandomEligibility:
             _random_params(temperature=1.0),
         ]
 
-        assert SamplingBatch.params_allow_native_random(params)
+        assert params_allow_native_random(params)
 
     def test_empty_specific_token_list_is_eligible(self) -> None:
-        assert SamplingBatch.params_allow_native_random(
-            [_random_params(logprob_token_ids=[])]
-        )
+        assert params_allow_native_random([_random_params(logprob_token_ids=[])])
 
     @pytest.mark.parametrize(
         ("label", "params_list"),
@@ -83,7 +82,7 @@ class TestNativeRandomEligibility:
     ) -> None:
         """Masks are per row: one request must never push the whole batch
         onto the torch sampler (that serialises every decode step)."""
-        assert SamplingBatch.params_allow_native_random(params_list)
+        assert params_allow_native_random(params_list)
 
     @pytest.mark.parametrize(
         ("label", "params_list"),
@@ -107,18 +106,18 @@ class TestNativeRandomEligibility:
         ],
     )
     def test_ineligible_batches_fall_back(self, label, params_list) -> None:
-        assert not SamplingBatch.params_allow_native_random(params_list)
+        assert not params_allow_native_random(params_list)
 
     def test_bad_words_fall_back(self) -> None:
         params = _random_params()
         params._bad_words_token_ids = [[99]]
 
-        assert not SamplingBatch.params_allow_native_random([params])
+        assert not params_allow_native_random([params])
 
     def test_min_tokens_returns_to_native_random_once_reached(self) -> None:
         params = [_random_params(min_tokens=2), _random_params()]
-        assert not SamplingBatch.params_allow_native_random(params, [1, 0])
-        assert SamplingBatch.params_allow_native_random(params, [2, 0])
+        assert not params_allow_native_random(params, [1, 0])
+        assert params_allow_native_random(params, [2, 0])
 
 
 class TestTopKTopPMaskParity:
@@ -275,7 +274,7 @@ class TestMlxRandomTokens:
             _random_params(temperature=1.5, top_k=4, top_p=1.0),
             _random_params(temperature=2.0, top_k=0, top_p=1.0),
         ]
-        assert SamplingBatch.params_allow_native_random(params)
+        assert params_allow_native_random(params)
 
         greedy_row, narrow_row, wide_row = set(), set(), set()
         key = mx.random.key(1)
@@ -476,8 +475,8 @@ class TestSeededNativeSampling:
 
     def test_seeded_rows_are_eligible_only_with_allow_seed(self) -> None:
         params = [_random_params(seed=7), _random_params()]
-        assert not SamplingBatch.params_allow_native_random(params)
-        assert SamplingBatch.params_allow_native_random(params, allow_seed=True)
+        assert not params_allow_native_random(params)
+        assert params_allow_native_random(params, allow_seed=True)
 
     def test_row_key_is_pure_and_position_dependent(self) -> None:
         a = native_sampling_key(7, 3)
