@@ -20,7 +20,7 @@ draft cache's blocks "cached" based on its own per-step bookkeeping,
 trusting that whatever it scheduled, the worker actually computed -- for
 *every* registered group, uniformly, every step. But
 ``SpeculativeDecodeController.draft_eligible_requests`` intentionally
-excludes non-greedy requests and intermediate prefill chunks from
+excludes unsupported sampling requests and intermediate prefill chunks from
 *drafting*. If those rows also skipped *ingest*, the scheduler would believe
 their draft cache blocks hold real KV when they never did, and a later,
 unrelated request whose prompt happens to hash-match that prefix could be
@@ -35,7 +35,7 @@ positions beyond it are never read by this proposer.
 Each step: ingest advances every row's committed KV to ``committed_len``,
 then ``num_speculative_tokens - 1`` single-token decode steps run for
 drafting rows only. Drafts are handed back via ``take_draft_token_ids`` and
-verified next step by ``SpeculativeDecodeController.verify_greedy``.
+verified by the target on the next scheduled decode step.
 
 **Skipping already-valid speculative KV (#482, direction 2).** The
 lookahead draft steps write KV for drafts ``d1..d(K-1)`` at positions
@@ -77,9 +77,10 @@ from vllm_metal.v1.proposer import (
     NoOwnKVProposer,
     validate_scheduler_blocks,
 )
+from vllm_metal.v1.sampling_batch import GREEDY_TEMPERATURE_EPS, native_sampling_key
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping
+    from collections.abc import Callable, Mapping, Sequence
 
     from vllm.config import ParallelConfig
     from vllm.config.speculative import SpeculativeConfig
@@ -93,7 +94,10 @@ if TYPE_CHECKING:
         RequestState,
     )
     from vllm_metal.v1.proposer import ProposeContext
-    from vllm_metal.v1.spec_decode import SpeculativeDecodeController
+    from vllm_metal.v1.spec_decode import (
+        PagedDecodeSegment,
+        SpeculativeDecodeController,
+    )
 
 logger = init_logger(__name__)
 
@@ -150,6 +154,7 @@ class DraftModelProposer(NoOwnKVProposer):
         selective_logits_supported: bool = False,
         merge_ingest_windows: bool = False,
         allow_deferred_zero_k_ingest: bool = False,
+        spec_config: SpeculativeConfig | None = None,
     ) -> None:
         self._model = model
         self._block_size = block_size
@@ -167,6 +172,9 @@ class DraftModelProposer(NoOwnKVProposer):
         self._model_adapter = model_adapter
         self._selective_logits_supported = selective_logits_supported
         self._allow_deferred_zero_k_ingest = allow_deferred_zero_k_ingest
+        self._spec_config = spec_config
+        # Raw logits by draft position, paired with the proposal the scheduler sees.
+        self._draft_logits_by_req: dict[str, tuple[tuple[int, ...], mx.array]] = {}
         # Structural half of the ingest window gate (see `build`); the
         # operator half (VLLM_METAL_SPEC_VERIFY_WINDOW) is read per call
         # like the runner's `merge_verify_windows` property.  The same
@@ -250,6 +258,7 @@ class DraftModelProposer(NoOwnKVProposer):
             # head_dim.  Only the decode kernel's head bound remains.
             merge_ingest_windows=dims.head_dim <= PA_WINDOW_MAX_HEAD_SIZE,
             allow_deferred_zero_k_ingest=allow_deferred_zero_k_ingest,
+            spec_config=speculative_config,
         )
         proposer._dims = dims
         proposer._draft_model_name = speculative_config.draft_model_config.model
@@ -404,6 +413,11 @@ class DraftModelProposer(NoOwnKVProposer):
 
         for req_id in ctx.finished_req_ids:
             self._context_limit_logged.pop(req_id, None)
+            self._draft_logits_by_req.pop(req_id, None)
+        if self._draft_logits_by_req:
+            # The scheduler consumed or discarded old proposals for scheduled rows.
+            for req_id, _ in ctx.decode_reqs:
+                self._draft_logits_by_req.pop(req_id, None)
         self._prune_finished(ctx.request_states)
         if num_speculative_tokens <= 0 and self._allow_deferred_zero_k_ingest:
             # Remember where lazy K=0 catch-up must start without running MLX.
@@ -420,9 +434,8 @@ class DraftModelProposer(NoOwnKVProposer):
         if not plans:
             return None
 
-        # Ingest every active row (see module docstring); predicts a first
-        # token per row, used below only for drafting rows.
-        first_tokens = self._ingest_and_draft_first(plans, self._offset_caches)
+        # Ingest every active row and retain the logits for the first draft.
+        first_logits = self._ingest_and_draft_first(plans, self._offset_caches)
 
         # The draft cache now holds KV through committed_len for every
         # row that ingested this step, drafting or not.
@@ -437,20 +450,52 @@ class DraftModelProposer(NoOwnKVProposer):
             [i for i, plan in enumerate(plans) if plan.is_drafting],
             dtype=mx.int32,
         )
-        draft_cols: list[mx.array] = [mx.take(first_tokens, drafting_indices, axis=0)]
+        logits_by_step: list[mx.array] = []
+        use_probabilistic = (
+            self._spec_config is not None
+            and self._spec_config.draft_sample_method == "probabilistic"
+        )
+        sampling_requests: list[RequestState] | None
+        if use_probabilistic:
+            first_logits = mx.take(first_logits, drafting_indices, axis=0)
+            logits_by_step.append(first_logits)
+            sampling_requests = [
+                ctx.request_states[plan.req_id] for plan in drafting_plans
+            ]
+            first_tokens = self._sample_draft_tokens(
+                first_logits, sampling_requests, draft_index=0
+            )
+        else:
+            sampling_requests = None
+            first_tokens = self._sample_draft_tokens(
+                first_logits, sampling_requests, draft_index=0
+            )
+            first_tokens = mx.take(first_tokens, drafting_indices, axis=0)
+        draft_cols = [first_tokens]
         # Steps 2..K: single-token decode per drafting row.
         for draft_index in range(1, num_speculative_tokens):
+            logits = self._draft_step(
+                drafting_plans, draft_cols[-1], draft_index, self._offset_caches
+            )
+
+            if use_probabilistic:
+                logits_by_step.append(logits)
             draft_cols.append(
-                self._draft_step(
-                    drafting_plans,
-                    draft_cols[-1],
-                    draft_index,
-                    self._offset_caches,
+                self._sample_draft_tokens(
+                    logits, sampling_requests, draft_index=draft_index
                 )
             )
 
         drafts = mx.stack(draft_cols, axis=1)  # [num_drafting, K]
-        mx.eval(drafts)
+        cached_logits = (
+            [
+                mx.stack([logits[i] for logits in logits_by_step])
+                for i in range(len(drafting_plans))
+            ]
+            if logits_by_step
+            else []
+        )
+        mx.eval(drafts, *cached_logits)
         rows: list[list[int]] = drafts.tolist()  # type: ignore[assignment]
 
         # Record the speculative KV this round's lookahead steps wrote, for
@@ -458,7 +503,12 @@ class DraftModelProposer(NoOwnKVProposer):
         # row[i-1] at position committed_len + i - 1 for i in 1..K-1, writing
         # its KV there; the K-th draft's KV is never written (no step feeds
         # it before verification).
-        for plan, row in zip(drafting_plans, rows, strict=True):
+        for index, (plan, row) in enumerate(zip(drafting_plans, rows, strict=True)):
+            if cached_logits:
+                self._draft_logits_by_req[plan.req_id] = (
+                    tuple(row),
+                    cached_logits[index],
+                )
             writes: dict[int, tuple[int, int]] = {}
             for i in range(num_speculative_tokens - 1):
                 position = plan.committed_len + i
@@ -473,12 +523,30 @@ class DraftModelProposer(NoOwnKVProposer):
             draft_token_ids=[[int(token) for token in row] for row in rows],
         )
 
+    def draft_probs_for(
+        self, segment: PagedDecodeSegment, *, temperature: float = 1.0
+    ) -> mx.array:
+        """Return FP32 probabilities in [scheduled_drafts, vocab_size] order."""
+        cached = self._draft_logits_by_req.get(segment.req_id)
+        if cached is None:
+            raise ValueError(f"Missing draft logits for request {segment.req_id!r}.")
+        tokens, logits = cached
+
+        width = len(segment.draft_token_ids)
+        if tokens[:width] != segment.draft_token_ids:
+            raise ValueError(
+                f"Scheduled drafts for {segment.req_id!r} differ from the proposal."
+            )
+
+        return mx.softmax(logits[:width].astype(mx.float32) / temperature, axis=-1)
+
     def release_requests(self, req_ids: set[str]) -> None:
         # Invalidate KV for recompute without repeating the context-cap log.
         # Finished IDs and pruning reset that diagnostic separately.
         for req_id in req_ids:
             self._draft_seq_lens.pop(req_id, None)
             self._spec_kv_writes.pop(req_id, None)
+            self._draft_logits_by_req.pop(req_id, None)
 
     # -- internals -----------------------------------------------------------
 
@@ -491,14 +559,13 @@ class DraftModelProposer(NoOwnKVProposer):
         for req_id in list(self._spec_kv_writes.keys()):
             if req_id not in request_states:
                 del self._spec_kv_writes[req_id]
+        for req_id in self._draft_logits_by_req.keys() - request_states.keys():
+            del self._draft_logits_by_req[req_id]
 
     def _collect_draft_plans(
         self, ctx: ProposeContext, num_speculative_tokens: int
     ) -> list[_DraftPlan]:
-        # can_draft_greedy/draft_eligible_requests decide *drafting*
-        # eligibility only here (greedy + non-intermediate prefill +
-        # greedy-only sampling); ingest itself runs for every active row
-        # regardless -- see module docstring.
+        # Ingest runs for every active row, including requests that cannot draft.
         drafting_req_ids: set[str] = set()
         for req_id, state in self._controller.draft_eligible_requests(
             ctx.decode_reqs,
@@ -507,6 +574,7 @@ class DraftModelProposer(NoOwnKVProposer):
             ctx.prefill_token_ids,
             ctx.prefill_result_modes,
             ctx.request_states,
+            speculative_config=self._spec_config,
         ):
             if num_speculative_tokens <= 0:
                 continue
@@ -786,7 +854,7 @@ class DraftModelProposer(NoOwnKVProposer):
             finally:
                 clear_context()
 
-            return mx.argmax(last, axis=-1)
+            return last
 
         # Cold ingest: a fresh prefix re-ingests the whole prompt into the
         # draft cache in one tiled prefill forward, stalling the engine for
@@ -829,10 +897,9 @@ class DraftModelProposer(NoOwnKVProposer):
             for selected_index, (plan_index, _) in enumerate(final_row_indices):
                 final_rows[plan_index] = selected[selected_index]
 
-        last = mx.stack(
+        return mx.stack(
             [final_rows[plan_index] for plan_index in range(len(plans))], axis=0
         )
-        return mx.argmax(last, axis=-1)
 
     def _project_ingest_rows(
         self,
@@ -859,6 +926,42 @@ class DraftModelProposer(NoOwnKVProposer):
         logits = self._extract_logits(self._model(input_ids, cache=offset_caches))
         return mx.take(logits[0], indices, axis=0)
 
+    @staticmethod
+    def _sample_draft_tokens(
+        logits: mx.array,
+        sampling_requests: Sequence[RequestState] | None,
+        *,
+        draft_index: int,
+    ) -> mx.array:
+        """Select one draft token per row. Only probabilistic mode passes requests."""
+        if sampling_requests is None or all(
+            state.sampling_params.temperature < GREEDY_TEMPERATURE_EPS
+            for state in sampling_requests
+        ):
+            return mx.argmax(logits, axis=-1)
+
+        tokens = []
+        for row, state in zip(logits, sampling_requests, strict=True):
+            params = state.sampling_params
+            if params.temperature < GREEDY_TEMPERATURE_EPS:
+                tokens.append(mx.argmax(row, axis=-1))
+                continue
+            key = (
+                native_sampling_key(
+                    params.seed, state.generated_tokens + draft_index, domain="draft"
+                )
+                if params.seed is not None
+                else None
+            )
+            # Categorical sampling applies softmax to the same scaled logits
+            # used by draft_probs_for() to recover q.
+            tokens.append(
+                mx.random.categorical(
+                    row.astype(mx.float32) / params.temperature, key=key
+                )
+            )
+        return mx.stack(tokens)
+
     def _draft_step(
         self,
         plans: list[_DraftPlan],
@@ -878,7 +981,7 @@ class DraftModelProposer(NoOwnKVProposer):
         finally:
             clear_context()
 
-        return mx.argmax(logits[0], axis=-1)
+        return logits[0]
 
 
 def resolve_draft_dims(

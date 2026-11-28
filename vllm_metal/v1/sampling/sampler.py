@@ -253,6 +253,18 @@ class Sampler(nn.Module):
             return torch.ops._C.greedy_argmax(logits)
         return logits.argmax(dim=-1).view(-1)
 
+    def apply_random_logits_processors(
+        self, logits: torch.Tensor, sampling_metadata: SamplingMetadata
+    ) -> torch.Tensor:
+        """Apply temperature and random-only processors before top-k/top-p."""
+        assert sampling_metadata.temperature is not None
+        logits = self.apply_temperature(
+            logits, sampling_metadata.temperature, sampling_metadata.all_random
+        )
+        for processor in sampling_metadata.logitsprocs.argmax_invariant:
+            logits = processor.apply(logits)
+        return logits
+
     def sample(
         self,
         logits: torch.Tensor,
@@ -282,18 +294,7 @@ class Sampler(nn.Module):
                         processed_logprobs = self.compute_logprobs(logits)
                 return greedy_sampled, processed_logprobs
 
-        assert sampling_metadata.temperature is not None
-
-        # Apply temperature.
-        logits = self.apply_temperature(
-            logits, sampling_metadata.temperature, sampling_metadata.all_random
-        )
-
-        # Apply logits processors that only apply to random sampling
-        # (argmax invariant)
-        for processor in sampling_metadata.logitsprocs.argmax_invariant:
-            logits = processor.apply(logits)
-
+        logits = self.apply_random_logits_processors(logits, sampling_metadata)
         # Apply top_k and/or top_p.
         random_sampled, processed_logprobs = self.topk_topp_sampler(
             logits,
@@ -305,6 +306,7 @@ class Sampler(nn.Module):
         if greedy_sampled is None:
             return random_sampled, processed_logprobs
 
+        assert sampling_metadata.temperature is not None
         sampled = torch.where(
             sampling_metadata.temperature < _SAMPLING_EPS,
             greedy_sampled,
