@@ -49,6 +49,31 @@ that this setting is off. Offline measurements remain useful when labeled with
 their actual topology, but their absolute rates or A/B ratios should not be
 substituted for serving results.
 
+## Measure short requests during a long prefill
+
+Set `--max-num-seqs` to at least 2 and allow two in-flight requests in the
+client. If you set `--max-num-active-seqs`, keep it at least 2 as well. In an
+otherwise idle server, sample `vllm:num_requests_running` on `/metrics` to
+check that both requests were admitted concurrently.
+
+Measure each request alone, then send the same short request at a fixed
+offset during a multi-chunk long prefill. Record the actual send offset
+relative to the long request and report both first-token latencies.
+
+Compare `--long-prefill-token-threshold` values at a fixed batch capacity
+and scheduling budget. vLLM can waive the cap for a lone prefill. To
+test shorter solo chunks, vary `--max-num-scheduled-tokens` separately
+and keep `--max-num-batched-tokens` fixed. Report the cost to cold solo
+prefill alongside any improvement in late-peer latency.
+
+Keep sampling and async scheduling fixed across arms. Compare cold runs
+separately from warmed runs, and match cached and fresh input token counts
+between arms. Use client timestamps to check whether the short stream
+started before the long stream's first token. In a separate diagnostic run,
+`--enable-logging-iteration-details` reports aggregate scheduled context
+and generation work. Use a scoped Metal trace when attributing that time
+to GPU execution.
+
 ## Control warmup and machine state
 
 - Warm every comparison arm with the real workload. Exclude model loading,
