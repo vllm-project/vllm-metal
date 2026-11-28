@@ -1,0 +1,52 @@
+name: PR readiness
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/pr-policy.yml
+      - .github/scripts/pr_policy.cjs
+      - .github/scripts/test_pr_policy.cjs
+      - .github/PULL_REQUEST_TEMPLATE.md
+  pull_request_target:
+    types: [opened, reopened, ready_for_review]
+
+permissions: {}
+
+jobs:
+  test:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: node --test .github/scripts/test_pr_policy.cjs
+
+  enforce:
+    if: >-
+      github.event_name == 'pull_request_target'
+      && github.repository == 'vllm-project/vllm-metal'
+      && vars.PR_POLICY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    concurrency:
+      group: pr-policy-${{ github.event.pull_request.user.id }}
+      queue: max
+    permissions:
+      # Required by the convertPullRequestToDraft GraphQL mutation.
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+      - uses: actions/github-script@v9.0.0
+        with:
+          script: |
+            const enforce = require('./.github/scripts/pr_policy.cjs');
+            await enforce({ github, context });
