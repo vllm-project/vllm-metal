@@ -70,6 +70,11 @@ from vllm_metal.metal import get_ops, paged_attention_capabilities
 
 logger = init_logger(__name__)
 
+# Conservative work floor for the aligned hybrid full-attention path. Use
+# both query rows and visible keys so short suffixes and wide scheduler
+# chunks can hit the same guard at different context lengths.
+_PREFILL_WAIT_QK_PAIRS = 32 * 1024 * 1024
+
 
 def _has_packed_qkv_sdpa_contract(module: nn.Module) -> bool:
     """Return True when *module* exposes the packed Phi-style SDPA contract."""
@@ -1165,6 +1170,31 @@ def sdpa_forward(
             sinks=sinks,
             **paged_kwargs,
         )
+        if (
+            ctx.state_group_slot_mappings is not None
+            and num_decode < len(ctx.context_lens)
+            and num_decode == ctx.num_decode_tokens
+            and layer_sliding_window < 0
+            and not ctx.segment_bidi_ranges
+            and ctx.cu_seqlens is not None
+            and sum(
+                (end - start) * length
+                for start, end, length in zip(
+                    ctx.cu_seqlens[:-1],
+                    ctx.cu_seqlens[1:],
+                    ctx.context_lens,
+                    strict=True,
+                )
+            )
+            >= _PREFILL_WAIT_QK_PAIRS
+        ):
+            # Finish a heavy layer before encoding more work on this stream.
+            # Submitting it asynchronously alone can leave several layers queued.
+            logger.info_once(
+                "Metal: completing heavy aligned hybrid prefill attention per layer."
+            )
+            mx.eval(out)
+            mx.synchronize()
 
     if recompute_after_kernel:
         assert ctx.cu_seqlens is not None
