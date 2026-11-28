@@ -317,15 +317,22 @@ class TestModelLifecycle:
                 "resolved/model", revision=revision, **hub
             )
 
+    @pytest.mark.parametrize(
+        "shard", ["layers-0.safetensors", "model-part.safetensors"]
+    )
     def test_private_mlx_lm_compatible_model_path_adapts_indexed_custom_shards(
-        self, tmp_path: Path
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shard: str
     ) -> None:
         model_dir = tmp_path / "model"
         model_dir.mkdir()
         for name in ("config.json", "tokenizer.json", "tokenizer_config.json"):
             (model_dir / name).write_text("{}", encoding="utf-8")
 
-        for name in ("layers-0.safetensors", "outside.safetensors", "mtp.safetensors"):
+        for name in (
+            shard,
+            "outside.safetensors",
+            "mtp.safetensors",
+        ):
             (model_dir / name).write_text("", encoding="utf-8")
 
         (model_dir / "model.safetensors.index.json").write_text(
@@ -333,7 +340,7 @@ class TestModelLifecycle:
                 {
                     "weight_map": {
                         "a": "outside.safetensors",
-                        "b": "layers-0.safetensors",
+                        "b": shard,
                         "c": "mtp.safetensors",
                     }
                 }
@@ -341,15 +348,17 @@ class TestModelLifecycle:
             encoding="utf-8",
         )
 
-        with model_lifecycle._mlx_lm_compatible_model_path(str(model_dir)) as compat:
+        monkeypatch.chdir(tmp_path)
+        with model_lifecycle._mlx_lm_compatible_model_path("model") as compat:
             compat_path = Path(compat)
 
             assert compat_path != model_dir
-            assert (compat_path / "config.json").is_symlink()
+            assert (compat_path / "config.json").read_text() == "{}"
             assert (compat_path / "tokenizer.json").is_symlink()
             compat_shards = sorted(
                 p.name for p in compat_path.glob("model*.safetensors")
             )
+            assert all((compat_path / name).is_file() for name in compat_shards)
             assert compat_shards == [
                 "model-00001-of-00003.safetensors",
                 "model-00002-of-00003.safetensors",
