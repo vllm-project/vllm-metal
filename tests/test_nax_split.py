@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Host-side NAX split/unsplit pipeline choice (vllm_metal.attention.nax_split)."""
 
+import os
+
 import mlx.core as mx
 import numpy as np
 import pytest
@@ -13,36 +15,68 @@ from vllm_metal.attention.nax_split import (
 )
 
 
-@pytest.fixture(params=[(144, 3, 0), (1328, 6, 1)], ids=["h3", "h6"])
-def grouped_prefill_inputs(nax_prefill, request):
-    """Exercise both native widths with shuffled, interleaved 784-token pages."""
-    import os
+def _grouped_inputs(q, prefix, geometry, cache_page):
+    inputs = _mixed_inputs(
+        [1],
+        prefill_kv=prefix + q,
+        geometry=geometry,
+        cache_block=cache_page,
+    )
+    inputs.update(
+        query=mx.random.normal((q, geometry[0], geometry[2])).astype(mx.bfloat16),
+        block_tables=inputs["block_tables"][-1:],
+        seq_lens=mx.array([prefix + q], mx.int32),
+        cu_seqlens_q=mx.array([0, q], mx.int32),
+        num_decode_requests=0,
+        num_decode_tokens=0,
+        max_decode_context_len=0,
+    )
+    return inputs
 
+
+@pytest.fixture(
+    params=[
+        # Q, split hint, (heads, KV heads, D, kernel page), physical page,
+        # prefix, GPU cores, expected width and compiled shader suffix.
+        pytest.param(
+            (144, 0, (24, 4, 256, 16), 784, 31360, 20, 3, "_gqa6_h3_full"),
+            id="gqa6-h3",
+        ),
+        pytest.param(
+            (1328, 1, (24, 4, 256, 16), 784, 31360, 10, 6, "_gqa6_h6_full"),
+            id="gqa6-h6",
+        ),
+        pytest.param(
+            (64, 0, (24, 4, 256, 16), 784, 31360, 20, 2, "_gqa6_h2_full"), id="gqa6-h2"
+        ),
+        pytest.param(
+            (16, 0, (16, 2, 256, 32), 1056, 31680, 40, 2, "_gqa8_h2_full"), id="gqa8-h2"
+        ),
+        pytest.param(
+            (128, 0, (16, 2, 256, 32), 544, 31681, 10, 4, "_gqa8_h4_full"),
+            id="gqa8-h4-kv-tail",
+        ),
+        pytest.param(
+            (2048, 1, (64, 8, 256, 32), 1056, 17, 10, 8, "_gqa8_h8_full"), id="gqa8-h8"
+        ),
+    ]
+)
+def grouped_prefill_inputs(nax_prefill, request):
+    """Exercise grouped layouts with shuffled, interleaved physical pages."""
     if os.environ.get("VLLM_METAL_NAX_GQA_PREFILL", "1") != "1":
         pytest.skip("Grouped layout coverage requires GQA prefill enabled")
     ops = nax_prefill
-    query_tokens, width, hint = request.param
-    prefix = 31360
-    # Fix host planning to cover both widths on every NAX-capable test host.
-    # This override is not a measurement of a 40-core GPU.
-    ops._override_detected_gpu_core_count_for_test(40)
+    q, hint, geometry, cache_page, prefix, cores, width, suffix = request.param
+    ops._override_detected_gpu_core_count_for_test(cores)
     try:
-        inputs = _mixed_inputs(
-            [1],
-            prefill_kv=prefix + query_tokens,
-            geometry=(24, 4, 256, 16),
-            cache_block=784,
+        inputs = _grouped_inputs(q, prefix, geometry, cache_page)
+        yield (
+            ops,
+            inputs,
+            hint,
+            (f"nax_gqa{geometry[0] // geometry[1]}_prefill", width),
+            suffix,
         )
-        inputs.update(
-            query=mx.random.normal((query_tokens, 24, 256)).astype(mx.bfloat16),
-            block_tables=inputs["block_tables"][-1:],
-            seq_lens=mx.array([prefix + query_tokens], mx.int32),
-            cu_seqlens_q=mx.array([0, query_tokens], mx.int32),
-            num_decode_requests=0,
-            num_decode_tokens=0,
-            max_decode_context_len=0,
-        )
-        yield ops, inputs, width, hint
     finally:
         mx.synchronize()
         ops._override_detected_gpu_core_count_for_test(-1)
@@ -50,21 +84,28 @@ def grouped_prefill_inputs(nax_prefill, request):
 
 def test_nax_grouped_translated_pages_match_compact_cache(grouped_prefill_inputs):
     """Each selected width must execute and preserve logical-page attention."""
-    ops, inputs, width, hint = grouped_prefill_inputs
-    assert inputs["key_cache"].shape[1] == 784 and inputs["block_size"] == 16
+    ops, inputs, hint, route, _ = grouped_prefill_inputs
+    head_size = inputs["query"].shape[2]
+    kv_heads, page = inputs["num_kv_heads"], inputs["block_size"]
+    assert inputs["key_cache"].shape[1] > page
     translated = _mixed_call(inputs, nax_split_hint=hint)
-    assert ops.last_paged_dispatch() == "nax_gqa6_prefill"
-    assert ops.last_nax_heads_per_threadgroup() == width
+    assert (ops.last_paged_dispatch(), ops.last_nax_heads_per_threadgroup()) == route
 
     # Independent contiguous kernel-page storage removes physical-page and
     # interleaved-head strides while preserving logical tokens/block IDs.
     compact = inputs | {
-        "key_cache": mx.contiguous(inputs["key_cache"]).reshape(-1, 16, 4, 256),
-        "value_cache": mx.contiguous(inputs["value_cache"]).reshape(-1, 16, 4, 256),
+        "key_cache": mx.contiguous(inputs["key_cache"]).reshape(
+            -1, page, kv_heads, head_size
+        ),
+        "value_cache": mx.contiguous(inputs["value_cache"]).reshape(
+            -1, page, kv_heads, head_size
+        ),
     }
     direct = _mixed_call(compact, nax_split_hint=hint)
-    assert ops.last_paged_dispatch() == "nax_gqa6_prefill"
-    assert ops.last_nax_heads_per_threadgroup() == width
+    assert (
+        ops.last_paged_dispatch(),
+        ops.last_nax_heads_per_threadgroup(),
+    ) == route
     assert mx.array_equal(translated, direct)
 
     ops._override_detected_gpu_core_count_for_test(0)
@@ -79,6 +120,24 @@ def test_nax_grouped_translated_pages_match_compact_cache(grouped_prefill_inputs
     ops._set_paged_dispatch_diagnostics(False)
     assert ops.last_nax_heads_per_threadgroup() == 0
     ops._set_paged_dispatch_diagnostics(True)
+
+
+def test_grouped_prefill_loose_kv_bound_preserves_output(nax_prefill):
+    """A loose cost estimate may select h3, but the shader still reads 65 tokens."""
+    ops = nax_prefill
+    inputs = _grouped_inputs(64, 1, (24, 4, 256, 16), 784)
+    ops._override_detected_gpu_core_count_for_test(10)
+    try:
+        reference = _mixed_call(inputs, nax_split_hint=0)
+        tight_width = ops.last_nax_heads_per_threadgroup()
+        loose = _mixed_call(inputs | {"max_seq_len": 130}, nax_split_hint=0)
+        assert mx.array_equal(loose, reference)
+        expected = (
+            (2, 3) if os.getenv("VLLM_METAL_NAX_GQA_PREFILL", "1") == "1" else (1, 1)
+        )
+        assert (tight_width, ops.last_nax_heads_per_threadgroup()) == expected
+    finally:
+        ops._override_detected_gpu_core_count_for_test(-1)
 
 
 def _work(seqs):
@@ -309,7 +368,7 @@ def test_native_prefill_hint_only_applies_after_decode_separation(
 
 def test_nax_trace_reports_executed_layout(grouped_prefill_inputs):
     """Trace fields describe the encoded layout without changing its output."""
-    ops, inputs, width, hint = grouped_prefill_inputs
+    ops, inputs, hint, (family, width), suffix = grouped_prefill_inputs
     query_tokens = inputs["query"].shape[0]
     ops._take_nax_prefill_dispatch_trace()
     plain = _mixed_call(inputs, nax_split_hint=hint)
@@ -324,17 +383,19 @@ def test_nax_trace_reports_executed_layout(grouped_prefill_inputs):
         assert not trace["overflow"] and trace["dropped_events"] == 0
         assert trace["dispatch_count"] == len(trace["events"]) == 1
         event = trace["events"][0]
-        suffix = "_gqa6_sub_full" if width == 3 else "_gqa6_full"
+        heads = inputs["query"].shape[1]
         assert event["function"].endswith(suffix)
+        assert event["family"] == family
         assert event["HEADS_PER_TG"] == width and event["threads"] == width * 32
         assert (event["gridx"], event["gridy"], event["BQ"]) == (
-            24 // width,
+            heads // width,
             query_tokens // 16 + 1,
             16,
         )
-        assert event["max_seq_len"] == 31360 + query_tokens
-        assert event["q_block_offset"] == 0 and event["key_page_tokens"] == 784
-        assert event["key_block_stride"] == 16 * event["key_stride1"]
+        assert event["max_seq_len"] == inputs["max_seq_len"]
+        assert event["q_block_offset"] == 0
+        assert event["key_page_tokens"] == inputs["key_cache"].shape[1]
+        assert event["key_block_stride"] == inputs["block_size"] * event["key_stride1"]
         assert event["key_head_stride"] == event["key_stride2"] == 512
     finally:
         ops._take_nax_prefill_dispatch_trace()
