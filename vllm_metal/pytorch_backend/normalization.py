@@ -8,15 +8,22 @@ from vllm import ir
 
 
 @cache
-def _add_rms_norm_kernel(dtype):
+def _normalization_library():
     from vllm_metal import envs
     from vllm_metal.metal.build import prepare_metallib
 
     path = prepare_metallib(
         "normalization_kern", build_from_source=envs.VLLM_METAL_BUILD_FROM_SOURCE
     )
-    library = torch.mps.load_metallib(path)
+    return torch.mps.load_metallib(path)
+
+
+@cache
+def _add_rms_norm_kernel(dtype, weight_dtype=None):
+    library = _normalization_library()
     name = "add_rms_norm_fp16" if dtype == torch.float16 else "add_rms_norm_bf16"
+    if weight_dtype == torch.float32:
+        name += "_weight_float"
     return library, getattr(library, name)
 
 
@@ -26,7 +33,7 @@ def _supports_rms_norm(x, weight, epsilon, variance_size=None):
         and x.dtype in (torch.float16, torch.bfloat16)
         and x.numel() > 0
         and weight is not None
-        and weight.dtype == x.dtype
+        and weight.dtype in (x.dtype, torch.float32)
         and weight.device == x.device
         and variance_size is None
     )
@@ -38,6 +45,36 @@ def rms_norm(
     epsilon: float,
     variance_size: int | None = None,
 ) -> torch.Tensor:
+    # Omni also calls this function directly, bypassing the registry filter.
+    if (
+        weight is not None
+        and weight.dtype == torch.float32
+        and _supports_rms_norm(x, weight, epsilon, variance_size)
+    ):
+        if (
+            x.is_contiguous()
+            and weight.is_contiguous()
+            and weight.ndim == 1
+            and weight.shape[0] == x.shape[-1]
+        ):
+            output = torch.empty_like(x)
+            suffix = "fp16" if x.dtype == torch.float16 else "bf16"
+            kernel = getattr(
+                _normalization_library(), f"rms_norm_{suffix}_weight_float"
+            )
+            kernel(
+                x,
+                weight,
+                output,
+                x.shape[-1],
+                epsilon,
+                threads=(256, x.numel() // x.shape[-1], 1),
+                group_size=(256, 1, 1),
+            )
+            return output
+        return torch.nn.functional.rms_norm(
+            x.float(), (x.shape[-1],), weight, epsilon
+        ).to(x.dtype)
     return torch.nn.functional.rms_norm(x, (x.shape[-1],), weight, epsilon)
 
 
@@ -74,7 +111,7 @@ def fused_add_rms_norm(
     ):
         output = torch.empty_like(x)
         residual = torch.empty_like(x)
-        _, kernel = _add_rms_norm_kernel(x.dtype)
+        _, kernel = _add_rms_norm_kernel(x.dtype, weight.dtype)
         kernel(
             x,
             x_residual,
@@ -98,4 +135,4 @@ def fused_add_rms_norm(
         torch.ones_like(weight, dtype=torch.float32),
         epsilon,
     )
-    return normalized.to(x.dtype) * weight, summed.to(x.dtype)
+    return (normalized.to(weight.dtype) * weight).to(x.dtype), summed.to(x.dtype)
