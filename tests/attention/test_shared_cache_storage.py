@@ -212,6 +212,7 @@ def test_budget_above_buffer_limit_uses_shared_regions(monkeypatch):
     )
     runner = SimpleNamespace(
         is_hybrid=True,
+        moe_expert_reserved_bytes=0,
         scheduler_memory_reporting_mode=lambda: "paged_attention_layout_budget",
         profile_run=lambda: 0,
     )

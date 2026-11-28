@@ -204,6 +204,7 @@ class TestWorkerRunnerBoundaryDelegation:
             scheduler_memory_reporting_mode=MagicMock(
                 return_value="paged_attention_layout_budget"
             ),
+            moe_expert_reserved_bytes=0,
             profile_run=MagicMock(return_value=overhead),
         )
         worker = _make_worker(model_runner)
@@ -624,6 +625,7 @@ class TestPagedAttentionPlanDiagnostics:
     ) -> None:
         runner = SimpleNamespace(
             is_hybrid=False,
+            moe_expert_reserved_bytes=0,
             scheduler_memory_reporting_mode=lambda: "paged_attention_layout_budget",
             profile_run=lambda: 100_000_000,
         )
@@ -646,9 +648,7 @@ class TestPagedAttentionPlanDiagnostics:
         assert mitigation in str(exc_info.value)
 
     def test_non_hybrid_oom_error_omits_gdn_reservation(self, monkeypatch) -> None:
-        runner = SimpleNamespace(
-            is_hybrid=False,
-        )
+        runner = SimpleNamespace(is_hybrid=False, moe_expert_reserved_bytes=0)
         planner = self._make_planner(runner, gpu_memory_utilization=0.1)
         monkeypatch.setattr(
             WorkerCachePlanner,
@@ -968,6 +968,7 @@ class TestCommitProbeBudget:
         worker = _make_worker(
             SimpleNamespace(
                 is_hybrid=False,
+                moe_expert_reserved_bytes=0,
                 tq_prefill_workspace_bytes=turboquant_workspace,
             )
         )
@@ -1136,7 +1137,9 @@ class TestCommitProbeBudget:
         assert plan.kv_budget == _PLANNED_KV_BUDGET
 
     def test_probe_can_be_switched_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        worker = _make_worker(SimpleNamespace(is_hybrid=False))
+        worker = _make_worker(
+            SimpleNamespace(is_hybrid=False, moe_expert_reserved_bytes=0)
+        )
         worker.cache_config.gpu_memory_utilization = 0.5
         worker.get_cache_block_size_bytes = MagicMock(return_value=1_000_000)
         planner = WorkerCachePlanner(worker)

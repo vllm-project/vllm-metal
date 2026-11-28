@@ -979,12 +979,11 @@ class WorkerCachePlanner:
                     "memory budget before KV sizing.",
                     workspace / 2**20,
                 )
-        if get_config().moe_expert_cache_bytes:
-            # Experts stream in after profiling: the cache plus one layer of
-            # experts stacked for a forward.
-            expert_bytes = self._worker.model_runner.moe_expert_reserved_bytes
-            overhead += expert_bytes
-            future_reserved_bytes += expert_bytes
+        # Experts stream in after profiling: the cache plus one layer of
+        # experts stacked for a forward.
+        expert_bytes = self._worker.model_runner.moe_expert_reserved_bytes
+        overhead += expert_bytes
+        future_reserved_bytes += expert_bytes
         usable_metal = int(metal_limit * fraction)
         kv_budget = (
             explicit

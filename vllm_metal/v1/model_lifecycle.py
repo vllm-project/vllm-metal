@@ -24,7 +24,7 @@ from vllm_metal.compat import (
     headless_load_scope,
 )
 from vllm_metal.compiled_mlp import CompiledMLPBlocks
-from vllm_metal.config import get_config
+from vllm_metal.config import get_config, moe_expert_cache_bytes
 from vllm_metal.gguf.source import GGUFLoadSource
 from vllm_metal.moe_offload import ExpertStore
 from vllm_metal.multimodal.gemma4 import Gemma4VisionSidecar
@@ -409,7 +409,9 @@ class ModelLifecycle:
             )
         )
 
-        expert_cache_bytes = get_config().moe_expert_cache_bytes
+        expert_cache_bytes = moe_expert_cache_bytes(
+            self._runner.vllm_config.additional_config
+        )
         if expert_cache_bytes and (is_gguf or use_mlx_vlm or awq_loader is not None):
             raise NotImplementedError(
                 "MoE expert offloading supports mlx-lm text checkpoints only, "

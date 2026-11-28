@@ -277,11 +277,9 @@ class TestModelLifecycle:
         request = GenerationLoadRequest.from_runner(runner, _mode_adapter("native"))
         assert request.is_vlm is (backend == "vlm")
         if backend == "offload":
-            monkeypatch.setattr(
-                model_lifecycle,
-                "get_config",
-                lambda: SimpleNamespace(moe_expert_cache_bytes=4096),
-            )
+            runner.vllm_config.additional_config = {
+                "moe_expert_offload": {"cache_gb": 4096 / 2**30}
+            }
             install_experts = Mock(return_value=object())
             monkeypatch.setattr(model_lifecycle.ExpertStore, "install", install_experts)
         assert (

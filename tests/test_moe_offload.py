@@ -12,7 +12,7 @@ import pytest
 from mlx.utils import tree_flatten
 from mlx_lm.models import olmoe
 
-from vllm_metal.config import MetalConfig
+from vllm_metal.config import moe_expert_cache_bytes
 from vllm_metal.moe_offload import ExpertStore, OffloadedSwitchGLU
 
 NUM_EXPERTS = 8
@@ -172,23 +172,20 @@ def test_shutdown_closes_expert_checkpoint(tmp_path) -> None:
 
 class TestConfig:
     def test_cache_gb_sets_the_byte_budget(self) -> None:
-        config = MetalConfig(mlx_device="gpu")
-        config.apply_moe_expert_offload({"moe_expert_offload": {"cache_gb": 1.5}})
-        assert config.moe_expert_cache_bytes == int(1.5 * 2**30)
+        assert moe_expert_cache_bytes({"moe_expert_offload": {"cache_gb": 1.5}}) == int(
+            1.5 * 2**30
+        )
 
     def test_absent_key_keeps_offloading_off(self) -> None:
-        config = MetalConfig(mlx_device="gpu")
-        config.apply_moe_expert_offload({"turboquant": True})
-        assert config.moe_expert_cache_bytes == 0
+        assert moe_expert_cache_bytes({"turboquant": True}) == 0
 
     @pytest.mark.parametrize(
         "options",
         [True, {}, {"cache_gb": 0}, {"cache_gb": "2"}, {"cache_gb": 2, "x": 1}],
     )
     def test_invalid_options_are_rejected(self, options) -> None:
-        config = MetalConfig(mlx_device="gpu")
         with pytest.raises(ValueError, match="moe_expert_offload"):
-            config.apply_moe_expert_offload({"moe_expert_offload": options})
+            moe_expert_cache_bytes({"moe_expert_offload": options})
 
 
 class TestPlatformGuards:

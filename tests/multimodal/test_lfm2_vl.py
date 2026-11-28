@@ -124,9 +124,10 @@ def test_model_load_preserves_processor_pixels_in_requested_format(
     )
     monkeypatch.setattr(model_lifecycle, "mlx_vlm_load_model", lambda *_, **__: model)
     runner = SimpleNamespace(
+        vllm_config=SimpleNamespace(additional_config={}),
         model_config=SimpleNamespace(
             revision=None, hf_config=SimpleNamespace(model_type=model_type)
-        )
+        ),
     )
     lifecycle = model_lifecycle.ModelLifecycle(runner, DefaultModelAdapter())
     assert lifecycle._load_generation_model("lfm2-checkpoint", is_vlm=True) is model

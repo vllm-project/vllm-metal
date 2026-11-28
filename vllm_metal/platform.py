@@ -15,6 +15,7 @@ from vllm_metal.config import (
     DSPARK_DRAFT_QUANTIZATION_KEY,
     DSPARK_DRAFT_QUANTIZATION_Q4,
     get_config,
+    moe_expert_cache_bytes,
 )
 
 if TYPE_CHECKING:
@@ -635,8 +636,6 @@ class MetalPlatform(Platform):
                 f"k_quant={config.k_quant}, v_quant={config.v_quant}"
             )
 
-        config.apply_moe_expert_offload(add)
-
         logger.debug("Metal config: %s", config)
 
         speculative_config = vllm_config.speculative_config
@@ -656,7 +655,7 @@ class MetalPlatform(Platform):
 
         if model_config is not None and model_config.enable_sleep_mode:
             cls._check_sleep_mode_config(vllm_config, backend)
-        if config.moe_expert_cache_bytes:
+        if moe_expert_cache_bytes(add):
             cls._check_moe_expert_offload_config(vllm_config, backend)
 
         # Set worker class for Metal
