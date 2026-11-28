@@ -24,23 +24,46 @@ class PunicaWrapperMLX:
         self._token_indices_by_slot: tuple[tuple[int, mx.array], ...] = ()
         self._num_tokens = 0
         self._no_lora = True
+        self._slots: list[int | None] = []
+        self._token_slots: mx.array | None = None
+        self._active_slots: frozenset[int] = frozenset()
+        self._has_unadapted_tokens = False
 
     @property
     def no_lora(self) -> bool:
         return self._no_lora
+
+    @property
+    def active_slots(self) -> frozenset[int]:
+        return self._active_slots
+
+    @property
+    def has_unadapted_tokens(self) -> bool:
+        return self._has_unadapted_tokens
+
+    @property
+    def token_slots(self) -> mx.array:
+        """Each token's adapter slot, ``-1`` for tokens without an adapter."""
+        if self._token_slots is None:
+            self._token_slots = mx.array(
+                [-1 if slot is None else slot for slot in self._slots], dtype=mx.int32
+            )
+        return self._token_slots
 
     def update_metadata(
         self, mapping: LoRAMapping, lora_index_to_id: list[int | None]
     ) -> None:
         slot_of = {aid: i for i, aid in enumerate(lora_index_to_id) if aid is not None}
         self._num_tokens = len(mapping.index_mapping)
+        self._slots = [slot_of.get(adapter_id) for adapter_id in mapping.index_mapping]
+        self._token_slots = None
+        self._has_unadapted_tokens = None in self._slots
 
         runs: list[tuple[int | None, int, int]] = []
         active_slots: set[int] = set()
         run_slot: int | None = None
         run_start = 0
-        for token_index, adapter_id in enumerate(mapping.index_mapping):
-            slot = slot_of.get(adapter_id)
+        for token_index, slot in enumerate(self._slots):
             if slot is not None:
                 active_slots.add(slot)
             if token_index == 0:
@@ -69,6 +92,7 @@ class PunicaWrapperMLX:
                 (slot, mx.array(indices, dtype=mx.int32))
                 for slot, indices in sorted(token_indices_by_slot.items())
             )
+        self._active_slots = frozenset(active_slots)
         self._no_lora = not active_slots
 
     def add_lora_linear(

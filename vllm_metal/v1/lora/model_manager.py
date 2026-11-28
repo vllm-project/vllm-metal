@@ -16,10 +16,14 @@ from vllm.lora.utils import is_in_target_modules
 from vllm.utils.cache import LRUCache
 
 from .layers import (
+    SWITCH_GLU_PROJECTIONS,
     MLXLinearWithLoRA,
     MLXQuantizedLinearWithLoRA,
+    MLXSwitchGLUWithLoRA,
+    MLXSwitchLinearWithLoRA,
     can_wrap,
     can_wrap_qlora,
+    can_wrap_switch_glu,
 )
 from .peft_loader import LoadedLoRA, LoRALayerWeightsMLX
 from .punica_wrapper import EncoderPunicaWrapperMLX, PunicaWrapperMLX
@@ -29,10 +33,18 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_WrappedModule = MLXLinearWithLoRA | MLXQuantizedLinearWithLoRA
+_WrappedModule = (
+    MLXLinearWithLoRA | MLXQuantizedLinearWithLoRA | MLXSwitchLinearWithLoRA
+)
 _PreparedLoRAWeights = tuple[mx.array, mx.array, int]
 _PreparedModuleUpdate = tuple[_WrappedModule, _PreparedLoRAWeights | None]
 _EMBEDDING_MODULES = frozenset({"embed_tokens", "lm_head"})
+# PEFT names one module per expert, ``<block>.experts.{e}.<proj>``; mlx_lm
+# stacks them into ``<block>.switch_mlp.<proj>``. Mixtral checkpoints call the
+# projections w1/w2/w3, which mlx_lm's sanitize maps the same way.
+_EXPERT_MODULE = re.compile(r"(?P<block>.+)\.experts\.(?P<expert>\d+)\.(?P<proj>[^.]+)")
+_EXPERT_PROJECTION_ALIASES = {"gate_proj": "w1", "down_proj": "w2", "up_proj": "w3"}
+_ExpertWeights = dict[tuple[str, str], dict[int, LoRALayerWeightsMLX]]
 
 
 class _PreparedAdapterUpdate(NamedTuple):
@@ -121,6 +133,13 @@ class MLXLoRAModelManager:
                 wrapped.append(w)
             if repls:
                 root.update_modules(tree_unflatten(repls))
+        switch_glus = self._wrappable_switch_glus()
+        for name, glu in switch_glus:
+            for proj_name, proj in glu.lora.items():
+                self.modules[f"{name}.{proj_name}"] = proj
+                wrapped.append(proj)
+        if switch_glus:
+            self.model.update_modules(tree_unflatten(switch_glus))
         if not wrapped:
             raise RuntimeError(
                 "MLXLoRAModelManager found no LoRA target modules to wrap. "
@@ -129,12 +148,14 @@ class MLXLoRAModelManager:
                 "contract for LoRA/QLoRA wrapping."
             )
         num_plain = sum(1 for w in wrapped if isinstance(w, MLXLinearWithLoRA))
+        num_experts = sum(1 for w in wrapped if isinstance(w, MLXSwitchLinearWithLoRA))
         logger.info(
             "MLXLoRAModelManager wrapped %d modules (%d plain, %d quantized, "
-            "%d in the multimodal encoder).",
+            "%d MoE expert projections, %d in the multimodal encoder).",
             len(wrapped),
             num_plain,
-            len(wrapped) - num_plain,
+            len(wrapped) - num_plain - num_experts,
+            num_experts,
             sum(1 for name in self.modules if self._is_encoder_module(name)),
         )
 
@@ -163,6 +184,29 @@ class MLXLoRAModelManager:
                     ),
                 )
             )
+        return repls
+
+    def _wrappable_switch_glus(self) -> list[tuple[str, MLXSwitchGLUWithLoRA]]:
+        targets = self.lora_config.target_modules
+        repls: list[tuple[str, MLXSwitchGLUWithLoRA]] = []
+        for name, m in self.model.named_modules():
+            if name.rsplit(".", 1)[-1] != "switch_mlp" or not can_wrap_switch_glu(m):
+                continue
+            lora = {
+                p: MLXSwitchLinearWithLoRA(
+                    getattr(m, p),
+                    self.lora_slots,
+                    self.lora_config.max_lora_rank,
+                    self.dtype,
+                )
+                for p in SWITCH_GLU_PROJECTIONS
+                if is_in_target_modules(f"{name}.{p}", targets)
+            }
+            if lora:
+                glu = MLXSwitchGLUWithLoRA(
+                    m, lora, self.punica_wrapper, self.lora_slots
+                )
+                repls.append((name, glu))
         return repls
 
     def _is_encoder_module(self, name: str) -> bool:
@@ -357,7 +401,30 @@ class MLXLoRAModelManager:
         updates: list[_PreparedModuleUpdate] = []
         loaded = 0
         consumed: set[str] = set()
+        expert_index: _ExpertWeights | None = None
         for name, module in self.modules.items():
+            if isinstance(module, MLXSwitchLinearWithLoRA):
+                if expert_index is None:
+                    expert_index = _index_expert_weights(adapter)
+                experts = _lookup_expert_weights(
+                    adapter, expert_index, name, module.num_experts
+                )
+                if experts is None:
+                    updates.append((module, None))
+                    continue
+                loaded += 1
+                consumed.update(w.module_name for w in experts if w is not None)
+                lora_a, lora_b = _stack_expert_weights(experts, module)
+                updates.append(
+                    (
+                        module,
+                        (
+                            *module.prepare_lora_weights(slot, lora_a, lora_b),
+                            int(lora_a.shape[1]),
+                        ),
+                    )
+                )
+                continue
             weights = _lookup_weights_for_module(adapter, name)
             if weights is None:
                 updates.append((module, None))
@@ -376,10 +443,11 @@ class MLXLoRAModelManager:
                 )
             )
         # Upstream applies LoRA to embedding modules and to MoE experts (the
-        # ".experts" names its check_unexpected_modules accepts). Metal does
-        # not wrap mlx_lm's SwitchLinear experts, so refuse rather than serve
-        # the adapter without them. Modules excluded by the deployment
-        # target_modules are dropped, as upstream does.
+        # ".experts" names its check_unexpected_modules accepts). Metal applies
+        # expert LoRA only to per-expert modules of SwitchGLU experts, so refuse
+        # other expert formats rather than serve the adapter without them.
+        # Modules excluded by the deployment target_modules are dropped, as
+        # upstream does.
         unsupported = {
             name
             for name in adapter.weights.keys() - consumed
@@ -467,3 +535,76 @@ def _lookup_weights_for_module(
             "one candidate matches."
         )
     return None
+
+
+def _index_expert_weights(adapter: LoadedLoRA) -> _ExpertWeights:
+    """Group the adapter's per-expert modules by ``(block, projection)``."""
+    index: _ExpertWeights = {}
+    for name, weights in adapter.weights.items():
+        if (m := _EXPERT_MODULE.fullmatch(name)) is not None:
+            index.setdefault((m["block"], m["proj"]), {})[int(m["expert"])] = weights
+    return index
+
+
+def _lookup_expert_weights(
+    adapter: LoadedLoRA,
+    index: _ExpertWeights,
+    module_name: str,
+    num_experts: int,
+) -> list[LoRALayerWeightsMLX | None] | None:
+    """Per-expert weights for a wrapped ``<block>.switch_mlp.<proj>``.
+
+    Matches the block like ``_lookup_weights_for_module``: directly, then by a
+    unique trailing suffix.
+    """
+    block, proj = module_name.rsplit(".switch_mlp.", 1)
+    names = (proj, _EXPERT_PROJECTION_ALIASES.get(proj))
+    experts = next((index[k] for n in names if (k := (block, n)) in index), None)
+    if experts is None:
+        matches = [
+            key
+            for key in index
+            if key[1] in names
+            and (key[0].endswith("." + block) or block.endswith("." + key[0]))
+        ]
+        if len(matches) > 1:
+            raise ValueError(
+                f"LoRA adapter {adapter.lora_id} has ambiguous expert matches for "
+                f"wrapped module {module_name!r}: {sorted(matches)}."
+            )
+        if not matches:
+            return None
+        experts = index[matches[0]]
+    if max(experts) >= num_experts:
+        raise ValueError(
+            f"LoRA adapter {adapter.lora_id} has weights for expert {max(experts)} "
+            f"of {module_name!r}, which has {num_experts} experts."
+        )
+    return [experts.get(e) for e in range(num_experts)]
+
+
+def _stack_expert_weights(
+    experts: list[LoRALayerWeightsMLX | None], module: MLXSwitchLinearWithLoRA
+) -> tuple[mx.array, mx.array]:
+    """Stack A ``(E, rank, in)`` and scaled B ``(E, out, rank)``; absent experts are 0."""
+    rank = max(w.rank for w in experts if w is not None)
+    dtype = module.lora_a_stacked.dtype
+    a_parts: list[mx.array] = []
+    b_parts: list[mx.array] = []
+    for w in experts:
+        if w is None:
+            a_parts.append(mx.zeros((rank, module.input_size), dtype))
+            b_parts.append(mx.zeros((module.output_size, rank), dtype))
+            continue
+        if tuple(w.lora_a.shape) != (w.rank, module.input_size) or tuple(
+            w.lora_b.shape
+        ) != (module.output_size, w.rank):
+            raise ValueError(
+                f"MoE expert LoRA weight shape mismatch for {w.module_name!r}: "
+                f"A={tuple(w.lora_a.shape)}, B={tuple(w.lora_b.shape)}; expected "
+                f"A=(rank, {module.input_size}), B=({module.output_size}, rank)"
+            )
+        pad = rank - w.rank
+        a_parts.append(mx.pad(w.lora_a.astype(dtype), [(0, pad), (0, 0)]))
+        b_parts.append(mx.pad((w.lora_b * w.scaling).astype(dtype), [(0, 0), (0, pad)]))
+    return mx.stack(a_parts), mx.stack(b_parts)

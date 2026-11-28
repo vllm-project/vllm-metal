@@ -13,6 +13,7 @@ import mlx.nn as nn
 import numpy as np
 import pytest
 import torch
+from mlx_lm.models.switch_layers import SwitchGLU
 from vllm.lora.layers import LoRAMapping
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import NewRequestData
@@ -1379,8 +1380,8 @@ def test_add_adapter_rejects_embedding_lora_metal_cannot_apply(extra: str) -> No
 
 
 def test_add_adapter_rejects_moe_expert_lora_metal_cannot_apply() -> None:
-    """Metal does not wrap mlx_lm SwitchLinear experts, so an adapter with
-    expert LoRA would serve without those deltas; the load must fail instead."""
+    """A model without SwitchGLU experts cannot apply expert LoRA, so the
+    adapter would serve without those deltas; the load must fail instead."""
     adapter = _adapter_with_extra_module("model.layers.0.mlp.experts.0.gate_proj")
     for name in (
         "model.layers.0.mlp.experts.1.gate_proj",
@@ -1402,6 +1403,155 @@ def test_add_adapter_rejects_moe_expert_lora_metal_cannot_apply() -> None:
     ):
         manager.add_adapter(adapter)
     assert manager.list_adapters() == set()
+
+
+# MoE expert LoRA on mlx_lm SwitchGLU
+
+_EXPERTS, _TOP_K, _MOE_DIM = 4, 2, 64
+
+
+class _SwitchGLUModel(nn.Module):
+    """An mlx_lm ``SwitchGLU`` at ``mlp.switch_mlp``, run on given experts."""
+
+    def __init__(self, *, quantized: bool = False) -> None:
+        super().__init__()
+        self.mlp = nn.Module()
+        self.mlp.switch_mlp = SwitchGLU(_MOE_DIM, _MOE_DIM, _EXPERTS)
+        self.o_proj = nn.Linear(_MOE_DIM, _MOE_DIM, bias=False)
+        if quantized:
+            for name in layers_mod.SWITCH_GLU_PROJECTIONS:
+                proj = getattr(self.mlp.switch_mlp, name)
+                setattr(self.mlp.switch_mlp, name, proj.to_quantized(64, 4))
+
+    def __call__(self, x: mx.array, experts: mx.array) -> mx.array:
+        return self.mlp.switch_mlp(x[None], experts[None])[0]
+
+
+def _expert_adapter(
+    lora_id: int, rng: np.random.Generator, names: dict[str, str]
+) -> tuple[peft_loader_mod.LoadedLoRA, dict[str, np.ndarray]]:
+    """PEFT per-expert adapter plus its merged deltas, ``(E, out, in)`` each."""
+    weights, deltas = {}, {}
+    for proj in layers_mod.SWITCH_GLU_PROJECTIONS:
+        a = rng.normal(size=(_EXPERTS, 2, _MOE_DIM)).astype(np.float32) * 0.3
+        b = rng.normal(size=(_EXPERTS, _MOE_DIM, 2)).astype(np.float32) * 0.3
+        deltas[proj] = 0.5 * b.astype(np.float64) @ a.astype(np.float64)
+        for e in range(_EXPERTS):
+            name = f"mlp.experts.{e}.{names[proj]}"
+            weights[name] = peft_loader_mod.LoRALayerWeightsMLX(
+                module_name=name,
+                rank=2,
+                lora_a=mx.array(a[e]),
+                lora_b=mx.array(b[e]),
+                scaling=0.5,
+            )
+    return peft_loader_mod.LoadedLoRA(lora_id, 2, weights), deltas
+
+
+def _expert_weights(glu: SwitchGLU) -> dict[str, np.ndarray]:
+    """Each projection's (dequantized) expert weights, ``(E, out, in)``."""
+    weights = {}
+    for name in layers_mod.SWITCH_GLU_PROJECTIONS:
+        proj = getattr(glu, name)
+        w = proj.weight
+        if hasattr(proj, "scales"):
+            w = mx.dequantize(w, proj.scales, proj.biases, 64, 4)
+        weights[name] = np.array(w, dtype=np.float64)
+    return weights
+
+
+def _switch_glu_reference(
+    base: dict[str, np.ndarray],
+    x: np.ndarray,
+    experts: np.ndarray,
+    deltas: list[dict[str, np.ndarray] | None],
+) -> np.ndarray:
+    out = np.zeros((*experts.shape, _MOE_DIM))
+    for t, token_experts in enumerate(experts):
+        w = {p: base[p] + (deltas[t] or {}).get(p, 0.0) for p in base}
+        for j, e in enumerate(token_experts):
+            gate, up = w["gate_proj"][e] @ x[t], w["up_proj"][e] @ x[t]
+            out[t, j] = w["down_proj"][e] @ (gate / (1 + np.exp(-gate)) * up)
+    return out
+
+
+@pytest.mark.parametrize("names", ["gate_up_down", "mixtral_w123"])
+@pytest.mark.parametrize("quantized", [False, True], ids=["plain", "quantized"])
+@pytest.mark.parametrize("num_tokens", [3, 40], ids=["unsorted", "sorted"])
+@pytest.mark.parametrize("max_loras", [1, 2])
+def test_switch_glu_lora_applies_each_tokens_expert_deltas(
+    max_loras: int, num_tokens: int, quantized: bool, names: str
+) -> None:
+    """Adapters in every slot and base tokens in one batch match per-expert
+    merged weights, on both SwitchGLU layouts (fewer and at least 64 routed
+    rows)."""
+    proj_names = {
+        "gate_up_down": {p: p for p in layers_mod.SWITCH_GLU_PROJECTIONS},
+        "mixtral_w123": {"gate_proj": "w1", "down_proj": "w2", "up_proj": "w3"},
+    }[names]
+    rng = np.random.default_rng(0)
+    model = _SwitchGLUModel(quantized=quantized)
+    base = _expert_weights(model.mlp.switch_mlp)
+    manager = model_manager_mod.MLXLoRAModelManager(
+        model=model,
+        lora_config=_lora_config_stub(max_loras=max_loras, max_lora_rank=4),
+        max_num_seqs=4,
+        max_num_batched_tokens=num_tokens,
+        dtype=mx.float32,
+    )
+    adapters = {i: _expert_adapter(i, rng, proj_names) for i in range(1, max_loras + 1)}
+    for adapter, _ in adapters.values():
+        manager.add_adapter(adapter)
+        manager.activate_adapter(adapter.lora_id)
+    token_ids = tuple((*adapters, 0)[t % (max_loras + 1)] for t in range(num_tokens))
+    manager.set_adapter_mapping(LoRAMapping(token_ids, token_ids))
+
+    x = rng.normal(size=(num_tokens, _MOE_DIM)).astype(np.float32)
+    experts = np.stack(
+        [rng.permutation(_EXPERTS)[:_TOP_K] for _ in range(num_tokens)]
+    ).astype(np.uint32)
+    out = np.array(model(mx.array(x), mx.array(experts)))
+
+    expected = _switch_glu_reference(
+        base,
+        x.astype(np.float64),
+        experts,
+        [adapters[i][1] if i else None for i in token_ids],
+    )
+    # MLX's sorted gather_mm is itself ~1.5e-3 from float64 here.
+    np.testing.assert_allclose(out, expected, rtol=0, atol=5e-3)
+
+
+def test_switch_glu_runs_base_experts_for_adapters_without_expert_weights(
+    monkeypatch,
+) -> None:
+    """An attention-only adapter on an MoE model leaves the experts on
+    mlx_lm's own SwitchGLU path."""
+    model = _SwitchGLUModel()
+    x = mx.random.normal((3, _MOE_DIM))
+    experts = mx.array([[0, 1], [2, 3], [1, 2]], dtype=mx.uint32)
+    expected = np.array(model(x, experts))
+    manager = model_manager_mod.MLXLoRAModelManager(
+        model=model,
+        lora_config=_lora_config_stub(max_loras=1, max_lora_rank=1),
+        max_num_seqs=1,
+        max_num_batched_tokens=3,
+        dtype=mx.float32,
+    )
+    adapter = _make_adapter(
+        lora_id=1, fc1_a=np.ones((1, _MOE_DIM)), fc1_b=np.ones((_MOE_DIM, 1))
+    )
+    adapter.weights = {"o_proj": dataclasses.replace(adapter.weights["fc1"])}
+    manager.add_adapter(adapter)
+    manager.activate_adapter(1)
+    manager.set_adapter_mapping(LoRAMapping((1, 1, 1), (1, 1, 1)))
+    monkeypatch.setattr(
+        layers_mod.MLXSwitchLinearWithLoRA,
+        "lora_delta",
+        lambda *args: pytest.fail("expert LoRA ran without expert weights"),
+    )
+
+    np.testing.assert_array_equal(np.array(model(x, experts)), expected)
 
 
 @pytest.mark.parametrize(
