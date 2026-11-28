@@ -594,7 +594,7 @@ class MetalModelRunner:
                     f"{PA_WINDOW_MAX_HEAD_SIZE}"
                 )
             return None
-        if not envs.VLLM_METAL_SPEC_VERIFY_WINDOW:
+        if not (envs.VLLM_METAL_SPEC_VERIFY_WINDOW or envs.VLLM_METAL_GQA_SPEC_VERIFY):
             return "VLLM_METAL_SPEC_VERIFY_WINDOW is off"
         if self.is_mla:
             return "window mode does not support MLA models"

@@ -156,6 +156,28 @@ std::string gqa_decode_kernel_name(
       + "_bs" + std::to_string(block_size) + "_ps" + std::to_string(partition_size);
 }
 
+std::string gqa_window_kernel_name(
+    const std::string& dtype, int head_size, int block_size, int partition_size) {
+  return "paged_attention_gqa_window_" + dtype + "_hs" + std::to_string(head_size)
+      + "_bs" + std::to_string(block_size) + "_ps" + std::to_string(partition_size);
+}
+
+static bool gqa_window_shape_supported(int num_heads, int num_kv_heads,
+                                       int head_size, int block_size) {
+  if (num_kv_heads <= 0 || num_heads <= 0 || num_heads % num_kv_heads != 0) {
+    return false;
+  }
+  const int group = num_heads / num_kv_heads;
+  if (group < 1 || group > 32) {
+    return false;
+  }
+  const bool hs_ok = head_size == 64 || head_size == 80 || head_size == 96 ||
+                     head_size == 112 || head_size == 128 || head_size == 192 ||
+                     head_size == 256;
+  const bool bs_ok = block_size == 8 || block_size == 16 || block_size == 32;
+  return hs_ok && bs_ok;
+}
+
 std::string gqa_decode_tq_kernel_name(
     const std::string& dtype, const std::string& k_cache_dtype, int head_size,
     int block_size, int partition_size) {
@@ -640,6 +662,7 @@ struct PagedAttentionMetadata {
   int decode_only_rows;
   bool gqa_disabled;
   bool force_gqa;
+  bool gqa_spec_verify;
   int nax_split_hint;
   int nax_prefill_split_hint;
 };
@@ -675,7 +698,7 @@ static bool gqa_decode_metadata_eligible(
 enum class PagedAttentionRoute {
   MixedNaxSplit, MixedNaxUnsplit, MixedTiled,
   NaxSplit, NaxUnsplit, Tiled,
-  GqaDecode, PerToken, SplitKv, Window, WindowSplitKv
+  GqaDecode, GqaWindow, PerToken, SplitKv, Window, WindowSplitKv
 };
 
 struct PagedAttentionPlan {
@@ -884,6 +907,29 @@ static PagedAttentionPlan select_paged_attention_route(
   plan.fallback = window_batch
       ? (partition ? PagedAttentionRoute::WindowSplitKv : PagedAttentionRoute::Window)
       : (partition ? PagedAttentionRoute::SplitKv : PagedAttentionRoute::PerToken);
+  const bool gqa_window_eligible =
+      window_batch && m.gqa_spec_verify && !m.gqa_disabled && !m.use_turboquant &&
+      !m.use_sinks && !m.use_mm_prefix && m.softcap <= 0.f &&
+      (m.query_dtype == float16 || m.query_dtype == bfloat16 ||
+       m.query_dtype == float32) &&
+      m.query_dtype == m.key_dtype && m.query_dtype == m.value_dtype &&
+      gqa_window_shape_supported(
+          m.num_heads, m.num_kv_heads, m.head_size, m.block_size);
+  if (gqa_window_eligible) {
+    const int64_t gqa_win_partitions = std::max<int64_t>(
+        1,
+        (static_cast<int64_t>(m.max_seq_len) + kGqaPartitionSize - 1) /
+            kGqaPartitionSize);
+    if (gqa_scratch_fits(total_q_tokens, m.num_heads, gqa_win_partitions,
+                         m.head_size, m.item_size)) {
+      plan.gqa_partition_size = kGqaPartitionSize;
+      plan.gqa_partitions = gqa_win_partitions;
+      plan.offsets = nullptr;
+      plan.compact = false;
+      plan.route = PagedAttentionRoute::GqaWindow;
+      return plan;
+    }
+  }
   plan.route = scratch_fits ? PagedAttentionRoute::GqaDecode : plan.fallback;
   return plan;
 }
@@ -1068,6 +1114,73 @@ static void dispatch_paged_attention_gqa_decode(
   return;
 }
 
+static void dispatch_paged_attention_gqa_window(
+    const PagedAttentionArrays& arrays, const PagedAttentionMetadata& metadata,
+    const PagedAttentionPlan& plan, const PagedAttentionEncoding& encoding,
+    MTL::ComputePipelineState* gkernel,
+    MTL::ComputePipelineState* gqa_rkernel) {
+  auto& enc = *encoding.encoder;
+  const int gqa_num_partitions = static_cast<int>(plan.gqa_partitions);
+  const int w_rows = gqa_window_rows(metadata.head_size);
+  const int sub_windows =
+      (metadata.window_seqlen_q + w_rows - 1) / w_rows;
+  const int num_threads = 32 * (metadata.num_heads / metadata.num_kv_heads);
+
+  record_paged_dispatch(
+      PagedDispatch::GqaWindow, plan.gqa_partition_size, plan.num_seqs);
+
+  const bool single_partition = (gqa_num_partitions == 1);
+  array g_tmp_out = arrays.out;
+  array g_exp_sums = arrays.out;
+  array g_max_logits = arrays.out;
+  if (!single_partition) {
+    Shape stats_shape{
+        plan.total_q_tokens, metadata.num_heads, gqa_num_partitions};
+    Shape output_shape = stats_shape;
+    output_shape.push_back(metadata.head_size);
+    g_tmp_out =
+        make_paged_attention_temp(enc, output_shape, arrays.query.dtype());
+    g_exp_sums = make_paged_attention_temp(enc, stats_shape, float32);
+    g_max_logits = make_paged_attention_temp(enc, stats_shape, float32);
+  }
+
+  enc.set_compute_pipeline_state(gkernel);
+  enc.set_output_array(g_exp_sums, 0);
+  enc.set_output_array(g_max_logits, 1);
+  enc.set_output_array(g_tmp_out, 2);
+  enc.set_input_array(arrays.query, 3);
+  enc.set_input_array(arrays.key_cache, 4);
+  enc.set_input_array(arrays.value_cache, 5);
+  int32_t g_nkv = static_cast<int32_t>(metadata.num_kv_heads);
+  enc.set_bytes(g_nkv, 8);
+  enc.set_bytes(metadata.scale, 9);
+  enc.set_input_array(arrays.block_tables, 11);
+  enc.set_input_array(arrays.seq_lens, 12);
+  int32_t g_max_blocks = static_cast<int32_t>(arrays.block_tables.shape(1));
+  enc.set_bytes(g_max_blocks, 13);
+  bind_paged_attn_strides(
+      enc, arrays.query, arrays.key_cache, metadata.block_size);
+  enc.set_input_array(arrays.cu_seqlens_q, 19);
+  int32_t sub_windows_i = static_cast<int32_t>(sub_windows);
+  enc.set_bytes(sub_windows_i, 20);
+  int32_t sliding_window_i = static_cast<int32_t>(metadata.sliding_window);
+  enc.set_bytes(sliding_window_i, 21);
+
+  enc.dispatch_threadgroups(
+      MTL::Size::Make(gqa_num_partitions, metadata.num_kv_heads,
+                      plan.num_seqs * sub_windows),
+      MTL::Size::Make(num_threads, 1, 1));
+
+  if (!single_partition) {
+    dispatch_paged_attention_v2_reduce(
+        *encoding.device, enc, arrays.out, g_exp_sums, g_max_logits, g_tmp_out,
+        arrays.seq_lens, arrays.cu_seqlens_q, plan.num_seqs,
+        plan.total_q_tokens, metadata.num_heads, metadata.head_size,
+        gqa_num_partitions, encoding.dt, /*use_sinks=*/false, nullptr,
+        /*use_tq_fc=*/false, plan.gqa_partition_size, gqa_rkernel, nullptr);
+  }
+}
+
 static void dispatch_paged_attention_per_token(
     const PagedAttentionArrays& arrays, const PagedAttentionMetadata& metadata,
     const PagedAttentionPlan& plan, const PagedAttentionEncoding& encoding) {
@@ -1196,7 +1309,8 @@ static void dispatch_paged_attention_v2_online(
     int decode_only_rows = 0, bool gqa_disabled = false,
     bool force_gqa = false,
     const GqaDecodeLengthPlan& gqa_length_plan = {},
-    int nax_split_hint = -1, int nax_prefill_split_hint = -1) {
+    int nax_split_hint = -1, int nax_prefill_split_hint = -1,
+    bool gqa_spec_verify = false) {
   int head_size = static_cast<int>(query.shape(2));
   PagedAttentionMetadata metadata{
       gqa_length_plan, query.dtype(), key_cache.dtype(), value_cache.dtype()};
@@ -1225,6 +1339,7 @@ static void dispatch_paged_attention_v2_online(
   metadata.decode_only_rows = decode_only_rows;
   metadata.gqa_disabled = gqa_disabled;
   metadata.force_gqa = force_gqa;
+  metadata.gqa_spec_verify = gqa_spec_verify;
   metadata.nax_split_hint = nax_split_hint;
   metadata.nax_prefill_split_hint = nax_prefill_split_hint;
   const PagedAttentionArrays arrays{
@@ -1248,6 +1363,7 @@ static void dispatch_paged_attention_v2_online(
       gpu_core_count, detected_gpu_core_count);
 
   MTL::ComputePipelineState* gqa_rkernel = nullptr;
+  MTL::ComputePipelineState* gqa_wkernel = nullptr;
   if (plan.route == PagedAttentionRoute::GqaDecode) {
     // Check the actual reducer pipeline before allocating scratch or encoding
     // the GQA producer. Dynamic statistics alone can fit while their sum with
@@ -1258,6 +1374,23 @@ static void dispatch_paged_attention_v2_online(
         plan.gqa_window > 0);
     // This compiled-pipeline check is the only GQA-to-per-token fallback.
     if (!paged_reduce_memory_fits(
+            kernels::paged_reduce_threadgroup_bytes(plan.gqa_partitions),
+            gqa_rkernel->staticThreadgroupMemoryLength(),
+            encoding.device->mtl_device()->maxThreadgroupMemoryLength())) {
+      plan.route = plan.fallback;
+    }
+  } else if (plan.route == PagedAttentionRoute::GqaWindow) {
+    std::string wname = gqa_window_kernel_name(
+        encoding.dt, metadata.head_size, metadata.block_size,
+        plan.gqa_partition_size);
+    gqa_wkernel = encoding.device->get_kernel(wname, encoding.library, wname);
+    gqa_rkernel = paged_attention_v2_reduce_kernel(
+        *encoding.device, encoding.dt, metadata.head_size,
+        plan.gqa_partition_size, false, false, false);
+    const size_t num_threads =
+        static_cast<size_t>(32 * (metadata.num_heads / metadata.num_kv_heads));
+    if (num_threads > gqa_wkernel->maxTotalThreadsPerThreadgroup() ||
+        !paged_reduce_memory_fits(
             kernels::paged_reduce_threadgroup_bytes(plan.gqa_partitions),
             gqa_rkernel->staticThreadgroupMemoryLength(),
             encoding.device->mtl_device()->maxThreadgroupMemoryLength())) {
@@ -1291,6 +1424,10 @@ static void dispatch_paged_attention_v2_online(
       return;
     case PagedAttentionRoute::GqaDecode:
       dispatch_paged_attention_gqa_decode(arrays, metadata, plan, encoding, gqa_rkernel);
+      return;
+    case PagedAttentionRoute::GqaWindow:
+      dispatch_paged_attention_gqa_window(
+          arrays, metadata, plan, encoding, gqa_wkernel, gqa_rkernel);
       return;
     case PagedAttentionRoute::PerToken:
     case PagedAttentionRoute::SplitKv:
@@ -1380,7 +1517,8 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
       int num_decode_tokens = 0, int max_decode_context_len = 0,
       bool gqa_disabled = false, bool force_gqa = false,
       const GqaDecodeLengthPlan& gqa_length_plan = {},
-      int nax_split_hint = -1, int nax_prefill_split_hint = -1)
+      int nax_split_hint = -1, int nax_prefill_split_hint = -1,
+      bool gqa_spec_verify = false)
       : UnaryPrimitive(stream),
         num_kv_heads_(num_kv_heads), scale_(scale), softcap_(softcap),
         block_size_(block_size), max_seq_len_(max_seq_len),
@@ -1392,6 +1530,7 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
         num_decode_tokens_(num_decode_tokens),
         max_decode_context_len_(max_decode_context_len),
         gqa_disabled_(gqa_disabled), force_gqa_(force_gqa),
+        gqa_spec_verify_(gqa_spec_verify),
         gqa_length_plan_(gqa_length_plan), nax_split_hint_(nax_split_hint),
         nax_prefill_split_hint_(nax_prefill_split_hint) {}
 
@@ -1427,7 +1566,7 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
         ks, vs, kz, vc, use_turboquant_, k_bits_, v_bits_, sk, mp,
         num_decode_requests_, num_decode_tokens_, max_decode_context_len_,
         0, gqa_disabled_, force_gqa_, gqa_length_plan_,
-        nax_split_hint_, nax_prefill_split_hint_);
+        nax_split_hint_, nax_prefill_split_hint_, gqa_spec_verify_);
   }
 
   const char* name() const override { return "PagedAttention"; }
@@ -1450,6 +1589,7 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
         && rhs->max_decode_context_len_ == max_decode_context_len_
         && rhs->gqa_disabled_ == gqa_disabled_
         && rhs->force_gqa_ == force_gqa_
+        && rhs->gqa_spec_verify_ == gqa_spec_verify_
         && rhs->gqa_length_plan_ == gqa_length_plan_
         && rhs->nax_split_hint_ == nax_split_hint_
         && rhs->nax_prefill_split_hint_ == nax_prefill_split_hint_;
@@ -1473,6 +1613,7 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
   int max_decode_context_len_;
   bool gqa_disabled_;
   bool force_gqa_;
+  bool gqa_spec_verify_;
   GqaDecodeLengthPlan gqa_length_plan_;
   int nax_split_hint_;
   int nax_prefill_split_hint_;
@@ -1498,7 +1639,8 @@ array paged_attention_primitive_fn(
     int max_decode_context_len, bool gqa_disabled,
     bool force_gqa,
     const std::optional<GqaDecodeLengthPlan>& gqa_length_plan,
-    int nax_split_hint, int nax_prefill_split_hint) {
+    int nax_split_hint, int nax_prefill_split_hint,
+    bool gqa_spec_verify) {
   if (nax_split_hint < -1 || nax_split_hint > 1)
     throw std::invalid_argument("nax_split_hint must be -1, 0 or 1");
   if (nax_prefill_split_hint < -1 || nax_prefill_split_hint > 1)
@@ -1662,7 +1804,7 @@ array paged_attention_primitive_fn(
       use_turboquant, k_bits, v_bits, window_seqlen_q, sinks != nullptr,
       mm_prefix_ranges != nullptr, num_decode_requests, num_decode_tokens,
       max_decode_context_len, gqa_disabled, force_gqa, lengths,
-      nax_split_hint, nax_prefill_split_hint);
+      nax_split_hint, nax_prefill_split_hint, gqa_spec_verify);
   std::vector<array> inputs = {query, key_cache, value_cache,
                                block_tables, seq_lens, cu_seqlens_q};
   if (use_turboquant) {

@@ -31,7 +31,7 @@ constexpr int kPartitionSize = VLLM_METAL_PARTITION_SIZE;
 enum class PagedDispatch {
   None, GqaDecode, PerToken, SplitKv, Window, WindowSplitKv, NaxPrefill,
   TiledPrefill, MixedPrefillDecode, MixedNaxPrefillDecode,
-  NaxGqa6Prefill, Count
+  NaxGqa6Prefill, GqaWindow, Count
 };
 using hardware::detected_gpu_core_count;
 using hardware::gpu_core_count;
@@ -119,6 +119,11 @@ bool gqa_decode_geometry_supported(int num_heads, int num_kv_heads,
                                    int head_size, int block_size);
 std::string gqa_decode_kernel_name(
     const std::string& dtype, int head_size, int block_size, int partition_size);
+std::string gqa_window_kernel_name(
+    const std::string& dtype, int head_size, int block_size, int partition_size);
+constexpr int gqa_window_rows(int head_size) {
+  return head_size <= 128 ? 4 : 2;
+}
 std::string gqa_decode_tq_kernel_name(
     const std::string& dtype, const std::string& k_cache_dtype, int head_size,
     int block_size, int partition_size);
@@ -149,7 +154,8 @@ array paged_attention_primitive_fn(
     int max_decode_context_len = 0, bool gqa_disabled = false,
     bool force_gqa = false,
     const std::optional<GqaDecodeLengthPlan>& gqa_length_plan = std::nullopt,
-    int nax_split_hint = -1, int nax_prefill_split_hint = -1);
+    int nax_split_hint = -1, int nax_prefill_split_hint = -1,
+    bool gqa_spec_verify = false);
 std::tuple<array, array, array, array, array> tq_encode_primitive_fn(
     const array& key, const array& value,
     const array& key_cache, const array& value_cache,

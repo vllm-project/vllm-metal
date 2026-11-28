@@ -127,6 +127,7 @@ if TYPE_CHECKING:
     VLLM_METAL_TQ_PREFILL: str = "auto"
     VLLM_METAL_TQ_PREFILL_MAX_MIB: int | str = "auto"
     VLLM_METAL_SPEC_VERIFY_WINDOW: bool = False
+    VLLM_METAL_GQA_SPEC_VERIFY: bool = False
     VLLM_METAL_SPEC_INGEST_CHUNK: int = 1024
     VLLM_METAL_BUILD_FROM_SOURCE: bool = False
     VLLM_METAL_VISIBLE_DEVICES: str | None = None
@@ -212,6 +213,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # +40% e2e at conc 16-32), measured losses single-stream on M4 Pro
     # and at conc 32 on M2 Max. Outputs are bitwise identical either way.
     "VLLM_METAL_SPEC_VERIFY_WINDOW": _bool("VLLM_METAL_SPEC_VERIFY_WINDOW", False),
+    # Opt-in GQA speculative-verification window kernel (default off).
+    "VLLM_METAL_GQA_SPEC_VERIFY": _bool("VLLM_METAL_GQA_SPEC_VERIFY", False),
     # Max tokens of cold draft KV ingested per forward (issue #482,
     # direction 3). The first propose of a fresh prefix ingests the whole
     # prompt into the draft model's KV in one tiled prefill forward;
