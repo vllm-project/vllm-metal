@@ -242,6 +242,39 @@ def test_punica_rejects_routing_row_count_mismatch() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "index_mapping",
+    [(11, 11, 22, 0), (11, 22, 11, 0)],
+    ids=["contiguous", "fragmented"],
+)
+def test_punica_add_lora_embedding_looks_up_each_tokens_adapter(
+    index_mapping: tuple[int, ...],
+) -> None:
+    """Each token adds column ``id`` of its own adapter's A, then that adapter's B."""
+    rng = np.random.default_rng(0)
+    a = rng.standard_normal((2, 2, 5)).astype(np.float32)  # (slots, rank, vocab)
+    b = rng.standard_normal((2, 3, 2)).astype(np.float32)  # (slots, hidden, rank)
+    token_ids = np.array([4, 1, 1, 3], dtype=np.int32)
+    wrapper = punica_mod.PunicaWrapperMLX(
+        max_num_batched_tokens=4, max_batches=4, max_loras=2
+    )
+    wrapper.update_metadata(
+        LoRAMapping(index_mapping=index_mapping, prompt_mapping=index_mapping),
+        lora_index_to_id=[11, 22],
+    )
+
+    out = wrapper.add_lora_embedding(
+        mx.zeros((4, 3)), mx.array(token_ids), mx.array(a), mx.array(b)
+    )
+
+    slot_of = {11: 0, 22: 1}
+    expected = [
+        a[slot_of[lid], :, tid] @ b[slot_of[lid]].T if lid else np.zeros(3)
+        for lid, tid in zip(index_mapping, token_ids, strict=True)
+    ]
+    np.testing.assert_allclose(np.array(out), np.stack(expected), rtol=1e-5)
+
+
 # MLXLinearWithLoRA wrapper
 
 
@@ -1426,6 +1459,225 @@ def test_add_adapter_accepts_lm_head_lora_it_places_or_is_told_to_skip(
         dtype=mx.float32,
     )
     assert manager.add_adapter(_adapter_with_extra_module("lm_head"))
+
+
+_VOCAB, _HIDDEN, _RANK = 6, 4, 2
+
+
+class _EmbeddingModel(nn.Module):
+    """mlx_lm-shaped decoder: ``model.embed_tokens`` -> ``model.fc`` -> head.
+
+    Without ``lm_head`` the head is tied through ``embed_tokens.as_linear``.
+    """
+
+    def __init__(self, *, tied: bool) -> None:
+        super().__init__()
+        rng = np.random.default_rng(1)
+        self.model = nn.Module()
+        self.model.embed_tokens = nn.Embedding(_VOCAB, _HIDDEN)
+        self.model.embed_tokens.weight = mx.array(
+            rng.standard_normal((_VOCAB, _HIDDEN)).astype(np.float32)
+        )
+        self.model.fc = nn.Linear(_HIDDEN, _HIDDEN, bias=False)
+        self.model.fc.weight = mx.zeros((_HIDDEN, _HIDDEN))
+        if not tied:
+            self.lm_head = nn.Linear(_HIDDEN, _VOCAB, bias=False)
+            self.lm_head.weight = mx.array(
+                rng.standard_normal((_VOCAB, _HIDDEN)).astype(np.float32)
+            )
+
+    def __call__(self, ids: mx.array) -> mx.array:
+        h = self.model.embed_tokens(ids)
+        h = h + self.model.fc(h)
+        if "lm_head" in self:
+            return self.lm_head(h)
+        return self.model.embed_tokens.as_linear(h)
+
+
+class _WeightTiedModel(_EmbeddingModel):
+    """Tied head computed from ``embed_tokens.weight``, bypassing ``as_linear``."""
+
+    def __call__(self, ids: mx.array) -> mx.array:
+        h = self.model.embed_tokens(ids)
+        return h @ self.model.embed_tokens.weight.T
+
+
+def _write_embedding_adapter(
+    tmp_path: Path, seed: int, *, vocab: int = _VOCAB
+) -> tuple[Path, dict[str, np.ndarray]]:
+    """PEFT layout for ``target_modules=["embed_tokens", "lm_head"]``."""
+    from safetensors.numpy import save_file
+
+    rng = np.random.default_rng(seed)
+    tensors = {
+        "embed_a": rng.standard_normal((_RANK, vocab)).astype(np.float32),
+        "embed_b": rng.standard_normal((_HIDDEN, _RANK)).astype(np.float32),
+        "head_a": rng.standard_normal((_RANK, _HIDDEN)).astype(np.float32),
+        "head_b": rng.standard_normal((_VOCAB, _RANK)).astype(np.float32),
+    }
+    adapter_dir = tmp_path / f"adapter-{seed}"
+    adapter_dir.mkdir()
+    config = {
+        "peft_type": "LORA",
+        "r": _RANK,
+        "lora_alpha": 2 * _RANK,
+        "target_modules": ["embed_tokens", "lm_head"],
+    }
+    (adapter_dir / "adapter_config.json").write_text(json.dumps(config))
+    prefix = "base_model.model."
+    save_file(
+        {
+            # PEFT also saves the base embedding next to its LoRA; vLLM skips it.
+            f"{prefix}model.embed_tokens.base_layer.weight": np.zeros(
+                (vocab, _HIDDEN), dtype=np.float32
+            ),
+            f"{prefix}model.embed_tokens.lora_embedding_A": tensors["embed_a"],
+            f"{prefix}model.embed_tokens.lora_embedding_B": tensors["embed_b"],
+            f"{prefix}lm_head.lora_A.weight": tensors["head_a"],
+            f"{prefix}lm_head.lora_B.weight": tensors["head_b"],
+        },
+        str(adapter_dir / "adapter_model.safetensors"),
+    )
+    return adapter_dir, tensors
+
+
+def _embedding_manager(
+    model: nn.Module, *, target_modules: list[str] | None = None
+) -> model_manager_mod.MLXLoRAModelManager:
+    return model_manager_mod.MLXLoRAModelManager(
+        model=model,
+        lora_config=_lora_config_stub(
+            max_loras=2, max_lora_rank=_RANK, target_modules=target_modules
+        ),
+        max_num_seqs=4,
+        max_num_batched_tokens=4,
+        dtype=mx.float32,
+    )
+
+
+@pytest.mark.parametrize("tied", [True, False], ids=["tied", "untied"])
+def test_embedding_and_head_lora_apply_per_token(tmp_path: Path, tied: bool) -> None:
+    """``embed_tokens`` and ``lm_head`` each apply their own A/B, as in PEFT: the
+    tied head does not reuse the embedding LoRA, and an untied head stays a
+    wrapped linear. Each token gets its own adapter's deltas."""
+    model = _EmbeddingModel(tied=tied)
+    embed = np.array(model.model.embed_tokens.weight)
+    head = embed if tied else np.array(model.lm_head.weight)
+    manager = _embedding_manager(model)
+    expected_head_cls = (
+        layers_mod.MLXTiedLMHeadWithLoRA if tied else layers_mod.MLXLinearWithLoRA
+    )
+    assert isinstance(manager.modules["lm_head"], expected_head_cls)
+    adapters = {}
+    for lora_id in (1, 2):
+        adapter_dir, adapters[lora_id] = _write_embedding_adapter(tmp_path, lora_id)
+        manager.add_adapter(
+            peft_loader_mod.load_peft_adapter(adapter_dir, lora_id=lora_id)
+        )
+        manager.activate_adapter(lora_id)
+    token_ids = [5, 0, 3, 5]
+    index_mapping = (1, 1, 2, 0)
+    manager.set_adapter_mapping(
+        LoRAMapping(index_mapping=index_mapping, prompt_mapping=index_mapping)
+    )
+
+    out = np.array(model(mx.array([token_ids])))[0]
+
+    scaling = 2.0  # lora_alpha / r
+    for row, (tid, lora_id) in enumerate(zip(token_ids, index_mapping, strict=True)):
+        h = embed[tid]
+        if lora_id:
+            w = adapters[lora_id]
+            h = h + scaling * w["embed_a"][:, tid] @ w["embed_b"].T
+        logits = h @ head.T
+        if lora_id:
+            logits = logits + scaling * (h @ w["head_a"].T) @ w["head_b"].T
+        np.testing.assert_allclose(out[row], logits, rtol=1e-4, atol=1e-4)
+
+
+def test_embedding_lora_on_quantized_embedding_matches_dequantized_math() -> None:
+    """MLX checkpoints quantize ``embed_tokens``; both deltas still apply on top."""
+    rng = np.random.default_rng(2)
+    dense = nn.Embedding(8, 32)
+    dense.weight = mx.array(rng.standard_normal((8, 32)).astype(np.float32))
+    quantized = nn.QuantizedEmbedding.from_embedding(dense, group_size=32, bits=8)
+    weight = np.array(
+        mx.dequantize(
+            quantized.weight, quantized.scales, quantized.biases, group_size=32, bits=8
+        )
+    )
+    embedding = layers_mod.MLXEmbeddingWithLoRA(quantized, 1, _RANK, mx.float32)
+    head = layers_mod.MLXTiedLMHeadWithLoRA(quantized, 1, _RANK, mx.float32)
+    embedding.set_tied_head(head)
+    punica = punica_mod.PunicaWrapperMLX(
+        max_num_batched_tokens=3, max_batches=1, max_loras=1
+    )
+    embedding.set_mapping(punica)
+    head.set_mapping(punica)
+    lora = {
+        name: rng.standard_normal(shape).astype(np.float32)
+        for name, shape in {
+            "embed_a": (_RANK, 8),
+            "embed_b": (32, _RANK),
+            "head_a": (_RANK, 32),
+            "head_b": (8, _RANK),
+        }.items()
+    }
+    embedding.set_lora(0, mx.array(lora["embed_a"]), mx.array(lora["embed_b"]))
+    head.set_lora(0, mx.array(lora["head_a"]), mx.array(lora["head_b"]))
+    punica.update_metadata(
+        LoRAMapping(index_mapping=(7, 7, 7), prompt_mapping=(7,)),
+        lora_index_to_id=[7],
+    )
+    token_ids = [1, 5, 1]
+
+    h = embedding(mx.array([token_ids]))
+    logits = embedding.as_linear(h)
+
+    expected_h = weight[token_ids] + lora["embed_a"][:, token_ids].T @ lora["embed_b"].T
+    expected_logits = (
+        expected_h @ weight.T + (expected_h @ lora["head_a"].T) @ lora["head_b"].T
+    )
+    np.testing.assert_allclose(np.array(h)[0], expected_h, rtol=1e-4, atol=1e-4)
+    np.testing.assert_allclose(
+        np.array(logits)[0], expected_logits, rtol=1e-4, atol=1e-3
+    )
+
+
+@pytest.mark.parametrize(
+    "model_cls,target_modules",
+    [
+        # The head never calls as_linear, so a tied head LoRA has no entry point.
+        (_WeightTiedModel, None),
+        # The tied head runs inside the embedding wrapper, excluded here.
+        (_EmbeddingModel, ["fc", "lm_head"]),
+    ],
+    ids=["head-bypasses-as-linear", "embedding-not-targeted"],
+)
+def test_add_adapter_rejects_tied_head_lora_without_wrapper(
+    tmp_path: Path,
+    model_cls: type[_EmbeddingModel],
+    target_modules: list[str] | None,
+) -> None:
+    manager = _embedding_manager(model_cls(tied=True), target_modules=target_modules)
+    assert "lm_head" not in manager.modules
+    adapter_dir, _ = _write_embedding_adapter(tmp_path, 1)
+
+    with pytest.raises(ValueError, match=r"\['lm_head'\].*cannot apply"):
+        manager.add_adapter(peft_loader_mod.load_peft_adapter(adapter_dir, lora_id=1))
+    assert manager.list_adapters() == set()
+
+
+def test_add_adapter_rejects_embedding_lora_for_a_different_vocab(
+    tmp_path: Path,
+) -> None:
+    """Upstream refuses embedding LoRA sized for a resized vocabulary."""
+    manager = _embedding_manager(_EmbeddingModel(tied=True))
+    adapter_dir, _ = _write_embedding_adapter(tmp_path, 1, vocab=_VOCAB + 2)
+
+    with pytest.raises(ValueError, match="Embedding LoRA weight shape mismatch"):
+        manager.add_adapter(peft_loader_mod.load_peft_adapter(adapter_dir, lora_id=1))
+    assert manager.list_adapters() == set()
 
 
 def test_add_adapter_rejects_ambiguous_suffix_match_before_cache_mutation() -> None:

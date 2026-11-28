@@ -7,6 +7,7 @@ active adapter rather than gathering a copy of the weights for every row.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import mlx.core as mx
@@ -81,6 +82,39 @@ class PunicaWrapperMLX:
         lora_ranks: list[int] | None = None,
     ) -> mx.array:
         """Apply LoRA deltas once per active adapter slot."""
+        return self._add_lora(
+            y, x, lora_a_stacked, lora_b_stacked, scale, lora_ranks, _shrink_linear
+        )
+
+    def add_lora_embedding(
+        self,
+        y: mx.array,
+        token_ids: mx.array,
+        lora_a_stacked: mx.array,
+        lora_b_stacked: mx.array,
+        lora_ranks: list[int] | None = None,
+    ) -> mx.array:
+        """Apply embedding LoRA deltas, ``A.T[ids] @ B.T``, per adapter slot."""
+        return self._add_lora(
+            y,
+            token_ids,
+            lora_a_stacked,
+            lora_b_stacked,
+            1.0,
+            lora_ranks,
+            _shrink_embedding,
+        )
+
+    def _add_lora(
+        self,
+        y: mx.array,
+        x: mx.array,
+        lora_a_stacked: mx.array,
+        lora_b_stacked: mx.array,
+        scale: float,
+        lora_ranks: list[int] | None,
+        shrink: Callable[[mx.array, mx.array], mx.array],
+    ) -> mx.array:
         if self._no_lora:
             return y
         if int(x.shape[0]) != self._num_tokens or int(y.shape[0]) != self._num_tokens:
@@ -107,7 +141,7 @@ class PunicaWrapperMLX:
                 lora_a = lora_a_stacked[slot, :rank]
                 lora_b = lora_b_stacked[slot, :, :rank]
                 x_run = x[start:end]
-                delta = mx.matmul(mx.matmul(x_run, lora_a.T), lora_b.T)
+                delta = mx.matmul(shrink(x_run, lora_a), lora_b.T)
                 if scale != 1.0:
                     delta = delta * scale
                 if delta.dtype != y.dtype:
@@ -126,13 +160,21 @@ class PunicaWrapperMLX:
             lora_a = lora_a_stacked[slot, :rank]
             lora_b = lora_b_stacked[slot, :, :rank]
             x_for_slot = mx.take(x, token_indices, axis=0)
-            delta = mx.matmul(mx.matmul(x_for_slot, lora_a.T), lora_b.T)
+            delta = mx.matmul(shrink(x_for_slot, lora_a), lora_b.T)
             if scale != 1.0:
                 delta = delta * scale
             if delta.dtype != y.dtype:
                 delta = delta.astype(y.dtype)
             output = output.at[token_indices].add(delta)
         return output
+
+
+def _shrink_linear(x: mx.array, lora_a: mx.array) -> mx.array:
+    return mx.matmul(x, lora_a.T)
+
+
+def _shrink_embedding(token_ids: mx.array, lora_a: mx.array) -> mx.array:
+    return mx.take(lora_a, token_ids, axis=1).T
 
 
 class EncoderPunicaWrapperMLX:

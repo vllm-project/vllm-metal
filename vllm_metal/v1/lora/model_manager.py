@@ -16,9 +16,12 @@ from vllm.lora.utils import is_in_target_modules
 from vllm.utils.cache import LRUCache
 
 from .layers import (
+    MLXEmbeddingWithLoRA,
     MLXLinearWithLoRA,
     MLXQuantizedLinearWithLoRA,
+    MLXTiedLMHeadWithLoRA,
     can_wrap,
+    can_wrap_embedding,
     can_wrap_qlora,
 )
 from .peft_loader import LoadedLoRA, LoRALayerWeightsMLX
@@ -29,7 +32,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_WrappedModule = MLXLinearWithLoRA | MLXQuantizedLinearWithLoRA
+_WrappedModule = (
+    MLXLinearWithLoRA
+    | MLXQuantizedLinearWithLoRA
+    | MLXEmbeddingWithLoRA
+    | MLXTiedLMHeadWithLoRA
+)
 _PreparedLoRAWeights = tuple[mx.array, mx.array, int]
 _PreparedModuleUpdate = tuple[_WrappedModule, _PreparedLoRAWeights | None]
 _EMBEDDING_MODULES = frozenset({"embed_tokens", "lm_head"})
@@ -121,6 +129,10 @@ class MLXLoRAModelManager:
                 wrapped.append(w)
             if repls:
                 root.update_modules(tree_unflatten(repls))
+        for name, head in self._tied_heads():
+            head.set_mapping(self.punica_wrapper)
+            self.modules[name] = head
+            wrapped.append(head)
         if not wrapped:
             raise RuntimeError(
                 "MLXLoRAModelManager found no LoRA target modules to wrap. "
@@ -129,12 +141,16 @@ class MLXLoRAModelManager:
                 "contract for LoRA/QLoRA wrapping."
             )
         num_plain = sum(1 for w in wrapped if isinstance(w, MLXLinearWithLoRA))
+        num_quantized = sum(
+            1 for w in wrapped if isinstance(w, MLXQuantizedLinearWithLoRA)
+        )
         logger.info(
             "MLXLoRAModelManager wrapped %d modules (%d plain, %d quantized, "
-            "%d in the multimodal encoder).",
+            "%d embedding, %d in the multimodal encoder).",
             len(wrapped),
             num_plain,
-            len(wrapped) - num_plain,
+            num_quantized,
+            len(wrapped) - num_plain - num_quantized,
             sum(1 for name in self.modules if self._is_encoder_module(name)),
         )
 
@@ -150,6 +166,12 @@ class MLXLoRAModelManager:
                 wrapper_cls: type[_WrappedModule] = MLXLinearWithLoRA
             elif can_wrap_qlora(m):
                 wrapper_cls = MLXQuantizedLinearWithLoRA
+            elif (
+                root is self.model
+                and name.rsplit(".", 1)[-1] == "embed_tokens"
+                and can_wrap_embedding(m)
+            ):
+                wrapper_cls = MLXEmbeddingWithLoRA
             else:
                 continue
             repls.append(
@@ -164,6 +186,40 @@ class MLXLoRAModelManager:
                 )
             )
         return repls
+
+    def _tied_heads(self) -> list[tuple[str, MLXTiedLMHeadWithLoRA]]:
+        """Attach a head LoRA to each wrapped embedding that is the tied head.
+
+        The head is tied when the text model has no ``lm_head`` and projects
+        its logits through ``embed_tokens.as_linear``. Models that multiply by
+        ``embed_tokens.weight`` directly get no head wrapper, so an adapter's
+        ``lm_head`` LoRA is refused for them instead of being dropped.
+        """
+        modules = dict(self.model.named_modules())
+        heads: list[tuple[str, MLXTiedLMHeadWithLoRA]] = []
+        for name, embedding in self.modules.items():
+            if not isinstance(embedding, MLXEmbeddingWithLoRA):
+                continue
+            # model.embed_tokens -> lm_head;
+            # language_model.model.embed_tokens -> language_model.lm_head.
+            backbone = name.rpartition(".")[0]
+            text_model_name = backbone.rpartition(".")[0]
+            head_name = f"{text_model_name}.lm_head" if text_model_name else "lm_head"
+            if (
+                head_name in modules
+                or not _projects_through_as_linear(modules[text_model_name])
+                or not is_in_target_modules(head_name, self.lora_config.target_modules)
+            ):
+                continue
+            head = MLXTiedLMHeadWithLoRA(
+                embedding.base_layer,
+                self.lora_slots,
+                self.lora_config.max_lora_rank,
+                self.dtype,
+            )
+            embedding.set_tied_head(head)
+            heads.append((head_name, head))
+        return heads
 
     def _is_encoder_module(self, name: str) -> bool:
         return self.encoder is not None and name.startswith(self.encoder.prefix)
@@ -376,10 +432,10 @@ class MLXLoRAModelManager:
                 )
             )
         # Upstream applies LoRA to embedding modules and to MoE experts (the
-        # ".experts" names its check_unexpected_modules accepts). Metal does
-        # not wrap mlx_lm's SwitchLinear experts, so refuse rather than serve
-        # the adapter without them. Modules excluded by the deployment
-        # target_modules are dropped, as upstream does.
+        # ".experts" names its check_unexpected_modules accepts). Refuse ones
+        # no wrapper consumed rather than serve the adapter without them; Metal
+        # does not wrap mlx_lm's SwitchLinear experts. Modules excluded by the
+        # deployment target_modules are dropped, as upstream does.
         unsupported = {
             name
             for name in adapter.weights.keys() - consumed
@@ -439,6 +495,10 @@ class MLXLoRAModelManager:
                 for stacked in (module.lora_a_stacked, module.lora_b_stacked)
             ]
         )
+
+
+def _projects_through_as_linear(text_model: nn.Module) -> bool:
+    return "as_linear" in type(text_model).__call__.__code__.co_names
 
 
 def _lookup_weights_for_module(
