@@ -848,7 +848,7 @@ def test_remote_load_source_rejects_unsupported_tag_before_download(
     ("model_type", "architecture"),
     [
         ("phi3", "Phi3ForCausalLM"),
-        ("qwen3_5_moe", "Qwen3_5MoeForConditionalGeneration"),
+        ("qwen3_next", "Qwen3NextForCausalLM"),
         ("qwen3_5_text", "Qwen3_5ForCausalLM"),
     ],
 )

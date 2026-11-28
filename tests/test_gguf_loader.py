@@ -582,13 +582,13 @@ def test_resolve_arch_accepts_llama_gguf_with_mistral_config():
         ("mistral", "mistral"),
         ("mistral3", "mistral"),
         ("mistral4", "mistral"),
-        ("qwen35moe", "qwen3_5_moe"),
+        ("qwen3next", "qwen3_next"),
     ],
 )
 def test_resolve_arch_rejects_unsupported_gguf_archs(gguf_arch, config_model_type):
     # The config-side mapping never widens the .gguf side: a file declaring a
-    # raw "mistral" arch is not a llama.cpp product, and the multimodal
-    # mistral3/mistral4 and MoE qwen35moe archs are out of scope; all stay
+    # raw "mistral" arch is not a llama.cpp product, and qwen3next and the
+    # multimodal mistral3/mistral4 archs are out of scope; all stay
     # allowlist-rejected.
     with pytest.raises(GGUFLoadError) as unsupported:
         GGUFModelAdapter.resolve_arch(
@@ -597,7 +597,7 @@ def test_resolve_arch_rejects_unsupported_gguf_archs(gguf_arch, config_model_typ
 
     assert str(unsupported.value) == (
         f"Architecture {gguf_arch!r} is not supported; the GGUF loader supports "
-        "['gemma3', 'llama', 'qwen2', 'qwen3', 'qwen35', 'qwen3moe']."
+        "['gemma3', 'llama', 'qwen2', 'qwen3', 'qwen35', 'qwen35moe', 'qwen3moe']."
     )
 
 
@@ -990,7 +990,7 @@ def test_rejects_gguf_config_arch_mismatch(tmp_path):
     ids=["attn_qkv", "ssm"],
 )
 def test_rejects_out_of_scope_tensor(tmp_path, name, spec):
-    # qwen35 admits these markers; every other arch still rejects them.
+    # qwen35 and qwen35moe admit these markers; every other arch still rejects them.
     gguf_path, cfg_dir = _build_dense_fixture(
         tmp_path, "qwen3", has_qk_norm=True, inject={name: spec}
     )
@@ -1396,6 +1396,14 @@ _QWEN35_TEXT_CONFIG = {
 }
 # full_attention_interval 2 makes layers 1 and 3 full attention.
 _QWEN35_GDN_LAYERS = (0, 2)
+_QWEN35_MOE_TEXT_CONFIG = {
+    **_QWEN35_TEXT_CONFIG,
+    "model_type": "qwen3_5_moe_text",
+    "num_experts": 4,
+    "num_experts_per_tok": 2,
+    "moe_intermediate_size": 256,
+    "shared_expert_intermediate_size": 256,
+}
 
 # GGUF tensor (after ``blk.N.``) -> mlx-lm parameter (after ``layers.N.``).
 _QWEN35_LAYER_TENSORS = {
@@ -1419,6 +1427,14 @@ _QWEN35_LAYER_TENSORS = {
     "ssm_conv1d.weight": "linear_attn.conv1d.weight",
     "ssm_norm.weight": "linear_attn.norm.weight",
     "ssm_out.weight": "linear_attn.out_proj.weight",
+    "ffn_gate_inp.weight": "mlp.gate.weight",
+    "ffn_gate_exps.weight": "mlp.switch_mlp.gate_proj.weight",
+    "ffn_up_exps.weight": "mlp.switch_mlp.up_proj.weight",
+    "ffn_down_exps.weight": "mlp.switch_mlp.down_proj.weight",
+    "ffn_gate_shexp.weight": "mlp.shared_expert.gate_proj.weight",
+    "ffn_up_shexp.weight": "mlp.shared_expert.up_proj.weight",
+    "ffn_down_shexp.weight": "mlp.shared_expert.down_proj.weight",
+    "ffn_gate_inp_shexp.weight": "mlp.shared_expert_gate.weight",
 }
 _QWEN35_GLOBAL_TENSORS = {
     "token_embd.weight": "model.embed_tokens.weight",
@@ -1431,9 +1447,10 @@ _QWEN35_LIVE_TO_GGUF_LAYER = {
 _QWEN35_LIVE_TO_GGUF_GLOBAL = {
     live: name for name, live in _QWEN35_GLOBAL_TENSORS.items()
 }
-# llama.cpp keeps 1-D tensors and the depthwise conv kernel in F32.
+# llama.cpp keeps 1-D tensors, the depthwise conv kernel and both MoE gates in F32.
 _QWEN35_PLAIN_TENSORS = frozenset(
     {"ssm_a", "ssm_dt.bias", "ssm_conv1d.weight"}
+    | {"ffn_gate_inp.weight", "ffn_gate_inp_shexp.weight"}
     | {kind for kind in _QWEN35_LAYER_TENSORS if kind.endswith("norm.weight")}
     | {"output_norm.weight"}
 )
@@ -1452,12 +1469,14 @@ _GDN_R2 = _GDNGeometry(num_k_heads=4, num_v_heads=8, v_head_dim=32)
 _GDN_R3 = _GDNGeometry(num_k_heads=2, num_v_heads=6, v_head_dim=128)
 
 
-def _qwen35_config(geometry: _GDNGeometry, *, tie: bool | None) -> dict:
-    """A Qwen3_5ForConditionalGeneration config; ``tie=None`` omits the text
-    tie flag the way the real 9B/27B configs do. The top-level flag always
+def _qwen35_config(
+    geometry: _GDNGeometry, *, tie: bool | None, moe: bool = False
+) -> dict:
+    """A Qwen3_5(Moe)ForConditionalGeneration config; ``tie=None`` omits the
+    text tie flag the way the real 9B/27B configs do. The top-level flag always
     disagrees with the text one, so only the built text model resolves it."""
     text = {
-        **_QWEN35_TEXT_CONFIG,
+        **(_QWEN35_MOE_TEXT_CONFIG if moe else _QWEN35_TEXT_CONFIG),
         "linear_num_key_heads": geometry.num_k_heads,
         "linear_num_value_heads": geometry.num_v_heads,
         "linear_value_head_dim": geometry.v_head_dim,
@@ -1465,8 +1484,12 @@ def _qwen35_config(geometry: _GDNGeometry, *, tie: bool | None) -> dict:
     if tie is not None:
         text["tie_word_embeddings"] = tie
     return {
-        "model_type": "qwen3_5",
-        "architectures": ["Qwen3_5ForConditionalGeneration"],
+        "model_type": "qwen3_5_moe" if moe else "qwen3_5",
+        "architectures": [
+            "Qwen3_5MoeForConditionalGeneration"
+            if moe
+            else "Qwen3_5ForConditionalGeneration"
+        ],
         "tie_word_embeddings": not tie,
         "text_config": text,
     }
@@ -1568,13 +1591,16 @@ def _build_qwen35_fixture(
     quant_overrides: dict[str, QT] | None = None,
     inject: dict | None = None,
     nextn_predict_layers: int | None = None,
+    moe: bool = False,
+    drop_unit_dims: bool = False,
 ) -> tuple[str, str, dict[str, np.ndarray]]:
-    """Write a tiny Qwen3.5 config and the GGUF llama.cpp converts it to.
+    """Write a tiny Qwen3.5 (MoE) config and the GGUF llama.cpp converts it to.
 
-    Returns ``(gguf_path, config_dir, hf)``; ``hf`` maps each GGUF name to the
-    HF-layout source value it was converted from.
+    ``drop_unit_dims`` writes a ``(1, n)`` tensor as ``(n,)``, as llama-quantize
+    does. Returns ``(gguf_path, config_dir, hf)``; ``hf`` maps each GGUF name to
+    the HF-layout source value it was converted from.
     """
-    config = _qwen35_config(geometry, tie=tie)
+    config = _qwen35_config(geometry, tie=tie, moe=moe)
     (tmp_path / "config.json").write_text(json.dumps(config))
     skeleton, _ = mlx_lm_utils.load_model(tmp_path, lazy=True, strict=False)
     rng = np.random.default_rng(0)
@@ -1587,14 +1613,20 @@ def _build_qwen35_fixture(
         for name, value in hf.items()
         if name not in (inject or {})
     }
+    if drop_unit_dims:
+        values = {
+            name: v.reshape(-1) if v.ndim == 2 and v.shape[0] == 1 else v
+            for name, v in values.items()
+        }
     specs = {
         name: ("f" if _qwen35_kind(name) in _QWEN35_PLAIN_TENSORS else "q", v.shape)
         for name, v in values.items()
     }
-    gguf_path = tmp_path / "qwen35.gguf"
+    arch = "qwen35moe" if moe else "qwen35"
+    gguf_path = tmp_path / f"{arch}.gguf"
     _write_gguf(
         gguf_path,
-        "qwen35",
+        arch,
         specs,
         quant_type=quant_type,
         quant_overrides=quant_overrides,
@@ -1605,8 +1637,22 @@ def _build_qwen35_fixture(
     return str(gguf_path), str(tmp_path), hf
 
 
-def _qwen35_mtp_block(bid: int) -> dict:
+def _qwen35_mtp_block(bid: int, *, moe: bool = False) -> dict:
     """The MTP layer llama.cpp appends, as small plain tensors under real names."""
+    ffn = (
+        (
+            "ffn_gate_inp",
+            "ffn_gate_exps",
+            "ffn_up_exps",
+            "ffn_down_exps",
+            "ffn_gate_inp_shexp",
+            "ffn_gate_shexp",
+            "ffn_up_shexp",
+            "ffn_down_shexp",
+        )
+        if moe
+        else ("ffn_gate", "ffn_up", "ffn_down")
+    )
     kinds = (
         "attn_norm",
         "attn_q",
@@ -1616,9 +1662,7 @@ def _qwen35_mtp_block(bid: int) -> dict:
         "attn_k_norm",
         "attn_output",
         "post_attention_norm",
-        "ffn_gate",
-        "ffn_up",
-        "ffn_down",
+        *ffn,
         "nextn.eh_proj",
         "nextn.enorm",
         "nextn.hnorm",
@@ -1655,17 +1699,26 @@ def _gdn(model: nn.Module, layer: int) -> nn.Module:
 
 
 @pytest.mark.parametrize(
-    "geometry",
+    ("geometry", "moe", "drop_unit_dims"),
     [
-        pytest.param(_GDN_R1, id="r1"),
-        pytest.param(_GDN_R2, id="r2"),
-        pytest.param(_GDN_R3, id="r3"),
+        pytest.param(_GDN_R1, False, False, id="r1"),
+        pytest.param(_GDN_R2, False, False, id="r2"),
+        pytest.param(_GDN_R3, False, False, id="r3"),
+        pytest.param(_GDN_R2, True, True, id="moe-llama_quantize"),
+        pytest.param(_GDN_R2, True, False, id="moe-convert_hf_to_gguf"),
     ],
 )
-def test_qwen35_loads_the_model_it_was_converted_from(tmp_path, geometry):
+def test_qwen35_loads_the_model_it_was_converted_from(
+    tmp_path, geometry, moe, drop_unit_dims
+):
     # A plain file loads back to the exact source model, whatever the V-head ratio.
     gguf_path, cfg_dir, hf = _build_qwen35_fixture(
-        tmp_path, geometry, tie=False, quant_type=QT.F32
+        tmp_path,
+        geometry,
+        tie=False,
+        quant_type=QT.F32,
+        moe=moe,
+        drop_unit_dims=drop_unit_dims,
     )
     tokens = mx.array([[1, 2, 3, 4, 5, 6, 7, 8]])
     expected = np.array(_qwen35_source_model(cfg_dir, hf)(tokens))
@@ -1819,15 +1872,17 @@ def test_qwen35_rejects_out_of_scope_moe_tensor(tmp_path, moe_tensor):
         GGUFModelLoader(gguf_path, config_dir=cfg_dir, target_dtype=mx.float32).load()
 
 
-def test_qwen35_mtp_gguf_skips_appended_block_and_preserves_base_logits(tmp_path):
+@pytest.mark.parametrize("moe", [False, True], ids=["dense", "moe"])
+def test_qwen35_mtp_gguf_skips_appended_block_and_preserves_base_logits(tmp_path, moe):
     num_layers = _QWEN35_TEXT_CONFIG["num_hidden_layers"]
     gguf_path, cfg_dir, hf = _build_qwen35_fixture(
         tmp_path,
         _GDN_R1,
         tie=False,
         quant_type=QT.F32,
-        inject=_qwen35_mtp_block(num_layers),
+        inject=_qwen35_mtp_block(num_layers, moe=moe),
         nextn_predict_layers=1,
+        moe=moe,
     )
     tokens = mx.array([[1, 2, 3, 4, 5, 6, 7, 8]])
     expected = np.array(_qwen35_source_model(cfg_dir, hf)(tokens))
@@ -1839,6 +1894,37 @@ def test_qwen35_mtp_gguf_skips_appended_block_and_preserves_base_logits(tmp_path
 
     np.testing.assert_allclose(
         logits, expected, rtol=0, atol=float(np.abs(expected).max()) * 1e-6
+    )
+
+
+def test_qwen35moe_rejects_fused_gate_up_experts(tmp_path):
+    gguf_path, cfg_dir, _ = _build_qwen35_fixture(
+        tmp_path,
+        _GDN_R1,
+        moe=True,
+        inject={"blk.0.ffn_gate_up_exps.weight": ("f", (2, 256))},
+    )
+
+    with pytest.raises(
+        GGUFLoadError, match="Out-of-scope GGUF tensor 'blk.0.ffn_gate_up_exps.weight'"
+    ):
+        GGUFModelLoader(gguf_path, config_dir=cfg_dir, target_dtype=mx.float32).load()
+
+
+def test_qwen35moe_rejects_wrong_shape_shared_expert_gate(tmp_path):
+    gguf_path, cfg_dir, _ = _build_qwen35_fixture(
+        tmp_path,
+        _GDN_R2,
+        moe=True,
+        inject={"blk.0.ffn_gate_inp_shexp.weight": ("f", (2, 128))},
+    )
+
+    with pytest.raises(GGUFLoadError) as excinfo:
+        GGUFModelLoader(gguf_path, config_dir=cfg_dir, target_dtype=mx.float32).load()
+
+    assert str(excinfo.value) == (
+        "GGUF tensor 'blk.0.ffn_gate_inp_shexp.weight' shape (2, 128) != expected "
+        "(256,) or (1, 256) for model 'model.layers.0.mlp.shared_expert_gate.weight'."
     )
 
 
