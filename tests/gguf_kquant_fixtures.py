@@ -159,10 +159,10 @@ def build_iq4_blocks(
     return blocks.reshape(rows, -1)
 
 
-def build_iq3_blocks(
+def build_iq_grid_blocks(
     rows: int, cols: int, qtype: gguf.GGMLQuantizationType, seed: int = 0
 ) -> np.ndarray:
-    """Build valid random IQ3_S/IQ3_XXS superblocks, one byte row per row."""
+    """Build valid random IQ2_S/IQ3_S/IQ3_XXS superblocks, one byte row per row."""
     block_elems, block_bytes = gguf.GGML_QUANT_SIZES[qtype]
     if cols % block_elems:
         raise ValueError(

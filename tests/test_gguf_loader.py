@@ -25,8 +25,8 @@ from mlx_lm import utils as mlx_lm_utils
 
 import vllm_metal.gguf.loader as gguf_loader
 from tests.gguf_kquant_fixtures import (
-    build_iq3_blocks,
     build_iq4_blocks,
+    build_iq_grid_blocks,
     build_kquant_blocks,
 )
 from vllm_metal.gguf.adapter import GGUFModelAdapter
@@ -152,8 +152,8 @@ def _write_gguf(
                 raw = raw.reshape(*shape[:-1], -1)
             elif raw_dtype in (QT.IQ4_NL, QT.IQ4_XS):
                 raw = build_iq4_blocks(shape[0], shape[-1], raw_dtype)
-            elif raw_dtype in (QT.IQ3_S, QT.IQ3_XXS):
-                raw = build_iq3_blocks(shape[0], shape[-1], raw_dtype)
+            elif raw_dtype in (QT.IQ3_S, QT.IQ3_XXS, QT.IQ2_S):
+                raw = build_iq_grid_blocks(shape[0], shape[-1], raw_dtype)
             else:
                 quant_input = data.reshape(1, -1) if data.ndim == 1 else data
                 raw = gguf.quants.quantize(quant_input, raw_dtype)
@@ -492,6 +492,7 @@ def _write_minimal_tokenizer(config_dir: str, vocab_size: int) -> None:
         QT.Q5_K,
         QT.Q6_K,
         QT.IQ3_XXS,
+        QT.IQ2_S,
     ],
 )
 def test_quantized_llama_qk_are_row_unpermuted(tmp_path, quant_type):
@@ -1301,7 +1302,7 @@ def test_rejects_unsupported_kquant_weight_at_preflight(tmp_path):
     assert str(excinfo.value) == (
         "Unsupported qtype TQ2_0 on mapped weight 'blk.0.ffn_gate.weight'; "
         "only Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/IQ3_XXS/IQ4_NL/"
-        "IQ3_S/IQ4_XS "
+        "IQ3_S/IQ2_S/IQ4_XS "
         "(and plain F32/F16/BF16) are supported."
     )
 
@@ -1320,11 +1321,12 @@ def test_rejects_unsupported_kquant_weight_at_preflight(tmp_path):
         pytest.param(QT.Q3_K, QT.IQ4_NL, id="q3_k-iq4_nl-embd"),
         pytest.param(QT.Q4_K, QT.IQ3_S, id="q4_k-iq3_s-embd"),
         pytest.param(QT.IQ3_XXS, QT.IQ3_S, id="iq3_xxs-iq3_s-embd"),
+        pytest.param(QT.IQ2_S, QT.IQ3_S, id="iq2_s-iq3_s-embd"),
     ],
 )
 def test_loads_llama_cpp_qtype_mixes(tmp_path, body_type, embd_type):
     # llama.cpp mixes qtypes inside one file: Q6_K, Q8_0, Q5_0/Q5_1, IQ4_NL or
-    # IQ3_S embeddings next to a K-quant, Q4_0, IQ4_XS or IQ3_XXS body.
+    # IQ3_S embeddings next to a K-quant, Q4_0, IQ4_XS, IQ3_XXS or IQ2_S body.
     gguf_path, cfg_dir = _build_dense_fixture(
         tmp_path,
         "qwen3",

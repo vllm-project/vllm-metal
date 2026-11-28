@@ -22,8 +22,8 @@ import pytest
 
 import vllm_metal.gguf.mlx_native as mlx_native
 from tests.gguf_kquant_fixtures import (
-    build_iq3_blocks,
     build_iq4_blocks,
+    build_iq_grid_blocks,
     build_kquant_blocks,
 )
 from vllm_metal.gguf.mlx_native import (
@@ -78,7 +78,7 @@ def _raw_blocks(qtype, rows: int, cols: int) -> np.ndarray:
     if qtype in IQ4_QTYPES:
         return build_iq4_blocks(rows, cols, qtype)
     if qtype == GGMLQuantizationType.IQ3_S:
-        return build_iq3_blocks(rows, cols, qtype)
+        return build_iq_grid_blocks(rows, cols, qtype)
     weight = np.random.default_rng(0).standard_normal((rows, cols)).astype(np.float32)
     return gguf.quants.quantize(weight, qtype)
 
