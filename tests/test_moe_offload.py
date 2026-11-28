@@ -92,13 +92,15 @@ def test_offloaded_forward_matches_resident_model(checkpoint, num_tokens) -> Non
     """Both SwitchGLU paths (sorted gather from 64 routed slots) stay bit-exact."""
     reference, model_dir = checkpoint
     # Room for two experts: every layer call evicts, so misses are exercised.
-    twin, store = _offloaded_twin(reference, model_dir, 2 * _expert_bytes(reference))
+    cache_bytes = 2 * _expert_bytes(reference)
+    twin, store = _offloaded_twin(reference, model_dir, cache_bytes)
     tokens = mx.random.randint(0, 128, (1, num_tokens))
 
     expected = reference(tokens)
     actual = twin(tokens)
 
     assert mx.array_equal(expected, actual)
+    assert store.bytes <= cache_bytes
     assert store.misses > 0
     switch = twin.model.layers[0].mlp.switch_mlp
     assert isinstance(switch, OffloadedSwitchGLU)
@@ -110,24 +112,62 @@ def test_cache_honours_its_byte_budget_and_counts_hits(checkpoint) -> None:
     _, store = _offloaded_twin(reference, model_dir, 3 * _expert_bytes(reference))
     path = "model.layers.0.mlp.switch_mlp"
 
-    store.get(path, [0, 1, 2])
-    store.get(path, [2, 3])
-    assert store.bytes <= 3 * _expert_bytes(reference)
-    assert (store.hits, store.misses) == (1, 4)
+    store.get(path, [0, 1, 2, 3])
+    assert store.bytes == 3 * _expert_bytes(reference)
+    store.get(path, [2, 4])
+    assert (store.hits, store.misses) == (1, 5)
 
     # Expert 0 was the least recently used, so only it needs reading again.
-    store.get(path, [1, 3])
+    store.get(path, [3, 4])
     store.get(path, [0])
-    assert (store.hits, store.misses) == (3, 5)
+    assert (store.hits, store.misses) == (3, 6)
 
 
-def test_reserve_covers_the_cache_and_one_stacked_layer(checkpoint) -> None:
+def test_expert_larger_than_cache_is_returned_and_read_again(checkpoint) -> None:
     reference, model_dir = checkpoint
-    cache_bytes = 2 * _expert_bytes(reference)
+    _, store = _offloaded_twin(reference, model_dir, _expert_bytes(reference) - 1)
+    path = "model.layers.0.mlp.switch_mlp"
 
-    _, store = _offloaded_twin(reference, model_dir, cache_bytes)
+    expected = reference.model.layers[0].mlp.switch_mlp.up_proj.weight[1]
+    for _ in range(2):
+        (entry,) = store.get(path, [1])
+        assert mx.array_equal(entry["up_proj"]["weight"], expected)
+        assert store.bytes == 0
+    assert (store.hits, store.misses) == (0, 2)
 
-    assert store.reserved_bytes == cache_bytes + NUM_EXPERTS * _expert_bytes(reference)
+
+def test_short_checkpoint_read_can_be_retried(checkpoint) -> None:
+    reference, model_dir = checkpoint
+    _, store = _offloaded_twin(reference, model_dir, _expert_bytes(reference))
+    path = "model.layers.0.mlp.switch_mlp"
+    shard = model_dir / "model.safetensors"
+    data = shard.read_bytes()
+    shard.write_bytes(b"")
+    with pytest.raises(ValueError):
+        store.get(path, [1])
+
+    shard.write_bytes(data)
+    (entry,) = store.get(path, [1])
+    assert mx.array_equal(
+        entry["up_proj"]["weight"],
+        reference.model.layers[0].mlp.switch_mlp.up_proj.weight[1],
+    )
+    assert (store.hits, store.misses) == (0, 1)
+
+
+@pytest.mark.parametrize(
+    ("cache_experts", "reserved_experts"),
+    [(2, 2 * NUM_EXPERTS), (NUM_EXPERTS + 2, 2 * NUM_EXPERTS + 2)],
+)
+def test_reserve_covers_inputs_and_one_stacked_layer(
+    checkpoint, cache_experts, reserved_experts
+) -> None:
+    reference, model_dir = checkpoint
+    expert_bytes = _expert_bytes(reference)
+
+    _, store = _offloaded_twin(reference, model_dir, cache_experts * expert_bytes)
+
+    assert store.reserved_bytes == reserved_experts * expert_bytes
 
 
 @pytest.mark.parametrize(
