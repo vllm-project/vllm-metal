@@ -381,11 +381,23 @@ class MetalFileSystemTierManager(FileSystemTierManager):
 
     def submit_store(self, job_metadata: TransferJob) -> None:
         paths = {self.file_mapper.get_file_name(key): key for key in job_metadata.keys}
+
+        # Reserve space for every path that is not accounted for yet. A path
+        # can be shared by completed or in-flight jobs, so counting only this
+        # job's paths can evict unrelated cached blocks and under-reserve when
+        # multiple new store jobs overlap.
+        inflight_paths = {
+            path for job_paths in self._store_job_paths.values() for path in job_paths
+        }
+        reserved_paths = (inflight_paths | set(paths)) - set(self._store_index)
         self._store_job_paths[job_metadata.job_id] = paths
-        # Make room first so the store never crosses the cap. Deduped files
-        # over-reserve by their size for one step.
+
+        # Make room first so all completed and in-flight stores stay within the
+        # cap once their writes are accounted for.
         if self._max_store_bytes:
-            self._evict_to(self._max_store_bytes - len(paths) * self._block_size)
+            self._evict_to(
+                self._max_store_bytes - len(reserved_paths) * self._block_size
+            )
         super().submit_store(job_metadata)
 
     def submit_load(self, job_metadata: TransferJob) -> None:
