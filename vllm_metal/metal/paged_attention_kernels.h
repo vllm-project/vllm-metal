@@ -86,22 +86,8 @@ inline NaxConfig select_nax_config(
       (geometry.key_head_stride != geometry.qk_dim && geometry.key_head_stride != 2 * geometry.qk_dim) ||
       geometry.key_token_stride != geometry.kv_heads * geometry.key_head_stride) return kNaxBaseline;
 
-  const auto cost = [&](NaxConfig cfg) {
-    return nax_prefill_cost(sequence, geometry, {cfg.BQ, kNaxKvTile, cfg.HEADS_PER_TG},
-                            cfg.HEADS_PER_TG > 1 || upstream_split, cores);
-  };
-  constexpr double kMinimumGain = 0.10;
-  double best_cost = (1. - kMinimumGain) * cost(kNaxBaseline);
-  auto best = kNaxBaseline;
-  for (const int width : {2, ratio / 2, ratio}) {
-    const NaxConfig candidate{16, width, 32 * width, ratio};
-    const double candidate_cost = cost(candidate);
-    if (candidate_cost < best_cost) {
-      best = candidate;
-      best_cost = candidate_cost;
-    }
-  }
-  return best;
+  const int width = nax_prefill_width(sequence, geometry.heads, ratio, upstream_split, cores);
+  return width == 1 ? kNaxBaseline : NaxConfig{kNaxGroupedBQ, width, 32 * width, ratio};
 }
 
 inline constexpr NaxConfig nax_config_for_pipeline(

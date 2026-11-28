@@ -311,13 +311,12 @@ def nax_policy_binary(tmp_path_factory):
 int main(int argc, char** argv) {
   using namespace vllm_metal::kernels;
   if (argc > 1 && std::string(argv[1]) == "work") {
-    int q, prefix, heads, groups, bq, split;
+    int q, prefix, heads, bq, split;
     std::cout << std::setprecision(17);
-    while (std::cin >> q >> prefix >> heads >> groups >> bq >> split) {
+    while (std::cin >> q >> prefix >> heads >> bq >> split) {
       const auto w = nax_sequence_work(
-          {q, q + prefix}, heads, {bq, kNaxKvTile, groups}, split);
-      std::cout << w.visits << ' ' << w.guarded_visits << ' ' << w.groups << ' '
-                << w.longest_full_scan << ' ' << w.tail_scan << '\n';
+          {q, q + prefix}, heads, bq, split);
+      std::cout << w.visits << ' ' << w.guarded_visits << ' ' << w.query_blocks << '\n';
     }
     return 0;
   }
@@ -348,9 +347,9 @@ int main(int argc, char** argv) {
     return binary
 
 
-def _nax_work_loop(q, prefix, heads, width, bq, split):
-    """Count the visits and longest scans directly from causal block ends."""
-    visits = guarded = blocks = full_scan = tail_scan = 0
+def _nax_work_loop(q, prefix, heads, bq, split):
+    """Count tile visits and active query blocks directly from causal block ends."""
+    visits = guarded = blocks = 0
     for start in range(0, q, bq):
         valid = min(bq, q - start)
         end = prefix + start + valid
@@ -358,18 +357,8 @@ def _nax_work_loop(q, prefix, heads, width, bq, split):
         visits += tiles
         blocks += 1
         guarded += tiles if valid < bq or not split else int(tiles * 32 > prefix + q)
-        if valid == bq:
-            full_scan = tiles
-        else:
-            tail_scan = tiles
     lanes = heads * (bq // 16)
-    return (
-        lanes * visits,
-        lanes * guarded,
-        (heads // width) * blocks,
-        full_scan,
-        tail_scan,
-    )
+    return lanes * visits, lanes * guarded, blocks
 
 
 def test_nax_work_counts_match_independent_causal_loop(nax_policy_binary):
@@ -381,10 +370,10 @@ def test_nax_work_counts_match_independent_causal_loop(nax_policy_binary):
         for q in (127, 128, 129, 1327, 1328, 1329, 32767, 32768, 32769)
     ]
     cases = [
-        (q, prefix, heads, width, bq, split)
+        (q, prefix, heads, bq, split)
         for q, prefix in lengths
-        for heads, ratio in ((24, 6), (54, 6), (16, 8))
-        for bq, width in ((64, 1), (16, 2), (16, ratio // 2), (16, ratio))
+        for heads in (24, 54, 16)
+        for bq in (64, 16)
         for split in (0, 1)
     ]
     result = subprocess.run(
@@ -521,6 +510,20 @@ def _nax_plan_config(
                 "split": 1,
                 "q": 1568,
                 "prefix": 62720,
+            },
+            (16, 6, 192),
+        ),
+        # At 9.5 full-width groups/core the floating-point bulk comparison
+        # favors h6 by one ULP. A rounded density cutoff would choose h3.
+        (
+            {
+                "heads": 30,
+                "kv": 5,
+                "page": 16,
+                "physical": 768,
+                "q": 1216,
+                "prefix": 7435,
+                "split": 1,
             },
             (16, 6, 192),
         ),

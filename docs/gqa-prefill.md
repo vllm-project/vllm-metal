@@ -12,9 +12,11 @@ threadgroup.
 | 6 | 16 tokens | 2, 3, 6 |
 | 8 | 32 tokens | 2, 4, 8 |
 
-One cost rule scores ordinary NAX and every grouped width for both compact and
-interleaved caches. Ordinary NAX runs unless a grouped width is predicted to be
-more than 10% cheaper. The lowest-cost qualifying width wins.
+For compact and interleaved caches, the grouped kernel must be predicted more
+than 10% cheaper than ordinary NAX. The selector first checks the longest
+grouped KV scan against this margin. If it qualifies, h2 wins when it reaches
+the scan-time floor. Otherwise the selector compares the throughput costs of
+half and full width, keeping half width on a tie.
 
 Larger physical pages must be multiples of the kernel page size. Mixed batches,
 nonzero query-block offsets, sliding windows, softcap, sinks, and unsupported

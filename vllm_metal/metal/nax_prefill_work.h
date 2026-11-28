@@ -8,17 +8,17 @@
 namespace vllm_metal::kernels {
 
 inline constexpr int kNaxBQ = 64;
+inline constexpr int kNaxGroupedBQ = 16;
 inline constexpr int kNaxKvTile = 32;
+inline constexpr double kNaxGuardOverhead = 0.2;
 
 struct NaxSequence {
   int query_tokens;
   int kv_tokens;
-};
 
-struct NaxLayout {
-  int query_tile;
-  int kv_tile;
-  int heads_per_group;
+  int64_t kv_tiles() const {
+    return (int64_t(kv_tokens) + kNaxKvTile - 1) / kNaxKvTile;
+  }
 };
 
 struct NaxGeometry {
@@ -36,9 +36,11 @@ struct NaxGeometry {
 struct NaxPrefillWork {
   double visits;
   double guarded_visits;
-  int64_t groups;
-  int64_t longest_full_scan;
-  int64_t tail_scan;
+  int64_t query_blocks;
+
+  double weighted_visits() const {
+    return visits + kNaxGuardOverhead * guarded_visits;
+  }
 };
 
 // Sum ceil((prefix + i * query_tile) / kv_tile), i=1..blocks. The two
@@ -58,13 +60,13 @@ inline int64_t nax_full_tile_visits(
 }
 
 inline NaxPrefillWork nax_sequence_work(
-    NaxSequence sequence, int heads, NaxLayout layout, bool split) {
+    NaxSequence sequence, int heads, int bq, bool split) {
   const int q = sequence.query_tokens;
   const int prefix = sequence.kv_tokens - q;
-  const int bq = layout.query_tile, bkv = layout.kv_tile;
+  constexpr int bkv = kNaxKvTile;
   const int64_t full = q / bq, tail = q % bq;
   const int64_t full_visits = nax_full_tile_visits(full, prefix, bq, bkv);
-  const int64_t tail_scan = tail ? (int64_t(sequence.kv_tokens) + bkv - 1) / bkv : 0;
+  const int64_t tail_scan = tail ? sequence.kv_tiles() : 0;
   const int64_t full_end = int64_t(sequence.kv_tokens / bkv) * bkv;
   const int64_t edge_blocks = full - std::min(full,
       std::max(int64_t(0), full_end - prefix) / bq);
@@ -72,38 +74,42 @@ inline NaxPrefillWork nax_sequence_work(
   return {
       simd_groups * (full_visits + tail_scan),
       simd_groups * ((split ? edge_blocks : full_visits) + tail_scan),
-      (heads / layout.heads_per_group) * (full + (tail != 0)),
-      full ? (prefix + full * bq + bkv - 1) / bkv : 0,
-      tail_scan};
+      full + (tail != 0)};
 }
 
-inline double nax_prefill_cost(
-    NaxSequence sequence, const NaxGeometry& geometry, NaxLayout layout,
-    bool split, int cores) {
-  const auto work = nax_sequence_work(sequence, geometry.heads, layout, split);
-  // Fit to paired fixed-width D256 timings (https://github.com/vllm-project/vllm-metal/pull/1300).
-  constexpr double kGuardOverhead = 0.2;
+// Calibrated for BF16 D256 with GQA6/GQA8. See vllm-project/vllm-metal#1300.
+inline int nax_prefill_width(
+    NaxSequence sequence, int heads, int ratio, bool upstream_split, int cores) {
   constexpr double kTilesPerCore = 8.;
   constexpr double kKvReadCost = 1. / 3.;
-  constexpr double kGroupsPerCore = 5.;
-  constexpr double kWideTileCost = 0.4;
-  constexpr double kWideScanCost = 0.1;
+  constexpr double kWideGroupCost = 2.;
+  constexpr double kMinimumGain = 0.10;
+  const auto bulk = [&](double tile_work, int width, double penalty = 0.) {
+    return tile_work * (1. + kKvReadCost / width) * (1. + penalty) / (kTilesPerCore * cores);
+  };
 
-  // A wider group shares KV reads across heads but holds more live Q rows.
-  // D256 is common to all candidates, so state scales with rows per group.
-  const double width = layout.heads_per_group;
-  const double extra_state = std::max(0., layout.query_tile * width / kNaxBQ - 1.);
-  const double scarcity = std::min(1., kGroupsPerCore * cores / work.groups);
-  const double tile_work = work.visits + kGuardOverhead * work.guarded_visits;
-  const double bulk = tile_work * (1. + kKvReadCost / width)
-      * (1. + kWideTileCost * extra_state * extra_state * scarcity)
-      / (kTilesPerCore * cores);
+  const double scan = double(sequence.kv_tiles());
+  const double guarded_scan = scan * (1. + kNaxGuardOverhead);
+  const double ordinary_scan = upstream_split && sequence.query_tokens % kNaxBQ == 0
+      ? scan : guarded_scan;
+  const double grouped_scan = sequence.query_tokens % kNaxGroupedBQ == 0 ? scan : guarded_scan;
+  const auto ordinary = nax_sequence_work(sequence, heads, kNaxBQ, upstream_split);
+  const double ordinary_cost = std::max(bulk(ordinary.weighted_visits(), 1), ordinary_scan);
+  // Half-width bulk is at most 5/6 (GQA6) or 13/16 (GQA8) of ordinary bulk.
+  // All grouped widths share this scan floor, so it alone can veto admission.
+  if (grouped_scan >= (1. - kMinimumGain) * ordinary_cost) return 1;
 
-  // More groups cannot shorten the longest serial KV scan of any one tile.
-  const double full_scan = work.longest_full_scan * (split ? 1. : 1. + kGuardOverhead);
-  const double tail_scan = work.tail_scan * (1. + kGuardOverhead);
-  const double serial = std::max(full_scan, tail_scan) * (1. + kWideScanCost * extra_state);
-  return std::max(bulk, serial);
+  const auto grouped = nax_sequence_work(sequence, heads, kNaxGroupedBQ, true);
+  const double tile_work = grouped.weighted_visits();
+  // Half width has cheaper bulk than h2. At the scan floor they tie and h2 wins.
+  if (bulk(tile_work, 2) <= grouped_scan) return 2;
+
+  // Full width can beat half width only in the throughput-limited region.
+  const int half_width = ratio / 2;
+  const int64_t full_groups = grouped.query_blocks * (heads / ratio);
+  const double extra_rows = double(kNaxGroupedBQ * ratio) / kNaxBQ - 1.;
+  const double penalty = kWideGroupCost * extra_rows * extra_rows * cores / full_groups;
+  return bulk(tile_work, ratio, penalty) < bulk(tile_work, half_width) ? ratio : half_width;
 }
 
 }  // namespace vllm_metal::kernels
