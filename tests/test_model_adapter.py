@@ -919,6 +919,56 @@ class TestNormalizeModelConfig:
             "image": ImageDummyOptions(count=4)
         }
 
+    @pytest.mark.parametrize(
+        ("model_type", "architecture"),
+        [
+            ("qwen3_vl", "Qwen3VLForConditionalGeneration"),
+            ("paddleocr_vl", "PaddleOCRVLForConditionalGeneration"),
+            ("lfm2_vl", "Lfm2VlForConditionalGeneration"),
+            ("lfm3_vl", "Lfm3VlForConditionalGeneration"),
+            ("lfm3_audio", "Lfm3AudioForConditionalGeneration"),
+        ],
+    )
+    def test_native_adapter_family_with_speculative_decoding_serves_text_only(
+        self, model_type: str, architecture: str
+    ) -> None:
+        # The native multimodal forward cannot verify draft tokens, so a drafted
+        # media request would kill the engine; media must be refused up front.
+        model_config = SimpleNamespace(
+            quantization=None,
+            multimodal_config=MultiModalConfig(limit_per_prompt={"image": 4}),
+            hf_config=SimpleNamespace(
+                model_type=model_type, architectures=[architecture]
+            ),
+        )
+
+        DefaultModelAdapter().normalize_model_config(
+            model_config, speculative_config=object()
+        )
+
+        assert model_config.multimodal_config is None
+
+    def test_vlm_without_native_adapter_with_speculative_decoding_keeps_config(
+        self,
+    ) -> None:
+        # Media is already refused without a native adapter; the checkpoint keeps
+        # loading through the native path it needs.
+        multimodal_config = MultiModalConfig(limit_per_prompt={"image": 4})
+        model_config = SimpleNamespace(
+            quantization=None,
+            multimodal_config=multimodal_config,
+            hf_config=SimpleNamespace(
+                model_type="gemma3", architectures=["Gemma3ForConditionalGeneration"]
+            ),
+        )
+
+        DefaultModelAdapter().normalize_model_config(
+            model_config, speculative_config=object()
+        )
+
+        assert model_config.multimodal_config is multimodal_config
+        assert multimodal_config.get_limit_per_prompt("image") == 0
+
 
 class TestTextModel:
     def test_returns_language_model_when_present(self) -> None:

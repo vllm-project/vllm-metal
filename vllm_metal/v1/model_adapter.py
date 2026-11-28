@@ -577,9 +577,23 @@ class DefaultModelAdapter(ModelAdapter):
         if model_config.quantization == "gguf":
             return "text_only"
         if getattr(hf_config, "model_type", None) not in _GEMMA4_MODEL_TYPES:
-            return (
-                "text_only" if self.should_force_text_backbone(hf_config) else "native"
-            )
+            if self.should_force_text_backbone(hf_config):
+                return "text_only"
+            # The native multimodal forward cannot verify multi-token drafts, so
+            # a drafted media request would kill the engine at its first decode.
+            # Serve text-only, as Gemma 4 does, so the frontend refuses media.
+            if (
+                speculative_config is not None
+                and self._native_multimodal_family(hf_config) is not None
+            ):
+                logger.warning_once(
+                    "Metal: multimodal input disabled for model_type=%s, serving "
+                    "text-only: speculative decoding is configured and the "
+                    "native multimodal path cannot verify draft tokens",
+                    getattr(hf_config, "model_type", "unknown"),
+                )
+                return "text_only"
+            return "native"
 
         key = (
             str(getattr(model_config, "model", "")),
