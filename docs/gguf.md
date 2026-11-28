@@ -1,10 +1,10 @@
 # GGUF
 
-vllm-metal supports dense decoder (including Gemma 3), Qwen3 MoE, and Qwen3.5
-GGUF checkpoints through the MLX runtime. A GGUF file carries weights only, so
-it needs a Hugging Face config and tokenizer source. That source can be a
-quantized checkpoint, such as an mlx-community 4-bit, FP8, or AWQ repository;
-vllm-metal reads only its config and tokenizer.
+vllm-metal supports dense decoder (including Gemma 3), Qwen3 MoE, Qwen3.5, and
+Qwen3.5 MoE GGUF checkpoints through the MLX runtime. A GGUF file carries
+weights only, so it needs a Hugging Face config and tokenizer source. That
+source can be a quantized checkpoint, such as an mlx-community 4-bit, FP8, or
+AWQ repository; vllm-metal reads only its config and tokenizer.
 
 ## Local weights
 
@@ -47,11 +47,14 @@ missing, ambiguous, or shard-only matches also fail before model load.
 ## Current scope
 
 - Supported model families: Qwen2, Qwen3, Qwen3 MoE (`qwen3moe`), Llama,
-  Mistral, Qwen3.5 (`qwen35`), and Gemma 3 (`gemma3`).
+  Mistral, Qwen3.5 (`qwen35`), Qwen3.5 MoE (`qwen35moe`), and Gemma 3
+  (`gemma3`).
 - Gemma 3 serves text only. Point `--tokenizer` at the 1B text config or a 4B+
   `Gemma3ForConditionalGeneration` repository, such as `google/gemma-3-4b-it`.
-- Qwen3.5 serves text only and images are refused. Point `--tokenizer` at the
-  `Qwen3_5ForConditionalGeneration` repository, such as `Qwen/Qwen3.5-9B`.
+- Qwen3.5 and Qwen3.5 MoE serve text only and images are refused. Point
+  `--tokenizer` at the `Qwen3_5ForConditionalGeneration` or
+  `Qwen3_5MoeForConditionalGeneration` repository, such as `Qwen/Qwen3.5-9B`
+  or `Qwen/Qwen3.6-35B-A3B`.
   vllm-metal does not load `mmproj` files. Files that embed a
   multi-token-prediction block, such as unsloth's `-MTP-GGUF` repos, load
   with that block skipped. MTP speculative decoding is not supported.
@@ -76,6 +79,6 @@ missing, ambiguous, or shard-only matches also fail before model load.
   llama.cpp does: llama-quantize stores that table at the output qtype (for
   example Q6_K) even when `token_embd` uses a lower one. An `output.weight` in
   a qtype the loader cannot run is skipped and the head stays tied.
-- Unsupported: IQ1, IQ2_XXS, IQ2_XS and T-quants, MoE models other than Qwen3
-  MoE, SSM or hybrid models other than Qwen3.5, vision input, sharded GGUF
-  files, and LoRA (`--enable-lora`).
+- Unsupported: IQ1, IQ2_XXS, IQ2_XS, MXFP4 and T-quants, MoE models other than
+  Qwen3 MoE and Qwen3.5 MoE, SSM or hybrid models other than Qwen3.5 and
+  Qwen3.5 MoE, vision input, sharded GGUF files, and LoRA (`--enable-lora`).

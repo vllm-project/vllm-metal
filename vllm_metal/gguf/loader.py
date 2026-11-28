@@ -491,17 +491,20 @@ class GGUFModelLoader:
         transform: GGUFPlainTransform | None = None,
     ) -> None:
         module_path, _, param_name = param_path.rpartition(".")
-        expected = tuple(
+        model_shape = tuple(
             int(d)
             for d in getattr(self._resolve_path(model, module_path), param_name).shape
         )
-        if transform is not None:
-            expected = transform.source_shape(expected)
+        expected = (
+            (model_shape,)
+            if transform is None
+            else transform.source_shapes(model_shape)
+        )
         actual = tuple(int(d) for d in array.shape)
-        if actual != expected:
+        if actual not in expected:
             raise GGUFLoadError(
-                f"GGUF tensor {name!r} shape {actual} != expected {expected} for "
-                f"model {param_path!r}."
+                f"GGUF tensor {name!r} shape {actual} != expected "
+                f"{' or '.join(map(str, expected))} for model {param_path!r}."
             )
 
     @classmethod

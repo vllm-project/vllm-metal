@@ -32,8 +32,10 @@ class GGUFLoadError(RuntimeError):
 class GGUFPlainTransform(Protocol):
     """Undo how llama.cpp stores a plain tensor relative to its live parameter."""
 
-    def source_shape(self, model_shape: tuple[int, ...]) -> tuple[int, ...]:
-        """The shape the file stores a parameter of ``model_shape`` in."""
+    def source_shapes(
+        self, model_shape: tuple[int, ...]
+    ) -> tuple[tuple[int, ...], ...]:
+        """The shapes the file may store a parameter of ``model_shape`` in."""
         ...
 
     def apply(self, source: mx.array) -> mx.array:
@@ -44,8 +46,10 @@ class GGUFPlainTransform(Protocol):
 class _SqueezedUnitAxis:
     """The file squeezes a conv kernel ``(C, K, 1)`` to ``(C, K)``."""
 
-    def source_shape(self, model_shape: tuple[int, ...]) -> tuple[int, ...]:
-        return model_shape[:-1]
+    def source_shapes(
+        self, model_shape: tuple[int, ...]
+    ) -> tuple[tuple[int, ...], ...]:
+        return (model_shape[:-1],)
 
     def apply(self, source: mx.array) -> mx.array:
         return mx.expand_dims(source, -1)
@@ -54,8 +58,10 @@ class _SqueezedUnitAxis:
 class _NegatedExp:
     """The file stores ``-exp(x)`` (llama.cpp's ``ssm_a = -exp(A_log)``)."""
 
-    def source_shape(self, model_shape: tuple[int, ...]) -> tuple[int, ...]:
-        return model_shape
+    def source_shapes(
+        self, model_shape: tuple[int, ...]
+    ) -> tuple[tuple[int, ...], ...]:
+        return (model_shape,)
 
     def apply(self, source: mx.array) -> mx.array:
         return mx.log(-source)
@@ -64,11 +70,25 @@ class _NegatedExp:
 class _ShiftedByOne:
     """The file stores ``x + 1`` (llama.cpp folds Gemma's ``1 + weight`` norm)."""
 
-    def source_shape(self, model_shape: tuple[int, ...]) -> tuple[int, ...]:
-        return model_shape
+    def source_shapes(
+        self, model_shape: tuple[int, ...]
+    ) -> tuple[tuple[int, ...], ...]:
+        return (model_shape,)
 
     def apply(self, source: mx.array) -> mx.array:
         return source - 1
+
+
+class _SqueezedLeadingUnitAxis:
+    """The file may squeeze a ``(1, n)`` weight to ``(n,)`` (llama-quantize does)."""
+
+    def source_shapes(
+        self, model_shape: tuple[int, ...]
+    ) -> tuple[tuple[int, ...], ...]:
+        return (model_shape[1:], model_shape)
+
+    def apply(self, source: mx.array) -> mx.array:
+        return source.reshape(1, -1)
 
 
 @dataclass(frozen=True)
@@ -134,6 +154,20 @@ class GGUFModelAdapter:
             global_transforms={"output_norm.weight": _ShiftedByOne()},
             trimmed_vocab=True,
         ),
+        "qwen35moe": GGUFArchSpec(
+            config_model_types=frozenset({"qwen3_5_moe"}),
+            admitted_substrings=frozenset(
+                {"attn_qkv", "ssm_", "_exps", "ffn_gate_inp"}
+            ),
+            param_aliases={"dt_bias": "dt_proj.bias", "switch_mlp": "experts"},
+            layer_transforms={
+                "ssm_a": _NegatedExp(),
+                "ssm_conv1d.weight": _SqueezedUnitAxis(),
+                "ffn_gate_inp_shexp.weight": _SqueezedLeadingUnitAxis(),
+            },
+            tiled_v_heads=True,
+            appended_mtp_blocks=True,
+        ),
         "qwen3moe": GGUFArchSpec(
             config_model_types=frozenset({"qwen3_moe"}),
             admitted_substrings=frozenset({"_exps", "ffn_gate_inp"}),
@@ -144,8 +178,9 @@ class GGUFModelAdapter:
     SUPPORTED_ARCHS = frozenset(_ARCH_SPECS)
 
     # Substrings flagging an out-of-scope tensor: fused QKV, SSM/Mamba, MoE
-    # experts + router, vision/mmproj. Defense in depth behind the arch
-    # allowlist; an arch admits only the markers its own decoder tensors carry.
+    # experts + router, fused gate/up experts, vision/mmproj. Defense in depth
+    # behind the arch allowlist; an arch admits only the markers its own decoder
+    # tensors carry.
     # ``ffn_gate_inp`` is the MoE router: llama-family MoE (e.g. Mixtral) declares
     # general.architecture "llama", so its expert tensors (caught by ``_exps``)
     # and router (this) are reachable once "llama" is admitted.
@@ -153,6 +188,7 @@ class GGUFModelAdapter:
         "attn_qkv",
         "ssm_",
         "_exps",
+        "gate_up_exps",
         "ffn_gate_inp",
         "mmproj",
         "mm.",
