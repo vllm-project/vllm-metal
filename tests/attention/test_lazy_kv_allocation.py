@@ -20,6 +20,9 @@ Deterministic, no model load.
 
 from __future__ import annotations
 
+import ctypes
+import resource
+
 import mlx.core as mx
 import pytest
 import torch
@@ -109,13 +112,13 @@ def test_attention_only_config_is_allocated_uninitialized():
     )
 
 
-def test_uniform_caches_skip_vllms_zero_filling_allocator(monkeypatch):
+def test_no_config_goes_through_vllms_zero_filling_allocator(monkeypatch):
     """A revert of the lazy path must fail here, not merely cost memory.
 
     The layout assertions below hold for both allocations, so they cannot tell
-    the two apart. This pins the contract itself: a uniform-precision cache
-    delegates to vLLM's allocator with an uninitialized ``allocate`` callback,
-    while a Mamba cache keeps vLLM's zero-filling default.
+    the two apart. This pins the contract itself: every cache delegates to
+    vLLM's allocator with its own ``allocate`` callback. A Mamba cache still
+    reads as zeros, but the zeros come from the OS instead of a fill.
     """
     allocators: list[object] = []
     original = storage_module.allocate_kv_cache
@@ -132,7 +135,7 @@ def test_uniform_caches_skip_vllms_zero_filling_allocator(monkeypatch):
 
     KVCacheStorage(_hybrid_config())
     assert len(allocators) == 2
-    assert allocators[1] is None
+    assert allocators[1] is not None
 
 
 def test_uninitialized_backing_matches_upstream_layout():
@@ -164,6 +167,78 @@ def test_mamba_config_keeps_vllms_zero_filled_allocation():
     storage = KVCacheStorage(config)
     assert not storage.tensors["s0"].any()
     assert not storage.tensors["s1"].any()
+
+
+def _resident_bytes(tensor: torch.Tensor) -> int:
+    """Bytes of the tensor's storage that are in physical memory (mincore)."""
+    page = resource.getpagesize()
+    start = tensor.untyped_storage().data_ptr()
+    first = start - start % page
+    pages = -(-(start + tensor.untyped_storage().nbytes() - first) // page)
+    vec = (ctypes.c_char * pages)()
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.mincore(ctypes.c_void_p(first), ctypes.c_size_t(pages * page), vec):
+        raise OSError(ctypes.get_errno(), "mincore failed")
+    return sum(byte & 1 for byte in vec.raw) * page
+
+
+def test_pool_is_not_resident_under_the_workers_wired_limit():
+    """The worker sets an MLX wired limit, and MLX wires the buffers it adopts
+    from torch while one is set: the whole pool used to be resident before the
+    first request (#1198). Only what the GPU actually uses may be committed."""
+    # Large enough that the allocator hands out fresh, never-touched pages.
+    pool_bytes = 256 << 20
+    layers = 2
+    num_blocks = pool_bytes // (
+        layers * _attention_config().kv_cache_tensors[0].block_stride
+    )
+    previous = mx.set_wired_limit(
+        int(mx.device_info()["max_recommended_working_set_size"])
+    )
+    try:
+        storage = KVCacheStorage(_attention_config(num_blocks=num_blocks))
+        mx.eval(mx.ones(16) + 1)  # an unrelated command buffer
+        backing = next(iter(storage.tensors.values()))
+        assert storage.nbytes == pool_bytes
+        assert _resident_bytes(backing) == 0
+    finally:
+        mx.set_wired_limit(previous)
+
+
+# A Mamba-bearing pool of 128 MiB. Attention and state layers share one
+# allocation: 2 layers x 2048-byte pages.
+_HYBRID_POOL_BYTES = 128 << 20
+_HYBRID_POOL_BLOCKS = _HYBRID_POOL_BYTES // (2 * 2048)
+
+
+def _partial_pages_bytes() -> int:
+    """Zeroing writes at most the two partial pages at the ends of the pool."""
+    return 2 * resource.getpagesize()
+
+
+def test_zero_filled_pools_read_zero_without_being_resident():
+    """State is read before it is written, so the pool must read as zeros, but
+    a fill would commit all of it before the first request."""
+    storage = KVCacheStorage(_hybrid_config(num_blocks=_HYBRID_POOL_BLOCKS))
+    backing = next(iter(storage.tensors.values()))
+    assert storage.config.needs_kv_cache_zeroing
+    assert storage.nbytes == _HYBRID_POOL_BYTES
+    assert _resident_bytes(backing) <= _partial_pages_bytes()
+    raw = torch.empty(0, dtype=torch.uint8).set_(backing.untyped_storage())
+    assert not raw.any()
+
+
+def test_wake_zeroes_the_pool_without_committing_it():
+    storage = KVCacheStorage(_hybrid_config(num_blocks=_HYBRID_POOL_BLOCKS))
+    backing = next(iter(storage.tensors.values()))
+    raw = torch.empty(0, dtype=torch.uint8).set_(backing.untyped_storage())
+    raw.fill_(7)
+
+    storage.release()
+    storage.reallocate()
+
+    assert _resident_bytes(backing) <= _partial_pages_bytes()
+    assert not raw.any()
 
 
 def _run_decode(ctx: int, tail_is_nan: bool) -> mx.array:

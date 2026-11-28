@@ -118,9 +118,7 @@ def test_copy_cycles_snapshot_sources_and_deduplicate_aliases(monkeypatch):
         raise AssertionError("cache runtime must not cross the Torch/MLX bridge")
 
     storage = make_storage()
-    monkeypatch.setattr(
-        "vllm_metal.attention.caches.storage.torch_to_mlx", no_runtime_bridge
-    )
+    monkeypatch.setattr(get_ops(), "wrap_host_memory", no_runtime_bridge)
     storage.tensors["a0"][1].fill_(1)
     storage.tensors["a0"][2].fill_(2)
     storage.tensors["a1"][1].fill_(3)
@@ -191,21 +189,20 @@ def test_budget_above_buffer_limit_uses_shared_regions(monkeypatch):
     from vllm.v1.core.kv_cache_planning import get_kv_cache_config_from_groups
 
     from tests.stub_runner import make_cache_config
-    from vllm_metal.tensor_bridge import torch_to_mlx
     from vllm_metal.v1.cache_policy import WorkerCachePlanner
 
     groups = make_storage().config.kv_cache_groups
     buffer_limit = 16_384
+    ops = get_ops()
+    wrap = ops.wrap_host_memory
     imported = []
 
-    def import_region(tensor):
-        assert tensor.nbytes <= buffer_limit
-        imported.append(tensor)
-        return torch_to_mlx(tensor)
+    def wrap_region(ptr, rows, cols):
+        assert rows * cols <= buffer_limit
+        imported.append((ptr, rows * cols))
+        return wrap(ptr, rows, cols)
 
-    monkeypatch.setattr(
-        "vllm_metal.attention.caches.storage.torch_to_mlx", import_region
-    )
+    monkeypatch.setattr(ops, "wrap_host_memory", wrap_region)
     config = SimpleNamespace(
         attention_config=AttentionConfig(),
         cache_config=make_cache_config(gpu_memory_utilization=0.5),
@@ -239,7 +236,10 @@ def test_budget_above_buffer_limit_uses_shared_regions(monkeypatch):
 
     assert storage.nbytes == budget == 2 * buffer_limit
     assert len(imported) == len(storage.buffers) == 2
-    assert len({tensor.untyped_storage().data_ptr() for tensor in imported}) == 1
+    # Both regions are wrapped out of the one backing allocation.
+    backing = next(iter(storage.tensors.values())).untyped_storage()
+    start, end = backing.data_ptr(), backing.data_ptr() + backing.nbytes()
+    assert all(start <= ptr and ptr + size <= end for ptr, size in imported)
     assert sum(buffer.nbytes for buffer in storage.buffers) == storage.nbytes
     assert storage.state_views(["s0", "s1"])[0][0].shape[0] == planned.num_blocks
 
