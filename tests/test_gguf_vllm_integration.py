@@ -989,7 +989,19 @@ def test_remote_tag_selects_embedded_mtp_model_over_draft_sibling(
 
 
 @pytest.mark.parametrize(
-    "tag", ["Q6_K", "Q6_K_L", "Q8_0", "IQ4_NL", "IQ4_XS", "IQ3_S", "IQ3_M"]
+    "tag",
+    [
+        "Q6_K",
+        "Q6_K_L",
+        "Q8_0",
+        "IQ4_NL",
+        "IQ4_XS",
+        "IQ3_S",
+        "IQ3_M",
+        "IQ3_XS",
+        "IQ3_XXS",
+        "IQ2_M",
+    ],
 )
 def test_remote_tag_resolves_its_own_file(tmp_path, monkeypatch, tag) -> None:
     snapshot = tmp_path / "weights"
@@ -1004,6 +1016,9 @@ def test_remote_tag_resolves_its_own_file(tmp_path, monkeypatch, tag) -> None:
         "model-IQ4_XS.gguf",
         "model-IQ3_S.gguf",
         "model-IQ3_M.gguf",
+        "model-IQ3_XS.gguf",
+        "model-IQ3_XXS.gguf",
+        "model-IQ2_M.gguf",
     ]
     monkeypatch.setattr(
         gguf_source,
