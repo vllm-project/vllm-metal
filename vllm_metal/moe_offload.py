@@ -23,6 +23,7 @@ import struct
 from collections import OrderedDict
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -72,7 +73,7 @@ class ExpertStore:
         "BF16": (np.uint16, mx.bfloat16),
     }
     PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
-    COMPONENTS = ("weight", "scales", "biases")
+    COMPONENTS = ("weight", "scales", "biases", "bias")
     # Parallel preads per batch of cache misses; SSD reads are latency bound.
     READ_THREADS = 8
 
@@ -91,11 +92,13 @@ class ExpertStore:
             OrderedDict()
         )
         # Opened up front: reads run on pool threads.
-        self._handles = {
-            path: os.open(path, os.O_RDONLY)
-            for path in {location.path for location in index.values()}
-        }
-        self._pool = ThreadPoolExecutor(max_workers=self.READ_THREADS)
+        with ExitStack() as resources:
+            self._handles = {
+                path: resources.enter_context(path.open("rb", buffering=0))
+                for path in {location.path for location in index.values()}
+            }
+            self._pool = resources.enter_context(ThreadPoolExecutor(self.READ_THREADS))
+            self._resources = resources.pop_all()
         self.bytes = 0
         self.hits = 0
         self.misses = 0
@@ -122,15 +125,19 @@ class ExpertStore:
             for path, module in targets
         )
         store = cls(index, cache_bytes, stack_bytes)
-        model.update_modules(
-            tree_unflatten(
-                [
-                    (path, OffloadedSwitchGLU(module, path, store))
-                    for path, module in targets
-                ]
+        try:
+            model.update_modules(
+                tree_unflatten(
+                    [
+                        (path, OffloadedSwitchGLU(module, path, store))
+                        for path, module in targets
+                    ]
+                )
             )
-        )
-        mx.eval(model.parameters())
+            mx.eval(model.parameters())
+        except BaseException:
+            store.close()
+            raise
         logger.info(
             "MoE expert offloading: %d layers stream experts from %s with a "
             "%.2f GiB cache.",
@@ -173,12 +180,19 @@ class ExpertStore:
         self._evict(keep=len(experts))
         return [self._entries[(module_path, expert)] for expert in experts]
 
+    def close(self) -> None:
+        """Wait for pending reads and close all checkpoint files."""
+        self._resources.close()
+        self.clear()
+
     def clear(self) -> None:
         self._entries.clear()
         self.bytes = 0
 
     def _read(self, piece: ExpertSlice) -> bytes:
-        return os.pread(self._handles[piece.location.path], piece.nbytes, piece.offset)
+        return os.pread(
+            self._handles[piece.location.path].fileno(), piece.nbytes, piece.offset
+        )
 
     def _evict(self, *, keep: int) -> None:
         # The experts of the current call stay cached even when they alone

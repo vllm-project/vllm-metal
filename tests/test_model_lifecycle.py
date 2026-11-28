@@ -261,6 +261,7 @@ class TestModelLifecycle:
         lifecycle, runner = _make_lifecycle(
             model_config=_runner_model_config(
                 model="org/model",
+                hf_token="test-token",
                 revision=revision,
                 is_multimodal_model=backend == "vlm",
                 hf_config=SimpleNamespace(model_type="lfm3")
@@ -268,6 +269,8 @@ class TestModelLifecycle:
                 else None,
             )
         )
+        runner.vllm_config.load_config.download_dir = "/model-cache"
+        hub = {"token": "test-token", "cache_dir": "/model-cache"}
         runner._is_pooling = backend == "pooling"
         resolve_path = Mock(return_value="resolved/model")
         monkeypatch.setattr(model_lifecycle, "get_model_download_path", resolve_path)
@@ -293,20 +296,26 @@ class TestModelLifecycle:
         )
         resolve_path.assert_called_once_with("org/model", revision=revision)
         if backend == "awq":
-            loader.assert_called_once_with("resolved/model", revision=revision)
+            loader.assert_called_once_with("resolved/model", revision=revision, **hub)
         else:
-            download.assert_called_once_with("resolved/model", revision=revision)
+            download.assert_called_once_with(
+                "resolved/model",
+                revision=revision,
+                **({} if backend in {"vlm", "lfm3"} else hub),
+            )
             selected_loader = loader if backend in {"vlm", "lfm3"} else weights_loader
             selected_loader.assert_called_once_with(
                 Path("cached-model"), lazy=backend == "offload"
             )
         if backend == "offload":
             install_experts.assert_called_once_with(
-                model, "resolved/model", revision, 4096
+                model, "cached-model", revision, 4096
             )
             assert runner._expert_store is install_experts.return_value
         if backend not in {"vlm", "lfm3"}:
-            detect_awq.assert_called_once_with("resolved/model", revision=revision)
+            detect_awq.assert_called_once_with(
+                "resolved/model", revision=revision, **hub
+            )
 
     def test_private_mlx_lm_compatible_model_path_adapts_indexed_custom_shards(
         self, tmp_path: Path
@@ -646,7 +655,7 @@ class TestModelLifecycle:
 
         class _StubAWQLoader:
             @classmethod
-            def for_model(cls, _model_name: str, *, revision: str | None) -> None:
+            def for_model(cls, _model_name: str, **_kwargs: object) -> None:
                 return None
 
         def _load_text(
@@ -1049,11 +1058,11 @@ class TestModelLifecycle:
         class _StubAWQLoader:
             @classmethod
             def for_model(
-                cls, _model_name: str, *, revision: str | None
+                cls, _model_name: str, **_kwargs: object
             ) -> _StubAWQLoader | None:
                 return cls() if is_awq else None
 
-            def load(self, model_path: str, *, revision: str | None) -> object:
+            def load(self, model_path: str, **_kwargs: object) -> object:
                 awq_load_calls.append({"model_path": model_path})
                 return fake_model
 
@@ -1212,7 +1221,7 @@ class TestModelLifecycle:
 
         class _StubAWQLoader:
             @classmethod
-            def for_model(cls, _model_name: str, *, revision: str | None) -> None:
+            def for_model(cls, _model_name: str, **_kwargs: object) -> None:
                 return None
 
         monkeypatch.setitem(sys.modules, "gguf", None)

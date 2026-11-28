@@ -53,13 +53,16 @@ class TestConfigDetection:
         )
         monkeypatch.setattr("vllm_metal.quant.awq_loader.mlx_lm_load_model", load)
 
-        loader = AWQQuantLoader.for_model("org/model", revision=revision)
+        hub = {"token": "test-token", "cache_dir": str(tmp_path)}
+        loader = AWQQuantLoader.for_model("org/model", revision=revision, **hub)
         assert loader is not None
-        loader.load("org/model", revision=revision)
+        loader.load("org/model", revision=revision, **hub)
 
-        download.assert_called_once_with("org/model", "config.json", revision=revision)
+        download.assert_called_once_with(
+            "org/model", "config.json", revision=revision, **hub
+        )
         load.assert_called_once()
-        resolve.assert_called_once_with("org/model", revision=revision)
+        resolve.assert_called_once_with("org/model", revision=revision, **hub)
         assert load.call_args.args == (config_dir,)
         assert load.call_args.kwargs["model_config"] == {
             "quantization_config": _AWQ_INNER

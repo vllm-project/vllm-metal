@@ -97,6 +97,11 @@ class D3ReadoutPooler:
                 f"{self.config.label}."
             )
 
+        config = self.config.pooler_config
+        if config.logit_mean is not None:
+            logits = logits - config.logit_mean
+        if config.logit_sigma is not None:
+            logits = logits / config.logit_sigma
         tensor = mlx_to_torch(self._activate(logits, span.pooling_params), device="cpu")
         return tensor.detach().clone()
 

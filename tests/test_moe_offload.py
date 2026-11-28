@@ -33,10 +33,16 @@ def _tiny_olmoe(seed: int) -> nn.Module:
             "vocab_size": 128,
             "num_experts": NUM_EXPERTS,
             "num_experts_per_tok": TOP_K,
+            "mlp_bias": True,
             "tie_word_embeddings": False,
         }
     )
     model = olmoe.Model(args)
+    for layer in model.model.layers:
+        projection = layer.mlp.switch_mlp.down_proj
+        projection.bias = mx.broadcast_to(
+            mx.arange(NUM_EXPERTS, dtype=mx.float32)[:, None], projection.bias.shape
+        )
     nn.quantize(model, group_size=32, bits=4)
     mx.eval(model.parameters())
     return model
@@ -143,6 +149,25 @@ def test_missing_expert_tensors_fail_at_install(tmp_path, drop, match) -> None:
 def test_dense_model_is_rejected(tmp_path) -> None:
     with pytest.raises(ValueError, match="SwitchGLU"):
         ExpertStore.install(nn.Linear(4, 4), str(tmp_path), None, 1 << 20)
+
+
+def test_shutdown_closes_expert_checkpoint(tmp_path) -> None:
+    import psutil
+
+    from vllm_metal.v1.worker import MetalWorker
+
+    reference = _tiny_olmoe(seed=1)
+    directory = tmp_path / "checkpoint"
+    _save_checkpoint(reference, directory, per_expert=False)
+    model, store = _offloaded_twin(reference, directory, 4096)
+    mx.eval(model(mx.array([[1, 2]])))
+    shard = str((directory / "model.safetensors").resolve())
+    worker = object.__new__(MetalWorker)
+    worker.model_runner = SimpleNamespace(model=model, _expert_store=store)
+    worker._metal_profiler = None
+    assert shard in {file.path for file in psutil.Process().open_files()}
+    worker.shutdown()
+    assert shard not in {file.path for file in psutil.Process().open_files()}
 
 
 class TestConfig:

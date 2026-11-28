@@ -10,6 +10,8 @@ list. Blocks sit under a ``.noindex`` directory so Spotlight skips them.
 from __future__ import annotations
 
 import collections
+import hashlib
+import json
 import os
 import shutil
 import stat
@@ -97,6 +99,18 @@ def layout_signature() -> str:
     return f"tq-{cfg.k_quant}-{cfg.v_quant}"
 
 
+def _weights_namespace(gguf_weights_path: str | None) -> str:
+    """Separate weights that upstream's mapper sees as the same companion model."""
+    if gguf_weights_path is None:
+        return "native"
+    path = os.path.realpath(gguf_weights_path, strict=True)
+    st = os.stat(path)
+    identity = json.dumps(
+        [path, st.st_dev, st.st_ino, st.st_size, st.st_ctime_ns]
+    ).encode()
+    return "gguf-" + hashlib.sha256(identity).hexdigest()
+
+
 class MetalFileSystemTierManager(FileSystemTierManager):
     """``FileSystemTierManager`` with a store cap and LRU eviction.
 
@@ -113,6 +127,8 @@ class MetalFileSystemTierManager(FileSystemTierManager):
         tier_type: str,
         root_dir: str,
         max_size_gib: float | None = None,
+        *,
+        gguf_weights_path: str | None = None,
         **kwargs,
     ) -> None:
         # The factory passes the class name; report "fs" like the CUDA path.
@@ -125,7 +141,11 @@ class MetalFileSystemTierManager(FileSystemTierManager):
         if store_dir != root_dir:
             logger.info("KV store blocks live under %s (Spotlight-excluded)", store_dir)
         super().__init__(
-            offloading_spec, primary_kv_view, tier_type, store_dir, **kwargs
+            offloading_spec,
+            primary_kv_view,
+            tier_type,
+            os.path.join(store_dir, _weights_namespace(gguf_weights_path)),
+            **kwargs,
         )
         # Scheduler-thread bookkeeping. Paths of in-flight jobs pin their files.
         # path -> (size, key); key is None if the path does not map back to one.

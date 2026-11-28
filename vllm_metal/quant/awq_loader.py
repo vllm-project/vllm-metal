@@ -51,7 +51,12 @@ class AWQQuantLoader:
 
     @classmethod
     def for_model(
-        cls, model_name: str, *, revision: str | None = None
+        cls,
+        model_name: str,
+        *,
+        revision: str | None = None,
+        token: str | bool | None = None,
+        cache_dir: str | None = None,
     ) -> AWQQuantLoader | None:
         """Detect AWQ in ``model_name``'s ``config.json`` (local dir or HF
         Hub) and return a configured loader. Returns ``None`` when the
@@ -67,7 +72,9 @@ class AWQQuantLoader:
             UnsupportedQuantizationConfigError: AWQ but outside v1 scope,
                 or GPTQ (not yet validated for vllm-metal).
         """
-        raw_qc = cls._read_raw_quantization_config(model_name, revision=revision)
+        raw_qc = cls._read_raw_quantization_config(
+            model_name, revision=revision, token=token, cache_dir=cache_dir
+        )
         if raw_qc is None:
             return None
         quant_method = raw_qc.get("quant_method")
@@ -81,7 +88,14 @@ class AWQQuantLoader:
             return None
         return cls(normalize_quant_config(raw_qc))
 
-    def load(self, model_path: str, *, revision: str | None = None) -> Any:
+    def load(
+        self,
+        model_path: str,
+        *,
+        revision: str | None = None,
+        token: str | bool | None = None,
+        cache_dir: str | None = None,
+    ) -> Any:
         """Run ``mlx_lm.utils.load_model`` with the normalized quant config.
 
         The model keeps the dtype mlx-lm loads it in, the checkpoint's
@@ -94,7 +108,9 @@ class AWQQuantLoader:
         the lifecycle resolves via ``_mlx_lm_compatible_model_path``; the
         owner does not duplicate that path discovery.
         """
-        resolved_path = resolve_mlx_lm_model_path(model_path, revision=revision)
+        resolved_path = resolve_mlx_lm_model_path(
+            model_path, revision=revision, token=token, cache_dir=cache_dir
+        )
         model, _ = mlx_lm_load_model(
             resolved_path, model_config=self._mlx_lm_model_config
         )
@@ -104,7 +120,11 @@ class AWQQuantLoader:
 
     @staticmethod
     def _read_raw_quantization_config(
-        model_name: str, *, revision: str | None = None
+        model_name: str,
+        *,
+        revision: str | None = None,
+        token: str | bool | None = None,
+        cache_dir: str | None = None,
     ) -> Mapping[str, Any] | None:
         """Read ``quantization_config`` from the model's ``config.json``
         without invoking ``mlx_lm.utils.load_model``. Returns ``None`` if the field is
@@ -132,7 +152,13 @@ class AWQQuantLoader:
                 return None
         else:
             config_path = Path(
-                hf_hub_download(model_name, "config.json", revision=revision)
+                hf_hub_download(
+                    model_name,
+                    "config.json",
+                    revision=revision,
+                    token=token,
+                    cache_dir=cache_dir,
+                )
             )
         with open(config_path, encoding="utf-8") as fid:
             config = json.load(fid)

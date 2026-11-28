@@ -31,6 +31,7 @@ from vllm_metal.multimodal.gemma4 import Gemma4VisionSidecar
 from vllm_metal.quant.awq_loader import AWQQuantLoader
 from vllm_metal.tensor_bridge import TORCH_TO_MLX_DTYPE
 from vllm_metal.utils import get_model_download_path, resolve_mlx_lm_model_path
+from vllm_metal.v1.cache_policy import uses_metal_offloading
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPAssistantLoader
 from vllm_metal.v1.mlx_lm_paths import (
     mlx_lm_compatible_model_path as _mlx_lm_compatible_model_path,
@@ -212,6 +213,17 @@ class ModelLifecycle:
         ):
             loaded_model = self._load_generation(request)
 
+        # The uni executor loads the weights before constructing its disk tiers.
+        # A Hub GGUF selector has resolved to the exact file used by the loader.
+        config = self._runner.vllm_config
+        if uses_metal_offloading(config):
+            assert config.kv_transfer_config is not None
+            extra = config.kv_transfer_config.kv_connector_extra_config
+            for tier in extra.get("secondary_tiers") or ():
+                tier["gguf_weights_path"] = (
+                    request.gguf_source.weights_path if request.gguf_source else None
+                )
+
         self._install_generation_model(loaded_model, request)
 
         # Runtime extensions may depend on dimensions derived from model_args.
@@ -389,7 +401,12 @@ class ModelLifecycle:
         awq_loader = (
             None
             if is_gguf or use_mlx_vlm
-            else AWQQuantLoader.for_model(model_name, revision=revision)
+            else AWQQuantLoader.for_model(
+                model_name,
+                revision=revision,
+                token=model_config.hf_token,
+                cache_dir=self._runner.vllm_config.load_config.download_dir,
+            )
         )
 
         expert_cache_bytes = get_config().moe_expert_cache_bytes
@@ -416,18 +433,26 @@ class ModelLifecycle:
 
         elif awq_loader is not None:
             load_label = "AWQ model"
-            model = self._load_awq_text_model(model_name, awq_loader, revision=revision)
+            model = self._load_awq_text_model(
+                model_name,
+                awq_loader,
+                revision=revision,
+                token=model_config.hf_token,
+                cache_dir=self._runner.vllm_config.load_config.download_dir,
+            )
 
         else:
             load_label = "MLX-LM model"
             model = self._load_mlx_lm_text_model(
                 model_name,
                 lazy=lazy_weights or bool(expert_cache_bytes),
+                token=model_config.hf_token,
+                cache_dir=self._runner.vllm_config.load_config.download_dir,
                 revision=revision,
             )
             if expert_cache_bytes:
                 self._runner._expert_store = ExpertStore.install(
-                    model, model_name, revision, expert_cache_bytes
+                    model, str(self._resolved_model_path), revision, expert_cache_bytes
                 )
 
         loaded_from = (
@@ -462,9 +487,16 @@ class ModelLifecycle:
         awq_loader: AWQQuantLoader,
         *,
         revision: str | None = None,
+        token: str | bool | None = None,
+        cache_dir: str | None = None,
     ) -> Any:
         with _mlx_lm_compatible_model_path(model_name) as compatible_model_name:
-            return awq_loader.load(str(compatible_model_name), revision=revision)
+            return awq_loader.load(
+                str(compatible_model_name),
+                revision=revision,
+                token=token,
+                cache_dir=cache_dir,
+            )
 
     def _load_mlx_lm_text_model(
         self,
@@ -472,8 +504,12 @@ class ModelLifecycle:
         *,
         lazy: bool = False,
         revision: str | None = None,
+        token: str | bool | None = None,
+        cache_dir: str | None = None,
     ) -> Any:
-        model_path = resolve_mlx_lm_model_path(model_name, revision=revision)
+        model_path = resolve_mlx_lm_model_path(
+            model_name, revision=revision, token=token, cache_dir=cache_dir
+        )
         # Pooling backends read checkpoint files next to the weights
         # (d3's readout), so remember the directory the loader actually used:
         # re-resolving it from the config string needs the Hub and rejects any

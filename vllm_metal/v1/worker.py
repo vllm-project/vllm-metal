@@ -496,6 +496,9 @@ class MetalWorker(WorkerBase):
             self._metal_profiler = None
 
         if hasattr(self, "model_runner") and self.model_runner is not None:
+            expert_store = getattr(self.model_runner, "_expert_store", None)
+            if expert_store is not None:
+                expert_store.close()
             del self.model_runner
             self.model_runner = None
 

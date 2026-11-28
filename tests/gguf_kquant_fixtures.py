@@ -159,16 +159,18 @@ def build_iq4_blocks(
     return blocks.reshape(rows, -1)
 
 
-def build_iq3s_blocks(rows: int, cols: int, seed: int = 0) -> np.ndarray:
-    """Build valid random IQ3_S superblocks, one byte row per row."""
-    block_elems, block_bytes = gguf.GGML_QUANT_SIZES[QT.IQ3_S]
+def build_iq3_blocks(
+    rows: int, cols: int, qtype: gguf.GGMLQuantizationType, seed: int = 0
+) -> np.ndarray:
+    """Build valid random IQ3_S/IQ3_XXS superblocks, one byte row per row."""
+    block_elems, block_bytes = gguf.GGML_QUANT_SIZES[qtype]
     if cols % block_elems:
         raise ValueError(
-            f"IQ3_S rows need a multiple of {block_elems} columns, got {cols}"
+            f"{qtype.name} rows need a multiple of {block_elems} columns, got {cols}"
         )
     rng = np.random.default_rng(seed)
     n = rows * (cols // block_elems)
     d = rng.uniform(2**-10, 2**-4, (n, 1)).astype(np.float16)
-    # Every grid index, sign bit and scale nibble is valid, so the rest is random.
+    # Every grid index, sign and scale field is valid, so the rest is random.
     rest = rng.integers(0, 256, (n, block_bytes - 2), dtype=np.uint8)
     return np.concatenate([d.view(np.uint8), rest], axis=1).reshape(rows, -1)
