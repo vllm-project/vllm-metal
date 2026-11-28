@@ -876,6 +876,49 @@ def test_remote_load_source_rejects_unsupported_family_before_download(
     )
 
 
+def test_remote_load_source_rejects_gemma4_moe_before_download(
+    tmp_path, monkeypatch
+) -> None:
+    # 26B-A4B shares the gemma4 arch and model_type with the dense checkpoints;
+    # only its text_config marks the MoE, which preflight rejects after download.
+    def fail_hub(*_: object, **__: object) -> None:
+        raise AssertionError("an MoE config must not reach the weights repo")
+
+    monkeypatch.setattr(gguf_source, "HfApi", fail_hub)
+    monkeypatch.setattr(gguf_source, "snapshot_download", fail_hub)
+    config = {
+        "model_type": "gemma4",
+        "architectures": ["Gemma4ForConditionalGeneration"],
+        "text_config": {**_TINY_CONFIG, "enable_moe_block": True},
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    model_config = _engine_args(
+        model="org/gemma-4-26B-A4B-it-GGUF:Q4_0", tokenizer=str(tmp_path)
+    ).create_model_config()
+
+    with pytest.raises(GGUFLoadError) as excinfo:
+        gguf_source.GGUFLoadSource.from_model_config(model_config)
+
+    assert str(excinfo.value) == (
+        "Config enable_moe_block=true marks an MoE 'gemma4' checkpoint; the GGUF "
+        "loader supports 'gemma4' dense checkpoints only."
+    )
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"model_type": "gemma4", "text_config": {"enable_moe_block": False}},
+        {"model_type": "gemma4_unified", "text_config": {}},
+        {"model_type": "qwen3_moe", "enable_moe_block": True},
+    ],
+    ids=["gemma4-dense", "gemma4-unified", "flag-other-arch"],
+)
+def test_validate_config_admits_dense_gemma4(config) -> None:
+    # Only an arch that names an MoE flag reads it.
+    GGUFModelAdapter.validate_config(config)
+
+
 def test_remote_load_source_rejects_missing_config_before_download(
     tmp_path, monkeypatch
 ) -> None:

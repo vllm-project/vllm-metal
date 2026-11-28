@@ -1,10 +1,10 @@
 # GGUF
 
-vllm-metal supports dense decoder (including Gemma 3), Qwen3 MoE, and Qwen3.5
-GGUF checkpoints through the MLX runtime. A GGUF file carries weights only, so
-it needs a Hugging Face config and tokenizer source. That source can be a
-quantized checkpoint, such as an mlx-community 4-bit, FP8, or AWQ repository;
-vllm-metal reads only its config and tokenizer.
+vllm-metal supports dense decoder (including Gemma 3 and Gemma 4), Qwen3 MoE,
+and Qwen3.5 GGUF checkpoints through the MLX runtime. A GGUF file carries
+weights only, so it needs a Hugging Face config and tokenizer source. That
+source can be a quantized checkpoint, such as an mlx-community 4-bit, FP8, or
+AWQ repository; vllm-metal reads only its config and tokenizer.
 
 ## Local weights
 
@@ -47,9 +47,13 @@ missing, ambiguous, or shard-only matches also fail before model load.
 ## Current scope
 
 - Supported model families: Qwen2, Qwen3, Qwen3 MoE (`qwen3moe`), Llama,
-  Mistral, Qwen3.5 (`qwen35`), and Gemma 3 (`gemma3`).
+  Mistral, Qwen3.5 (`qwen35`), Gemma 3 (`gemma3`), and dense Gemma 4
+  (`gemma4`).
 - Gemma 3 serves text only. Point `--tokenizer` at the 1B text config or a 4B+
   `Gemma3ForConditionalGeneration` repository, such as `google/gemma-3-4b-it`.
+- Gemma 4 serves text only, for the dense E2B, E4B, 12B and 31B checkpoints.
+  Point `--tokenizer` at the original repository, such as
+  `google/gemma-4-E2B-it`. The 26B-A4B MoE checkpoint is not supported.
 - Qwen3.5 serves text only and images are refused. Point `--tokenizer` at the
   `Qwen3_5ForConditionalGeneration` repository, such as `Qwen/Qwen3.5-9B`.
   vllm-metal does not load `mmproj` files. Files that embed a
