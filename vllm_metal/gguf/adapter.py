@@ -93,6 +93,10 @@ class GGUFArchSpec:
     appended_mtp_blocks: bool = False
     # token_embd cut to the tokenizer's tokens, so config vocab_size can exceed it.
     trimmed_vocab: bool = False
+    # Layers that reuse an earlier layer's K/V, whose own K/V the file may keep.
+    kv_shared_layers: bool = False
+    # Config flag marking an MoE variant that shares this arch and model_type.
+    moe_config_flag: str | None = None
 
 
 class GGUFModelAdapter:
@@ -133,6 +137,15 @@ class GGUFModelAdapter:
             },
             global_transforms={"output_norm.weight": _ShiftedByOne()},
             trimmed_vocab=True,
+        ),
+        # Dense Gemma 4 (E2B, E4B, 12B, 31B). Its norms are stored as is, and the
+        # 12B's gemma4_unified config converts here too. llama.cpp names the
+        # per-layer scalar ``layer_scalar.weight``; mlx-lm's has no ``.weight``.
+        "gemma4": GGUFArchSpec(
+            config_model_types=frozenset({"gemma4_unified"}),
+            param_aliases={"layer_scalar": "layer_scalar.weight"},
+            kv_shared_layers=True,
+            moe_config_flag="enable_moe_block",
         ),
         "qwen3moe": GGUFArchSpec(
             config_model_types=frozenset({"qwen3_moe"}),
@@ -231,13 +244,25 @@ class GGUFModelAdapter:
         return arch
 
     @classmethod
-    def validate_config_model_type(cls, config_model_type: str) -> None:
-        """Reject a config family that :meth:`resolve_arch` rejects for every .gguf."""
+    def validate_config(cls, config: Mapping[str, Any]) -> None:
+        """Reject a config the loader rejects for every .gguf, before a download."""
+        config_model_type = str(config.get("model_type", ""))
         config_arch = cls._config_model_type_to_gguf_arch(config_model_type)
         if config_arch not in cls.SUPPORTED_ARCHS:
             raise GGUFLoadError(
                 f"Config model_type {config_model_type!r} is not supported; the "
                 f"GGUF loader supports {sorted(cls.SUPPORTED_ARCHS)}."
+            )
+        # The MoE files of a dense arch fail preflight on their expert tensors.
+        flag = cls._ARCH_SPECS[config_arch].moe_config_flag
+        text_config = config.get("text_config")
+        if flag is not None and (
+            config.get(flag)
+            or (isinstance(text_config, Mapping) and text_config.get(flag))
+        ):
+            raise GGUFLoadError(
+                f"Config {flag}=true marks an MoE {config_arch!r} checkpoint; the "
+                f"GGUF loader supports {config_arch!r} dense checkpoints only."
             )
 
     @classmethod
@@ -337,6 +362,9 @@ class GGUFModelAdapter:
             for name in cls._nextn_block_names(
                 gguf, arch_enum, num_hidden_layers, nextn_predict_layers
             ):
+                translation_map[name] = None
+        if spec.kv_shared_layers:
+            for name in cls._kv_shared_layer_names(model):
                 translation_map[name] = None
         v_head_rows, v_head_columns = (
             cls._build_v_head_index(model) if spec.tiled_v_heads else ({}, {})
@@ -440,6 +468,20 @@ class GGUFModelAdapter:
             )
             for kind in kinds
             if "{bid}" in gguf.TENSOR_NAMES[kind]
+        ]
+
+    @staticmethod
+    def _kv_shared_layer_names(model: nn.Module) -> list[str]:
+        """GGUF K/V tensors of the layers that reuse an earlier layer's K/V.
+
+        llama.cpp's converter keeps them though nothing reads them; mlx-lm builds
+        no K/V module for these layers and its own ``sanitize`` drops them.
+        """
+        return [
+            f"blk.{i}.{tensor}"
+            for i, layer in enumerate(model.model.layers)
+            if not layer.self_attn.has_kv
+            for tensor in ("attn_k.weight", "attn_v.weight", "attn_k_norm.weight")
         ]
 
     @staticmethod

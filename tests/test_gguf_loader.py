@@ -597,7 +597,7 @@ def test_resolve_arch_rejects_unsupported_gguf_archs(gguf_arch, config_model_typ
 
     assert str(unsupported.value) == (
         f"Architecture {gguf_arch!r} is not supported; the GGUF loader supports "
-        "['gemma3', 'llama', 'qwen2', 'qwen3', 'qwen35', 'qwen3moe']."
+        "['gemma3', 'gemma4', 'llama', 'qwen2', 'qwen3', 'qwen35', 'qwen3moe']."
     )
 
 
@@ -2061,3 +2061,267 @@ def test_truncated_header_raises_gguf_load_error(tmp_path, cut):
 
     with pytest.raises(GGUFLoadError, match="Could not read GGUF file"):
         GGUFModelLoader(truncated, config_dir=cfg_dir, target_dtype=mx.float32).load()
+
+
+# --- gemma4 -----------------------------------------------------------------
+
+_GEMMA4_ROPE = {
+    "full_attention": {
+        "partial_rotary_factor": 0.25,
+        "rope_theta": 1000000.0,
+        "rope_type": "proportional",
+    },
+    "sliding_attention": {"rope_theta": 10000.0, "rope_type": "default"},
+}
+_GEMMA4_TEXT_BASE = {
+    "hidden_size": 64,
+    "intermediate_size": 64,
+    "num_attention_heads": 2,
+    "head_dim": 32,
+    "global_head_dim": 64,
+    "vocab_size": 256,
+    "vocab_size_per_layer_input": 256,
+    "rms_norm_eps": 1e-6,
+    "sliding_window": 4,
+    "max_position_embeddings": 512,
+    "final_logit_softcapping": 30.0,
+    "rope_parameters": _GEMMA4_ROPE,
+    "tie_word_embeddings": True,
+}
+_SLIDING, _FULL = "sliding_attention", "full_attention"
+# E2B/E4B layout: per-layer embeddings, and the last layers reuse earlier K/V
+# (no k/v projections of their own) with a double-wide MLP.
+_GEMMA4_PER_LAYER_CONFIG = {
+    "model_type": "gemma4",
+    "architectures": ["Gemma4ForConditionalGeneration"],
+    "text_config": {
+        **_GEMMA4_TEXT_BASE,
+        "model_type": "gemma4_text",
+        "num_hidden_layers": 6,
+        "num_key_value_heads": 1,
+        "hidden_size_per_layer_input": 32,
+        "num_kv_shared_layers": 2,
+        "use_double_wide_mlp": True,
+        "attention_k_eq_v": False,
+        "layer_types": [_SLIDING, _SLIDING, _FULL, _SLIDING, _SLIDING, _FULL],
+    },
+}
+# 31B layout: full-attention layers reuse K as V, with their own KV head count.
+_GEMMA4_K_EQ_V_CONFIG = {
+    "model_type": "gemma4",
+    "architectures": ["Gemma4ForConditionalGeneration"],
+    "text_config": {
+        **_GEMMA4_TEXT_BASE,
+        "model_type": "gemma4_text",
+        "num_hidden_layers": 4,
+        "num_key_value_heads": 2,
+        "num_global_key_value_heads": 1,
+        "hidden_size_per_layer_input": 0,
+        "num_kv_shared_layers": 0,
+        "use_double_wide_mlp": False,
+        "attention_k_eq_v": True,
+        "layer_types": [_SLIDING, _SLIDING, _SLIDING, _FULL],
+    },
+}
+# The 12B has the 31B layout under a gemma4_unified config.
+_GEMMA4_UNIFIED_CONFIG = {
+    "model_type": "gemma4_unified",
+    "architectures": ["Gemma4UnifiedForConditionalGeneration"],
+    "text_config": {
+        **_GEMMA4_K_EQ_V_CONFIG["text_config"],
+        "model_type": "gemma4_unified_text",
+    },
+}
+
+# GGUF tensor (after ``blk.N.``) -> mlx-lm parameter (after ``layers.N.``).
+_GEMMA4_LAYER_TENSORS = {
+    "attn_norm.weight": "input_layernorm.weight",
+    "attn_q.weight": "self_attn.q_proj.weight",
+    "attn_k.weight": "self_attn.k_proj.weight",
+    "attn_v.weight": "self_attn.v_proj.weight",
+    "attn_output.weight": "self_attn.o_proj.weight",
+    "attn_q_norm.weight": "self_attn.q_norm.weight",
+    "attn_k_norm.weight": "self_attn.k_norm.weight",
+    "post_attention_norm.weight": "post_attention_layernorm.weight",
+    "ffn_norm.weight": "pre_feedforward_layernorm.weight",
+    "ffn_gate.weight": "mlp.gate_proj.weight",
+    "ffn_up.weight": "mlp.up_proj.weight",
+    "ffn_down.weight": "mlp.down_proj.weight",
+    "post_ffw_norm.weight": "post_feedforward_layernorm.weight",
+    "inp_gate.weight": "per_layer_input_gate.weight",
+    "proj.weight": "per_layer_projection.weight",
+    "post_norm.weight": "post_per_layer_input_norm.weight",
+    # llama.cpp appends ``.weight`` to the per-layer scalar before naming it.
+    "layer_output_scale.weight": "layer_scalar",
+}
+# Gemma 4 ties its head, so llama.cpp writes no output.weight.
+_GEMMA4_GLOBAL_TENSORS = {
+    "token_embd.weight": "model.embed_tokens.weight",
+    "output_norm.weight": "model.norm.weight",
+    "per_layer_token_embd.weight": "model.embed_tokens_per_layer.weight",
+    "per_layer_model_proj.weight": "model.per_layer_model_projection.weight",
+    "per_layer_proj_norm.weight": "model.per_layer_projection_norm.weight",
+}
+_GEMMA4_LIVE_TO_GGUF_LAYER = {
+    live: kind for kind, live in _GEMMA4_LAYER_TENSORS.items()
+}
+_GEMMA4_LIVE_TO_GGUF_GLOBAL = {
+    live: name for name, live in _GEMMA4_GLOBAL_TENSORS.items()
+}
+
+
+def _gemma4_gguf_name(param_path: str) -> str:
+    """Live mlx-lm parameter path -> the GGUF tensor llama.cpp writes for it."""
+    param_path = param_path.removeprefix("language_model.")
+    if not param_path.startswith("model.layers."):
+        return _GEMMA4_LIVE_TO_GGUF_GLOBAL[param_path]
+    _, _, layer, leaf = param_path.split(".", 3)
+    return f"blk.{layer}.{_GEMMA4_LIVE_TO_GGUF_LAYER[leaf]}"
+
+
+def _is_gemma4_plain(gguf_name: str) -> bool:
+    """llama.cpp keeps norms and the per-layer scalar in F32."""
+    return gguf_name.endswith(("norm.weight", "layer_output_scale.weight"))
+
+
+def _build_gemma4_fixture(
+    tmp_path: Path, config: dict, *, quant_type, inject: dict | None = None
+) -> tuple[str, str, dict[str, np.ndarray]]:
+    """Write a tiny Gemma 4 config and the GGUF llama.cpp converts it to.
+
+    Norms are stored as is, and llama.cpp adds a ``rope_freqs`` tensor for the
+    full-attention RoPE. Returns ``(gguf_path, config_dir, hf)``; ``hf`` maps each
+    GGUF name to its source value.
+    """
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    skeleton, _ = mlx_lm_utils.load_model(tmp_path, lazy=True, strict=False)
+    rng = np.random.default_rng(0)
+    hf = {}
+    for path, param in tree_flatten(skeleton.parameters()):
+        shape = tuple(param.shape)
+        value = rng.standard_normal(shape)
+        if _is_gemma4_plain(_gemma4_gguf_name(path)):
+            value = 1 + 0.1 * value
+        elif "embed_tokens" not in path:
+            value = value / np.sqrt(shape[1])
+        hf[_gemma4_gguf_name(path)] = value.astype(np.float32)
+    specs = {
+        name: ("f" if _is_gemma4_plain(name) else "q", value.shape)
+        for name, value in hf.items()
+    }
+    text = config["text_config"]
+    rope_dims = text["global_head_dim"] // 2
+    rotated = int(rope_dims * _GEMMA4_ROPE["full_attention"]["partial_rotary_factor"])
+    rope_freqs = np.array([1.0] * rotated + [1e30] * (rope_dims - rotated))
+    specs["rope_freqs.weight"] = ("f", rope_freqs.shape)
+    values = {**hf, "rope_freqs.weight": rope_freqs.astype(np.float32)}
+    gguf_path = tmp_path / "gemma4.gguf"
+    _write_gguf(
+        gguf_path, "gemma4", specs, quant_type=quant_type, values=values, inject=inject
+    )
+    return str(gguf_path), str(tmp_path), hf
+
+
+def _gemma4_source_model(cfg_dir: str, hf: dict[str, np.ndarray]) -> nn.Module:
+    """The dense mlx-lm model the fixture's GGUF was converted from."""
+    model, _ = mlx_lm_utils.load_model(Path(cfg_dir), lazy=True, strict=False)
+    params = [path for path, _ in tree_flatten(model.parameters())]
+    model.load_weights(
+        [(path, mx.array(hf[_gemma4_gguf_name(path)])) for path in params]
+    )
+    model.eval()
+    return model
+
+
+_GEMMA4_LAYOUTS = [
+    pytest.param(_GEMMA4_PER_LAYER_CONFIG, id="per-layer-embeddings"),
+    pytest.param(_GEMMA4_K_EQ_V_CONFIG, id="k-eq-v"),
+    pytest.param(_GEMMA4_UNIFIED_CONFIG, id="unified"),
+]
+
+
+@pytest.mark.parametrize("config", _GEMMA4_LAYOUTS)
+def test_gemma4_loads_the_model_it_was_converted_from(tmp_path, config):
+    # The norms load as stored, layer_output_scale.weight fills layer_scalar,
+    # rope_freqs is skipped, and the 12B's gemma4_unified config pairs with the
+    # gemma4 arch, so a plain file loads back exactly.
+    gguf_path, cfg_dir, hf = _build_gemma4_fixture(tmp_path, config, quant_type=QT.F32)
+    tokens = mx.array([[1, 2, 3, 4, 5, 6, 7, 8]])
+    expected = np.array(_gemma4_source_model(cfg_dir, hf)(tokens))
+
+    model = GGUFModelLoader(
+        gguf_path, config_dir=cfg_dir, target_dtype=mx.float32
+    ).load()
+    logits = np.array(model(tokens))
+
+    np.testing.assert_allclose(
+        logits, expected, rtol=0, atol=float(np.abs(expected).max()) * 1e-6
+    )
+
+
+def test_gemma4_skips_the_kv_of_kv_shared_layers(tmp_path):
+    # llama.cpp's BF16 E2B/E4B exports keep the K/V of the layers that reuse an
+    # earlier layer's K/V (here layers 4 and 5); nothing reads them.
+    text = _GEMMA4_PER_LAYER_CONFIG["text_config"]
+    layers = text["num_hidden_layers"]
+    shared = range(layers - text["num_kv_shared_layers"], layers)
+    inject = {}
+    for i in shared:
+        full = text["layer_types"][i] == _FULL
+        head_dim = text["global_head_dim"] if full else text["head_dim"]
+        rows = text["num_key_value_heads"] * head_dim
+        inject[f"blk.{i}.attn_k.weight"] = ("f", (rows, text["hidden_size"]))
+        inject[f"blk.{i}.attn_v.weight"] = ("f", (rows, text["hidden_size"]))
+        inject[f"blk.{i}.attn_k_norm.weight"] = ("f", (head_dim,))
+    gguf_path, cfg_dir, hf = _build_gemma4_fixture(
+        tmp_path, _GEMMA4_PER_LAYER_CONFIG, quant_type=QT.F32, inject=inject
+    )
+    tokens = mx.array([[1, 2, 3, 4, 5, 6, 7, 8]])
+    expected = np.array(_gemma4_source_model(cfg_dir, hf)(tokens))
+
+    model = GGUFModelLoader(
+        gguf_path, config_dir=cfg_dir, target_dtype=mx.float32
+    ).load()
+    logits = np.array(model(tokens))
+
+    np.testing.assert_allclose(
+        logits, expected, rtol=0, atol=float(np.abs(expected).max()) * 1e-6
+    )
+
+
+@pytest.mark.parametrize("config", _GEMMA4_LAYOUTS)
+def test_gemma4_quantized_file_loads_source_scalars_and_norms(tmp_path, config):
+    # llama.cpp's exports keep the norms and layer scalars plain next to
+    # quantized weights.
+    gguf_path, cfg_dir, hf = _build_gemma4_fixture(tmp_path, config, quant_type=QT.Q8_0)
+
+    model = GGUFModelLoader(
+        gguf_path, config_dir=cfg_dir, target_dtype=mx.float32
+    ).load()
+
+    plain = [
+        (path, value)
+        for path, value in tree_flatten(model.parameters())
+        if _is_gemma4_plain(_gemma4_gguf_name(path))
+    ]
+    layers = config["text_config"]["num_hidden_layers"]
+    assert sum(path.endswith("layer_scalar") for path, _ in plain) == layers
+    for path, value in plain:
+        np.testing.assert_allclose(
+            np.array(value), hf[_gemma4_gguf_name(path)], rtol=0, atol=1e-6
+        )
+
+
+@pytest.mark.parametrize("router", ["ffn_gate_inp.weight", "ffn_down_exps.weight"])
+def test_gemma4_rejects_moe_file(tmp_path, router):
+    # 26B-A4B converts under gemma4 with a gemma4 config too; its expert and
+    # router tensors stay out of scope.
+    gguf_path, cfg_dir, _ = _build_gemma4_fixture(
+        tmp_path,
+        _GEMMA4_K_EQ_V_CONFIG,
+        quant_type=QT.F32,
+        inject={f"blk.0.{router}": ("f", (4, 64))},
+    )
+
+    with pytest.raises(GGUFLoadError, match=f"blk.0.{router}"):
+        GGUFModelLoader(gguf_path, config_dir=cfg_dir, target_dtype=mx.float32).load()
