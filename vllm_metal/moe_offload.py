@@ -37,6 +37,8 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
+ExpertWeights = dict[str, dict[str, mx.array]]
+
 
 @dataclass(frozen=True, slots=True)
 class TensorLocation:
@@ -85,12 +87,10 @@ class ExpertStore:
     ) -> None:
         self._index = index
         self._cache_bytes = cache_bytes
-        # A forward stacks the experts it touches on top of the cache, and a
-        # long prefill touches nearly every expert of a layer.
-        self.reserved_bytes = cache_bytes + stack_bytes
-        self._entries: OrderedDict[tuple[str, int], dict[str, dict[str, mx.array]]] = (
-            OrderedDict()
-        )
+        # A prefill can need every expert in one layer. The input slices
+        # survive eviction until MLX materializes their stacked projections.
+        self.reserved_bytes = max(cache_bytes, stack_bytes) + stack_bytes
+        self._entries: OrderedDict[tuple[str, int], ExpertWeights] = OrderedDict()
         # Opened up front: reads run on pool threads.
         with ExitStack() as resources:
             self._handles = {
@@ -147,12 +147,14 @@ class ExpertStore:
         )
         return store
 
-    def get(
-        self, module_path: str, experts: Iterable[int]
-    ) -> list[dict[str, dict[str, mx.array]]]:
+    def get(self, module_path: str, experts: Iterable[int]) -> list[ExpertWeights]:
         """Return ``{projection: {component: array}}`` per expert, in order."""
         experts = list(experts)
-        missing = [e for e in experts if (module_path, e) not in self._entries]
+        missing: dict[int, ExpertWeights] = {
+            expert: {p: {} for p in self.PROJECTIONS}
+            for expert in experts
+            if (module_path, expert) not in self._entries
+        }
         jobs = [
             (expert, projection, component, piece)
             for expert in missing
@@ -166,19 +168,24 @@ class ExpertStore:
             is not None
         ]
         # Reads run in parallel; arrays are created on the calling thread.
-        raws = list(self._pool.map(lambda job: self._read(job[3]), jobs))
+        raws = self._pool.map(lambda job: self._read(job[3]), jobs)
+        bytes_read = 0
         for (expert, projection, component, piece), raw in zip(jobs, raws, strict=True):
-            entry = self._entries.setdefault(
-                (module_path, expert), {p: {} for p in self.PROJECTIONS}
-            )
-            entry[projection][component] = self._to_array(piece, raw)
-            self.bytes += len(raw)
+            missing[expert][projection][component] = self._to_array(piece, raw)
+            bytes_read += len(raw)
+        # Publish only complete reads so a failed batch can be retried.
+        for expert, entry in missing.items():
+            self._entries[(module_path, expert)] = entry
+        self.bytes += bytes_read
         self.misses += len(missing)
         self.hits += len(experts) - len(missing)
+        batch = []
         for expert in experts:
-            self._entries.move_to_end((module_path, expert))
-        self._evict(keep=len(experts))
-        return [self._entries[(module_path, expert)] for expert in experts]
+            key = (module_path, expert)
+            batch.append(self._entries[key])
+            self._entries.move_to_end(key)
+        self._evict()
+        return batch
 
     def close(self) -> None:
         """Wait for pending reads and close all checkpoint files."""
@@ -194,10 +201,8 @@ class ExpertStore:
             self._handles[piece.location.path].fileno(), piece.nbytes, piece.offset
         )
 
-    def _evict(self, *, keep: int) -> None:
-        # The experts of the current call stay cached even when they alone
-        # exceed the budget; the layer needs all of them at once.
-        while self.bytes > self._cache_bytes and len(self._entries) > keep:
+    def _evict(self) -> None:
+        while self.bytes > self._cache_bytes:
             _, entry = self._entries.popitem(last=False)
             self.bytes -= sum(
                 array.nbytes

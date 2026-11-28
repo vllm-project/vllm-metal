@@ -980,8 +980,8 @@ class WorkerCachePlanner:
                     workspace / 2**20,
                 )
         if get_config().moe_expert_cache_bytes:
-            # Experts stream in after profiling: the cache plus one layer of
-            # experts stacked for a forward.
+            # The expert store budgets cached weights and the working set
+            # needed to assemble one layer after profiling.
             expert_bytes = self._worker.model_runner.moe_expert_reserved_bytes
             overhead += expert_bytes
             future_reserved_bytes += expert_bytes
