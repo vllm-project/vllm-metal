@@ -3,6 +3,7 @@
 """MPS request mapping, cache sizing and normalization parity."""
 
 import mmap
+import os
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -811,6 +812,49 @@ def test_mrope_positions_preserve_ragged_prefill_and_decode():
         [81, 82, 11, 12, 13, 0, -1],
         [89, 90, 11, 12, 13, 0, -1],
     ]
+
+
+@pytest.mark.slow
+def test_lfm3_streaming_codec_flushes_complete_waveform():
+    pytest.importorskip("vllm_omni")
+    from vllm_omni.model_executor.models.lfm3_omni.code2wav import Lfm3OmniCode2Wav
+
+    checkpoint = os.environ.get("LFM3_OMNI_TEST_MODEL")
+    if not checkpoint:
+        pytest.skip("Requires local LFM3-Omni checkpoint code and audio_tokenizer/")
+
+    config = SimpleNamespace(
+        model=checkpoint,
+        trust_remote_code=True,
+        revision=None,
+        code_revision=None,
+        async_chunk=False,
+    )
+    with torch.inference_mode(), torch.device("mps"):
+        stage = Lfm3OmniCode2Wav(vllm_config=SimpleNamespace(model_config=config))
+        codes = torch.arange(stage.codec.config.n_q * 12).reshape(1, -1, 12)
+
+        def decode(chunk, finished):
+            payload = {
+                "req_id": "speech",
+                "codes": {"audio": chunk},
+                "meta": {"stream_finished": finished},
+            }
+            return stage(runtime_additional_information=[payload]).multimodal_outputs[
+                "model_outputs"
+            ][0]
+
+        reference = decode(codes, True)
+        config.async_chunk = True
+        streamed = torch.cat(
+            [decode(codes[..., :6], False), decode(codes[..., 6:], True)]
+        )
+        assert (
+            streamed.shape
+            == reference.shape
+            == (12 * stage.codec.config.frame_samples,)
+        )
+        assert torch.nn.functional.cosine_similarity(streamed, reference, dim=0) > 0.99
 
 
 def test_omni_repetition_penalty_matches_upstream_torch():
