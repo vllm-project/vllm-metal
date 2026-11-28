@@ -53,7 +53,7 @@ Transcribe audio to text.
 | `model` | string | `"whisper"` | Model identifier |
 | `language` | string | `null` | ISO 639-1 language code (e.g. `en`, `zh`) |
 | `prompt` | string | `null` | Guide transcription (e.g. proper nouns) |
-| `response_format` | string | `"json"` | `json`, `text`, or `verbose_json` |
+| `response_format` | string | `"json"` | `json` or `text` on MLX |
 | `temperature` | float | `0.0` | Sampling temperature; `0` decodes greedily |
 | `top_p` / `top_k` / `min_p` | float / int / float | disabled | Restrict the candidate tokens sampled at each step |
 | `seed` | int | `null` | Makes a sampled transcription reproducible |
@@ -74,13 +74,6 @@ Translate audio to English. Same parameters as transcriptions (except `language`
 {"text": "Hello, world."}
 ```
 
-**`verbose_json`**:
-```json
-{
-  "text": "Hello, world.",
-  "language": "en",
-  "duration": 2.5
-}
-```
-
 **`text`**: Plain text output.
+
+Whisper on MLX currently returns HTTP 500 for `verbose_json`. The speech handler needs token log probabilities to build transcription segments. [Tracking issue](https://github.com/vllm-project/vllm-metal/issues/1421)
