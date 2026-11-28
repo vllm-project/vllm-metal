@@ -27,6 +27,7 @@ from vllm_metal import envs
 
 if TYPE_CHECKING:
     from vllm_metal.attention.impls.mla import MLAForwardMetadata
+    from vllm_metal.attention.nax_split import NaxTileWork
 
 # ---------------------------------------------------------------------------
 # Global context (thread-local)
@@ -155,9 +156,8 @@ class PagedAttentionContext:
     paged_native_capabilities: dict[str, bool] | None = None
     # Immutable native length statistics, shared by all KV groups/layers.
     gqa_length_plan: Any = None
-    # NAX tile counts keyed by (sliding window, first sequence), so whole
-    # batches and prefill subsets are shared only by matching layers.
-    nax_tile_work: Any = None
+    # Per-window whole-batch and optional prefill-suffix counts for this forward.
+    nax_tile_work: dict[int, tuple[NaxTileWork, NaxTileWork | None]] | None = None
     # Per-row Llama 4 query scale memo keyed by (beta, original_max); every
     # scaled layer of this forward shares it (``impls.sdpa.llama4_query_scale``).
     llama4_query_scales: dict[tuple[float, int], Any] = field(default_factory=dict)

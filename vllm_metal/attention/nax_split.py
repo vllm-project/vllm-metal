@@ -50,24 +50,40 @@ def _tiles(kv_end: int) -> int:
 def nax_tile_work(
     cu_seqlens: Sequence[int], kv_lens: Sequence[int], sliding_window: int = -1
 ) -> NaxTileWork:
-    """Count the KV tiles the NAX kernel visits for full and partial Q blocks.
+    """Count tiles for one view using its CPU query and KV lengths."""
+    return nax_tile_work_views(cu_seqlens, kv_lens, sliding_window)[0]
 
-    ``cu_seqlens`` are cumulative query rows and ``kv_lens`` each sequence's
-    KV length including this step's tokens (``PagedAttentionContext``).
-    Causal tiles past a block's last row are skipped, and with
-    ``sliding_window >= 0`` so are the tiles before the block's first row's
-    window, mirroring ``kb_start`` / ``kb_end`` in ``pagedattention_nax.metal``.
+
+def nax_tile_work_views(
+    cu_seqlens: Sequence[int],
+    kv_lens: Sequence[int],
+    sliding_window: int = -1,
+    *,
+    prefill_start: int | None = None,
+) -> tuple[NaxTileWork, NaxTileWork | None]:
+    """Count the whole batch and an optional proper prefill suffix in one pass.
+
+    Each sequence contributes independently. Restart the counters at the
+    decode/prefill boundary so the prefill rows are only visited once.
+    With no boundary, only the whole-batch count is needed.
     """
     if len(cu_seqlens) != len(kv_lens) + 1:
         raise ValueError("cu_seqlens must have one more entry than kv_lens")
+
+    if prefill_start is not None and not 0 < prefill_start < len(kv_lens):
+        raise ValueError("prefill_start must identify a nonempty suffix")
 
     def first_tile(q_abs: int) -> int:
         if sliding_window < 0:
             return 0
         return max(0, (q_abs + 1 - sliding_window) // _TILE_KV)
 
+    prefix = None
     full_blocks = full_tiles = partial_tiles = 0
     for i, kv in enumerate(kv_lens):
+        if i == prefill_start:
+            prefix = NaxTileWork(full_blocks, full_tiles, partial_tiles)
+            full_blocks = full_tiles = partial_tiles = 0
         q = cu_seqlens[i + 1] - cu_seqlens[i]
         if q <= 0:
             continue
@@ -79,7 +95,15 @@ def nax_tile_work(
             full_tiles += _tiles(start + _BQ) - first_tile(start)
         if q % _BQ:
             partial_tiles += _tiles(kv) - first_tile(context + n_full * _BQ)
-    return NaxTileWork(full_blocks, full_tiles, partial_tiles)
+    work = NaxTileWork(full_blocks, full_tiles, partial_tiles)
+    if prefix is None:
+        return work, None
+    whole = NaxTileWork(
+        prefix.full_blocks + full_blocks,
+        prefix.full_tiles + full_tiles,
+        prefix.partial_tiles + partial_tiles,
+    )
+    return whole, work
 
 
 def nax_split_hint(work: NaxTileWork, head_size: int) -> int:

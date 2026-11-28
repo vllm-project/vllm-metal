@@ -10,6 +10,7 @@ from vllm_metal.attention.nax_split import (
     nax_split_hint,
     nax_split_kwargs,
     nax_tile_work,
+    nax_tile_work_views,
 )
 
 
@@ -128,8 +129,8 @@ def test_split_kwargs_defaults_to_the_original_loop():
 
 def test_separated_decode_work_changes_the_prefill_hint():
     cu, kv = [0, 1, 257], [131072, 8192]
-    whole = nax_tile_work(cu, kv)
-    prefill = nax_tile_work(cu[1:], kv[1:])
+    whole, prefill = nax_tile_work_views(cu, kv, prefill_start=1)
+    assert prefill is not None
     assert (whole.full_blocks, whole.full_tiles, whole.partial_tiles) == (4, 1012, 4096)
     assert (prefill.full_blocks, prefill.full_tiles, prefill.partial_tiles) == (
         4,
@@ -153,8 +154,7 @@ def test_separated_decode_work_changes_the_prefill_hint():
     ids=["legacy", "whole-batch-only", "prefill-subset"],
 )
 def test_prefill_hint_keeps_whole_batch_and_old_build_compatibility(caps, expected):
-    whole = nax_tile_work([0, 1, 257], [131072, 8192])
-    prefill = nax_tile_work([1, 257], [8192])
+    whole, prefill = nax_tile_work_views([0, 1, 257], [131072, 8192], prefill_start=1)
     assert nax_split_kwargs(caps, whole, 256, prefill_work=prefill) == expected
     if caps.get("nax_split_hint"):
         assert nax_split_kwargs(caps, whole, 256) == {"nax_split_hint": 0}

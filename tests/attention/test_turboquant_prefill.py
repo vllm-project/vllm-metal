@@ -3,7 +3,7 @@
 
 import gc
 from contextlib import nullcontext
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
 import numpy as np
@@ -134,8 +134,10 @@ def test_unsupported_reason_covers_each_gate() -> None:
     ],
 )
 def test_prefill_quantization_formats(
-    recorded_ops, prefill_backend, dtype, k_quant, v_quant
+    recorded_ops, prefill_backend, monkeypatch, dtype, k_quant, v_quant
 ):
+    # Test the host hint on CI machines with or without a NAX library.
+    monkeypatch.setattr(get_ops(), "nax_ready", lambda: True)
     case = build_case(dtype=dtype, k_quant=k_quant, v_quant=v_quant)
     assert_parity(case)
     assert len(recorded_ops) == 1
@@ -151,8 +153,10 @@ def test_prefill_quantization_formats(
     ("head_dim", "block_size"), [(64, 8), (128, 32), (256, 544), (512, 64)]
 )
 def test_prefill_strided_translated_pages(
-    recorded_ops, prefill_backend, head_dim, block_size
+    recorded_ops, prefill_backend, monkeypatch, head_dim, block_size
 ):
+    # Test the host hint on CI machines with or without a NAX library.
+    monkeypatch.setattr(get_ops(), "nax_ready", lambda: True)
     case = build_case(
         head_dim=head_dim,
         block_size=block_size,
@@ -221,13 +225,18 @@ def test_lone_decode_fallback_honours_the_gqa_kill_switch(
     assert fallback[1].get("gqa_disabled", False) is gqa_disabled
 
 
-def test_nax_hint_describes_only_the_dequantized_prefill(recorded_ops):
+def test_nax_hint_describes_only_the_dequantized_prefill(recorded_ops, monkeypatch):
     """The compressed short request must not suppress the full prefill blocks."""
+    # Test the host hint on CI machines with or without a NAX library.
+    monkeypatch.setattr(get_ops(), "nax_ready", lambda: True)
+    work = MagicMock(wraps=turboquant_prefill.nax_tile_work)
+    monkeypatch.setattr(turboquant_prefill, "nax_tile_work", work)
     case = build_case(qlens=(256, 63), context_lens=(257, 2111))
     assert_parity(case)
     prefill = [kw for _, kw in recorded_ops if not kw.get("use_turboquant", False)]
     assert len(prefill) == 1
     assert prefill[0]["nax_split_hint"] == 1
+    work.assert_called_once_with([0, 256], [257])
 
 
 @pytest.mark.parametrize("qlen", [1, 2, 32, 127, 128])
@@ -730,9 +739,12 @@ def test_rollout_requires_nax_or_explicit_opt_in(
 ):
     monkeypatch.setenv("VLLM_METAL_TQ_PREFILL", mode)
     monkeypatch.setattr(get_ops(), "nax_ready", lambda: ready)
+    work = MagicMock(wraps=turboquant_prefill.nax_tile_work)
+    monkeypatch.setattr(turboquant_prefill, "nax_tile_work", work)
     case = build_case()
     assert_parity(case)
     assert recorded_ops[0][1].get("use_turboquant", False) == (not selected)
+    assert work.call_count == int(selected and ready)
 
 
 def test_workspace_plan_key_includes_kv_geometry():
