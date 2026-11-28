@@ -32,8 +32,10 @@ class GGUFLoadError(RuntimeError):
 class GGUFPlainTransform(Protocol):
     """Undo how llama.cpp stores a plain tensor relative to its live parameter."""
 
-    def source_shape(self, model_shape: tuple[int, ...]) -> tuple[int, ...]:
-        """The shape the file stores a parameter of ``model_shape`` in."""
+    def source_shapes(
+        self, model_shape: tuple[int, ...]
+    ) -> tuple[tuple[int, ...], ...]:
+        """The shapes the file may store a parameter of ``model_shape`` in."""
         ...
 
     def apply(self, source: mx.array) -> mx.array:
@@ -44,8 +46,10 @@ class GGUFPlainTransform(Protocol):
 class _SqueezedUnitAxis:
     """The file squeezes a conv kernel ``(C, K, 1)`` to ``(C, K)``."""
 
-    def source_shape(self, model_shape: tuple[int, ...]) -> tuple[int, ...]:
-        return model_shape[:-1]
+    def source_shapes(
+        self, model_shape: tuple[int, ...]
+    ) -> tuple[tuple[int, ...], ...]:
+        return (model_shape[:-1],)
 
     def apply(self, source: mx.array) -> mx.array:
         return mx.expand_dims(source, -1)
@@ -54,8 +58,10 @@ class _SqueezedUnitAxis:
 class _NegatedExp:
     """The file stores ``-exp(x)`` (llama.cpp's ``ssm_a = -exp(A_log)``)."""
 
-    def source_shape(self, model_shape: tuple[int, ...]) -> tuple[int, ...]:
-        return model_shape
+    def source_shapes(
+        self, model_shape: tuple[int, ...]
+    ) -> tuple[tuple[int, ...], ...]:
+        return (model_shape,)
 
     def apply(self, source: mx.array) -> mx.array:
         return mx.log(-source)
@@ -64,8 +70,10 @@ class _NegatedExp:
 class _ShiftedByOne:
     """The file stores ``x + 1`` (llama.cpp folds Gemma's ``1 + weight`` norm)."""
 
-    def source_shape(self, model_shape: tuple[int, ...]) -> tuple[int, ...]:
-        return model_shape
+    def source_shapes(
+        self, model_shape: tuple[int, ...]
+    ) -> tuple[tuple[int, ...], ...]:
+        return (model_shape,)
 
     def apply(self, source: mx.array) -> mx.array:
         return source - 1
